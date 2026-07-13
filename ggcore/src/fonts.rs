@@ -1,0 +1,246 @@
+//! Font store: loads Windows system TTFs, resolves per-glyph fallback
+//! (Segoe UI -> Malgun Gothic for Hangul -> Segoe UI Symbol), measures
+//! text with kerning, and caches rasterized glyphs.
+
+use std::collections::HashMap;
+use std::fs;
+
+pub struct Variant {
+    pub primary: usize,
+    pub fallbacks: Vec<usize>,
+}
+
+pub struct CachedGlyph {
+    pub width: usize,
+    pub height: usize,
+    pub xmin: i32,
+    pub ymin: i32,
+    pub advance: f32,
+    pub coverage: Vec<u8>,
+}
+
+pub struct FontStore {
+    fonts: Vec<fontdue::Font>,
+    file_ids: HashMap<&'static str, usize>,
+    variants: Vec<Variant>,
+    variant_ids: HashMap<(String, bool, bool), u32>,
+    glyph_cache: HashMap<(usize, u32, char), CachedGlyph>,
+    metrics_cache: HashMap<(u32, u32), (f32, f32, f32)>,
+}
+
+const FONT_DIR: &str = r"C:\Windows\Fonts";
+
+/// (family, bold, italic) -> file name
+const FONT_FILES: &[(&str, bool, bool, &str)] = &[
+    ("segoe ui", false, false, "segoeui.ttf"),
+    ("segoe ui", true, false, "segoeuib.ttf"),
+    ("segoe ui", false, true, "segoeuii.ttf"),
+    ("segoe ui", true, true, "segoeuiz.ttf"),
+    ("consolas", false, false, "consola.ttf"),
+    ("consolas", true, false, "consolab.ttf"),
+    ("consolas", false, true, "consolai.ttf"),
+    ("consolas", true, true, "consolaz.ttf"),
+    ("georgia", false, false, "georgia.ttf"),
+    ("georgia", true, false, "georgiab.ttf"),
+    ("georgia", false, true, "georgiai.ttf"),
+    ("georgia", true, true, "georgiaz.ttf"),
+    ("malgun gothic", false, false, "malgun.ttf"),
+    ("malgun gothic", true, false, "malgunbd.ttf"),
+    ("symbols", false, false, "seguisym.ttf"),
+];
+
+impl FontStore {
+    pub fn new() -> Result<FontStore, String> {
+        let mut fonts = Vec::new();
+        let mut file_ids = HashMap::new();
+        for &(_, _, _, file) in FONT_FILES {
+            if file_ids.contains_key(file) {
+                continue;
+            }
+            let path = format!("{}\\{}", FONT_DIR, file);
+            let data = fs::read(&path)
+                .map_err(|e| format!("cannot read {}: {}", path, e))?;
+            let font = fontdue::Font::from_bytes(
+                data,
+                fontdue::FontSettings::default(),
+            )
+            .map_err(|e| format!("cannot parse {}: {}", path, e))?;
+            file_ids.insert(file, fonts.len());
+            fonts.push(font);
+        }
+        Ok(FontStore {
+            fonts,
+            file_ids,
+            variants: Vec::new(),
+            variant_ids: HashMap::new(),
+            glyph_cache: HashMap::new(),
+            metrics_cache: HashMap::new(),
+        })
+    }
+
+    fn file_font(&self, file: &str) -> usize {
+        *self.file_ids.get(file).unwrap_or(&0)
+    }
+
+    fn lookup_variant_file(family: &str, bold: bool, italic: bool) -> &'static str {
+        // exact variant, then same family without italic/bold, then default
+        for &(fam, b, i, file) in FONT_FILES {
+            if fam == family && b == bold && i == italic {
+                return file;
+            }
+        }
+        for &(fam, b, _, file) in FONT_FILES {
+            if fam == family && b == bold {
+                return file;
+            }
+        }
+        for &(fam, _, _, file) in FONT_FILES {
+            if fam == family {
+                return file;
+            }
+        }
+        match (bold, italic) {
+            (false, false) => "segoeui.ttf",
+            (true, false) => "segoeuib.ttf",
+            (false, true) => "segoeuii.ttf",
+            (true, true) => "segoeuiz.ttf",
+        }
+    }
+
+    pub fn variant_id(&mut self, family: &str, bold: bool, italic: bool) -> u32 {
+        let family = family.to_ascii_lowercase();
+        let key = (family.clone(), bold, italic);
+        if let Some(&id) = self.variant_ids.get(&key) {
+            return id;
+        }
+        let primary =
+            self.file_font(Self::lookup_variant_file(&family, bold, italic));
+        // Hangul/symbol fallbacks; prefer bold Malgun for bold variants
+        let mut fallbacks = Vec::new();
+        if bold {
+            fallbacks.push(self.file_font("malgunbd.ttf"));
+        }
+        fallbacks.push(self.file_font("malgun.ttf"));
+        fallbacks.push(self.file_font("seguisym.ttf"));
+        fallbacks.retain(|&f| f != primary);
+
+        let id = self.variants.len() as u32;
+        self.variants.push(Variant { primary, fallbacks });
+        self.variant_ids.insert(key, id);
+        id
+    }
+
+    fn resolve(&self, variant: u32, c: char) -> Option<usize> {
+        let v = self.variants.get(variant as usize)?;
+        if self.fonts[v.primary].lookup_glyph_index(c) != 0 {
+            return Some(v.primary);
+        }
+        for &f in &v.fallbacks {
+            if self.fonts[f].lookup_glyph_index(c) != 0 {
+                return Some(f);
+            }
+        }
+        None
+    }
+
+    /// (ascent, descent, linespace) for a variant at a pixel size.
+    pub fn metrics(&mut self, variant: u32, size: f32) -> (f32, f32, f32) {
+        let key = (variant, (size * 4.0) as u32);
+        if let Some(&m) = self.metrics_cache.get(&key) {
+            return m;
+        }
+        let primary = self
+            .variants
+            .get(variant as usize)
+            .map(|v| v.primary)
+            .unwrap_or(0);
+        let lm = self.fonts[primary]
+            .horizontal_line_metrics(size)
+            .unwrap_or(fontdue::LineMetrics {
+                ascent: size * 0.8,
+                descent: -size * 0.2,
+                line_gap: 0.0,
+                new_line_size: size,
+            });
+        let ascent = lm.ascent;
+        let descent = -lm.descent;
+        let linespace = ascent + descent + lm.line_gap;
+        let m = (ascent, descent, linespace);
+        self.metrics_cache.insert(key, m);
+        m
+    }
+
+    pub fn measure(&mut self, variant: u32, size: f32, text: &str) -> f32 {
+        let mut width = 0.0f32;
+        let mut prev: Option<(usize, char)> = None;
+        for mut c in text.chars() {
+            if c == '\u{a0}' {
+                c = ' ';
+            }
+            if c == '\t' {
+                let sp = self.advance(variant, size, ' ');
+                width += sp * 4.0;
+                prev = None;
+                continue;
+            }
+            match self.resolve(variant, c) {
+                Some(f) => {
+                    if let Some((pf, pc)) = prev {
+                        if pf == f {
+                            if let Some(k) =
+                                self.fonts[f].horizontal_kern(pc, c, size)
+                            {
+                                width += k;
+                            }
+                        }
+                    }
+                    width += self.glyph(f, size, c).advance;
+                    prev = Some((f, c));
+                }
+                None => {
+                    width += size * 0.6; // missing glyph box
+                    prev = None;
+                }
+            }
+        }
+        width
+    }
+
+    fn advance(&mut self, variant: u32, size: f32, c: char) -> f32 {
+        match self.resolve(variant, c) {
+            Some(f) => self.glyph(f, size, c).advance,
+            None => size * 0.6,
+        }
+    }
+
+    pub fn glyph(&mut self, font_idx: usize, size: f32, c: char) -> &CachedGlyph {
+        let key = (font_idx, (size * 4.0) as u32, c);
+        if !self.glyph_cache.contains_key(&key) {
+            let (m, coverage) = self.fonts[font_idx].rasterize(c, size);
+            self.glyph_cache.insert(
+                key,
+                CachedGlyph {
+                    width: m.width,
+                    height: m.height,
+                    xmin: m.xmin,
+                    ymin: m.ymin,
+                    advance: m.advance_width,
+                    coverage,
+                },
+            );
+        }
+        self.glyph_cache.get(&key).unwrap()
+    }
+
+    /// Per-char font resolution for the rasterizer.
+    pub fn resolve_char(&self, variant: u32, c: char) -> Option<usize> {
+        self.resolve(variant, c)
+    }
+
+    /// Kerning between two chars if both live in the same font.
+    pub fn kern(&self, font_idx: usize, a: char, b: char, size: f32) -> f32 {
+        self.fonts[font_idx]
+            .horizontal_kern(a, b, size)
+            .unwrap_or(0.0)
+    }
+}

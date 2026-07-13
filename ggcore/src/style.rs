@@ -1,0 +1,582 @@
+//! Style computation: hash-bucket rule index + cascade + inheritance.
+
+use std::collections::HashMap;
+
+use crate::css::{CssParser, Rule, Simple};
+use crate::dom::Document;
+
+const INHERITED: &[(&str, &str)] = &[
+    ("font-size", "16px"),
+    ("font-style", "normal"),
+    ("font-weight", "normal"),
+    ("font-family", "default"),
+    ("color", "black"),
+    ("text-align", "left"),
+    ("white-space", "normal"),
+];
+
+fn parse_px(value: &str, default: f64) -> f64 {
+    let v = value.trim();
+    let v = v.strip_suffix("px").unwrap_or(v);
+    v.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|x| x.is_finite())
+        .unwrap_or(default)
+}
+
+/// Bucket key: rightmost compound's most selective simple selector.
+enum BucketKey<'r> {
+    Id(&'r str),
+    Class(&'r str),
+    Tag(&'r str),
+    Universal,
+}
+
+fn bucket_key(rule: &Rule) -> BucketKey<'_> {
+    let compound = rule.selector.chain.last().unwrap();
+    for p in compound {
+        if let Simple::Id(id) = p {
+            return BucketKey::Id(id);
+        }
+    }
+    for p in compound {
+        if let Simple::Class(c) = p {
+            return BucketKey::Class(c);
+        }
+    }
+    for p in compound {
+        if let Simple::Tag(t) = p {
+            return BucketKey::Tag(t);
+        }
+    }
+    BucketKey::Universal
+}
+
+struct RuleIndex<'r> {
+    by_id: HashMap<&'r str, Vec<usize>>,
+    by_class: HashMap<&'r str, Vec<usize>>,
+    by_tag: HashMap<&'r str, Vec<usize>>,
+    universal: Vec<usize>,
+    rules: &'r [Rule],
+}
+
+impl<'r> RuleIndex<'r> {
+    fn new(rules: &'r [Rule]) -> Self {
+        let mut idx = RuleIndex {
+            by_id: HashMap::new(),
+            by_class: HashMap::new(),
+            by_tag: HashMap::new(),
+            universal: Vec::new(),
+            rules,
+        };
+        for (order, rule) in rules.iter().enumerate() {
+            match bucket_key(rule) {
+                BucketKey::Id(k) => {
+                    idx.by_id.entry(k).or_default().push(order)
+                }
+                BucketKey::Class(k) => {
+                    idx.by_class.entry(k).or_default().push(order)
+                }
+                BucketKey::Tag(k) => {
+                    idx.by_tag.entry(k).or_default().push(order)
+                }
+                BucketKey::Universal => idx.universal.push(order),
+            }
+        }
+        idx
+    }
+
+    fn matching(&self, doc: &Document, node_idx: usize) -> Vec<usize> {
+        let node = &doc.nodes[node_idx];
+        let mut candidates: Vec<usize> = Vec::new();
+        if let Some(tag) = node.tag.as_deref() {
+            if let Some(v) = self.by_tag.get(tag) {
+                candidates.extend_from_slice(v);
+            }
+        }
+        for cls in &node.classes {
+            if let Some(v) = self.by_class.get(cls.as_str()) {
+                candidates.extend_from_slice(v);
+            }
+        }
+        if let Some(id) = node.attr("id") {
+            if let Some(v) = self.by_id.get(id) {
+                candidates.extend_from_slice(v);
+            }
+        }
+        candidates.extend_from_slice(&self.universal);
+
+        let mut matched: Vec<usize> = candidates
+            .into_iter()
+            .filter(|&o| self.rules[o].selector.matches(doc, node_idx))
+            .collect();
+        // cascade: sort by (origin, specificity, source order) —
+        // must mirror compute_styles' global sort
+        matched.sort_by_key(|&o| {
+            (self.rules[o].origin, self.rules[o].selector.specificity, o)
+        });
+        matched
+    }
+}
+
+/// Parse css sources in cascade order and compute styles for every node.
+pub fn compute_styles(doc: &mut Document, css_sources: &[String]) {
+    let mut rules: Vec<Rule> = Vec::new();
+    for (si, src) in css_sources.iter().enumerate() {
+        let mut parsed = CssParser::new(src).parse();
+        if si == 0 {
+            // the first source is the UA sheet (see native.py)
+            for r in &mut parsed {
+                r.origin = 0;
+            }
+        }
+        rules.extend(parsed);
+    }
+    // stable sort keeps source order among equal keys; origin outranks
+    // specificity so author resets can override the UA sheet
+    rules.sort_by_key(|r| (r.origin, r.selector.specificity));
+
+    let index = RuleIndex::new(&rules);
+    let root = doc.root;
+    let default_style: HashMap<String, String> = INHERITED
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    style_node(doc, &index, root, &default_style, &HashMap::new());
+}
+
+fn style_node(
+    doc: &mut Document,
+    index: &RuleIndex,
+    idx: usize,
+    parent_style: &HashMap<String, String>,
+    parent_vars: &HashMap<String, String>,
+) {
+    let mut style: HashMap<String, String> = HashMap::with_capacity(12);
+
+    // 1. inherited defaults
+    for (prop, default) in INHERITED {
+        let v = parent_style
+            .get(*prop)
+            .cloned()
+            .unwrap_or_else(|| default.to_string());
+        style.insert(prop.to_string(), v);
+    }
+
+    if doc.nodes[idx].is_element() {
+        // 2. cascade via rule index
+        for order in index.matching(doc, idx) {
+            for (prop, value) in &index.rules[order].decls {
+                apply(&mut style, prop, value);
+            }
+        }
+        // 3. inline style attribute wins
+        if let Some(inline) = doc.nodes[idx].attr("style") {
+            let inline = inline.to_string();
+            for (prop, value) in CssParser::new(&inline).body() {
+                apply(&mut style, &prop, &value);
+            }
+        }
+    }
+
+    // 3.5 custom properties: collect --* declarations into the
+    // inherited variable scope (copy-on-write — nodes that define none
+    // share the parent's map), then substitute var() references. A
+    // failed substitution is "invalid at computed-value time":
+    // inherited properties fall back to the parent's value, others are
+    // dropped. Mirrors Python style._style.
+    let own: Vec<String> = style
+        .keys()
+        .filter(|k| k.starts_with("--"))
+        .cloned()
+        .collect();
+    let vars_storage;
+    let vars: &HashMap<String, String> = if own.is_empty() {
+        parent_vars
+    } else {
+        let mut merged = parent_vars.clone();
+        for prop in own {
+            if let Some(v) = style.remove(&prop) {
+                merged.insert(prop, v);
+            }
+        }
+        vars_storage = merged;
+        &vars_storage
+    };
+    let needs_vars: Vec<String> = style
+        .iter()
+        .filter(|(_, v)| find_var(v, 0).is_some())
+        .map(|(k, _)| k.clone())
+        .collect();
+    for prop in needs_vars {
+        let resolved = resolve_var_refs(&style[&prop], vars, 0);
+        match resolved {
+            Some(r) if !r.trim().is_empty() => {
+                style.insert(prop, r.trim().to_string());
+            }
+            _ => {
+                if let Some((_, default)) =
+                    INHERITED.iter().find(|(k, _)| *k == prop)
+                {
+                    let v = parent_style
+                        .get(&prop)
+                        .cloned()
+                        .unwrap_or_else(|| default.to_string());
+                    style.insert(prop, v);
+                } else {
+                    style.remove(&prop);
+                }
+            }
+        }
+    }
+
+    // 4. resolve relative font sizes against the parent
+    let parent_px = parse_px(
+        parent_style
+            .get("font-size")
+            .map(String::as_str)
+            .unwrap_or("16px"),
+        16.0,
+    );
+    let fs = style.get("font-size").cloned().unwrap_or_default();
+    let resolved = if let Some(rem) = fs.strip_suffix("rem") {
+        // must be checked before "em" (its suffix); rem is relative to
+        // the root font-size (16px)
+        Some(16.0 * rem.trim().parse::<f64>().unwrap_or(1.0))
+    } else if let Some(pct) = fs.strip_suffix('%') {
+        Some(parent_px * pct.trim().parse::<f64>().unwrap_or(100.0) / 100.0)
+    } else if let Some(em) = fs.strip_suffix("em") {
+        Some(parent_px * em.trim().parse::<f64>().unwrap_or(1.0))
+    } else if fs.ends_with("px") {
+        None
+    } else {
+        Some(match fs.as_str() {
+            "xx-small" => 9.0,
+            "x-small" => 10.0,
+            "small" => 13.0,
+            "medium" => 16.0,
+            "large" => 18.0,
+            "x-large" => 24.0,
+            "xx-large" => 32.0,
+            _ => parent_px,
+        })
+    };
+    if let Some(px) = resolved {
+        style.insert("font-size".to_string(), px_string(px));
+    }
+
+    doc.nodes[idx].style = style;
+
+    let children = doc.nodes[idx].children.clone();
+    let my_style = doc.nodes[idx].style.clone();
+    for child in children {
+        style_node(doc, index, child, &my_style, vars);
+    }
+}
+
+// --- CSS custom properties (var) — mirrors Python style.py ------------
+
+const VAR_MAX_DEPTH: u32 = 16;
+
+fn ident_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c >= 0x80
+}
+
+/// Next var(...) in value: (open_idx, end_idx_past_paren, inner).
+fn find_var(value: &str, from: usize) -> Option<(usize, usize, &str)> {
+    let b = value.as_bytes();
+    let mut i = from;
+    while i + 4 <= b.len() {
+        if b[i..i + 4].eq_ignore_ascii_case(b"var(")
+            && (i == 0 || !ident_byte(b[i - 1]))
+        {
+            let mut depth = 1usize;
+            let mut j = i + 4;
+            while j < b.len() && depth > 0 {
+                match b[j] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth > 0 {
+                return None; // unbalanced — treat the rest as plain text
+            }
+            return Some((i, j, &value[i + 4..j - 1]));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split "name" / "name, fallback" at the first top-level comma.
+fn split_fallback(inner: &str) -> (&str, Option<&str>) {
+    let b = inner.as_bytes();
+    let mut depth = 0usize;
+    for (k, &c) in b.iter().enumerate() {
+        match c {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                return (&inner[..k], Some(&inner[k + 1..]));
+            }
+            _ => {}
+        }
+    }
+    (inner, None)
+}
+
+/// Substitute every var() in value using vars. Returns None when the
+/// value is invalid at computed-value time (undefined variable with no
+/// fallback, or a reference cycle).
+fn resolve_var_refs(
+    value: &str,
+    vars: &HashMap<String, String>,
+    depth: u32,
+) -> Option<String> {
+    if depth > VAR_MAX_DEPTH {
+        return None;
+    }
+    let mut out = String::new();
+    let mut i = 0usize;
+    loop {
+        match find_var(value, i) {
+            None => {
+                out.push_str(&value[i..]);
+                break;
+            }
+            Some((start, end, inner)) => {
+                out.push_str(&value[i..start]);
+                let (name, fallback) = split_fallback(inner);
+                let key = name.trim().to_ascii_lowercase();
+                let mut resolved = match vars.get(&key) {
+                    Some(sub) if !sub.trim().is_empty() => {
+                        resolve_var_refs(sub, vars, depth + 1)
+                    }
+                    _ => None,
+                };
+                if resolved.as_deref().map_or(true, |r| r.trim().is_empty())
+                {
+                    if let Some(fb) = fallback {
+                        resolved =
+                            resolve_var_refs(fb.trim(), vars, depth + 1);
+                    }
+                }
+                match resolved {
+                    Some(r) if !r.trim().is_empty() => out.push_str(&r),
+                    _ => return None,
+                }
+                i = end;
+            }
+        }
+    }
+    Some(out)
+}
+
+fn expand_box(style: &mut HashMap<String, String>, prefix: &str, value: &str) {
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    let (t, r, b, l) = match parts.len() {
+        1 => (parts[0], parts[0], parts[0], parts[0]),
+        2 => (parts[0], parts[1], parts[0], parts[1]),
+        3 => (parts[0], parts[1], parts[2], parts[1]),
+        4 => (parts[0], parts[1], parts[2], parts[3]),
+        _ => return,
+    };
+    style.insert(format!("{prefix}-top"), t.into());
+    style.insert(format!("{prefix}-right"), r.into());
+    style.insert(format!("{prefix}-bottom"), b.into());
+    style.insert(format!("{prefix}-left"), l.into());
+}
+
+/// Mirror of Python's style.parse_size (default bases).
+fn parse_size(value: &str) -> Option<f64> {
+    let v = value.trim().to_ascii_lowercase();
+    if matches!(v.as_str(), "auto" | "none" | "inherit" | "initial"
+        | "unset" | "min-content" | "max-content" | "fit-content")
+    {
+        return None;
+    }
+    if let Some(n) = v.strip_suffix("px") {
+        return n.trim().parse().ok().filter(|x: &f64| x.is_finite());
+    }
+    if let Some(n) = v.strip_suffix("rem") {
+        return n.trim().parse::<f64>().ok().map(|x| x * 16.0)
+            .filter(|x| x.is_finite());
+    }
+    if let Some(n) = v.strip_suffix("em") {
+        return n.trim().parse::<f64>().ok().map(|x| x * 16.0)
+            .filter(|x| x.is_finite());
+    }
+    if v.ends_with('%') || v.ends_with("vw") || v.ends_with("vh") {
+        return Some(0.0);
+    }
+    v.parse().ok().filter(|x: &f64| x.is_finite())
+}
+
+fn px_string(value: f64) -> String {
+    if !value.is_finite() {
+        return "0px".to_string(); // parity with Python px_str()
+    }
+    if value.fract() == 0.0 && value.abs() < 1e15 {
+        format!("{}px", value as i64)
+    } else {
+        format!("{}px", value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::html;
+
+    fn styled(css: &str, html_src: &str) -> Document {
+        let mut doc = html::parse(html_src);
+        compute_styles(
+            &mut doc,
+            &["".to_string(), css.to_string()],
+        );
+        doc
+    }
+
+    fn tag_style<'d>(
+        doc: &'d Document,
+        tag: &str,
+    ) -> &'d HashMap<String, String> {
+        let idx = (0..doc.nodes.len())
+            .find(|&i| doc.nodes[i].tag.as_deref() == Some(tag))
+            .unwrap();
+        &doc.nodes[idx].style
+    }
+
+    #[test]
+    fn var_resolves_from_root() {
+        let doc = styled(":root{--c:#123456} p{color:var(--c)}", "<p>x</p>");
+        assert_eq!(tag_style(&doc, "p")["color"], "#123456");
+        assert!(!tag_style(&doc, "p").contains_key("--c"));
+    }
+
+    #[test]
+    fn where_root_defines_vars() {
+        let doc = styled(
+            ":where(:root,:host){--bg:#0f0} p{background-color:var(--bg)}",
+            "<p>x</p>",
+        );
+        assert_eq!(tag_style(&doc, "p")["background-color"], "#0f0");
+    }
+
+    #[test]
+    fn chained_vars_and_fallback() {
+        let doc = styled(
+            "html{--a:var(--b)} :root{--b:red} \
+             p{color:var(--a)} div{color:var(--nope, blue)}",
+            "<div>y</div><p>x</p>",
+        );
+        assert_eq!(tag_style(&doc, "p")["color"], "red");
+        assert_eq!(tag_style(&doc, "div")["color"], "blue");
+    }
+
+    #[test]
+    fn unresolvable_inherited_falls_back_to_parent() {
+        let doc = styled(
+            "body{color:#222} p{color:var(--gone)}",
+            "<body><p>x</p></body>",
+        );
+        assert_eq!(tag_style(&doc, "p")["color"], "#222");
+    }
+
+    #[test]
+    fn unresolvable_non_inherited_is_dropped() {
+        let doc = styled("p{background-color:var(--gone)}", "<p>x</p>");
+        assert!(!tag_style(&doc, "p").contains_key("background-color"));
+    }
+
+    #[test]
+    fn var_cycle_terminates_and_uses_fallback() {
+        let doc = styled(
+            ":root{--a:var(--b);--b:var(--a)} p{color:var(--a,#345678)}",
+            "<p>x</p>",
+        );
+        assert_eq!(tag_style(&doc, "p")["color"], "#345678");
+    }
+
+    #[test]
+    fn var_font_size_resolves_relative_units() {
+        let doc = styled(":root{--fs:2em} p{font-size:var(--fs)}",
+                         "<p>x</p>");
+        assert_eq!(tag_style(&doc, "p")["font-size"], "32px");
+    }
+
+    #[test]
+    fn where_attr_alternatives_stay_inert_without_the_attribute() {
+        let doc = styled(
+            ":where([data-theme=dark]){--x:#000} p{color:var(--x,#eee)}",
+            "<p>x</p>",
+        );
+        assert_eq!(tag_style(&doc, "p")["color"], "#eee");
+    }
+
+    #[test]
+    fn attribute_selectors_match() {
+        let doc = styled(
+            "[data-x=on]{color:red} [data-y]{color:blue} \
+             [href^=\"https:\"]{color:green} [class~=big]{color:purple}",
+            "<p data-x=on>a</p><div data-y=1>b</div>\
+             <a href=\"https://x\">c</a><b class=\"a big\">d</b>",
+        );
+        assert_eq!(tag_style(&doc, "p")["color"], "red");
+        assert_eq!(tag_style(&doc, "div")["color"], "blue");
+        assert_eq!(tag_style(&doc, "a")["color"], "green");
+        assert_eq!(tag_style(&doc, "b")["color"], "purple");
+    }
+
+    #[test]
+    fn attribute_selector_mismatch_is_ignored() {
+        let doc = styled("[data-x=on]{color:red}", "<p data-x=off>a</p>");
+        assert_eq!(tag_style(&doc, "p")["color"], "black");
+    }
+}
+
+fn apply(style: &mut HashMap<String, String>, prop: &str, value: &str) {
+    let value = value.trim();
+    if prop == "margin" {
+        expand_box(style, "margin", value);
+    } else if prop == "padding" {
+        expand_box(style, "padding", value);
+    } else if prop == "border" {
+        let mut width: Option<f64> = None;
+        let mut color: Option<&str> = None;
+        for part in value.split_whitespace() {
+            let p = part.to_ascii_lowercase();
+            if p == "none" || p == "hidden" {
+                width = Some(0.0);
+            } else if matches!(p.as_str(), "solid" | "dashed" | "dotted"
+                | "double" | "groove" | "ridge" | "inset" | "outset")
+            {
+                continue;
+            } else if let Some(w) = parse_size(&p) {
+                width = Some(w);
+            } else {
+                color = Some(part);
+            }
+        }
+        match width {
+            Some(w) => {
+                style.insert("border-width".into(), px_string(w));
+            }
+            None => {
+                style
+                    .entry("border-width".into())
+                    .or_insert_with(|| "1px".into());
+            }
+        }
+        if let Some(c) = color {
+            style.insert("border-color".into(), c.to_string());
+        }
+    } else if prop == "font" {
+        // too complex to fully parse; ignore rather than misrender
+    } else {
+        style.insert(prop.to_string(), value.to_string());
+    }
+}

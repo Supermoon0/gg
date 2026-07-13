@@ -1,0 +1,6 @@
+﻿__pycache__/
+*.pyc
+ggcore/target/
+ggcore/target-gnu/
+ggcore/dist/
+.claude/
