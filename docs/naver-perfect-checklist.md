@@ -154,7 +154,16 @@ class 2회) 문법 갭이 좁고, `display:grid`·`position:sticky`도 **0회**�
       컨테이닝 블록 기준, 한쪽만 지정 시 고유 비율 유지; % 높이는
       기준 없음 → 속성/비율 폴백). input은 블록 박스 모델이라 기존에
       이미 적용됨
-- [ ] `float` + `clear` (×25)
+- [x] **`float` + `clear` v1** (×25) — 07-18: 블록 모드를 증분 배치로
+      전환(앞선 float가 등록돼야 뒤 형제가 회피 가능). **폭 명시된
+      float만 참여**(auto 폭은 일반 흐름 폴백 — v1 게이트):
+      좌/우 가장자리에 흐름 하단 y로 배치, 같은 y의 기존 float 뒤로
+      스택. 자동 폭 in-flow 블록은 상단이 겹치는 float만큼 x 시프트+
+      폭 축소(라인박스 단위가 아니라 블록 통째 회피 — 근사).
+      `clear`: left/right/both가 해당 float 바닥 아래로 강하.
+      컨테이너 높이는 float 바닥 포함(클리어픽스형 봉쇄).
+      갭: 인라인 흐름 안의 float, float 아래로 텍스트 재확장,
+      margin 있는 float의 스택 x 근사
 - [ ] inline-block 정식 배치 (지금은 근사)
 - [ ] margin collapsing
 - [x] ~~grid~~ (×0), ~~sticky~~ (×0) — 네이버 홈엔 없음, 스킵
@@ -545,7 +554,7 @@ postMessage/scrollTo/getComputedStyle/XHR은 코드에 이미 있었는데 문�
 오후: **M6 lazy 컴파일 가동** — 지연 배분 실측용 프로파일 하니스
 `cargo test --release -- --ignored profile_phases --nocapture` 상설화.
 저녁: lazy parse + M4 transform — smoke 111종).
-항목을 완료하면 [x]로 바꾸고 날짜를 적을 것. cargo 156/156, smoke 135종
+항목을 완료하면 [x]로 바꾸고 날짜를 적을 것. cargo 156/156, smoke 141종
 (엔진 파트; 실네트워크 관문은 egress 제한 환경에서 측정 불가) 기준.
 검증 체인: cargo test → maturin build → pip 재설치 → smoke_test.py →
 basket_test.py (네이버 단건은 scratchpad diag 스크립트).*
