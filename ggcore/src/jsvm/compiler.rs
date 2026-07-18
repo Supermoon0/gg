@@ -298,7 +298,15 @@ impl FnCtx {
     fn alloc(&mut self) -> Result<u8, CompileError> {
         if self.tmp_top >= 250 {
             return Err(CompileError {
-                msg: format!("expression too deep in {}", self.name),
+                msg: format!(
+                    "expression too deep in {} (locals={}, tmp={}, \
+                     code={}, last={:?})",
+                    self.name,
+                    self.locals_end,
+                    self.tmp_top,
+                    self.code.len(),
+                    &self.code[self.code.len().saturating_sub(6)..]
+                ),
             });
         }
         let r = self.tmp_top;
@@ -854,6 +862,422 @@ fn ast_arrow(params: Vec<String>, body: Vec<Stmt>) -> Expr {
     }))
 }
 
+// --- await normalization ------------------------------------------------
+// Before chaining, every `await` is hoisted so it only ever appears as
+// `var __awN = await E;` with E itself await-free. This makes awaits in
+// expression position (`x = await f() + 1`, `if (await ok())`, call
+// arguments, ...) reduce to the shapes chain_async knows. Short-circuit
+// operands and ternary arms are hoisted too, which evaluates them
+// unconditionally — an approximation, but strictly better than the
+// compile error these produced before.
+
+fn expr_has_await(e: &Expr) -> bool {
+    match e {
+        Expr::Await(_) => true,
+        Expr::Func(_) | Expr::Arrow(_) => false, // their own context
+        Expr::Unary(_, a) => expr_has_await(a),
+        Expr::Update { target, .. } => expr_has_await(target),
+        Expr::Binary(_, a, b) | Expr::Logical(_, a, b) => {
+            expr_has_await(a) || expr_has_await(b)
+        }
+        Expr::Assign(_, a, b) => expr_has_await(a) || expr_has_await(b),
+        Expr::Cond(c, a, b) => {
+            expr_has_await(c) || expr_has_await(a) || expr_has_await(b)
+        }
+        Expr::Member { obj, prop, .. } => {
+            expr_has_await(obj)
+                || matches!(prop, MemberProp::Computed(k)
+                    if expr_has_await(k))
+        }
+        Expr::Call { callee, args, .. } | Expr::New { callee, args } => {
+            expr_has_await(callee) || args.iter().any(expr_has_await)
+        }
+        Expr::Array(v) | Expr::Seq(v) => v.iter().any(expr_has_await),
+        Expr::Object(props) => props.iter().any(|p| {
+            expr_has_await(&p.value)
+                || matches!(&p.key, PropKey::Computed(k)
+                    if expr_has_await(k))
+        }),
+        Expr::Template(parts) => parts.iter().any(|p| {
+            matches!(p, TplPart::Expr(e) if expr_has_await(e))
+        }),
+        _ => false,
+    }
+}
+
+fn stmt_has_await(s: &Stmt) -> bool {
+    match s {
+        Stmt::Expr(e) | Stmt::Throw(e) => expr_has_await(e),
+        Stmt::VarDecl { decls, .. } => decls
+            .iter()
+            .any(|(_, init)| init.as_ref().is_some_and(expr_has_await)),
+        Stmt::Return(e) => e.as_ref().is_some_and(expr_has_await),
+        Stmt::If { test, cons, alt } => {
+            expr_has_await(test)
+                || stmt_has_await(cons)
+                || alt.as_deref().is_some_and(stmt_has_await)
+        }
+        Stmt::While { test, body } => {
+            expr_has_await(test) || stmt_has_await(body)
+        }
+        Stmt::DoWhile { body, test } => {
+            expr_has_await(test) || stmt_has_await(body)
+        }
+        Stmt::For { init, test, update, body } => {
+            init.as_deref().is_some_and(stmt_has_await)
+                || test.as_ref().is_some_and(expr_has_await)
+                || update.as_ref().is_some_and(expr_has_await)
+                || stmt_has_await(body)
+        }
+        Stmt::ForIn { obj, body, .. } => {
+            expr_has_await(obj) || stmt_has_await(body)
+        }
+        Stmt::Block(v) => v.iter().any(stmt_has_await),
+        Stmt::Labeled { body, .. } => stmt_has_await(body),
+        Stmt::Try { block, catch, finally } => {
+            block.iter().any(stmt_has_await)
+                || catch
+                    .as_ref()
+                    .is_some_and(|c| c.body.iter().any(stmt_has_await))
+                || finally
+                    .as_ref()
+                    .is_some_and(|f| f.iter().any(stmt_has_await))
+        }
+        Stmt::Switch { disc, cases } => {
+            expr_has_await(disc)
+                || cases
+                    .iter()
+                    .any(|c| c.body.iter().any(stmt_has_await))
+        }
+        _ => false,
+    }
+}
+
+/// Rewrite `e`, hoisting every await into `pre` as
+/// `var __awN = await X;` (evaluation order), leaving temp reads.
+fn hoist_expr(e: Expr, pre: &mut Vec<Stmt>, n: &mut usize) -> Expr {
+    if !expr_has_await(&e) {
+        return e;
+    }
+    match e {
+        Expr::Await(inner) => {
+            let inner = hoist_expr(*inner, pre, n);
+            *n += 1;
+            let name = format!("__aw{n}");
+            pre.push(Stmt::VarDecl {
+                kind: DeclKind::Var,
+                decls: vec![(
+                    name.clone(),
+                    Some(Expr::Await(Box::new(inner))),
+                )],
+            });
+            Expr::Ident(name)
+        }
+        Expr::Unary(op, a) => {
+            Expr::Unary(op, Box::new(hoist_expr(*a, pre, n)))
+        }
+        Expr::Update { op, prefix, target } => Expr::Update {
+            op,
+            prefix,
+            target: Box::new(hoist_expr(*target, pre, n)),
+        },
+        Expr::Binary(op, a, b) => {
+            let a = hoist_expr(*a, pre, n);
+            let b = hoist_expr(*b, pre, n);
+            Expr::Binary(op, Box::new(a), Box::new(b))
+        }
+        Expr::Logical(op, a, b) => {
+            let a = hoist_expr(*a, pre, n);
+            let b = hoist_expr(*b, pre, n);
+            Expr::Logical(op, Box::new(a), Box::new(b))
+        }
+        Expr::Assign(op, t, v) => {
+            let t = hoist_expr(*t, pre, n);
+            let v = hoist_expr(*v, pre, n);
+            Expr::Assign(op, Box::new(t), Box::new(v))
+        }
+        Expr::Cond(c, a, b) => {
+            let c = hoist_expr(*c, pre, n);
+            let a = hoist_expr(*a, pre, n);
+            let b = hoist_expr(*b, pre, n);
+            Expr::Cond(Box::new(c), Box::new(a), Box::new(b))
+        }
+        Expr::Member { obj, prop, optional } => Expr::Member {
+            obj: Box::new(hoist_expr(*obj, pre, n)),
+            prop: match prop {
+                MemberProp::Computed(k) => MemberProp::Computed(Box::new(
+                    hoist_expr(*k, pre, n),
+                )),
+                p => p,
+            },
+            optional,
+        },
+        Expr::Call { callee, args, optional } => Expr::Call {
+            callee: Box::new(hoist_expr(*callee, pre, n)),
+            args: args
+                .into_iter()
+                .map(|a| hoist_expr(a, pre, n))
+                .collect(),
+            optional,
+        },
+        Expr::New { callee, args } => Expr::New {
+            callee: Box::new(hoist_expr(*callee, pre, n)),
+            args: args
+                .into_iter()
+                .map(|a| hoist_expr(a, pre, n))
+                .collect(),
+        },
+        Expr::Array(v) => Expr::Array(
+            v.into_iter().map(|a| hoist_expr(a, pre, n)).collect(),
+        ),
+        Expr::Seq(v) => Expr::Seq(
+            v.into_iter().map(|a| hoist_expr(a, pre, n)).collect(),
+        ),
+        Expr::Object(props) => Expr::Object(
+            props
+                .into_iter()
+                .map(|p| Prop {
+                    key: match p.key {
+                        PropKey::Computed(k) => {
+                            PropKey::Computed(hoist_expr(k, pre, n))
+                        }
+                        k => k,
+                    },
+                    value: hoist_expr(p.value, pre, n),
+                })
+                .collect(),
+        ),
+        Expr::Template(parts) => Expr::Template(
+            parts
+                .into_iter()
+                .map(|p| match p {
+                    TplPart::Expr(e) => {
+                        TplPart::Expr(Box::new(hoist_expr(*e, pre, n)))
+                    }
+                    c => c,
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn boxed_block(v: Vec<Stmt>) -> Box<Stmt> {
+    Box::new(Stmt::Block(v))
+}
+
+/// Normalize one statement (see module comment); returns replacement
+/// statements.
+fn normalize_stmt(s: Stmt, n: &mut usize) -> Vec<Stmt> {
+    if !stmt_has_await(&s) {
+        return vec![s];
+    }
+    let mut pre = Vec::new();
+    match s {
+        Stmt::Expr(e) => {
+            let e = hoist_expr(e, &mut pre, n);
+            pre.push(Stmt::Expr(e));
+            pre
+        }
+        Stmt::Throw(e) => {
+            let e = hoist_expr(e, &mut pre, n);
+            pre.push(Stmt::Throw(e));
+            pre
+        }
+        Stmt::Return(Some(e)) => {
+            let e = hoist_expr(e, &mut pre, n);
+            pre.push(Stmt::Return(Some(e)));
+            pre
+        }
+        Stmt::VarDecl { kind, decls } => {
+            let mut out = Vec::new();
+            for (name, init) in decls {
+                match init {
+                    Some(Expr::Await(inner)) => {
+                        // already the canonical shape; hoist only inside
+                        let mut p2 = Vec::new();
+                        let inner = hoist_expr(*inner, &mut p2, n);
+                        out.append(&mut p2);
+                        out.push(Stmt::VarDecl {
+                            kind,
+                            decls: vec![(
+                                name,
+                                Some(Expr::Await(Box::new(inner))),
+                            )],
+                        });
+                    }
+                    Some(init) => {
+                        let mut p2 = Vec::new();
+                        let init = hoist_expr(init, &mut p2, n);
+                        out.append(&mut p2);
+                        out.push(Stmt::VarDecl {
+                            kind,
+                            decls: vec![(name, Some(init))],
+                        });
+                    }
+                    None => out.push(Stmt::VarDecl {
+                        kind,
+                        decls: vec![(name, None)],
+                    }),
+                }
+            }
+            out
+        }
+        Stmt::If { test, cons, alt } => {
+            let test = hoist_expr(test, &mut pre, n);
+            let cons = boxed_block(normalize_stmt(*cons, n));
+            let alt =
+                alt.map(|a| boxed_block(normalize_stmt(*a, n)));
+            pre.push(Stmt::If { test, cons, alt });
+            pre
+        }
+        // Loops keep their awaits (in the test or the body) — the
+        // chain pass rewrites whole loops into recursive promise
+        // chains; only the body statements get normalized here.
+        Stmt::While { test, body } => {
+            let body_v = normalize_stmt(*body, n);
+            vec![Stmt::While { test, body: boxed_block(body_v) }]
+        }
+        Stmt::DoWhile { body, test } => {
+            let body_v = normalize_stmt(*body, n);
+            vec![Stmt::DoWhile { body: boxed_block(body_v), test }]
+        }
+        Stmt::For { init, test, update, body } => {
+            let mut out = Vec::new();
+            if let Some(i) = init {
+                out.extend(normalize_stmt(*i, n));
+            }
+            let body_v = normalize_stmt(*body, n);
+            out.push(Stmt::For {
+                init: None,
+                test,
+                update,
+                body: boxed_block(body_v),
+            });
+            out
+        }
+        Stmt::ForIn { decl_kind, var, obj, body, of } => {
+            let obj = hoist_expr(obj, &mut pre, n);
+            let body = boxed_block(normalize_stmt(*body, n));
+            pre.push(Stmt::ForIn { decl_kind, var, obj, body, of });
+            pre
+        }
+        Stmt::Block(v) => {
+            vec![Stmt::Block(normalize_body(v, n))]
+        }
+        Stmt::Labeled { label, body } => {
+            let body = boxed_block(normalize_stmt(*body, n));
+            vec![Stmt::Labeled { label, body }]
+        }
+        Stmt::Try { block, catch, finally } => {
+            let block = normalize_body(block, n);
+            let catch = catch.map(|mut c| {
+                c.body = normalize_body(c.body, n);
+                c
+            });
+            let finally = finally.map(|f| normalize_body(f, n));
+            vec![Stmt::Try { block, catch, finally }]
+        }
+        Stmt::Switch { disc, cases } => {
+            let disc = hoist_expr(disc, &mut pre, n);
+            let cases = cases
+                .into_iter()
+                .map(|mut c| {
+                    c.body = normalize_body(c.body, n);
+                    c
+                })
+                .collect();
+            pre.push(Stmt::Switch { disc, cases });
+            pre
+        }
+        other => vec![other],
+    }
+}
+
+fn normalize_body(body: Vec<Stmt>, n: &mut usize) -> Vec<Stmt> {
+    body.into_iter()
+        .flat_map(|s| normalize_stmt(s, n))
+        .collect()
+}
+
+/// A statement chain_async can lift: does it or its nested control
+/// flow contain a statement-level await (post-normalization)?
+fn chainable_await_inside(s: &Stmt) -> bool {
+    stmt_has_await(s)
+}
+
+/// Statements of a block (or the single statement itself).
+fn block_stmts(s: &Stmt) -> Vec<Stmt> {
+    match s {
+        Stmt::Block(v) => v.clone(),
+        other => vec![other.clone()],
+    }
+}
+
+/// Statement kinds that stop an IIFE wrap. `RET` = return (allowed
+/// when the wrapped construct is the function's last statement — the
+/// value then propagates through the promise chain); `BRK` =
+/// break/continue (never wrappable: they can't cross a function
+/// boundary).
+fn exit_kinds(stmts: &[Stmt]) -> (bool, bool) {
+    let mut ret = false;
+    let mut brk = false;
+    fn walk(s: &Stmt, ret: &mut bool, brk: &mut bool) {
+        match s {
+            Stmt::Return(_) => *ret = true,
+            Stmt::Break(_) | Stmt::Continue(_) => *brk = true,
+            Stmt::If { cons, alt, .. } => {
+                walk(cons, ret, brk);
+                if let Some(a) = alt {
+                    walk(a, ret, brk);
+                }
+            }
+            Stmt::Block(v) => v.iter().for_each(|s| walk(s, ret, brk)),
+            Stmt::Labeled { body, .. } => walk(body, ret, brk),
+            Stmt::Try { block, catch, finally } => {
+                block.iter().for_each(|s| walk(s, ret, brk));
+                if let Some(c) = catch {
+                    c.body.iter().for_each(|s| walk(s, ret, brk));
+                }
+                if let Some(f) = finally {
+                    f.iter().for_each(|s| walk(s, ret, brk));
+                }
+            }
+            // break/continue inside a nested loop/switch bind to that
+            // construct, not to the wrap — don't flag them
+            Stmt::While { .. } | Stmt::DoWhile { .. }
+            | Stmt::For { .. } | Stmt::ForIn { .. }
+            | Stmt::Switch { .. } => {
+                // returns still escape a nested loop
+                fn ret_only(s: &Stmt, ret: &mut bool) {
+                    let mut b2 = false;
+                    walk(s, ret, &mut b2);
+                }
+                match s {
+                    Stmt::While { body, .. }
+                    | Stmt::DoWhile { body, .. }
+                    | Stmt::For { body, .. }
+                    | Stmt::ForIn { body, .. } => ret_only(body, ret),
+                    Stmt::Switch { cases, .. } => cases
+                        .iter()
+                        .flat_map(|c| c.body.iter())
+                        .for_each(|s| ret_only(s, ret)),
+                    _ => unreachable!(),
+                }
+            }
+            _ => {}
+        }
+    }
+    stmts.iter().for_each(|s| walk(s, &mut ret, &mut brk));
+    (ret, brk)
+}
+
+/// Branches that early-exit can't be IIFE-wrapped (loop bodies).
+fn has_early_exit(stmts: &[Stmt]) -> bool {
+    let (ret, brk) = exit_kinds(stmts);
+    ret || brk
+}
+
 enum AwaitStmt {
     Bind(String, Expr), // var x = await E
     Discard(Expr),      // await E;
@@ -876,28 +1300,278 @@ fn stmt_await(s: &Stmt) -> Option<AwaitStmt> {
     }
 }
 
-fn chain_async(stmts: &[Stmt]) -> Vec<Stmt> {
-    let j = stmts.iter().position(|s| stmt_await(s).is_some());
+/// `Promise.resolve(e)`
+fn ast_presolve(e: Expr) -> Expr {
+    ast_call(ast_member(ast_ident("Promise"), "resolve"), vec![e])
+}
+
+/// `(() => { body })()`
+fn ast_iife(body: Vec<Stmt>) -> Expr {
+    ast_call(ast_arrow(Vec::new(), body), vec![])
+}
+
+fn chain_async(stmts: &[Stmt], n: &mut usize) -> Vec<Stmt> {
+    let j = stmts.iter().position(|s| {
+        stmt_await(s).is_some() || chainable_await_inside(s)
+    });
     let Some(j) = j else {
         return stmts.to_vec(); // all synchronous
     };
     let mut out: Vec<Stmt> = stmts[..j].to_vec();
-    match stmt_await(&stmts[j]).unwrap() {
-        // return await E  ==  return E (the outer .then adopts the promise)
-        AwaitStmt::Ret(e) => out.push(Stmt::Return(Some(e))),
-        AwaitStmt::Bind(name, e) => {
-            let rest = chain_async(&stmts[j + 1..]);
-            let cont = ast_arrow(vec![name], rest);
-            out.push(Stmt::Return(Some(
-                ast_call(ast_member(e, "then"), vec![cont]),
-            )));
+    if let Some(aw) = stmt_await(&stmts[j]) {
+        match aw {
+            // return await E == return E (the outer .then adopts it)
+            AwaitStmt::Ret(e) => out.push(Stmt::Return(Some(e))),
+            AwaitStmt::Bind(name, e) => {
+                let rest = chain_async(&stmts[j + 1..], n);
+                let cont = ast_arrow(vec![name], rest);
+                out.push(Stmt::Return(Some(
+                    ast_call(ast_member(e, "then"), vec![cont]),
+                )));
+            }
+            AwaitStmt::Discard(e) => {
+                let rest = chain_async(&stmts[j + 1..], n);
+                let cont = ast_arrow(vec!["__await".to_string()], rest);
+                out.push(Stmt::Return(Some(
+                    ast_call(ast_member(e, "then"), vec![cont]),
+                )));
+            }
         }
-        AwaitStmt::Discard(e) => {
-            let rest = chain_async(&stmts[j + 1..]);
-            let cont = ast_arrow(vec!["__await".to_string()], rest);
-            out.push(Stmt::Return(Some(
-                ast_call(ast_member(e, "then"), vec![cont]),
-            )));
+        return out;
+    }
+    // control flow containing awaits (post-normalization)
+    match &stmts[j] {
+        // a bare block: splice its statements into the stream
+        Stmt::Block(v) => {
+            let mut merged = v.clone();
+            merged.extend_from_slice(&stmts[j + 1..]);
+            out.extend(chain_async(&merged, n));
+        }
+        // if with awaited branch(es): each branch becomes an async
+        // IIFE; rest continues after whichever promise it returns.
+        // Branches that early-exit (return/break/continue) can't be
+        // wrapped — leave the statement alone (codegen will report
+        // the await) rather than silently change semantics.
+        Stmt::If { test, cons, alt } => {
+            let cons_v = block_stmts(cons);
+            let alt_v = alt.as_deref().map(block_stmts);
+            let rest_stmts = &stmts[j + 1..];
+            let (ret, brk) = {
+                let (r1, b1) = exit_kinds(&cons_v);
+                let (r2, b2) = alt_v
+                    .as_deref()
+                    .map(exit_kinds)
+                    .unwrap_or((false, false));
+                (r1 || r2, b1 || b2)
+            };
+            // returns are fine when nothing follows: the branch value
+            // becomes the function's promise result
+            if brk || (ret && !rest_stmts.is_empty()) {
+                out.push(stmts[j].clone());
+                out.extend(chain_async(rest_stmts, n));
+                return out;
+            }
+            let a = ast_iife(chain_async(&cons_v, n));
+            let b = match alt_v {
+                Some(av) => ast_iife(chain_async(&av, n)),
+                None => ast_ident("undefined"),
+            };
+            let sel =
+                Expr::Cond(Box::new(test.clone()), Box::new(a), Box::new(b));
+            if rest_stmts.is_empty() {
+                out.push(Stmt::Return(Some(ast_presolve(sel))));
+            } else {
+                let rest = chain_async(rest_stmts, n);
+                out.push(Stmt::Return(Some(ast_call(
+                    ast_member(ast_presolve(sel), "then"),
+                    vec![ast_arrow(Vec::new(), rest)],
+                ))));
+            }
+        }
+        // while/for with awaits: a recursive promise chain
+        // `var __loop = function(){ if(!t) return;
+        //    return Promise.resolve(IIFE(body)).then(__loop); }`
+        Stmt::While { test, body } | Stmt::For { test: Some(test),
+            update: None, init: None, body } => {
+            let body_v = block_stmts(body);
+            if has_early_exit(&body_v) {
+                out.push(stmts[j].clone());
+                out.extend(chain_async(&stmts[j + 1..], n));
+                return out;
+            }
+            *n += 1;
+            let loop_name = format!("__loop{n}");
+            let mut lf: Vec<Stmt> = Vec::new();
+            let mut t = test.clone();
+            if expr_has_await(&t) {
+                t = hoist_expr(t, &mut lf, n);
+            }
+            lf.push(Stmt::If {
+                test: Expr::Unary(UnOp::Not, Box::new(t)),
+                cons: Box::new(Stmt::Return(None)),
+                alt: None,
+            });
+            lf.push(Stmt::Return(Some(ast_call(
+                ast_member(
+                    ast_presolve(ast_iife(chain_async(&body_v, n))),
+                    "then",
+                ),
+                vec![ast_ident(&loop_name)],
+            ))));
+            let lf = chain_async(&lf, n);
+            out.push(Stmt::VarDecl {
+                kind: DeclKind::Var,
+                decls: vec![(
+                    loop_name.clone(),
+                    Some(Expr::Func(Box::new(FuncLit {
+                        name: None,
+                        params: Vec::new(),
+                        body: lf,
+                        is_async: false,
+                    }))),
+                )],
+            });
+            let rest = chain_async(&stmts[j + 1..], n);
+            out.push(Stmt::Return(Some(ast_call(
+                ast_member(
+                    ast_presolve(ast_call(ast_ident(&loop_name), vec![])),
+                    "then",
+                ),
+                vec![ast_arrow(Vec::new(), rest)],
+            ))));
+        }
+        // general for: like while, with the update run before recursing
+        Stmt::For { init, test, update, body } => {
+            let body_v = block_stmts(body);
+            if has_early_exit(&body_v) {
+                out.push(stmts[j].clone());
+                out.extend(chain_async(&stmts[j + 1..], n));
+                return out;
+            }
+            if let Some(i) = init {
+                out.push((**i).clone());
+            }
+            *n += 1;
+            let loop_name = format!("__loop{n}");
+            let mut lf: Vec<Stmt> = Vec::new();
+            if let Some(t0) = test {
+                let mut t = t0.clone();
+                if expr_has_await(&t) {
+                    t = hoist_expr(t, &mut lf, n);
+                }
+                lf.push(Stmt::If {
+                    test: Expr::Unary(UnOp::Not, Box::new(t)),
+                    cons: Box::new(Stmt::Return(None)),
+                    alt: None,
+                });
+            }
+            // then-continuation: update, then recurse
+            let mut cont: Vec<Stmt> = Vec::new();
+            if let Some(u) = update {
+                let mut u2 = u.clone();
+                let mut upre = Vec::new();
+                if expr_has_await(&u2) {
+                    u2 = hoist_expr(u2, &mut upre, n);
+                }
+                cont.extend(upre);
+                cont.push(Stmt::Expr(u2));
+            }
+            cont.push(Stmt::Return(Some(ast_call(
+                ast_ident(&loop_name),
+                vec![],
+            ))));
+            let cont = chain_async(&cont, n);
+            lf.push(Stmt::Return(Some(ast_call(
+                ast_member(
+                    ast_presolve(ast_iife(chain_async(&body_v, n))),
+                    "then",
+                ),
+                vec![ast_arrow(Vec::new(), cont)],
+            ))));
+            let lf = chain_async(&lf, n);
+            out.push(Stmt::VarDecl {
+                kind: DeclKind::Var,
+                decls: vec![(
+                    loop_name.clone(),
+                    Some(Expr::Func(Box::new(FuncLit {
+                        name: None,
+                        params: Vec::new(),
+                        body: lf,
+                        is_async: false,
+                    }))),
+                )],
+            });
+            let rest = chain_async(&stmts[j + 1..], n);
+            out.push(Stmt::Return(Some(ast_call(
+                ast_member(
+                    ast_presolve(ast_call(ast_ident(&loop_name), vec![])),
+                    "then",
+                ),
+                vec![ast_arrow(Vec::new(), rest)],
+            ))));
+        }
+        // try/catch with awaits: promise rejection carries the error
+        // `Promise.resolve(IIFE(block)).catch(e => IIFE(handler))
+        //    .then(() => rest)`; finally chains as an extra .then-both
+        Stmt::Try { block, catch, finally } => {
+            let rest_stmts = &stmts[j + 1..];
+            let (ret, brk) = {
+                let (mut r, mut b) = exit_kinds(block);
+                if let Some(c) = catch {
+                    let (r2, b2) = exit_kinds(&c.body);
+                    r |= r2;
+                    b |= b2;
+                }
+                if let Some(f) = finally {
+                    let (r2, b2) = exit_kinds(f);
+                    r |= r2;
+                    b |= b2;
+                }
+                (r, b)
+            };
+            if brk || (ret && !rest_stmts.is_empty()) {
+                out.push(stmts[j].clone());
+                out.extend(chain_async(rest_stmts, n));
+                return out;
+            }
+            let mut chain =
+                ast_presolve(ast_iife(chain_async(block, n)));
+            if let Some(c) = catch {
+                let param = c
+                    .param
+                    .clone()
+                    .unwrap_or_else(|| "__err".to_string());
+                chain = ast_call(
+                    ast_member(chain, "catch"),
+                    vec![ast_arrow(
+                        vec![param],
+                        chain_async(&c.body, n),
+                    )],
+                );
+            }
+            if let Some(f) = finally {
+                // run on both paths (value/handled-error alike)
+                let fin = ast_arrow(Vec::new(), chain_async(f, n));
+                chain = ast_call(
+                    ast_member(chain, "then"),
+                    vec![fin.clone(), fin],
+                );
+            }
+            if rest_stmts.is_empty() {
+                out.push(Stmt::Return(Some(chain)));
+            } else {
+                let rest = chain_async(rest_stmts, n);
+                out.push(Stmt::Return(Some(ast_call(
+                    ast_member(chain, "then"),
+                    vec![ast_arrow(Vec::new(), rest)],
+                ))));
+            }
+        }
+        // other constructs (do-while with await bodies) are beyond
+        // this chain — keep them; codegen reports the await cleanly
+        other => {
+            out.push(other.clone());
+            out.extend(chain_async(&stmts[j + 1..], n));
         }
     }
     out
@@ -907,7 +1581,9 @@ fn chain_async(stmts: &[Stmt]) -> Vec<Stmt> {
 /// `return Promise.resolve().then(() => { <chain> });`
 /// The outer wrapper turns a synchronous throw into a rejection too.
 fn desugar_async(body: &[Stmt]) -> Vec<Stmt> {
-    let inner = chain_async(body);
+    let mut aw_n = 0usize;
+    let body = normalize_body(body.to_vec(), &mut aw_n);
+    let inner = chain_async(&body, &mut aw_n);
     let presolve =
         ast_call(ast_member(ast_ident("Promise"), "resolve"), vec![]);
     let wrapper = ast_call(
@@ -1376,7 +2052,27 @@ impl Compiler {
             }
             Stmt::VarDecl { kind: DeclKind::Var, decls } => {
                 for (name, init) in decls {
-                    let Some(init) = init else { continue };
+                    let Some(init) = init else {
+                        // `var u;` at script level: mark the global
+                        // defined (reads yield undefined, not a
+                        // ReferenceError) without clobbering any
+                        // existing value
+                        if self.fx().is_main
+                            && self.fx().lookup(name).is_none()
+                        {
+                            let r = self.fx().alloc()?;
+                            let a = self.atom(name);
+                            self.fx().emit(Instr::GetGlobalSafe {
+                                dst: r,
+                                atom: a,
+                            });
+                            self.fx().emit(Instr::SetGlobal {
+                                atom: a,
+                                src: r,
+                            });
+                        }
+                        continue;
+                    };
                     let r = self.expr(init)?;
                     self.store_name(name, r);
                 }
@@ -1732,7 +2428,10 @@ impl Compiler {
                 // or its key list (for-in).
                 let rsrc = self.expr(obj)?;
                 if *of {
-                    self.fx().emit(Instr::Move { dst: arr, src: rsrc });
+                    self.fx().emit(Instr::IterMaterialize {
+                        dst: arr,
+                        obj: rsrc,
+                    });
                 } else {
                     self.fx().emit(Instr::ForInKeys { dst: arr, obj: rsrc });
                 }
@@ -2549,9 +3248,17 @@ impl Compiler {
                 Ok(rf)
             }
             Expr::Seq(items) => {
+                // non-final items are evaluated for effect only:
+                // release their temps, or a 400-term comma sequence
+                // (core-js entry: `e(1),e(2),...`) eats the register file
                 let mut last = 0;
-                for e in items {
+                for (i, e) in items.iter().enumerate() {
+                    let checkpoint = self.fx().tmp_top;
                     last = self.expr(e)?;
+                    if i + 1 < items.len() {
+                        let f = self.fx();
+                        f.tmp_top = checkpoint.max(f.locals_end);
+                    }
                 }
                 Ok(last)
             }

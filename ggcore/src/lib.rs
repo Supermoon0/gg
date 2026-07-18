@@ -134,6 +134,7 @@ impl TextEngine {
             height.max(1) as usize,
             bg,
         );
+        let mut clip_stack: Vec<(i32, i32, i32, i32)> = Vec::new();
         for (kind, x1, y1, x2, y2, color, aux, font, text) in cmds {
             match kind {
                 // rect; aux is the border-radius (0 = square)
@@ -172,6 +173,13 @@ impl TextEngine {
                                 p[4] != 0.0, p[5] != 0.0,
                             );
                         }
+                    }
+                }
+                // kind 6: push clip (x1,y1,x2,y2 = rect); kind 7: pop
+                6 => clip_stack.push(r.push_clip(*x1, *y1, *x2, *y2)),
+                7 => {
+                    if let Some(prev) = clip_stack.pop() {
+                        r.set_clip(prev);
                     }
                 }
                 _ => {}
@@ -419,6 +427,50 @@ impl Doc {
         out
     }
 
+    /// Tell the JS engine the page URL so `location.*` is real.
+    /// Call before run_scripts. No-op on the Boa path.
+    fn set_page_url(&mut self, url: String) {
+        if self.use_ggjs {
+            self.ggvm().set_page_url(&url);
+        }
+    }
+
+    /// One real-time slice of the live event loop: fires timers/rAF
+    /// due within the next dt_ms of virtual time. Returns (console
+    /// output, fetches to service). The render loop calls this
+    /// periodically after load.
+    fn tick(&mut self, dt_ms: f64) -> (Vec<String>, Vec<(u32, String)>) {
+        if self.use_ggjs {
+            self.ggvm().tick(dt_ms)
+        } else {
+            (Vec::new(), Vec::new())
+        }
+    }
+
+    /// DOM mutation counter — re-style/re-layout only when it changes.
+    fn dom_version(&self) -> u64 {
+        self.doc.borrow().version
+    }
+
+    /// Fire DOMContentLoaded / load once all scripts have run — app
+    /// bundles bootstrap from these. Returns console output.
+    fn fire_lifecycle(&mut self) -> Vec<String> {
+        if self.use_ggjs {
+            self.ggvm().fire_lifecycle()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// (listeners, timers, microtasks) for boot diagnosis.
+    fn pending_counts(&mut self) -> (usize, usize, usize) {
+        if self.use_ggjs {
+            self.ggvm().pending_counts()
+        } else {
+            (0, 0, 0)
+        }
+    }
+
     /// Run scripts (in order) against the DOM. Returns console output.
     /// The JS context persists, so later events see earlier definitions.
     fn run_scripts(&mut self, sources: Vec<String>) -> Vec<String> {
@@ -495,8 +547,12 @@ impl Doc {
     }
 
     /// css_sources are parsed in order (UA sheet first, then page css).
-    fn compute_styles(&mut self, css_sources: Vec<String>) {
-        style::compute_styles(&mut self.doc.borrow_mut(), &css_sources);
+    /// viewport_width drives @media (min/max-width) evaluation.
+    #[pyo3(signature = (css_sources, viewport_width=1280.0))]
+    fn compute_styles(&mut self, css_sources: Vec<String>,
+                      viewport_width: f64) {
+        style::compute_styles_vw(
+            &mut self.doc.borrow_mut(), &css_sources, viewport_width);
     }
 
     /// Flat pre-order dump; Python rebuilds its Element/Text tree from it.

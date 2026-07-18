@@ -132,6 +132,85 @@ class WhereSelector:
         return ":where(" + ",".join(repr(o) for o in self.options) + ")"
 
 
+def _media_len(v):
+    """A media-feature length in px (em/rem taken as 16px)."""
+    v = v.strip()
+    try:
+        if v.endswith("px"):
+            return float(v[:-2])
+        if v.endswith(("em", "rem")):
+            return float(v.rstrip("erm")) * 16.0
+        return float(v)
+    except ValueError:
+        return None
+
+
+def _element_siblings(node):
+    parent = node.parent
+    if parent is None:
+        return []
+    return [c for c in parent.children if isinstance(c, Element)]
+
+
+class NotSelector:
+    """:not(compound) — matches when the inner selector does not."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.specificity = (0, 1, 0)
+
+    def matches(self, node):
+        return isinstance(node, Element) and not self.inner.matches(node)
+
+    def __repr__(self):
+        return f":not({self.inner!r})"
+
+
+class NthChildSelector:
+    """:nth-child(odd|even|N) — structural position among element
+    siblings (an+b is rejected at parse time)."""
+
+    def __init__(self, kind):
+        self.kind = kind  # "odd" | "even" | int (1-based)
+        self.specificity = (0, 1, 0)
+
+    def matches(self, node):
+        if not isinstance(node, Element):
+            return False
+        sibs = _element_siblings(node)
+        try:
+            nth = sibs.index(node) + 1
+        except ValueError:
+            return False
+        if self.kind == "odd":
+            return nth % 2 == 1
+        if self.kind == "even":
+            return nth % 2 == 0
+        return nth == self.kind
+
+    def __repr__(self):
+        return f":nth-child({self.kind})"
+
+
+class StructuralSelector:
+    """:first-child / :last-child."""
+
+    def __init__(self, last):
+        self.last = last
+        self.specificity = (0, 1, 0)
+
+    def matches(self, node):
+        if not isinstance(node, Element):
+            return False
+        sibs = _element_siblings(node)
+        if not sibs:
+            return False
+        return node is (sibs[-1] if self.last else sibs[0])
+
+    def __repr__(self):
+        return ":last-child" if self.last else ":first-child"
+
+
 class CompoundSelector:
     """Several simple selectors that must all match one node: p.intro#x"""
 
@@ -172,9 +251,10 @@ class DescendantSelector:
 
 
 class CSSParser:
-    def __init__(self, s):
+    def __init__(self, s, viewport_width=1280.0):
         self.s = s
         self.i = 0
+        self.vw = viewport_width
 
     def whitespace(self):
         while self.i < len(self.s) and self.s[self.i].isspace():
@@ -280,6 +360,32 @@ class CSSParser:
                         nxt and (nxt.isalnum() or nxt in "-_")):
                     self.i += 5
                     parts.append(RootSelector())
+                elif self.s[self.i:self.i + 5].casefold() == ":not(":
+                    self.i += 5
+                    inner = self.simple_selector()
+                    self.whitespace()
+                    self.literal(")")
+                    parts.append(NotSelector(inner))
+                elif self.s[self.i:self.i + 11].casefold() \
+                        == ":nth-child(":
+                    self.i += 11
+                    arg = self.until_chars(")").strip().casefold()
+                    self.literal(")")
+                    if arg in ("odd", "even"):
+                        parts.append(NthChildSelector(arg))
+                    else:
+                        try:
+                            parts.append(NthChildSelector(int(arg)))
+                        except ValueError:
+                            raise Exception("an+b not supported")
+                elif self.s[self.i:self.i + 12].casefold() \
+                        == ":first-child":
+                    self.i += 12
+                    parts.append(StructuralSelector(False))
+                elif self.s[self.i:self.i + 11].casefold() \
+                        == ":last-child":
+                    self.i += 11
+                    parts.append(StructuralSelector(True))
                 else:
                     break
             else:
@@ -392,9 +498,13 @@ class CSSParser:
             # Unsupported pseudo suffixes like :hover -> bail on rule
             # (:root / :where( / [attr] are handled by simple_selector)
             if self.i < len(self.s) and self.s[self.i] == ":":
-                low = self.s[self.i:self.i + 7].casefold()
+                low = self.s[self.i:self.i + 12].casefold()
                 if not (low.startswith(":root")
-                        or low.startswith(":where(")):
+                        or low.startswith(":where(")
+                        or low.startswith(":not(")
+                        or low.startswith(":nth-child(")
+                        or low.startswith(":first-child")
+                        or low.startswith(":last-child")):
                     raise Exception("unsupported selector feature")
             descendant = self.simple_selector()
             out = DescendantSelector(out, descendant)
@@ -410,7 +520,10 @@ class CSSParser:
                 if self.i >= len(self.s):
                     break
                 if self.s[self.i] == "@":
-                    self._skip_at_rule()
+                    if self.s[self.i:self.i + 6].casefold() == "@media":
+                        self._media(rules)
+                    else:
+                        self._skip_at_rule()
                     continue
                 selectors = [self.selector()]
                 self.whitespace()
@@ -433,8 +546,80 @@ class CSSParser:
                     break
         return rules
 
+    def _media(self, rules):
+        """@media <cond> { rules }: when the condition matches the
+        viewport, parse the inner rules at this level, else skip."""
+        self.i += 6  # past "@media"
+        start = self.i
+        while self.i < len(self.s) and self.s[self.i] != "{":
+            self.i += 1
+        cond = self.s[start:self.i].casefold()
+        if self.i >= len(self.s):
+            return
+        self.i += 1  # past "{"
+        if self._media_matches(cond):
+            while self.i < len(self.s):
+                self.whitespace()
+                if self.i >= len(self.s) or self.s[self.i] == "}":
+                    break
+                try:
+                    selectors = [self.selector()]
+                    self.whitespace()
+                    while self.i < len(self.s) and self.s[self.i] == ",":
+                        self.literal(",")
+                        self.whitespace()
+                        selectors.append(self.selector())
+                        self.whitespace()
+                    self.literal("{")
+                    self.whitespace()
+                    body = self.body()
+                    self.literal("}")
+                    for sel in selectors:
+                        rules.append((sel, body))
+                except Exception:
+                    why = self.ignore_until("}")
+                    if why == "}":
+                        self.i += 1
+                    else:
+                        break
+            if self.i < len(self.s) and self.s[self.i] == "}":
+                self.i += 1
+        else:
+            depth = 1
+            while self.i < len(self.s) and depth > 0:
+                c = self.s[self.i]
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                self.i += 1
+
+    def _media_matches(self, cond):
+        return any(self._media_query(q.strip())
+                   for q in cond.split(","))
+
+    def _media_query(self, q):
+        ok = True
+        for part in q.split(" and "):
+            p = part.strip().replace("only ", "").strip()
+            if not p or p in ("screen", "all"):
+                continue
+            if p in ("print", "speech"):
+                return False
+            if p.startswith("(") and p.endswith(")"):
+                inner = p[1:-1]
+                if ":" in inner:
+                    feat, val = inner.split(":", 1)
+                    px = _media_len(val.strip())
+                    if px is not None:
+                        if feat.strip() == "min-width":
+                            ok = ok and self.vw >= px
+                        elif feat.strip() == "max-width":
+                            ok = ok and self.vw <= px
+        return ok
+
     def _skip_at_rule(self):
-        # @import ...; or @media { ... { ... } ... }
+        # @import ...; or non-media @rule { ... }
         while self.i < len(self.s) and self.s[self.i] not in ";{":
             self.i += 1
         if self.i >= len(self.s):

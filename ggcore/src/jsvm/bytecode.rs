@@ -95,6 +95,9 @@ pub enum Instr {
     /// dst = a fresh array of `obj`'s enumerable keys as strings, in
     /// insertion order (array indices first). Backs `for..in`.
     ForInKeys { dst: u8, obj: u8 },
+    /// for-of source: arrays pass through; Map/Set and objects with
+    /// an `@@iterator` are materialized into a fresh array.
+    IterMaterialize { dst: u8, obj: u8 },
     /// dst = obj[key] (integer keys on arrays)
     GetIndex { dst: u8, obj: u8, key: u8 },
     SetIndex { obj: u8, key: u8, src: u8 },

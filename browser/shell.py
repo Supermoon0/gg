@@ -124,7 +124,8 @@ class Shell:
                 native.load_document(
                     body,
                     lambda hrefs: _fetch_many(hrefs, url),
-                    lambda srcs: _fetch_many(srcs, url))
+                    lambda srcs: _fetch_many(srcs, url),
+                    page_url=url)
         finally:
             if prev is None:
                 os.environ.pop("GGJS", None)

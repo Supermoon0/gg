@@ -13,6 +13,8 @@ pub struct Raster {
     pub width: usize,
     pub height: usize,
     pub buf: Vec<u8>, // RGB
+    /// current clip rect (x1, y1, x2, y2); pixels outside are skipped
+    clip: (i32, i32, i32, i32),
 }
 
 impl Raster {
@@ -23,12 +25,49 @@ impl Raster {
             buf.push(bg.1);
             buf.push(bg.2);
         }
-        Raster { width, height, buf }
+        Raster {
+            width,
+            height,
+            buf,
+            clip: (0, 0, width as i32, height as i32),
+        }
+    }
+
+    pub fn clip(&self) -> (i32, i32, i32, i32) {
+        self.clip
+    }
+
+    /// Intersect the clip with a new rect (rounded), returning the
+    /// previous clip so the caller can restore it.
+    pub fn push_clip(
+        &mut self,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    ) -> (i32, i32, i32, i32) {
+        let prev = self.clip;
+        self.clip = (
+            (x1.round() as i32).max(prev.0),
+            (y1.round() as i32).max(prev.1),
+            (x2.round() as i32).min(prev.2),
+            (y2.round() as i32).min(prev.3),
+        );
+        prev
+    }
+
+    pub fn set_clip(&mut self, c: (i32, i32, i32, i32)) {
+        self.clip = c;
     }
 
     #[inline]
     fn blend(&mut self, x: i32, y: i32, color: (u8, u8, u8), alpha: u8) {
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32
+        {
+            return;
+        }
+        if x < self.clip.0 || y < self.clip.1
+            || x >= self.clip.2 || y >= self.clip.3
         {
             return;
         }
@@ -52,10 +91,10 @@ impl Raster {
     }
 
     pub fn fill_rect(&mut self, x1: f64, y1: f64, x2: f64, y2: f64, color: (u8, u8, u8)) {
-        let x1 = (x1.round() as i32).max(0);
-        let y1 = (y1.round() as i32).max(0);
-        let x2 = (x2.round() as i32).min(self.width as i32);
-        let y2 = (y2.round() as i32).min(self.height as i32);
+        let x1 = (x1.round() as i32).max(0).max(self.clip.0);
+        let y1 = (y1.round() as i32).max(0).max(self.clip.1);
+        let x2 = (x2.round() as i32).min(self.width as i32).min(self.clip.2);
+        let y2 = (y2.round() as i32).min(self.height as i32).min(self.clip.3);
         for y in y1..y2 {
             let row = y as usize * self.width;
             for x in x1..x2 {

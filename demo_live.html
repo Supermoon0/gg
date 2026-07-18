@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head><title>GG 라이브 데모</title></head>
+<body style="background-color:#ffffff; padding:24px">
+  <h1 style="color:#03c75a">M4 동적 렌더 루프 데모</h1>
+  <p>이 페이지의 숫자들은 로드 후에 JS가 실시간으로 바꿉니다:</p>
+
+  <div style="margin-top:16px; padding:14px; background-color:#f5f7f9; border-radius:12px">
+    <p>초시계 (setInterval 1초): <span id="clock" style="color:#03c75a; font-weight:bold">0</span>초</p>
+    <p>빠른 카운터 (rAF): <span id="raf" style="color:#3366cc; font-weight:bold">0</span> 프레임</p>
+    <p id="msg">3초 후 이 문장이 바뀝니다…</p>
+  </div>
+
+  <ul id="log" style="margin-top:16px"></ul>
+
+  <script>
+    var secs = 0;
+    setInterval(function () {
+      secs += 1;
+      document.getElementById('clock').textContent = '' + secs;
+      if (secs % 5 === 0) {
+        var li = document.createElement('li');
+        li.textContent = secs + '초 경과 - 새 리스트 항목 추가됨';
+        document.getElementById('log').appendChild(li);
+      }
+    }, 1000);
+
+    var frames = 0;
+    function frame() {
+      frames += 1;
+      if (frames % 6 === 0) {
+        document.getElementById('raf').textContent = '' + frames;
+      }
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+
+    setTimeout(function () {
+      var m = document.getElementById('msg');
+      m.textContent = '✔ setTimeout(3000)이 발화했습니다 - 페이지가 살아있습니다!';
+      m.style.color = '#03c75a';
+    }, 3000);
+  </script>
+</body>
+</html>

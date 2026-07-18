@@ -66,6 +66,416 @@ SyntaxError.prototype.name = 'SyntaxError';
 function ReferenceError(m) { if (m !== undefined) this.message = '' + m; }
 ReferenceError.prototype = new Error();
 ReferenceError.prototype.name = 'ReferenceError';
+// Symbol: a string-based stand-in. Unique enough for property keys and
+// the well-known-symbol protocol; `typeof` reports 'string' (known gap).
+var __ggSymN = 0;
+function Symbol(d) {
+  __ggSymN += 1;
+  return '@@Sym(' + (d === undefined ? '' : '' + d) + ')' + __ggSymN;
+}
+Symbol.iterator = '@@iterator';
+Symbol.asyncIterator = '@@asyncIterator';
+Symbol.toStringTag = '@@toStringTag';
+Symbol.toPrimitive = '@@toPrimitive';
+Symbol.hasInstance = '@@hasInstance';
+Symbol.unscopables = '@@unscopables';
+Symbol.for = function (k) { return '@@SymFor:' + k; };
+Symbol.keyFor = function (s) {
+  return ('' + s).indexOf('@@SymFor:') === 0
+    ? ('' + s).slice(9) : undefined;
+};
+// DOM events (dispatchEvent walks the tree natively; these are the
+// value shapes it reads/writes)
+function Event(type, opts) {
+  this.type = '' + type;
+  opts = opts || {};
+  this.bubbles = !!opts.bubbles;
+  this.cancelable = !!opts.cancelable;
+  this.defaultPrevented = false;
+  this.target = null;
+  this.currentTarget = null;
+}
+Event.prototype.preventDefault = function () {
+  if (this.cancelable) this.defaultPrevented = true;
+};
+Event.prototype.stopPropagation = function () {
+  this.__stopped = true;
+};
+Event.prototype.stopImmediatePropagation = function () {
+  this.__stopped = true;
+};
+function CustomEvent(type, opts) {
+  Event.call(this, type, opts);
+  this.detail = (opts || {}).detail;
+}
+CustomEvent.prototype = new Event('');
+// --- platform stub layer -------------------------------------------
+// Enough surface for feature-detecting bundles to take their happy
+// path. Intentionally absent: Proxy and Reflect (their absence routes
+// Babel/core-js to safer fallbacks than a half-stub would).
+function MutationObserver(cb) { this._cb = cb; }
+MutationObserver.prototype.observe = function () {};
+MutationObserver.prototype.disconnect = function () {};
+MutationObserver.prototype.takeRecords = function () { return []; };
+function IntersectionObserver(cb, opts) { this._cb = cb; }
+IntersectionObserver.prototype.observe = function (t) {
+  // everything is "visible": lazy content loads eagerly
+  var self = this;
+  setTimeout(function () {
+    self._cb([{ isIntersecting: true, intersectionRatio: 1,
+                target: t }], self);
+  }, 0);
+};
+IntersectionObserver.prototype.unobserve = function () {};
+IntersectionObserver.prototype.disconnect = function () {};
+function ResizeObserver(cb) { this._cb = cb; }
+ResizeObserver.prototype.observe = function () {};
+ResizeObserver.prototype.unobserve = function () {};
+ResizeObserver.prototype.disconnect = function () {};
+function matchMedia(q) {
+  return { matches: false, media: '' + q,
+    onchange: null,
+    addListener: function () {}, removeListener: function () {},
+    addEventListener: function () {},
+    removeEventListener: function () {},
+    dispatchEvent: function () { return false; } };
+}
+function getComputedStyle(el) {
+  var s = (el && el.style) || {};
+  return s;
+}
+var customElements = {
+  define: function () {}, get: function () {},
+  whenDefined: function () { return Promise.resolve(); }
+};
+function AbortController() {
+  this.signal = { aborted: false,
+    addEventListener: function () {},
+    removeEventListener: function () {} };
+}
+AbortController.prototype.abort = function () {
+  this.signal.aborted = true;
+};
+function URLSearchParams(init) {
+  this._p = [];
+  if (typeof init === 'string') {
+    var s = init.charAt(0) === '?' ? init.slice(1) : init;
+    if (s) {
+      var parts = s.split('&');
+      for (var i = 0; i < parts.length; i++) {
+        var kv = parts[i].split('=');
+        this._p.push([decodeURIComponent(kv[0]),
+                      decodeURIComponent(kv[1] || '')]);
+      }
+    }
+  }
+}
+URLSearchParams.prototype.get = function (k) {
+  for (var i = 0; i < this._p.length; i++) {
+    if (this._p[i][0] === k) return this._p[i][1];
+  }
+  return null;
+};
+URLSearchParams.prototype.has = function (k) {
+  return this.get(k) !== null;
+};
+URLSearchParams.prototype.set = function (k, v) {
+  for (var i = 0; i < this._p.length; i++) {
+    if (this._p[i][0] === k) { this._p[i][1] = '' + v; return; }
+  }
+  this._p.push([k, '' + v]);
+};
+URLSearchParams.prototype.append = function (k, v) {
+  this._p.push([k, '' + v]);
+};
+URLSearchParams.prototype.toString = function () {
+  var out = [];
+  for (var i = 0; i < this._p.length; i++) {
+    out.push(encodeURIComponent(this._p[i][0]) + '=' +
+             encodeURIComponent(this._p[i][1]));
+  }
+  return out.join('&');
+};
+URLSearchParams.prototype['delete'] = function (k, v) {
+  var out = [];
+  for (var i = 0; i < this._p.length; i++) {
+    var e = this._p[i];
+    if (e[0] === k && (v === undefined || '' + e[1] === '' + v)) {
+      continue;
+    }
+    out.push(e);
+  }
+  this._p = out;
+};
+URLSearchParams.prototype.forEach = function (cb, thisArg) {
+  for (var i = 0; i < this._p.length; i++) {
+    cb.call(thisArg, this._p[i][1], this._p[i][0], this);
+  }
+};
+URLSearchParams.prototype.getAll = function (k) {
+  var out = [];
+  for (var i = 0; i < this._p.length; i++) {
+    if (this._p[i][0] === k) out.push(this._p[i][1]);
+  }
+  return out;
+};
+URLSearchParams.prototype.keys = function () {
+  var out = [];
+  for (var i = 0; i < this._p.length; i++) out.push(this._p[i][0]);
+  return out;
+};
+URLSearchParams.prototype.values = function () {
+  var out = [];
+  for (var i = 0; i < this._p.length; i++) out.push(this._p[i][1]);
+  return out;
+};
+URLSearchParams.prototype.entries = function () {
+  var out = [];
+  for (var i = 0; i < this._p.length; i++) {
+    out.push([this._p[i][0], this._p[i][1]]);
+  }
+  return out;
+};
+URLSearchParams.prototype.sort = function () {
+  this._p.sort(function (a, b) {
+    return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
+  });
+};
+function URL(u, base) {
+  u = '' + u;
+  if (base && u.indexOf('://') < 0) {
+    base = '' + base;
+    var origin = base.split('/').slice(0, 3).join('/');
+    u = u.charAt(0) === '/' ? origin + u
+      : base.replace(/[^\/]*$/, '') + u;
+  }
+  this.href = u;
+  var m = u.split('://');
+  this.protocol = (m.length > 1 ? m[0] : 'https') + ':';
+  var rest = m.length > 1 ? m[1] : u;
+  var slash = rest.indexOf('/');
+  this.host = slash < 0 ? rest : rest.slice(0, slash);
+  this.hostname = this.host.split(':')[0];
+  this.port = this.host.indexOf(':') > 0
+    ? this.host.split(':')[1] : '';
+  var pathq = slash < 0 ? '/' : rest.slice(slash);
+  var hi = pathq.indexOf('#');
+  this.hash = hi < 0 ? '' : pathq.slice(hi);
+  if (hi >= 0) pathq = pathq.slice(0, hi);
+  var qi = pathq.indexOf('?');
+  this.search = qi < 0 ? '' : pathq.slice(qi);
+  this.pathname = qi < 0 ? pathq : pathq.slice(0, qi);
+  this.origin = this.protocol + '//' + this.host;
+  this.searchParams = new URLSearchParams(this.search);
+}
+URL.prototype.toString = function () { return this.href; };
+function TextEncoder() {}
+TextEncoder.prototype.encode = function (s) {
+  s = '' + s;
+  var out = [];
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charCodeAt(i);
+    if (c < 128) { out.push(c); }
+    else if (c < 2048) {
+      out.push(192 | (c >> 6), 128 | (c & 63));
+    } else {
+      out.push(224 | (c >> 12), 128 | ((c >> 6) & 63),
+               128 | (c & 63));
+    }
+  }
+  return out;
+};
+function TextDecoder() {}
+TextDecoder.prototype.decode = function () { return ''; };
+function Worker() {}
+Worker.prototype.postMessage = function () {};
+Worker.prototype.terminate = function () {};
+Worker.prototype.addEventListener = function () {};
+function XMLHttpRequest() {
+  this.readyState = 0;
+  this.status = 0;
+  this.responseText = '';
+  this.response = '';
+  this._headers = {};
+}
+XMLHttpRequest.prototype.open = function (method, url) {
+  this._method = method;
+  this._url = url;
+  this.readyState = 1;
+};
+XMLHttpRequest.prototype.setRequestHeader = function (k, v) {
+  this._headers[k] = v;
+};
+XMLHttpRequest.prototype.getResponseHeader = function () {
+  return null;
+};
+XMLHttpRequest.prototype.abort = function () {};
+XMLHttpRequest.prototype.addEventListener = function (ty, cb) {
+  if (ty === 'load') this.onload = cb;
+  if (ty === 'error') this.onerror = cb;
+};
+XMLHttpRequest.prototype.send = function () {
+  var self = this;
+  fetch(this._url).then(function (r) {
+    return r.text();
+  }).then(function (t) {
+    self.readyState = 4;
+    self.status = 200;
+    self.responseText = t;
+    self.response = t;
+    if (self.onreadystatechange) self.onreadystatechange();
+    if (self.onload) self.onload();
+  }, function (e) {
+    self.readyState = 4;
+    self.status = 0;
+    if (self.onreadystatechange) self.onreadystatechange();
+    if (self.onerror) self.onerror(e);
+  });
+};
+// DOM interface constructors: patch surfaces for polyfills
+// (real DOM nodes are engine values, not instances of these)
+function EventTarget() {}
+function Node() {}
+function Element() {}
+function HTMLElement() {}
+function HTMLDivElement() {}
+function HTMLAnchorElement() {}
+function HTMLScriptElement() {}
+function HTMLImageElement() {}
+function HTMLInputElement() {}
+function SVGElement() {}
+function Document() {}
+function HTMLDocument() {}
+function CharacterData() {}
+function Text() {}
+function Comment() {}
+function DocumentFragment() {}
+function HTMLCollection() {}
+function NodeList() {}
+function DOMTokenList() {}
+function ShadowRoot() {}
+function DocumentType() {}
+function ProcessingInstruction() {}
+function CDATASection() {}
+function Attr() {}
+function DOMException(m, n) {
+  this.message = '' + (m || '');
+  this.name = '' + (n || 'Error');
+}
+function MessageChannel() {
+  this.port1 = { onmessage: null,
+    postMessage: function () {},
+    addEventListener: function () {} };
+  this.port2 = { onmessage: null,
+    postMessage: function () {},
+    addEventListener: function () {} };
+}
+function Blob() {}
+function File() {}
+function FormData() {}
+FormData.prototype.append = function () {};
+FormData.prototype.get = function () { return null; };
+// --- Date: a real class over the virtual clock (UTC == local, tz 0).
+// Calendar math is Howard Hinnant's civil algorithm.
+function __gg_civil(z) {
+  z += 719468;
+  var era = Math.floor(z / 146097);
+  var doe = z - era * 146097;
+  var yoe = Math.floor((doe - Math.floor(doe / 1460)
+    + Math.floor(doe / 36524) - Math.floor(doe / 146096)) / 365);
+  var y = yoe + era * 400;
+  var doy = doe - (365 * yoe + Math.floor(yoe / 4)
+    - Math.floor(yoe / 100));
+  var mp = Math.floor((5 * doy + 2) / 153);
+  var d = doy - Math.floor((153 * mp + 2) / 5) + 1;
+  var m = mp + (mp < 10 ? 3 : -9);
+  return [y + (m <= 2 ? 1 : 0), m, d];
+}
+function __gg_days(y, m, d) {
+  y -= m <= 2 ? 1 : 0;
+  var era = Math.floor(y / 400);
+  var yoe = y - era * 400;
+  var mp = m + (m > 2 ? -3 : 9);
+  var doy = Math.floor((153 * mp + 2) / 5) + d - 1;
+  var doe = yoe * 365 + Math.floor(yoe / 4)
+    - Math.floor(yoe / 100) + doy;
+  return era * 146097 + doe - 719468;
+}
+function Date(a, b, c, d, e, f, g) {
+  if (arguments.length === 0) { this._t = __ggDateNow(); }
+  else if (arguments.length === 1) {
+    if (typeof a === 'number') { this._t = a; }
+    else if (a instanceof Date) { this._t = a._t; }
+    else { this._t = Date.parse('' + a); }
+  } else {
+    this._t = Date.UTC(a, b, c === undefined ? 1 : c,
+                       d || 0, e || 0, f || 0, g || 0);
+  }
+}
+Date.now = __ggDateNow;
+Date.UTC = function (y, m, d, h, mi, s, ms) {
+  return __gg_days(+y, (+m || 0) + 1, d === undefined ? 1 : +d)
+    * 86400000 + (h || 0) * 3600000 + (mi || 0) * 60000
+    + (s || 0) * 1000 + (ms || 0);
+};
+Date.parse = function (s) {
+  s = ('' + s).replace('T', ' ');
+  var m = /^(\d{4})-(\d{2})-(\d{2})(?:[ ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?)?/.exec(s);
+  if (!m) return NaN;
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] || 0),
+                  +(m[5] || 0), +(m[6] || 0), +(m[7] || 0));
+};
+(function () {
+  var P = Date.prototype;
+  function day(t) { return Math.floor(t / 86400000); }
+  function mod(t, n) { var r = t % n; return r < 0 ? r + n : r; }
+  P.getTime = function () { return this._t; };
+  P.valueOf = function () { return this._t; };
+  P.setTime = function (t) { this._t = +t; return this._t; };
+  P.getFullYear = function () { return __gg_civil(day(this._t))[0]; };
+  P.getMonth = function () { return __gg_civil(day(this._t))[1] - 1; };
+  P.getDate = function () { return __gg_civil(day(this._t))[2]; };
+  P.getDay = function () { return mod(day(this._t) + 4, 7); };
+  P.getHours = function () {
+    return Math.floor(mod(this._t, 86400000) / 3600000);
+  };
+  P.getMinutes = function () {
+    return Math.floor(mod(this._t, 3600000) / 60000);
+  };
+  P.getSeconds = function () {
+    return Math.floor(mod(this._t, 60000) / 1000);
+  };
+  P.getMilliseconds = function () { return mod(this._t, 1000); };
+  P.getYear = function () { return this.getFullYear() - 1900; };
+  P.getTimezoneOffset = function () { return 0; };
+  P.getUTCFullYear = P.getFullYear;
+  P.getUTCMonth = P.getMonth;
+  P.getUTCDate = P.getDate;
+  P.getUTCDay = P.getDay;
+  P.getUTCHours = P.getHours;
+  P.getUTCMinutes = P.getMinutes;
+  P.getUTCSeconds = P.getSeconds;
+  P.getUTCMilliseconds = P.getMilliseconds;
+  function pad(n, w) {
+    n = '' + n;
+    while (n.length < (w || 2)) n = '0' + n;
+    return n;
+  }
+  P.toISOString = function () {
+    var c = __gg_civil(day(this._t));
+    return pad(c[0], 4) + '-' + pad(c[1]) + '-' + pad(c[2])
+      + 'T' + pad(this.getHours()) + ':' + pad(this.getMinutes())
+      + ':' + pad(this.getSeconds()) + '.'
+      + pad(this.getMilliseconds(), 3) + 'Z';
+  };
+  P.toJSON = function () { return this.toISOString(); };
+  P.toString = function () { return this.toISOString(); };
+  P.toLocaleDateString = P.toString;
+  P.toLocaleTimeString = P.toString;
+  P.toLocaleString = P.toString;
+  P.toUTCString = P.toString;
+  P.toGMTString = P.toString;
+})();
 "#;
 use crate::dom;
 
@@ -114,7 +524,11 @@ impl PageVm {
             ("debug", Native::ConsoleLog),
             ("trace", Native::ConsoleLog),
         ]);
-        vm.install_object("Date", &[("now", Native::DateNow)]);
+        // the prelude builds a real Date class over this native tick
+        let dn = make_native(&mut vm.st, Native::DateNow);
+        vm.set_global("__ggDateNow", dn);
+        vm.set_global("NaN", Value::number(f64::NAN));
+        vm.set_global("Infinity", Value::number(f64::INFINITY));
         vm.install_object(
             "JSON",
             &[
@@ -148,6 +562,18 @@ impl PageVm {
             ("clearInterval", Native::ClearTimeout),
             ("queueMicrotask", Native::QueueMicrotask),
             ("fetch", Native::Fetch),
+            ("requestAnimationFrame", Native::Raf),
+            ("cancelAnimationFrame", Native::ClearTimeout),
+            ("requestIdleCallback", Native::Raf),
+            ("cancelIdleCallback", Native::ClearTimeout),
+            ("encodeURIComponent",
+             Native::UriCoder { encode: true, component: true }),
+            ("decodeURIComponent",
+             Native::UriCoder { encode: false, component: true }),
+            ("encodeURI",
+             Native::UriCoder { encode: true, component: false }),
+            ("decodeURI",
+             Native::UriCoder { encode: false, component: false }),
         ] {
             let fv = make_native(&mut vm.st, n);
             vm.set_global(name, fv);
@@ -201,6 +627,12 @@ impl PageVm {
                 ("entries", Native::HostFn(host::O_ENTRIES)),
                 ("assign", Native::HostFn(host::O_ASSIGN)),
                 ("freeze", Native::HostFn(host::O_FREEZE)),
+                ("defineProperty", Native::HostFn(host::O_DEFINE_PROP)),
+                ("getOwnPropertyDescriptor",
+                 Native::HostFn(host::O_GET_OWN_PD)),
+                ("create", Native::HostFn(host::O_CREATE)),
+                ("getPrototypeOf", Native::HostFn(host::O_GET_PROTO)),
+                ("setPrototypeOf", Native::HostFn(host::O_SET_PROTO)),
             ],
         );
         vm.st.known.object = object_ctor;
@@ -213,6 +645,25 @@ impl PageVm {
             ],
         );
         vm.st.known.array = array_ctor;
+        // Object.prototype staples as extractable values (webpack's
+        // runtime does Object.prototype.hasOwnProperty.call(...))
+        let oproto = vm::fn_prototype(&mut vm.st, object_ctor);
+        for m in ["hasOwnProperty", "toString", "valueOf",
+                  "propertyIsEnumerable", "isPrototypeOf"] {
+            let k = vm.name_id(m);
+            let f = make_native(&mut vm.st, Native::MethodRef(k));
+            raw_set_prop(&mut vm.st, oproto.index() as usize, k, f);
+        }
+        // Array.prototype.values/keys/entries as extractables
+        // (iterator-helper polyfills read them off the prototype)
+        let aproto = vm::fn_prototype(&mut vm.st, array_ctor);
+        for m in ["values", "keys", "entries", "slice", "concat",
+                  "join", "indexOf", "push", "pop", "forEach", "map",
+                  "filter", "@@iterator"] {
+            let k = vm.name_id(m);
+            let f = make_native(&mut vm.st, Native::MethodRef(k));
+            raw_set_prop(&mut vm.st, aproto.index() as usize, k, f);
+        }
         // Number/String stay callable (coercion: Number("3"), String(42)),
         // so isNaN/isFinite live as the *global* functions they also are
         // in JS. (Number.isInteger etc. are a later add — a function value
@@ -231,16 +682,174 @@ impl PageVm {
         // (`self.webpackChunk... = ...`); alias both to window
         vm.set_global("self", window);
         vm.set_global("globalThis", window);
-        // bundles register load/resize/scroll handlers on window before
-        // doing anything useful; accept and ignore them
-        for m in ["addEventListener", "removeEventListener",
-                  "postMessage", "scrollTo"] {
+        // typed-array/binary globals are deliberately ABSENT: half-real
+        // stubs made core-js take its native path and crash inside our
+        // empty shells (naver polyfill, module 34697). With them gone,
+        // core-js builds its own pure-JS ArrayBuffer/DataView/typed
+        // arrays on WeakMap-backed internal state — which we support.
+        // window listeners are real (lifecycle events find them by the
+        // WINDOW_NODE key); the rest stay accepted-and-ignored
+        for (m, add) in [("addEventListener", true),
+                         ("removeEventListener", false)] {
+            let f = make_native(&mut vm.st, Native::WinEvent { add });
+            vm.set_object_prop(window, m, f);
+        }
+        for m in ["postMessage", "scrollTo"] {
             let noop = make_native(&mut vm.st, Native::Noop);
             vm.set_object_prop(window, m, noop);
         }
         vm.st.known.window = window;
         let fctor = make_native(&mut vm.st, Native::FunctionCtor);
         vm.set_global("Function", fctor);
+        // Function.prototype.call/apply/bind as extractable values
+        // (core-js uncurryThis reads them off the prototype object)
+        let fproto = vm::fn_prototype(&mut vm.st, fctor);
+        for m in ["call", "apply", "bind"] {
+            let k = vm.name_id(m);
+            let f = make_native(&mut vm.st, Native::MethodRef(k));
+            raw_set_prop(&mut vm.st, fproto.index() as usize, k, f);
+        }
+        let rctor = make_native(&mut vm.st, Native::RegExpCtor);
+        vm.set_global("RegExp", rctor);
+        // RegExp.prototype.exec/test as extractable methods (core-js
+        // regexp-exec reads then re-applies them via .call)
+        let rproto = vm::fn_prototype(&mut vm.st, rctor);
+        for m in ["exec", "test"] {
+            let k = vm.name_id(m);
+            let f = make_native(&mut vm.st, Native::MethodRef(k));
+            raw_set_prop(&mut vm.st, rproto.index() as usize, k, f);
+        }
+        // Map/Set (Weak variants share the impl — no GC either way).
+        // Their prototypes carry extractable methods (core-js pulls
+        // Set.prototype.forEach/keys off and re-applies them).
+        for (name, ctor) in [("Map", Native::MapCtor),
+                             ("WeakMap", Native::MapCtor),
+                             ("Set", Native::SetCtor),
+                             ("WeakSet", Native::SetCtor)] {
+            let f = make_native(&mut vm.st, ctor);
+            vm.set_global(name, f);
+            let proto = vm::fn_prototype(&mut vm.st, f);
+            for m in ["get", "set", "add", "has", "delete", "clear",
+                      "forEach", "keys", "values", "entries",
+                      "@@iterator"] {
+                let k = vm.name_id(m);
+                let mf = make_native(&mut vm.st, Native::MethodRef(k));
+                raw_set_prop(
+                    &mut vm.st, proto.index() as usize, k, mf);
+            }
+        }
+        // browser objects: location / navigator / performance /
+        // history / screen (location gets real values via
+        // set_page_url once the loader knows the URL)
+        {
+            let loc = new_plain_object(&mut vm.st);
+            let li = loc.index() as usize;
+            for (f, dv) in [("href", ""), ("protocol", "https:"),
+                            ("host", ""), ("hostname", ""),
+                            ("pathname", "/"), ("search", ""),
+                            ("hash", ""), ("origin", ""),
+                            ("port", "")] {
+                let k = vm.name_id(f);
+                let sv = vm::intern(&mut vm.st, dv);
+                raw_set_prop(&mut vm.st, li, k, sv);
+            }
+            for m in ["assign", "replace", "reload"] {
+                let k = vm.name_id(m);
+                let f = make_native(&mut vm.st, Native::Noop);
+                raw_set_prop(&mut vm.st, li, k, f);
+            }
+            vm.set_global("location", loc);
+            vm.set_object_prop(window, "location", loc);
+
+            let nav = new_plain_object(&mut vm.st);
+            let ni = nav.index() as usize;
+            for (f, dv) in [
+                ("userAgent",
+                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+                  AppleWebKit/537.36 (KHTML, like Gecko) \
+                  GGBrowser/0.1"),
+                ("platform", "Win32"),
+                ("language", "ko-KR"),
+                ("vendor", ""),
+                ("appName", "Netscape"),
+            ] {
+                let k = vm.name_id(f);
+                let sv = vm::intern(&mut vm.st, dv);
+                raw_set_prop(&mut vm.st, ni, k, sv);
+            }
+            let k = vm.name_id("cookieEnabled");
+            raw_set_prop(&mut vm.st, ni, k, Value::boolean(true));
+            let k = vm.name_id("sendBeacon");
+            let f = make_native(&mut vm.st, Native::Noop);
+            raw_set_prop(&mut vm.st, ni, k, f);
+            vm.set_global("navigator", nav);
+            vm.set_object_prop(window, "navigator", nav);
+
+            let perf = new_plain_object(&mut vm.st);
+            let pi = perf.index() as usize;
+            let k = vm.name_id("now");
+            let f = make_native(&mut vm.st, Native::PerfNow);
+            raw_set_prop(&mut vm.st, pi, k, f);
+            for m in ["mark", "measure", "clearMarks",
+                      "clearMeasures", "getEntriesByName"] {
+                let k = vm.name_id(m);
+                let f = make_native(&mut vm.st, Native::Noop);
+                raw_set_prop(&mut vm.st, pi, k, f);
+            }
+            let k = vm.name_id("timeOrigin");
+            raw_set_prop(&mut vm.st, pi, k, Value::number(0.0));
+            vm.set_global("performance", perf);
+            vm.set_object_prop(window, "performance", perf);
+
+            let hist = new_plain_object(&mut vm.st);
+            let hi = hist.index() as usize;
+            let k = vm.name_id("length");
+            raw_set_prop(&mut vm.st, hi, k, Value::int(1));
+            let k = vm.name_id("state");
+            raw_set_prop(&mut vm.st, hi, k, Value::NULL);
+            for m in ["pushState", "replaceState", "back",
+                      "forward", "go"] {
+                let k = vm.name_id(m);
+                let f = make_native(&mut vm.st, Native::Noop);
+                raw_set_prop(&mut vm.st, hi, k, f);
+            }
+            vm.set_global("history", hist);
+            vm.set_object_prop(window, "history", hist);
+
+            let scr = new_plain_object(&mut vm.st);
+            let si = scr.index() as usize;
+            for (f, n) in [("width", 1280), ("height", 800),
+                           ("availWidth", 1280),
+                           ("availHeight", 760),
+                           ("colorDepth", 24), ("pixelDepth", 24)] {
+                let k = vm.name_id(f);
+                raw_set_prop(&mut vm.st, si, k, Value::int(n));
+            }
+            vm.set_global("screen", scr);
+            vm.set_object_prop(window, "screen", scr);
+        }
+        // localStorage / sessionStorage (in-memory key-value)
+        for (name, session) in [("localStorage", false),
+                                ("sessionStorage", true)] {
+            let store = new_plain_object(&mut vm.st);
+            for (m, op) in [("getItem", 0u8), ("setItem", 1),
+                            ("removeItem", 2), ("clear", 3), ("key", 4)] {
+                let key = vm.name_id(m);
+                let fv = make_native(
+                    &mut vm.st, Native::Storage { session, op });
+                raw_set_prop(&mut vm.st, store.index() as usize, key, fv);
+            }
+            vm.set_global(name, store);
+            vm.set_object_prop(window, name, store);
+        }
+        // core-js reads Function.prototype.apply/call/bind as values
+        // (uncurryThis); seed them as extraction dispatchers
+        let fproto = vm::fn_prototype(&mut vm.st, fctor);
+        for m in ["apply", "call", "bind"] {
+            let key = vm.name_id(m);
+            let mv = make_native(&mut vm.st, Native::MethodRef(key));
+            raw_set_prop(&mut vm.st, fproto.index() as usize, key, mv);
+        }
         if has_doc {
             vm.set_global("document", Value::dom_node(DOC_NODE));
         }
@@ -470,6 +1079,117 @@ impl PageVm {
     }
 
     /// One-shot headless eval (tests, jsvm_eval/jsvm_run).
+    /// Fire the document lifecycle: readyState -> interactive,
+    /// DOMContentLoaded (document + window), readyState -> complete,
+    /// then window `load`. The loader calls this once after all
+    /// scripts ran — app bundles bootstrap from these.
+    pub fn fire_lifecycle(&mut self) -> Vec<String> {
+        self.st.ready_state = "interactive";
+        self.dispatch_simple(vm::DOC_NODE, "domcontentloaded");
+        self.dispatch_simple(vm::WINDOW_NODE, "domcontentloaded");
+        self.st.ready_state = "complete";
+        self.dispatch_simple(vm::WINDOW_NODE, "load");
+        self.dispatch_simple(vm::DOC_NODE, "load");
+        std::mem::take(&mut self.st.logs)
+    }
+
+    fn dispatch_simple(&mut self, node: u32, ty: &str) {
+        let cbs = self
+            .st
+            .listeners
+            .get(&(node, ty.to_string()))
+            .cloned()
+            .unwrap_or_default();
+        if cbs.is_empty() {
+            return;
+        }
+        let evt = new_plain_object(&mut self.st);
+        let tk = self.name_id("type");
+        let tv = vm::intern(&mut self.st, ty);
+        raw_set_prop(&mut self.st, evt.index() as usize, tk, tv);
+        for cb in cbs {
+            if let Err(e) =
+                call_value(&mut self.st, &self.mods, cb, &[evt])
+            {
+                self.st
+                    .logs
+                    .push(format!("[gg-js error] {}", e.msg));
+            }
+        }
+    }
+
+    /// (listeners, timers, microtasks) — boot diagnosis: did the page
+    /// register anything to wake up for?
+    pub fn pending_counts(&self) -> (usize, usize, usize) {
+        (
+            self.st.listeners.values().map(|v| v.len()).sum(),
+            self.st.timers.len(),
+            self.st.microtasks.len(),
+        )
+    }
+
+    /// One real-time slice of the event loop (see vm::pump_bounded).
+    /// Returns (console output, fetches to service).
+    pub fn tick(
+        &mut self,
+        dt_ms: f64,
+    ) -> (Vec<String>, Vec<(u32, String)>) {
+        let fetches =
+            vm::pump_bounded(&mut self.st, &self.mods, 10_000, dt_ms);
+        (std::mem::take(&mut self.st.logs), fetches)
+    }
+
+    /// Fill location.* from the real page URL (loader calls this
+    /// before scripts run).
+    pub fn set_page_url(&mut self, url: &str) {
+        let (scheme, rest) =
+            url.split_once("://").unwrap_or(("https", url));
+        let (hostport, pathq) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        let (pathq, hash) = match pathq.find('#') {
+            Some(i) => (&pathq[..i], &pathq[i..]),
+            None => (pathq, ""),
+        };
+        let (path, search) = match pathq.find('?') {
+            Some(i) => (&pathq[..i], &pathq[i..]),
+            None => (pathq, ""),
+        };
+        let (hostname, port) = match hostport.rsplit_once(':') {
+            Some((h, p))
+                if !p.is_empty()
+                    && p.chars().all(|c| c.is_ascii_digit()) =>
+            {
+                (h, p)
+            }
+            _ => (hostport, ""),
+        };
+        let origin = format!("{scheme}://{hostport}");
+        let sets = [
+            ("href", url.to_string()),
+            ("protocol", format!("{scheme}:")),
+            ("host", hostport.to_string()),
+            ("hostname", hostname.to_string()),
+            ("pathname", path.to_string()),
+            ("search", search.to_string()),
+            ("hash", hash.to_string()),
+            ("origin", origin),
+            ("port", port.to_string()),
+        ];
+        let lockey = self.name_id("location");
+        let loc = self.st.globals[lockey as usize];
+        if !loc.is_object() {
+            return;
+        }
+        let li = loc.index() as usize;
+        for (f, v) in sets {
+            let k = self.name_id(f);
+            let sv = vm::push_str(&mut self.st, v);
+            raw_set_prop(&mut self.st, li, k, sv);
+        }
+    }
+
     pub fn eval(src: &str) -> Result<(Value, Vec<String>), String> {
         let mut vm = PageVm::new(None);
         let v = vm.run_source(src)?;
@@ -535,6 +1255,96 @@ mod tests {
         assert_eq!(
             n("var s = 0; loop: for (var i = 0; i < 5; i++) { \
                if (i === 3) break; s += i; } s"), 3.0);
+    }
+
+    #[test]
+    fn descriptors_and_accessors() {
+        // getter invoked on read, with the right this
+        assert_eq!(
+            n("var o = {v: 6}; Object.defineProperty(o, 'x', \
+               {get: function() { return this.v * 7; }}); o.x"), 42.0);
+        // setter intercepts writes
+        assert_eq!(
+            n("var o = {}; Object.defineProperty(o, 'y', \
+               {set: function(v) { this.stored = v * 2; }}); \
+               o.y = 21; o.stored"), 42.0);
+        // data descriptor + read-back
+        assert_eq!(
+            n("var o = {}; Object.defineProperty(o, 'z', {value: 5}); \
+               o.z * 10 + Object.getOwnPropertyDescriptor(o, 'z').value"),
+            55.0);
+        // accessor on a prototype: instances hit it with their own this
+        assert_eq!(
+            n("function F(v) { this.v = v; } \
+               Object.defineProperty(F.prototype, 'twice', \
+               {get: function() { return this.v * 2; }}); \
+               new F(4).twice * 10 + new F(9).twice"), 98.0);
+        // Object.create / getPrototypeOf / setPrototypeOf
+        assert_eq!(
+            n("var p = {a: 7}; var o = Object.create(p); \
+               (Object.getPrototypeOf(o) === p ? 100 : 0) + o.a"), 107.0);
+        assert_eq!(
+            n("var o = {}; Object.setPrototypeOf(o, {b: 3}); o.b"), 3.0);
+        // missing descriptor -> undefined
+        assert_eq!(
+            n("Object.getOwnPropertyDescriptor({}, 'nope') === \
+               undefined ? 1 : 0"), 1.0);
+    }
+
+    #[test]
+    fn extracted_call_apply_bind() {
+        // the core-js uncurryThis pattern end to end
+        assert_eq!(
+            n("var ap = Function.prototype.apply; \
+               function f(a, b) { return this.v + a * 10 + b; } \
+               ap.call(f, {v: 100}, [2, 3])"), 123.0);
+        assert_eq!(
+            n("function f(a) { return this.v + a; } \
+               var c = f.call; c.call(f, {v: 7}, 5)"), 12.0);
+        assert_eq!(
+            n("function f(a) { return a * 2; } \
+               var b = f.bind; var g = b.call(f, null, 21); g()"), 42.0);
+    }
+
+    #[test]
+    fn bound_constructor_new() {
+        // Babel _construct: new (Function.bind.apply(C, [null, args]))
+        assert_eq!(
+            n("function C(v) { \
+               if (!(this instanceof C)) throw new TypeError('nope'); \
+               this.v = v; } \
+               var B = Function.prototype.bind.apply(C, [null, 7]); \
+               var i = new B(); \
+               (i instanceof C ? 100 : 0) + i.v"), 107.0);
+        assert_eq!(
+            n("function C(a, b) { this.s = a + b; } \
+               var B = C.bind(null, 40); (new B(2)).s"), 42.0);
+    }
+
+    #[test]
+    fn function_bind() {
+        assert_eq!(
+            n("function f(a, b) { return this.v + a * 10 + b; } \
+               var g = f.bind({v: 100}, 2); g(3)"), 123.0);
+        // bind of bind stacks partials, this stays from the first bind
+        assert_eq!(
+            n("function f(a, b) { return this.v + a * 10 + b; } \
+               var g = f.bind({v: 5}).bind({v: 9}, 4); g(6)"), 51.0);
+        // webpack loader staple: r.bind(null, 0)
+        assert_eq!(
+            n("function r(x, y) { return x * 10 + y; } \
+               var p = r.bind(null, 7); p(3) + p(1) * 100"), 7173.0);
+    }
+
+    #[test]
+    #[ignore] // diagnostic: run with -- --ignored (needs the saved file)
+    fn polyfill_diag() {
+        let path = r"C:\Users\ehdgu\AppData\Local\Temp\claude\E--gg\1e9603b2-4741-42c9-807a-54c1120767e2\scratchpad\polyfill_full.js";
+        let Ok(src) = std::fs::read_to_string(path) else { return };
+        match eval(&src) {
+            Ok(_) => println!("polyfill: OK"),
+            Err(e) => println!("polyfill: {e}"),
+        }
     }
 
     #[test]
@@ -669,6 +1479,655 @@ mod tests {
     }
 
     #[test]
+    fn rest_params_and_object_spread() {
+        // rest parameters (desugared to arguments.slice(n))
+        assert_eq!(
+            n("function f(a, ...r) { return a + r.length } f(1, 2, 3, 4)"),
+            4.0);
+        assert_eq!(n("function f(...r) { return r[0] + r[2] } f(5, 6, 7)"),
+                   12.0);
+        assert_eq!(n("var f = (...xs) => xs.length; f()"), 0.0);
+        // object literal spread (desugared to Object.assign)
+        assert_eq!(
+            n("var o = {a: 1, ...{b: 2, c: 3}, d: 4}; o.a + o.b + o.c + o.d"),
+            10.0);
+        assert_eq!(n("var s = {a: 5}; var o = {a: 1, ...s}; o.a"), 5.0);
+        assert_eq!(n("var o = {...{x: 2}}; o.x"), 2.0);
+        // object rest pattern: rest gets the unbound keys only
+        assert_eq!(
+            n("var {a, ...rest} = {a: 1, b: 2, c: 3}; \
+               a + rest.b + rest.c + (rest.a === undefined ? 100 : 0)"),
+            106.0);
+        // RegExp constructor builds a working regex (new and plain call)
+        assert_eq!(n("new RegExp('a+', 'i').test('bAAb') ? 1 : 0"), 1.0);
+        assert_eq!(n("RegExp('\\\\d{2}').test('x42') ? 1 : 0"), 1.0);
+    }
+
+    #[test]
+    fn engine_errors_are_catchable_typeerrors() {
+        // unresolved global: a catchable ReferenceError
+        assert_eq!(
+            n("var r = 0; try { totallyMissing(); } catch (e) { \
+               r = (e instanceof ReferenceError ? 1 : 0) \
+                 + (e instanceof Error ? 2 : 0); } r"),
+            3.0);
+        // `var u;` (no init) declares the global: reads are undefined
+        assert_eq!(n("var u; u === undefined ? 1 : 0"), 1.0);
+        // member read on undefined: caught, instanceof TypeError+Error
+        assert_eq!(
+            n("var r = 0; try { var u; u.x; } catch (e) { \
+               r = (e instanceof TypeError ? 1 : 0) \
+                 + (e instanceof Error ? 2 : 0) \
+                 + (e.name === 'TypeError' ? 4 : 0); } r"),
+            7.0);
+        // calling a missing method
+        assert_eq!(
+            n("var r = 0; try { ({}).nope(); } \
+               catch (e) { r = e instanceof TypeError ? 1 : 0; } r"),
+            1.0);
+        // method call on null
+        assert_eq!(
+            n("var r = 0; try { null.foo(); } \
+               catch (e) { r = e.name === 'TypeError' ? 1 : 0; } r"),
+            1.0);
+        // calling a non-function value
+        assert_eq!(
+            n("var r = 0; try { var x = 5; x(); } \
+               catch (e) { r = e instanceof TypeError ? 1 : 0; } r"),
+            1.0);
+        // toString inherited from the Error prelude chain
+        assert_eq!(
+            n("var r = ''; try { var u; u.x; } \
+               catch (e) { r = e.toString(); } \
+               r.indexOf('TypeError') === 0 ? 1 : 0"),
+            1.0);
+    }
+
+    #[test]
+    fn js_semantics_instead_of_bails() {
+        // null/bool keys stringify like real JS
+        assert_eq!(n("var o = {}; o[null] = 5; o['null']"), 5.0);
+        assert_eq!(n("var o = {}; o[true] = 3; o[true]"), 3.0);
+        // negative / fractional indices are named properties
+        assert_eq!(n("var a = [1]; a[-1] = 7; a[-1] + a.length"), 8.0);
+        assert_eq!(n("var a = []; a[0.5] = 3; a[0.5]"), 3.0);
+        assert_eq!(
+            n("var a = [1, 2]; a[-1] === undefined ? 1 : 0"), 1.0);
+        // string propertyIsEnumerable / hasOwnProperty
+        assert_eq!(n("'ab'.propertyIsEnumerable(0) ? 1 : 0"), 1.0);
+        assert_eq!(n("'ab'.propertyIsEnumerable(5) ? 1 : 0"), 0.0);
+        assert_eq!(n("'ab'.hasOwnProperty('length') ? 1 : 0"), 1.0);
+        // object propertyIsEnumerable via the universal fallback
+        assert_eq!(
+            n("var o = {a: 1}; (o.propertyIsEnumerable('a') ? 1 : 0) \
+               + (o.propertyIsEnumerable('b') ? 10 : 0)"),
+            1.0);
+        // primitive indexing yields undefined, not an engine bail
+        assert_eq!(n("var n = 0; (n[1] === undefined) ? 1 : 0"), 1.0);
+        // new with spread args (Babel _construct shape)
+        assert_eq!(
+            n("function P(a, b) { this.s = a + b; } \
+               var args = [3, 4]; new P(...args).s"),
+            7.0);
+        // string/number/computed-keyed method shorthand
+        assert_eq!(n("var o = { 'hi'() { return 5; } }; o.hi()"), 5.0);
+        assert_eq!(n("var o = { 7() { return 3; } }; o[7]()"), 3.0);
+        assert_eq!(
+            n("var k = 'm'; var o = { [k]() { return 9; } }; o.m()"),
+            9.0);
+    }
+
+    #[test]
+    fn small_syntax_gaps() {
+        // object literal getter/setter shorthand
+        assert_eq!(
+            n("var o = { _v: 3, get v() { return this._v * 2; }, \
+               set v(x) { this._v = x; } }; o.v = 5; o.v"),
+            10.0);
+        // for-of / for-in with a destructuring head
+        assert_eq!(
+            n("var s = 0; \
+               for (var [a, b] of [[1, 2], [3, 4]]) { s += a * b; } s"),
+            14.0);
+        assert_eq!(
+            n("var ks = []; var o = {x: 1, y: 2}; \
+               for (const [k, v] of Object.entries ? [] : []) {} \
+               ks.length"),
+            0.0);
+        // destructuring assignment expressions
+        assert_eq!(
+            n("var a, b; [a, b] = [7, 8]; a * 10 + b"), 78.0);
+        assert_eq!(
+            n("var x, y; ({x, y} = {x: 2, y: 3}); x * y"), 6.0);
+        assert_eq!(
+            n("var p, q; [p, q = 9] = [4]; p + q"), 13.0);
+        assert_eq!(
+            n("var o = {}; [o.v] = [5]; o.v"), 5.0);
+        // Array.prototype.splice: removal, insertion, return value
+        assert_eq!(
+            n("var a = [1, 2, 3, 4, 5]; var r = a.splice(1, 2, 9); \
+               a.join('-') + '|' + r.join('-') === '1-9-4-5|2-3' ? 1 : 0"),
+            1.0);
+        assert_eq!(
+            n("var a = [1, 2, 3]; a.splice(1); a.length"), 1.0);
+    }
+
+    #[test]
+    fn class_extends_super_static() {
+        // super() in the constructor + method inheritance
+        assert_eq!(
+            n("class A { constructor(x) { this.x = x; } \
+                 getX() { return this.x; } } \
+               class B extends A { constructor(x) { super(x * 2); } } \
+               new B(21).getX()"),
+            42.0);
+        // super.method() delegation
+        assert_eq!(
+            n("class A { hi() { return 10; } } \
+               class B extends A { hi() { return super.hi() + 5; } } \
+               new B().hi()"),
+            15.0);
+        // default ctor forwards arguments to the parent
+        assert_eq!(
+            n("class A { constructor(a, b) { this.s = a + b; } } \
+               class B extends A {} new B(4, 5).s"),
+            9.0);
+        // instanceof sees the chain
+        assert_eq!(
+            n("class A {} class B extends A {} \
+               var b = new B(); \
+               (b instanceof B ? 1 : 0) + (b instanceof A ? 2 : 0)"),
+            3.0);
+        // static methods and class fields
+        assert_eq!(
+            n("class C { static make(v) { return new C(v); } \
+                 constructor(v) { this.v = v; } } \
+               C.make(7).v"),
+            7.0);
+        assert_eq!(
+            n("class P { count = 3; bump() { return ++this.count; } } \
+               new P().bump()"),
+            4.0);
+        // getter via class accessor syntax
+        assert_eq!(
+            n("class G { constructor() { this._v = 6; } \
+                 get v() { return this._v * 2; } } \
+               new G().v"),
+            12.0);
+        // plain classes keep working (legacy path)
+        assert_eq!(
+            n("class K { constructor() { this.n = 1; } m() { return 2; } } \
+               var k = new K(); k.n + k.m()"),
+            3.0);
+    }
+
+    #[test]
+    fn generators_state_machine() {
+        // basic yields + done protocol
+        assert_eq!(
+            n("function* g() { yield 1; yield 2; return 3; } \
+               var it = g(); \
+               var a = it.next(), b = it.next(), c = it.next(), \
+                   d = it.next(); \
+               (a.value === 1 && !a.done ? 1 : 0) \
+               + (b.value === 2 && !b.done ? 10 : 0) \
+               + (c.value === 3 && c.done ? 100 : 0) \
+               + (d.value === undefined && d.done ? 1000 : 0)"),
+            1111.0);
+        // locals persist across next() calls; sent values arrive
+        assert_eq!(
+            n("function* acc(start) { \
+                 var total = start; \
+                 var x = yield total; \
+                 total += x; \
+                 var y = yield total; \
+                 total += y; \
+                 return total; \
+               } \
+               var it = acc(10); \
+               it.next(); it.next(5); it.next(7).value"),
+            22.0);
+        // generator methods in object literals and classes
+        assert_eq!(
+            n("var o = { *pair() { yield 'a'; yield 'b'; } }; \
+               var it = o.pair(); \
+               it.next().value + it.next().value === 'ab' ? 1 : 0"),
+            1.0);
+        assert_eq!(
+            n("class C { *nums() { yield 4; yield 2; } } \
+               var it = new C().nums(); \
+               it.next().value * 10 + it.next().value"),
+            42.0);
+        // return() closes the iterator early
+        assert_eq!(
+            n("function* g() { yield 1; yield 2; } var it = g(); \
+               it.next(); it['return'](9); \
+               var r = it.next(); \
+               (r.done ? 1 : 0) + (r.value === undefined ? 2 : 0)"),
+            3.0);
+        // yield inside control flow: a clear error, not wrong code
+        assert!(eval(
+            "function* bad() { while (true) { yield 1; } } bad()")
+            .is_err());
+    }
+
+    #[test]
+    fn for_of_iterator_protocol() {
+        // for-of drives a generator
+        assert_eq!(
+            n("function* g() { yield 1; yield 2; yield 3; } \
+               var s = 0; for (var v of g()) { s += v; } s"),
+            6.0);
+        // for-of over Set (insertion order, deduped)
+        assert_eq!(
+            n("var s = 0; for (var v of new Set([5, 5, 7])) { s += v; } \
+               s"),
+            12.0);
+        // for-of over Map with a destructuring head
+        assert_eq!(
+            n("var m = new Map([['a', 1], ['b', 2]]); var s = 0; \
+               for (var [k, v] of m) { s += v; } s"),
+            3.0);
+        // custom iterable via Symbol.iterator
+        assert_eq!(
+            n("var obj = {}; \
+               obj[Symbol.iterator] = function () { \
+                 var i = 0; \
+                 return { next: function () { \
+                   i += 1; \
+                   return i <= 3 ? { value: i * 10, done: false } \
+                                 : { value: undefined, done: true }; \
+                 } }; \
+               }; \
+               var s = 0; for (var v of obj) { s += v; } s"),
+            60.0);
+        // arrays and strings keep the fast path
+        assert_eq!(
+            n("var s = 0; for (var v of [1, 2]) { s += v; } s"), 3.0);
+    }
+
+    #[test]
+    fn symbol_map_set() {
+        // Symbol: unique values, stable well-knowns, for/keyFor
+        assert_eq!(n("Symbol('a') === Symbol('a') ? 0 : 1"), 1.0);
+        assert_eq!(n("Symbol.iterator === Symbol.iterator ? 1 : 0"), 1.0);
+        assert_eq!(
+            n("Symbol.keyFor(Symbol.for('x')) === 'x' ? 1 : 0"), 1.0);
+        // Map: set-chaining, get/has/size, seed from pairs, delete
+        assert_eq!(
+            n("var m = new Map(); m.set('a', 1).set('b', 2); \
+               m.get('a') + m.size + (m.has('c') ? 0 : 10)"),
+            13.0);
+        assert_eq!(
+            n("var m = new Map([['k', 5]]); m.delete('k'); \
+               m.size + (m.get('k') === undefined ? 1 : 0)"),
+            1.0);
+        // object keys compare by identity
+        assert_eq!(
+            n("var o1 = {}, o2 = {}; var m = new Map(); \
+               m.set(o1, 'x'); (m.get(o1) === 'x' ? 1 : 0) \
+               + (m.get(o2) === undefined ? 2 : 0)"),
+            3.0);
+        // forEach and for-of over entries()/values() (arrays)
+        assert_eq!(
+            n("var m = new Map([['a', 1], ['b', 2]]); var s = 0; \
+               m.forEach(function (v, k) { s += v; }); s"),
+            3.0);
+        assert_eq!(
+            n("var m = new Map([['a', 1], ['b', 2]]); var s = 0; \
+               for (var p of m.entries()) { s += p[1]; } s"),
+            3.0);
+        // Set: dedup on seed and add, chaining, has/delete/clear
+        assert_eq!(
+            n("var s = new Set([1, 2, 2, 3]); s.add(3).add(4); \
+               s.size + (s.has(2) ? 10 : 0)"),
+            14.0);
+        assert_eq!(
+            n("var s = new Set(); s.add(1); s.clear(); s.size"), 0.0);
+        // WeakMap shares the impl
+        assert_eq!(
+            n("var o = {}; var wm = new WeakMap(); wm.set(o, 7); \
+               wm.get(o)"),
+            7.0);
+    }
+
+    #[test]
+    fn m3_browser_objects() {
+        // location fields fill from set_page_url
+        let mut vm = PageVm::new(None);
+        vm.set_page_url(
+            "https://www.naver.com:8080/path/x?q=1#frag");
+        let logs = vm.run_scripts(&["\
+            console.log(location.hostname);\n\
+            console.log(location.pathname);\n\
+            console.log(location.search);\n\
+            console.log(location.hash);\n\
+            console.log(location.port);\n\
+            console.log(window.location.origin);\n"
+            .to_string()]);
+        assert_eq!(logs, vec![
+            "www.naver.com", "/path/x", "?q=1", "#frag", "8080",
+            "https://www.naver.com:8080",
+        ]);
+        // navigator / performance / history / screen exist
+        assert_eq!(
+            n("(navigator.userAgent.indexOf('GGBrowser') >= 0 ? 1 : 0) \
+               + (typeof performance.now() === 'number' ? 2 : 0) \
+               + (history.length === 1 ? 4 : 0) \
+               + (screen.width === 1280 ? 8 : 0)"),
+            15.0);
+        // document.cookie round-trip (needs a document)
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<p>x</p>"),
+        ))));
+        let logs = vm.run_scripts(&["\
+            document.cookie = 'a=1';\n\
+            document.cookie = 'b=2; Path=/';\n\
+            document.cookie = 'a=3';\n\
+            console.log(document.cookie);\n"
+            .to_string()]);
+        assert_eq!(logs, vec!["a=3; b=2"]);
+        // requestAnimationFrame fires via the pump with a timestamp
+        let mut vm = PageVm::new(None);
+        vm.run_scripts(&["\
+            requestAnimationFrame(function (ts) { \
+              console.log('raf ' + (typeof ts)); });\n"
+            .to_string()]);
+        let (logs, _) = vm.pump();
+        assert!(logs.contains(&"raf number".to_string()), "{logs:?}");
+    }
+
+    #[test]
+    fn babel_es5_class_inheritance() {
+        // the exact shapes @babel/preset-env emits for `class B
+        // extends A` — naver's bundles boot through this
+        assert_eq!(
+            n(r#"
+function _classCallCheck(i, C) {
+  if (!(i instanceof C)) {
+    throw new TypeError('Cannot call a class as a function');
+  }
+}
+function _inherits(sub, sup) {
+  sub.prototype = Object.create(sup && sup.prototype, {
+    constructor: { value: sub, writable: true, configurable: true }
+  });
+  if (sup) Object.setPrototypeOf(sub, sup);
+}
+function _getPrototypeOf(o) {
+  return Object.getPrototypeOf ? Object.getPrototypeOf(o) : o.__proto__;
+}
+function _possibleConstructorReturn(self, call) {
+  if (call && (typeof call === 'object' || typeof call === 'function')) {
+    return call;
+  }
+  return self;
+}
+function _createSuper(D) {
+  return function () {
+    var Super = _getPrototypeOf(D);
+    var result = Super.apply(this, arguments);
+    return _possibleConstructorReturn(this, result);
+  };
+}
+var A = function A(v) {
+  _classCallCheck(this, A);
+  this.v = v;
+};
+A.prototype.get = function () { return this.v; };
+A.mk = function () { return 'static'; };
+var B = (function (_A) {
+  _inherits(B, _A);
+  var _super = _createSuper(B);
+  function B(v) {
+    _classCallCheck(this, B);
+    return _super.call(this, v * 2);
+  }
+  return B;
+})(A);
+var b = new B(21);
+(b.get() === 42 ? 1 : 0)
+  + (b instanceof B ? 2 : 0)
+  + (b instanceof A ? 4 : 0)
+  + (B.mk() === 'static' ? 8 : 0)
+"#),
+            15.0);
+    }
+
+    #[test]
+    fn zz_uncurry_probe() {
+        // core-js uncurryThis, NATIVE_BIND path
+        eprintln!("A: {:?}", eval(r#"
+var i = Function.prototype, o = i.call;
+var s = i.bind.bind(o, o);
+var c = s(Set.prototype.keys);
+var it = c(new Set([1,2]));
+console.log('A typeof it: ' + typeof it);
+console.log('A next: ' + typeof it.next);
+"#).map(|(_, l)| l));
+        // fallback path
+        eprintln!("B: {:?}", eval(r#"
+var o = Function.prototype.call;
+var c = function (t) {
+  return function () { return o.apply(t, arguments); };
+}(Set.prototype.keys);
+var it = c(new Set([1,2]));
+console.log('B typeof it: ' + typeof it);
+"#).map(|(_, l)| l));
+    }
+
+    #[test]
+    fn date_class() {
+        // 16e11 ms = 2020-09-13 (the exact probe naver's polyfill runs)
+        assert_eq!(
+            n("var d = new Date(16e11); \
+               (d.getFullYear() === 2020 ? 1 : 0) \
+               + (d.getYear() === 120 ? 2 : 0) \
+               + (d.getMonth() === 8 ? 4 : 0) \
+               + (d.getDate() === 13 ? 8 : 0)"),
+            15.0);
+        assert_eq!(
+            n("Date.parse('2026-07-17 12:30:05') \
+               === Date.UTC(2026, 6, 17, 12, 30, 5) ? 1 : 0"),
+            1.0);
+        assert_eq!(
+            n("new Date(0).toISOString() \
+               === '1970-01-01T00:00:00.000Z' ? 1 : 0"),
+            1.0);
+        assert_eq!(n("new Date(86400000 * 3).getDay()"), 0.0); // Sun
+        assert_eq!(n("typeof Date.now() === 'number' ? 1 : 0"), 1.0);
+        assert_eq!(
+            n("new Date(2026, 0, 2).getFullYear() === 2026 ? 1 : 0"),
+            1.0);
+    }
+
+    #[test]
+    fn platform_stub_layer() {
+        // observers register; IntersectionObserver reports visible
+        let mut vm = PageVm::new(None);
+        vm.run_scripts(&["\
+            new MutationObserver(function () {}).observe();\n\
+            new IntersectionObserver(function (es) {\n\
+              console.log('io ' + es[0].isIntersecting);\n\
+            }).observe({});\n"
+            .to_string()]);
+        let (logs, _) = vm.pump();
+        assert!(logs.contains(&"io true".to_string()), "{logs:?}");
+        // URL/URLSearchParams parse
+        assert_eq!(
+            n("var u = new URL('https://a.b:8000/p/q?x=1&y=2#f'); \
+               (u.hostname === 'a.b' ? 1 : 0) \
+               + (u.pathname === '/p/q' ? 2 : 0) \
+               + (u.searchParams.get('y') === '2' ? 4 : 0) \
+               + (u.hash === '#f' ? 8 : 0)"),
+            15.0);
+        assert_eq!(
+            n("new URL('/z', 'https://a.b/c/d').pathname === '/z' \
+               ? 1 : 0"),
+            1.0);
+        // matchMedia and getComputedStyle don't throw
+        assert_eq!(
+            n("matchMedia('(min-width: 0px)').matches === false \
+               ? 1 : 0"),
+            1.0);
+    }
+
+    #[test]
+    fn lifecycle_events_fire() {
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<p>x</p>"),
+        ))));
+        let logs = vm.run_scripts(&["\
+            console.log('rs:' + document.readyState);\n\
+            document.addEventListener('DOMContentLoaded', function (e) {\n\
+              console.log('dcl ' + e.type + ' ' + document.readyState);\n\
+            });\n\
+            window.addEventListener('load', function () {\n\
+              console.log('load ' + document.readyState);\n\
+            });\n"
+            .to_string()]);
+        assert_eq!(logs, vec!["rs:loading"]);
+        let logs = vm.fire_lifecycle();
+        assert_eq!(logs, vec![
+            "dcl domcontentloaded interactive",
+            "load complete",
+        ]);
+    }
+
+    #[test]
+    fn live_tick_paces_raf() {
+        let mut vm = PageVm::new(None);
+        vm.run_scripts(&["\
+            var n = 0;\n\
+            function frame() { n += 1; console.log('f' + n); \
+              if (n < 3) requestAnimationFrame(frame); }\n\
+            requestAnimationFrame(frame);\n"
+            .to_string()]);
+        // 20ms slices fire one 16ms frame each — no fast-forward spin
+        let (logs, _) = vm.tick(20.0);
+        assert_eq!(logs, vec!["f1"]);
+        let (logs, _) = vm.tick(20.0);
+        assert_eq!(logs, vec!["f2"]);
+        let (logs, _) = vm.tick(1.0); // nothing due in 1ms
+        assert!(logs.is_empty(), "{logs:?}");
+        let (logs, _) = vm.tick(30.0);
+        assert_eq!(logs, vec!["f3"]);
+        // generator done: further ticks stay quiet
+        let (logs, _) = vm.tick(100.0);
+        assert!(logs.is_empty(), "{logs:?}");
+    }
+
+    #[test]
+    fn live_tick_dom_mutation_and_version() {
+        let doc = Rc::new(RefCell::new(crate::html::parse(
+            "<div id=t>old</div>",
+        )));
+        let v0 = doc.borrow().version;
+        let mut vm = PageVm::new(Some(doc.clone()));
+        vm.run_scripts(&["\
+            setTimeout(function () { \
+              document.getElementById('t').textContent = 'hi'; \
+            }, 50);\n"
+            .to_string()]);
+        vm.tick(20.0); // 20ms: timer not yet due
+        let t = crate::js::find_tag(&doc.borrow(), "div").unwrap();
+        assert_eq!(doc.borrow().collect_text(t), "old");
+        vm.tick(40.0); // 60ms total: fires
+        assert_eq!(doc.borrow().collect_text(t), "hi");
+        assert!(doc.borrow().version > v0, "version must bump");
+    }
+
+    #[test]
+    fn m3_style_dataset_events_tree() {
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse(
+                "<div id=a data-user-id='7' style='color: red'>\
+                 <p id=b>x</p><p id=c>y</p></div>",
+            ),
+        ))));
+        let logs = vm.run_scripts(&["\
+            var a = document.getElementById('a');\n\
+            var b = document.getElementById('b');\n\
+            var c = document.getElementById('c');\n\
+            // style proxy: read, camelCase write, cssText\n\
+            console.log(a.style.color);\n\
+            a.style.backgroundColor = 'blue';\n\
+            console.log(a.getAttribute('style'));\n\
+            // dataset\n\
+            console.log(a.dataset.userId);\n\
+            a.dataset.mode = 'dark';\n\
+            console.log(a.getAttribute('data-mode'));\n\
+            // tree getters + manipulation\n\
+            console.log(a.children.length);\n\
+            console.log(b.parentNode === a);\n\
+            a.insertBefore(c, b);\n\
+            console.log(a.children[0] === c);\n\
+            a.removeChild(c);\n\
+            console.log(a.children.length);\n\
+            var d = a.cloneNode(true);\n\
+            console.log(d.children.length);\n\
+            console.log(a.contains(b));\n\
+            console.log(a.tagName);\n\
+            // events: bubble + detail + preventDefault\n\
+            var got = '';\n\
+            a.addEventListener('ping', function (e) {\n\
+              got += 'a:' + e.detail; e.preventDefault();\n\
+            });\n\
+            b.addEventListener('ping', function (e) {\n\
+              got += 'b:' + e.detail + ' ';\n\
+            });\n\
+            var ok = b.dispatchEvent(new CustomEvent('ping',\n\
+              { bubbles: true, cancelable: true, detail: 5 }));\n\
+            console.log(got);\n\
+            console.log(ok);\n"
+            .to_string()]);
+        assert_eq!(logs, vec![
+            "red",
+            "color: red; background-color: blue",
+            "7",
+            "dark",
+            "2", "true", "true", "1", "1", "true", "DIV",
+            "b:5 a:5", "false",
+        ]);
+    }
+
+    #[test]
+    fn classlist_ops() {
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<div id=t class='a b'></div>"),
+        ))));
+        let logs = vm.run_scripts(&["\
+            var el = document.getElementById('t');\n\
+            el.classList.add('c');\n\
+            el.classList.remove('a');\n\
+            console.log(el.className);\n\
+            console.log(el.classList.contains('b'));\n\
+            console.log(el.classList.toggle('b'));\n\
+            console.log(el.classList.toggle('z'));\n\
+            console.log(el.className);\n"
+            .to_string()]);
+        assert_eq!(logs, vec!["b c", "true", "false", "true", "c z"]);
+    }
+
+    #[test]
+    fn web_storage() {
+        assert_eq!(
+            n("localStorage.setItem('k', 42); \
+               Number(localStorage.getItem('k'))"), 42.0);
+        assert_eq!(
+            n("localStorage.getItem('nope') === null ? 1 : 0"), 1.0);
+        assert_eq!(
+            n("localStorage.setItem('a', 'x'); localStorage.removeItem('a'); \
+               localStorage.getItem('a') === null ? 1 : 0"), 1.0);
+        // local and session are independent stores
+        assert_eq!(
+            n("localStorage.setItem('s', '1'); \
+               sessionStorage.getItem('s') === null ? 1 : 0"), 1.0);
+        assert_eq!(
+            n("window.localStorage === localStorage ? 1 : 0"), 1.0);
+    }
+
+    #[test]
     fn function_ctor_stub_yields_the_global() {
         assert_eq!(n("typeof Function === 'function' ? 1 : 0"), 1.0);
         assert_eq!(n("Function('return this')() === window ? 1 : 0"),
@@ -760,11 +2219,8 @@ mod tests {
             n("function F() {} (new F() instanceof F) ? 1 : 0"),
             1.0
         );
-        // non-callable RHS throws (catchably)
-        assert_eq!(
-            n("var r = 0; try { [] instanceof 5; } catch (e) { r = 1; } r"),
-            1.0
-        );
+        // non-callable RHS tolerates to false (07-16: SDK stubs)
+        assert_eq!(n("([] instanceof 5) ? 1 : 0"), 0.0);
     }
 
     #[test]
@@ -942,9 +2398,9 @@ mod tests {
         // pattern param on an arrow, plus default
         assert_eq!(
             n("var g = ({x}, k = 2) => x * k; g({x: 5})"), 10.0);
-        // rest params are cleanly rejected (not silently wrong)
-        assert!(eval("function f(...xs) { return xs.length; } f(1,2)")
-            .is_err());
+        // rest params collect the extra arguments
+        assert_eq!(
+            n("function f(...xs) { return xs.length; } f(1,2)"), 2.0);
     }
 
     #[test]
@@ -1015,8 +2471,9 @@ mod tests {
         assert_eq!(n("/(\\d+)/.exec('abc42')[1] === '42' ? 1 : 0"), 1.0);
         // regex is an object
         assert_eq!(n("typeof /x/ === 'object' ? 1 : 0"), 1.0);
-        // unsupported pattern errors cleanly (backreference)
-        assert!(eval("/(a)\\1/.test('aa')").is_err());
+        // unsupported pattern degrades to never-matching (07-16 —
+        // a dead regex must not kill the whole script)
+        assert_eq!(n("/(a)\\1/.test('aa') ? 1 : 0"), 0.0);
     }
 
     #[test]
@@ -1581,6 +3038,66 @@ mod tests {
     }
 
     // ---- async runtime (P3) ----
+
+    #[test]
+    fn await_in_expression_position() {
+        let mut vm = PageVm::new(None);
+        let logs = vm.run_scripts(&["\
+            async function one() { return 5; }\n\
+            async function sum() { return await one() + await one(); }\n\
+            async function branch(v) {\n\
+              if (await one() === v) { return 'eq'; }\n\
+              return 'ne';\n\
+            }\n\
+            async function cond() {\n\
+              var out = [];\n\
+              var i = 0;\n\
+              while (await one() > i) { out.push(i); i += 3; }\n\
+              return out.join(',');\n\
+            }\n\
+            async function ifbody(flag) {\n\
+              var x = 1;\n\
+              if (flag) { x = await one(); }\n\
+              return x + 10;\n\
+            }\n\
+            sum().then(function (v) { console.log('sum ' + v); });\n\
+            branch(5).then(function (v) { console.log('br ' + v); });\n\
+            cond().then(function (v) { console.log('loop ' + v); });\n\
+            ifbody(true).then(function (v) { console.log('ift ' + v); });\n\
+            ifbody(false).then(function (v) { console.log('iff ' + v); });\n"
+            .to_string()]);
+        assert!(logs.iter().all(|l| !l.contains("error")), "{logs:?}");
+        let (logs, _) = vm.pump();
+        assert!(logs.contains(&"sum 10".to_string()), "{logs:?}");
+        assert!(logs.contains(&"br eq".to_string()), "{logs:?}");
+        assert!(logs.contains(&"loop 0,3".to_string()), "{logs:?}");
+        assert!(logs.contains(&"ift 15".to_string()), "{logs:?}");
+        assert!(logs.contains(&"iff 11".to_string()), "{logs:?}");
+    }
+
+    #[test]
+    fn await_inside_try_catch() {
+        let mut vm = PageVm::new(None);
+        let logs = vm.run_scripts(&["\
+            async function boom() { throw 'bad'; }\n\
+            async function five() { return 5; }\n\
+            async function guarded() {\n\
+              try { var v = await five(); return v + 1; }\n\
+              catch (e) { return 'caught ' + e; }\n\
+            }\n\
+            async function rescued() {\n\
+              var r = 0;\n\
+              try { r = await boom(); } catch (e) { r = 'c:' + e; }\n\
+              return r;\n\
+            }\n\
+            guarded().then(function (v) { console.log('g ' + v); });\n\
+            rescued().then(function (v) { console.log('r ' + v); });\n"
+            .to_string()]);
+        assert!(logs.iter().all(|l| !l.contains("error")), "{logs:?}");
+        let (logs, _) = vm.pump();
+        assert!(logs.contains(&"g 6".to_string()), "{logs:?}");
+        assert!(logs.contains(&"r c:bad".to_string()), "{logs:?}");
+    }
 
     #[test]
     fn async_microtask_before_timer() {

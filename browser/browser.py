@@ -149,7 +149,8 @@ class Browser:
                     native.load_document(
                         body,
                         lambda hrefs: self.fetch_stylesheets(hrefs, url),
-                        lambda srcs: self.fetch_scripts(srcs, url))
+                        lambda srcs: self.fetch_scripts(srcs, url),
+                        page_url=url)
             finally:
                 if prev is None:
                     os.environ.pop("GGJS", None)
@@ -192,6 +193,70 @@ class Browser:
         if textengine.available():
             mode.append("raster")
         self.set_status("완료" + (f" ({'+'.join(mode)})" if mode else ""))
+        self._start_live_loop()
+
+    # --- M4: live event loop ------------------------------------------
+    # After load, keep the page alive: tick the JS event loop at frame
+    # pace (timers/rAF fire in real time) and re-style/re-layout only
+    # when the DOM version changes. Full recompute per change for now —
+    # the engine core is fast enough (~ms for shell pages); partial
+    # invalidation comes later.
+
+    _LIVE_INTERVAL_MS = 80
+    _LIVE_IDLE_AFTER = 150      # ~12s quiet -> back off, don't stop
+    _LIVE_IDLE_INTERVAL_MS = 500  # late timers (carousels) still fire
+
+    def _start_live_loop(self):
+        self._live_gen = getattr(self, "_live_gen", 0) + 1
+        if (self._doc is None or not hasattr(self._doc, "tick")
+                or not native.async_available()):
+            return
+        self._dom_version = self._doc.dom_version()
+        self._live_idle = 0
+        import time
+        self._live_last = time.monotonic()
+        gen = self._live_gen
+        self.window.after(self._LIVE_INTERVAL_MS,
+                          lambda: self._live_tick(gen))
+
+    def _live_tick(self, gen):
+        if gen != getattr(self, "_live_gen", 0) or self._doc is None:
+            return  # a newer page took over
+        from . import net as _net
+        import time
+        try:
+            # advance virtual time by real elapsed time (capped), so
+            # the idle backoff doesn't slow the page's clock down
+            now = time.monotonic()
+            dt = min((now - self._live_last) * 1000.0, 1000.0)
+            self._live_last = now
+            logs, fetches = self._doc.tick(dt)
+            for line in logs:
+                print(f"[js live] {line}")
+            for fetch_id, furl in fetches:
+                try:
+                    _h, body, _f = _net.request_text(
+                        self.url.resolve(furl))
+                    self._doc.resolve_fetch(fetch_id, 200, body)
+                except Exception as e:
+                    self._doc.reject_fetch(
+                        fetch_id, f"{type(e).__name__}: {e}")
+            version = self._doc.dom_version()
+            if version != self._dom_version:
+                self._dom_version = version
+                self._live_idle = 0
+                self.nodes = native.refresh(self._doc, self._css_sources)
+                self.load_images(self.nodes, self.url, keep_cache=True)
+                self.relayout()
+            else:
+                self._live_idle += 1
+        except Exception as e:
+            print(f"[live] tick error: {e}")
+            return
+        wait = (self._LIVE_IDLE_INTERVAL_MS
+                if self._live_idle >= self._LIVE_IDLE_AFTER
+                else self._LIVE_INTERVAL_MS)
+        self.window.after(wait, lambda: self._live_tick(gen))
 
     def load_images(self, nodes, url, keep_cache=False):
         """Fetch (parallel) and decode (Rust) every <img> on the page."""

@@ -122,9 +122,20 @@ impl<'r> RuleIndex<'r> {
 
 /// Parse css sources in cascade order and compute styles for every node.
 pub fn compute_styles(doc: &mut Document, css_sources: &[String]) {
+    compute_styles_vw(doc, css_sources, 1280.0);
+}
+
+/// As `compute_styles`, with an explicit viewport width for @media.
+pub fn compute_styles_vw(
+    doc: &mut Document,
+    css_sources: &[String],
+    viewport_width: f64,
+) {
     let mut rules: Vec<Rule> = Vec::new();
     for (si, src) in css_sources.iter().enumerate() {
-        let mut parsed = CssParser::new(src).parse();
+        let mut parser = CssParser::new(src);
+        parser.set_viewport(viewport_width);
+        let mut parsed = parser.parse();
         if si == 0 {
             // the first source is the UA sheet (see native.py)
             for r in &mut parsed {
@@ -137,22 +148,76 @@ pub fn compute_styles(doc: &mut Document, css_sources: &[String]) {
     // specificity so author resets can override the UA sheet
     rules.sort_by_key(|r| (r.origin, r.selector.specificity));
 
+    // ::before/::after rules style synthesized children — they must
+    // not participate in normal matching
+    let pseudo_rules: Vec<Rule> = {
+        let mut ps = Vec::new();
+        rules.retain_mut(|r| {
+            if r.selector.pseudo.is_some() {
+                ps.push(Rule {
+                    selector: r.selector.clone(),
+                    decls: std::mem::take(&mut r.decls),
+                    origin: r.origin,
+                });
+                false
+            } else {
+                true
+            }
+        });
+        ps
+    };
     let index = RuleIndex::new(&rules);
     let root = doc.root;
     let default_style: HashMap<String, String> = INHERITED
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-    style_node(doc, &index, root, &default_style, &HashMap::new());
+    style_node(
+        doc, &index, &pseudo_rules, root, &default_style,
+        &HashMap::new(),
+    );
+}
+
+/// Strip quotes from a CSS `content` string; None when the rule makes
+/// no box (`none`/`normal`) or the value form is unsupported.
+fn content_text(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() || t == "none" || t == "normal" {
+        return None;
+    }
+    let b = t.as_bytes();
+    if b.len() >= 2
+        && (b[0] == b'"' || b[0] == b'\'')
+        && b[b.len() - 1] == b[0]
+    {
+        return Some(t[1..t.len() - 1].to_string());
+    }
+    Some(String::new()) // attr()/counters: render an empty box
 }
 
 fn style_node(
     doc: &mut Document,
     index: &RuleIndex,
+    pseudo_rules: &[Rule],
     idx: usize,
     parent_style: &HashMap<String, String>,
     parent_vars: &HashMap<String, String>,
 ) {
+    // synthesized children keep the style their host computed for
+    // them; only their text child needs the inheritance pass
+    if doc.nodes[idx].tag.as_deref()
+        == Some("::before")
+        || doc.nodes[idx].tag.as_deref() == Some("::after")
+    {
+        let my_style = doc.nodes[idx].style.clone();
+        let children = doc.nodes[idx].children.clone();
+        for child in children {
+            style_node(
+                doc, index, pseudo_rules, child, &my_style, parent_vars,
+            );
+        }
+        return;
+    }
     let mut style: HashMap<String, String> = HashMap::with_capacity(12);
 
     // 1. inherited defaults
@@ -271,7 +336,100 @@ fn style_node(
     let children = doc.nodes[idx].children.clone();
     let my_style = doc.nodes[idx].style.clone();
     for child in children {
-        style_node(doc, index, child, &my_style, vars);
+        style_node(doc, index, pseudo_rules, child, &my_style, vars);
+    }
+
+    // synthesize ::before/::after children from matching pseudo rules
+    if doc.nodes[idx].is_element() {
+        synthesize_pseudos(doc, pseudo_rules, idx, vars);
+    }
+}
+
+/// Create/update the ::before and ::after children of `idx` from the
+/// pseudo rules whose base selector matches it. Mirrored in Python
+/// style.py — the two engines must synthesize identical nodes.
+fn synthesize_pseudos(
+    doc: &mut Document,
+    pseudo_rules: &[Rule],
+    idx: usize,
+    vars: &HashMap<String, String>,
+) {
+    for which in [0u8, 1u8] {
+        let mut style: HashMap<String, String> = HashMap::new();
+        // inherited properties come from the host element
+        for (prop, default) in INHERITED {
+            let v = doc.nodes[idx]
+                .style
+                .get(*prop)
+                .cloned()
+                .unwrap_or_else(|| default.to_string());
+            style.insert(prop.to_string(), v);
+        }
+        let mut any = false;
+        for r in pseudo_rules {
+            if r.selector.pseudo != Some(which)
+                || !r.selector.matches(doc, idx)
+            {
+                continue;
+            }
+            any = true;
+            for (prop, value) in &r.decls {
+                apply(&mut style, prop, value);
+            }
+        }
+        if !any {
+            continue;
+        }
+        // var() substitution with the host's variable scope
+        let needs: Vec<String> = style
+            .iter()
+            .filter(|(_, v)| find_var(v, 0).is_some())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for prop in needs {
+            match resolve_var_refs(&style[&prop], vars, 0) {
+                Some(r) if !r.trim().is_empty() => {
+                    style.insert(prop, r.trim().to_string());
+                }
+                _ => {
+                    style.remove(&prop);
+                }
+            }
+        }
+        let Some(text) =
+            style.get("content").and_then(|c| content_text(c))
+        else {
+            continue; // no content -> no box
+        };
+        if !style.contains_key("display") {
+            style.insert("display".into(), "inline".into());
+        }
+        let tag = if which == 0 { "::before" } else { "::after" };
+        // reuse an existing synthesized child (restyle pass)
+        let existing = doc.nodes[idx]
+            .children
+            .iter()
+            .copied()
+            .find(|&c| doc.nodes[c].tag.as_deref() == Some(tag));
+        let pidx = match existing {
+            Some(p) => p,
+            None => {
+                let p = doc.new_element(tag.to_string(), Vec::new(), None);
+                doc.nodes[p].parent = Some(idx);
+                if which == 0 {
+                    doc.nodes[idx].children.insert(0, p);
+                } else {
+                    doc.nodes[idx].children.push(p);
+                }
+                p
+            }
+        };
+        doc.nodes[pidx].style = style;
+        if !text.is_empty()
+            && doc.nodes[pidx].children.is_empty()
+        {
+            doc.new_text(text, pidx);
+        }
     }
 }
 
@@ -518,6 +676,53 @@ mod tests {
     }
 
     #[test]
+    fn pseudo_elements_synthesize_children() {
+        let doc = styled(
+            ".ico::before{content:\"\"; width:20px; height:20px; \
+             background-image:url(s.png)} \
+             p::after{content:\"!\"; color:red}",
+            "<p class=ico>hi</p>",
+        );
+        let p = (0..doc.nodes.len())
+            .find(|&i| doc.nodes[i].tag.as_deref() == Some("p"))
+            .unwrap();
+        let kids: Vec<&str> = doc.nodes[p]
+            .children
+            .iter()
+            .map(|&c| doc.nodes[c].tag.as_deref().unwrap_or("#text"))
+            .collect();
+        assert_eq!(kids, vec!["::before", "#text", "::after"]);
+        let before = doc.nodes[p].children[0];
+        assert_eq!(doc.nodes[before].style["width"], "20px");
+        assert!(doc.nodes[before].style["background-image"]
+            .contains("s.png"));
+        assert!(doc.nodes[before].children.is_empty()); // content:""
+        let after = *doc.nodes[p].children.last().unwrap();
+        assert_eq!(doc.nodes[after].style["color"], "red");
+        let atext = doc.nodes[after].children[0];
+        assert_eq!(doc.nodes[atext].text, "!");
+        // restyle must not duplicate the synthesized children
+        let mut doc = doc;
+        compute_styles(
+            &mut doc,
+            &["".to_string(),
+              ".ico::before{content:\"\"} p::after{content:\"!\"}"
+                  .to_string()],
+        );
+        assert_eq!(doc.nodes[p].children.len(), 3);
+    }
+
+    #[test]
+    fn content_none_makes_no_box() {
+        let doc = styled("p::before{content:none; color:red}",
+                         "<p>hi</p>");
+        let p = (0..doc.nodes.len())
+            .find(|&i| doc.nodes[i].tag.as_deref() == Some("p"))
+            .unwrap();
+        assert_eq!(doc.nodes[p].children.len(), 1); // text only
+    }
+
+    #[test]
     fn attribute_selectors_match() {
         let doc = styled(
             "[data-x=on]{color:red} [data-y]{color:blue} \
@@ -529,6 +734,67 @@ mod tests {
         assert_eq!(tag_style(&doc, "div")["color"], "blue");
         assert_eq!(tag_style(&doc, "a")["color"], "green");
         assert_eq!(tag_style(&doc, "b")["color"], "purple");
+    }
+
+    #[test]
+    fn media_queries_evaluate_against_viewport() {
+        // desktop viewport (default 1280): min-width applies, max-width
+        // mobile rule does not
+        let doc = styled(
+            "p{color:black} \
+             @media (min-width: 768px){p{color:red}} \
+             @media (max-width: 600px){p{color:blue}}",
+            "<p>x</p>",
+        );
+        assert_eq!(tag_style(&doc, "p")["color"], "red");
+        // explicit narrow viewport flips it
+        let mut d2 = html::parse("<p>x</p>");
+        compute_styles_vw(
+            &mut d2,
+            &["".to_string(),
+              "p{color:black} \
+               @media (min-width: 768px){p{color:red}} \
+               @media (max-width: 600px){p{color:blue}}".to_string()],
+            500.0,
+        );
+        let pi = (0..d2.nodes.len())
+            .find(|&i| d2.nodes[i].tag.as_deref() == Some("p"))
+            .unwrap();
+        assert_eq!(d2.nodes[pi].style["color"], "blue");
+        // `and`, screen type, unknown feature don't drop the rule
+        let doc = styled(
+            "@media screen and (min-width: 100px){p{font-weight:bold}}",
+            "<p>x</p>",
+        );
+        assert_eq!(tag_style(&doc, "p")["font-weight"], "bold");
+    }
+
+    #[test]
+    fn not_and_structural_selectors() {
+        let doc = styled(
+            "li:not(.skip){color:red} \
+             li:first-child{font-weight:bold} \
+             li:last-child{font-style:italic} \
+             li:nth-child(2){text-align:center} \
+             li:nth-child(even){white-space:nowrap}",
+            "<ul><li>a</li><li class=skip>b</li><li>c</li></ul>",
+        );
+        let lis: Vec<usize> = (0..doc.nodes.len())
+            .filter(|&i| doc.nodes[i].tag.as_deref() == Some("li"))
+            .collect();
+        // first li: :not(.skip) red, :first-child bold, nth-child(1) odd
+        assert_eq!(doc.nodes[lis[0]].style["color"], "red");
+        assert_eq!(doc.nodes[lis[0]].style["font-weight"], "bold");
+        // second li has .skip: :not(.skip) does NOT apply
+        assert_ne!(
+            doc.nodes[lis[1]].style.get("color").map(String::as_str),
+            Some("red")
+        );
+        // second li: nth-child(2) exact + even
+        assert_eq!(doc.nodes[lis[1]].style["text-align"], "center");
+        assert_eq!(doc.nodes[lis[1]].style["white-space"], "nowrap");
+        // third li: :last-child italic
+        assert_eq!(doc.nodes[lis[2]].style["font-style"], "italic");
     }
 
     #[test]

@@ -16,6 +16,13 @@ pub enum Simple {
     /// [attr] / [attr<op>=value] — op is 0 (presence) or one of
     /// b'=' b'~' b'^' b'$' b'*' b'|' (class-level specificity).
     Attr { name: String, op: u8, value: String },
+    /// :not(compound) — matches when the inner compound does not.
+    Not(Vec<Simple>),
+    /// :nth-child(..): 0=odd, 1=even, n>=2 -> exact index n-1 (1-based).
+    NthChild(u32),
+    /// :first-child / :last-child
+    FirstChild,
+    LastChild,
 }
 
 #[derive(Clone, Debug)]
@@ -23,6 +30,9 @@ pub struct Selector {
     /// Descendant chain of compound selectors; rightmost is last.
     pub chain: Vec<Vec<Simple>>,
     pub specificity: (u32, u32, u32),
+    /// ::before / ::after — the rule styles a synthesized child of
+    /// whatever the base selector matches (0 = before, 1 = after).
+    pub pseudo: Option<u8>,
 }
 
 impl Selector {
@@ -36,6 +46,10 @@ impl Selector {
                     Simple::Tag(_) => s.2 += 1,
                     Simple::Root => s.1 += 1,
                     Simple::Attr { .. } => s.1 += 1,
+                    Simple::Not(_)
+                    | Simple::NthChild(_)
+                    | Simple::FirstChild
+                    | Simple::LastChild => s.1 += 1,
                     Simple::Universal | Simple::Where(_) => {}
                 }
             }
@@ -81,6 +95,38 @@ pub fn compound_matches(doc: &Document, idx: usize, compound: &[Simple]) -> bool
         Simple::Where(options) => options
             .iter()
             .any(|opt| compound_matches(doc, idx, opt)),
+        Simple::Not(inner) => !compound_matches(doc, idx, inner),
+        Simple::NthChild(spec) => {
+            let Some(p) = node.parent else { return false };
+            let sibs: Vec<usize> = doc.nodes[p]
+                .children
+                .iter()
+                .copied()
+                .filter(|&c| doc.nodes[c].is_element())
+                .collect();
+            let Some(pos) = sibs.iter().position(|&c| c == idx) else {
+                return false;
+            };
+            let nth = pos + 1; // 1-based
+            match spec {
+                0 => nth % 2 == 1, // odd
+                1 => nth % 2 == 0, // even
+                k => nth == (*k as usize) - 1,
+            }
+        }
+        Simple::FirstChild | Simple::LastChild => {
+            let Some(p) = node.parent else { return false };
+            let sibs: Vec<usize> = doc.nodes[p]
+                .children
+                .iter()
+                .copied()
+                .filter(|&c| doc.nodes[c].is_element())
+                .collect();
+            match part {
+                Simple::FirstChild => sibs.first() == Some(&idx),
+                _ => sibs.last() == Some(&idx),
+            }
+        }
         Simple::Attr { name, op, value } => match node.attr(name) {
             None => false,
             Some(actual) => match op {
@@ -108,6 +154,20 @@ pub struct Rule {
     pub origin: u8,
 }
 
+/// A media-feature length in px (em taken as 16px).
+fn media_len(v: &str) -> Option<f64> {
+    let v = v.trim();
+    if let Some(n) = v.strip_suffix("px") {
+        n.trim().parse().ok()
+    } else if let Some(n) = v.strip_suffix("em") {
+        n.trim().parse::<f64>().ok().map(|x| x * 16.0)
+    } else if let Some(n) = v.strip_suffix("rem") {
+        n.trim().parse::<f64>().ok().map(|x| x * 16.0)
+    } else {
+        v.parse().ok()
+    }
+}
+
 /// Parse a selector list like "div.a, #b span" (for querySelector).
 pub fn parse_selector_list(s: &str) -> Vec<Selector> {
     let mut p = CssParser::new(s);
@@ -130,6 +190,8 @@ pub struct CssParser<'a> {
     s: &'a str,
     b: &'a [u8],
     i: usize,
+    /// viewport width in px, for evaluating @media (min/max-width: ...)
+    vw: f64,
 }
 
 impl<'a> CssParser<'a> {
@@ -138,7 +200,12 @@ impl<'a> CssParser<'a> {
             s,
             b: s.as_bytes(),
             i: 0,
+            vw: 1280.0, // desktop default; set_viewport overrides
         }
+    }
+
+    pub fn set_viewport(&mut self, vw: f64) {
+        self.vw = vw;
     }
 
     fn whitespace(&mut self) {
@@ -288,6 +355,36 @@ impl<'a> CssParser<'a> {
                 } else if self.peek_ci(":root") && !self.name_char_at(5) {
                     self.i += 5;
                     parts.push(Simple::Root);
+                } else if self.peek_ci(":not(") {
+                    self.i += 5;
+                    let inner = self.simple_selector()?;
+                    self.whitespace();
+                    self.literal(b')')?;
+                    parts.push(Simple::Not(inner));
+                } else if self.peek_ci(":nth-child(") {
+                    self.i += 11;
+                    let arg = self.until_chars(b")").trim()
+                        .to_ascii_lowercase();
+                    self.literal(b')')?;
+                    let spec = match arg.as_str() {
+                        "odd" => 0,
+                        "even" => 1,
+                        n => match n.parse::<u32>() {
+                            Ok(k) => k + 1,
+                            Err(_) => return Err(()), // an+b: reject rule
+                        },
+                    };
+                    parts.push(Simple::NthChild(spec));
+                } else if self.peek_ci(":first-child")
+                    && !self.name_char_at(12)
+                {
+                    self.i += 12;
+                    parts.push(Simple::FirstChild);
+                } else if self.peek_ci(":last-child")
+                    && !self.name_char_at(11)
+                {
+                    self.i += 11;
+                    parts.push(Simple::LastChild);
                 } else {
                     break;
                 }
@@ -427,20 +524,45 @@ impl<'a> CssParser<'a> {
                 self.i += 1;
                 self.whitespace();
             }
-            // pseudo suffixes like :hover are unsupported -> reject rule
-            // (:root / :where( / [attr] are handled by simple_selector)
-            if self.i < self.b.len()
-                && self.b[self.i] == b':'
-                && !self.peek_ci(":root")
-                && !self.peek_ci(":where(")
-            {
-                return Err(());
+            // ::before/::after terminate the selector as a pseudo
+            // element; other pseudo suffixes (:hover) reject the rule
+            if self.i < self.b.len() && self.b[self.i] == b':' {
+                if let Some(p) = self.eat_pseudo_element() {
+                    let specificity =
+                        Selector::compute_specificity(&chain);
+                    return Ok(Selector {
+                        chain,
+                        specificity,
+                        pseudo: Some(p),
+                    });
+                }
+                if !self.peek_ci(":root")
+                    && !self.peek_ci(":where(")
+                    && !self.peek_ci(":not(")
+                    && !self.peek_ci(":nth-child(")
+                    && !self.peek_ci(":first-child")
+                    && !self.peek_ci(":last-child")
+                {
+                    return Err(());
+                }
             }
             chain.push(self.simple_selector()?);
             self.whitespace();
         }
         let specificity = Selector::compute_specificity(&chain);
-        Ok(Selector { chain, specificity })
+        Ok(Selector { chain, specificity, pseudo: None })
+    }
+
+    /// Consume ::before/::after (and the legacy single-colon forms).
+    fn eat_pseudo_element(&mut self) -> Option<u8> {
+        for (pat, p) in [("::before", 0u8), ("::after", 1),
+                         (":before", 0), (":after", 1)] {
+            if self.peek_ci(pat) {
+                self.i += pat.len();
+                return Some(p);
+            }
+        }
+        None
     }
 
     pub fn parse(&mut self) -> Vec<Rule> {
@@ -464,7 +586,14 @@ impl<'a> CssParser<'a> {
             return Ok(false);
         }
         if self.b[self.i] == b'@' {
-            self.skip_at_rule();
+            // @media whose condition matches the viewport is unwrapped
+            // and its inner rules parsed at this level; everything else
+            // (and non-matching media) is skipped.
+            if self.s[self.i..].to_ascii_lowercase().starts_with("@media") {
+                self.parse_media(rules);
+            } else {
+                self.skip_at_rule();
+            }
             return Ok(true);
         }
         let mut selectors = vec![self.selector()?];
@@ -487,6 +616,93 @@ impl<'a> CssParser<'a> {
             });
         }
         Ok(true)
+    }
+
+    /// Parse `@media <condition> { <rules> }`. When the condition
+    /// matches the viewport, the inner rules are parsed into `rules`;
+    /// otherwise the whole block is skipped. `self.i` is at '@'.
+    fn parse_media(&mut self, rules: &mut Vec<Rule>) {
+        self.i += 6; // past "@media"
+        let cond_start = self.i;
+        while self.i < self.b.len() && self.b[self.i] != b'{' {
+            self.i += 1;
+        }
+        let cond = self.s[cond_start..self.i].to_ascii_lowercase();
+        if self.i >= self.b.len() {
+            return;
+        }
+        self.i += 1; // past '{'
+        if self.media_matches(&cond) {
+            // parse inner rules until the matching '}'
+            loop {
+                self.whitespace();
+                if self.i >= self.b.len() || self.b[self.i] == b'}' {
+                    break;
+                }
+                match self.parse_one(rules) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(()) => match self.ignore_until(b"};") {
+                        Some(b'}') => {
+                            // could be the media block's close; peek
+                            self.i += 1;
+                        }
+                        Some(_) => self.i += 1,
+                        None => break,
+                    },
+                }
+            }
+            if self.i < self.b.len() && self.b[self.i] == b'}' {
+                self.i += 1;
+            }
+        } else {
+            // skip the block body (depth 1 already entered)
+            let mut depth = 1usize;
+            while self.i < self.b.len() && depth > 0 {
+                match self.b[self.i] {
+                    b'{' => depth += 1,
+                    b'}' => depth -= 1,
+                    _ => {}
+                }
+                self.i += 1;
+            }
+        }
+    }
+
+    /// Evaluate a media condition against the viewport. Supports
+    /// min-width/max-width in px/em, the `screen`/`all` types, and
+    /// `and`. Unknown features are treated as matching (so a rule is
+    /// never lost to a feature we do not model). Comma = any (or).
+    fn media_matches(&self, cond: &str) -> bool {
+        cond.split(',').any(|q| self.media_query_matches(q.trim()))
+    }
+
+    fn media_query_matches(&self, q: &str) -> bool {
+        let mut ok = true;
+        for part in q.split(" and ") {
+            let p = part.trim().trim_start_matches("only ").trim();
+            if p.is_empty() || p == "screen" || p == "all" {
+                continue;
+            }
+            if p == "print" || p == "speech" {
+                return false;
+            }
+            if let Some(inner) =
+                p.strip_prefix('(').and_then(|x| x.strip_suffix(')'))
+            {
+                if let Some((feat, val)) = inner.split_once(':') {
+                    let feat = feat.trim();
+                    let px = media_len(val.trim());
+                    match (feat, px) {
+                        ("min-width", Some(v)) => ok &= self.vw >= v,
+                        ("max-width", Some(v)) => ok &= self.vw <= v,
+                        // width/height/orientation/etc: don't reject
+                        _ => {}
+                    }
+                }
+            }
+        }
+        ok
     }
 
     fn skip_at_rule(&mut self) {

@@ -74,8 +74,8 @@ rules = CSSParser(
     "@media (max-width: 5px) { p { color: blue; } }"
     "a:hover { color: green; } div { margin: 8px 16px; }"
 ).parse()
-check("CSS rule count (skips @media/:hover)", len(rules) == 4,
-      f"got {len(rules)}")
+check("CSS rule count (non-matching @media + :hover excluded)",
+      len(rules) == 4, f"got {len(rules)}")
 ua = default_rules()
 check("UA stylesheet parses", len(ua) > 20, f"{len(ua)} rules")
 
@@ -198,6 +198,211 @@ check("[attr] presence + ^= + ~= all apply",
       attr_p.style["color"] == "red"
       and attr_p.style["font-weight"] == "bold"
       and attr_p.style["text-align"] == "right", str(attr_p.style))
+
+# --- @media evaluation against viewport (M1 sweep) ---
+_media_css = ("p{color:black} "
+              "@media (min-width:768px){p{color:red}} "
+              "@media (max-width:600px){p{color:blue}}")
+def _media_color(vw):
+    d = HTMLParser("<p>x</p>").parse()
+    style(d, sorted(ua + CSSParser(_media_css, viewport_width=vw).parse(),
+                    key=cascade_priority))
+    return _find(d, "p").style["color"]
+check("@media min-width applies on desktop viewport",
+      _media_color(1280) == "red")
+check("@media max-width applies on narrow viewport",
+      _media_color(500) == "blue")
+_screen_rules = CSSParser(
+    "@media screen and (min-width:100px){p{font-weight:bold}} "
+    "@media (max-width:1px){a{color:red}} div{color:green}").parse()
+check("@media screen-and matches, non-matching skipped, flow continues",
+      len(_screen_rules) == 2)
+
+# --- :not / :nth-child / structural selectors (M1 sweep) ---
+sel_dom = _styled(
+    "li:not(.skip){color:red} li:first-child{font-weight:bold} "
+    "li:last-child{font-style:italic} li:nth-child(2){text-align:center} "
+    "li:nth-child(odd){white-space:nowrap}",
+    "<ul><li>a</li><li class=skip>b</li><li>c</li></ul>")
+_lis = [n for n in tree_to_list(sel_dom, [])
+        if isinstance(n, Element) and n.tag == "li"]
+check(":not() excludes matching, applies elsewhere",
+      _lis[0].style["color"] == "red"
+      and _lis[1].style.get("color") != "red")
+check(":first-child / :last-child structural",
+      _lis[0].style["font-weight"] == "bold"
+      and _lis[2].style["font-style"] == "italic")
+check(":nth-child(N) exact + odd/even",
+      _lis[1].style["text-align"] == "center"
+      and _lis[0].style["white-space"] == "nowrap"
+      and _lis[2].style["white-space"] == "nowrap"
+      and _lis[1].style.get("white-space") != "nowrap")
+
+# gradient background paints its first color stop as a solid fill
+from browser.layout import gradient_color as _grad
+check("gradient -> first stop color",
+      _grad("linear-gradient(to right, #03c75a, #fff)") == "#03c75a"
+      and _grad("radial-gradient(circle, red, blue)") == "red"
+      and _grad("#abc") == "")
+grad_dom = _styled(
+    "", '<div style="width:80px; height:20px; '
+    'background:linear-gradient(90deg, #03c75a, #ffffff)">x</div>')
+_gdoc = DocumentLayout(grad_dom)
+_gdoc.layout(400)
+_gcmds = paint_tree(_gdoc, [])
+check("gradient box paints a solid fill",
+      any(getattr(c, "color", "") == "#03c75a" for c in _gcmds),
+      str([getattr(c, "color", None) for c in _gcmds]))
+
+# line-height, white-space:nowrap, text-overflow:ellipsis, box-shadow
+from browser.layout import (line_height_factor as _lhf,
+                            box_shadow as _bshadow)
+class _N:  # minimal node stub for the pure helpers
+    def __init__(self, **s): self.style = s
+check("line-height: normal keeps 1.25",
+      abs(_lhf(_N(), 16.0) - 1.25) < 1e-9)
+check("line-height: unitless multiplier",
+      abs(_lhf(_N(**{"line-height": "2"}), 16.0) - 2.0) < 1e-9)
+check("line-height: px over font size",
+      abs(_lhf(_N(**{"line-height": "24px"}), 16.0) - 1.5) < 1e-9)
+check("box-shadow: offset + color parsed",
+      _bshadow("2px 4px 8px #03c75a") == (2.0, 4.0, "#03c75a"))
+check("box-shadow: inset / none ignored",
+      _bshadow("inset 0 0 2px red") is None
+      and _bshadow("none") is None)
+
+nowrap_dom = _styled(
+    "", '<div style="width:30px; white-space:nowrap">'
+    'aaa bbb ccc ddd eee</div>')
+_ndoc = DocumentLayout(nowrap_dom)
+_ndoc.layout(400)
+_nlist = layout_tree_to_list(_ndoc, [])
+_nlines = [b for b in _nlist if type(b).__name__ == "LineLayout"]
+check("white-space:nowrap keeps text on one line",
+      len(_nlines) == 1, f"{len(_nlines)} lines")
+
+ell_dom = _styled(
+    "", '<div style="width:40px; white-space:nowrap; '
+    'text-overflow:ellipsis">verylongtext</div>')
+_edoc = DocumentLayout(ell_dom)
+_edoc.layout(400)
+_etexts = [c.text for c in paint_tree(_edoc, []) if hasattr(c, "text")]
+check("text-overflow:ellipsis truncates with an ellipsis",
+      any(t.endswith("…") and t != "verylongtext" for t in _etexts),
+      str(_etexts))
+
+shadow_dom = _styled(
+    "", '<div style="width:40px; height:20px; background-color:#fff; '
+    'box-shadow:3px 3px 4px #888888">x</div>')
+_sdoc = DocumentLayout(shadow_dom)
+_sdoc.layout(400)
+_scmds = paint_tree(_sdoc, [])
+check("box-shadow paints an offset rect behind the box",
+      any(getattr(c, "color", "") == "#888888" for c in _scmds))
+
+# z-index reorders positioned siblings (lower z paints first = below)
+z_dom = _styled(
+    "", '<div>'
+    '<div style="position:relative; z-index:2; '
+    'background-color:#aaaaaa; height:10px">A</div>'
+    '<div style="position:relative; z-index:1; '
+    'background-color:#bbbbbb; height:10px">B</div></div>')
+_zdoc = DocumentLayout(z_dom)
+_zdoc.layout(400)
+_zcmds = paint_tree(_zdoc, [])
+_zorder = [c.color for c in _zcmds
+           if getattr(c, "color", "") in ("#aaaaaa", "#bbbbbb")]
+check("z-index paints lower value first (below higher)",
+      _zorder == ["#bbbbbb", "#aaaaaa"], str(_zorder))
+# without z-index, document order is preserved (stable)
+z2_dom = _styled(
+    "", '<div><div style="background-color:#111111; height:10px">A</div>'
+    '<div style="background-color:#222222; height:10px">B</div></div>')
+_z2doc = DocumentLayout(z2_dom)
+_z2doc.layout(400)
+_z2 = [c.color for c in paint_tree(_z2doc, [])
+       if getattr(c, "color", "") in ("#111111", "#222222")]
+check("no z-index keeps document paint order",
+      _z2 == ["#111111", "#222222"], str(_z2))
+
+# M4 live loop: tick fires timers in real-time slices; refresh
+# re-styles the mutated DOM
+import os
+from browser import native
+if native.async_available():
+    os.environ["GGJS"] = "1"
+    _live_html = (
+        '<div id="live">start</div><script>'
+        'var n = 0;'
+        'setInterval(function () { n += 1;'
+        ' document.getElementById("live").textContent = "tick" + n; },'
+        ' 30);</script>')
+    _lnodes, _ldoc, _lcss, _llogs = native.load_document(
+        _live_html, lambda h: {}, lambda s: {})
+    _v0 = _ldoc.dom_version()
+    _ldoc.tick(100.0)  # ~3 interval firings
+    check("live tick mutates the DOM (version bumps)",
+          _ldoc.dom_version() > _v0)
+    _lnodes2 = native.refresh(_ldoc, _lcss)
+    _ltexts = [t.text for t in tree_to_list(_lnodes2, [])
+               if isinstance(t, Text) and t.text.strip()]
+    check("refresh shows the timer-driven text",
+          any(t.startswith("tick") for t in _ltexts), str(_ltexts))
+    # bounded: a 1ms tick fires nothing further
+    _v1 = _ldoc.dom_version()
+    _ldoc.tick(1.0)
+    check("a 1ms tick is quiet (real-time pacing, no fast-forward)",
+          _ldoc.dom_version() == _v1)
+
+# reader mode: EAGER-DATA JSON -> injected readable section
+from browser import reader as _reader
+_fixture = ('<html><body><div id=app></div><script>'
+            'window["EAGER-DATA"] = {};'
+            'window["EAGER-DATA"]["PC-NEWSSTAND-X"] = {"blocks": ['
+            '{"title": "헤드라인 하나입니다", "url": "http://a.example/1"},'
+            '{"title": "두번째 뉴스 제목", "url": "http://a.example/2"}]};'
+            '</script></body></html>')
+_sections = _reader.extract_sections(_fixture)
+check("reader extracts title+url pairs from EAGER-DATA",
+      len(_sections) == 1 and len(_sections[0][1]) == 2,
+      str(_sections))
+_injected = _reader.inject(_fixture)
+check("reader injects a section before </body>",
+      "gg-reader" in _injected
+      and "헤드라인 하나입니다" in _injected
+      and _injected.index("gg-reader") < _injected.index("</body>"))
+check("reader is a no-op without EAGER-DATA",
+      _reader.inject("<html><body><p>x</p></body></html>")
+      == "<html><body><p>x</p></body></html>")
+# ad-ish keys are skipped
+_ad = ('<body><script>window["EAGER-DATA"]["PC-PREMIUM-AD"] = '
+       '{"title": "광고제목입니다", "url": "http://ad.example"};'
+       '</script></body>')
+check("reader skips ad blocks", _reader.inject(_ad) == _ad)
+
+# overflow:hidden emits a balanced clip push/pop around descendants
+from browser.draw import DrawClipPush as _Push, DrawClipPop as _Pop
+clip_dom = _styled(
+    "", '<div style="width:50px; height:20px; overflow:hidden">'
+    '<p>overflowing text that should be clipped</p></div>')
+_cdoc = DocumentLayout(clip_dom)
+_cdoc.layout(400)
+_ccmds = paint_tree(_cdoc, [])
+_pushes = [c for c in _ccmds if isinstance(c, _Push)]
+_pops = [c for c in _ccmds if isinstance(c, _Pop)]
+check("overflow:hidden emits one balanced clip push/pop",
+      len(_pushes) == 1 and len(_pops) == 1)
+# the push must precede the clipped text, the pop must follow it
+_pi = _ccmds.index(_pushes[0])
+_qi = _ccmds.index(_pops[0])
+_ti = next((i for i, c in enumerate(_ccmds)
+            if getattr(c, "text", "").startswith("overflowing")), None)
+check("clip brackets the descendant text",
+      _ti is not None and _pi < _ti < _qi)
+# native tuples: push=kind 6, pop=kind 7, and clip survives scaling
+_ntuple = _pushes[0].native(0.0)
+check("clip push serializes as kind 6", _ntuple[0] == 6)
+check("clip pop serializes as kind 7", _pops[0].native(0.0)[0] == 7)
 
 # --- M1 paint: border-radius, opacity gate, placeholder, bg-image ---
 from browser.draw import DrawBgImage as _DrawBg, parse_background
@@ -474,6 +679,34 @@ if native.available():
           and "border-color" not in rs_var_p.style
           and "border-color" not in py_var_p.style,
           f"rs={rs_var_p.style} py={py_var_p.style}")
+    # ::before/::after synthesis (native engine) + icon paint path
+    PSEUDO_PAGE = ('<html><head><style>'
+                   '.ico::before{content:""; width:20px; height:20px; '
+                   'background-image:url(i.png)} '
+                   'p::after{content:"!"}</style></head>'
+                   '<body><p class=ico>hi</p></body></html>')
+    ps_dom = native.parse_and_style(PSEUDO_PAGE, lambda hrefs: {})
+    ps_p = next(n for n in tree_to_list(ps_dom, [])
+                if isinstance(n, Element) and n.tag == "p")
+    kid_tags = [getattr(c, "tag", "#text") for c in ps_p.children]
+    check("native synthesizes ::before/::after",
+          kid_tags[0] == "::before" and kid_tags[-1] == "::after",
+          str(kid_tags))
+    ps_p.children[0]._bg = (9, 40, 40, {"url": "i.png", "position": [],
+                                        "size": [], "repeat": "no-repeat"})
+    import tkinter as _tk3
+    _r3 = _tk3.Tk(); _r3.withdraw()
+    from browser.draw import DrawBgImage as _DrawBg2
+    ps_doc = DocumentLayout(ps_dom)
+    ps_doc.layout(400)
+    ps_cmds = paint_tree(ps_doc, [])
+    _r3.destroy()
+    check("pseudo icon paints its background layer",
+          any(isinstance(c, _DrawBg2) and c.image_id == 9
+              for c in ps_cmds), str([type(c).__name__ for c in ps_cmds]))
+    check("pseudo text content paints",
+          any(getattr(c, "text", "") == "!" for c in ps_cmds))
+
     # inline SVG rasterizes to an image handle (naver search icon)
     from browser import textengine
     if textengine.available():

@@ -9,8 +9,8 @@ import tkinter.font
 
 from . import textengine
 from .colors import NAMED
-from .draw import (DrawBgImage, DrawImage, DrawLine, DrawOval, DrawRect,
-                   DrawText)
+from .draw import (DrawBgImage, DrawClipPop, DrawClipPush, DrawImage,
+                   DrawLine, DrawOval, DrawRect, DrawText)
 from .html_parser import Element, Text
 from .style import parse_px, parse_size
 
@@ -201,6 +201,29 @@ def effective_opacity(node):
     return o
 
 
+def line_height_factor(node, font_px):
+    """CSS line-height as a multiple of the font's natural linespace.
+    `normal` (default) keeps the engine's 1.25; a number multiplies the
+    font size; a length is taken relative to the font size. Returns the
+    factor to apply to (ascent+descent)."""
+    raw = node.style.get("line-height", "").strip().casefold()
+    if not raw or raw == "normal":
+        return 1.25
+    try:
+        if raw.endswith("px"):
+            target = float(raw[:-2])
+        elif raw.endswith(("em", "rem")):
+            target = float(raw.rstrip("erm")) * font_px
+        elif raw.endswith("%"):
+            target = float(raw[:-1]) / 100.0 * font_px
+        else:
+            target = float(raw) * font_px  # unitless multiplier
+    except ValueError:
+        return 1.25
+    # convert the target line box height into a factor over font metrics
+    return max(target / font_px, 0.1) if font_px else 1.25
+
+
 def corner_radius(node, w, h):
     """First border-radius value in px (uniform corners; % of the
     smaller box side, so 50% keeps a pill/circle shape)."""
@@ -250,6 +273,47 @@ def safe_color(value, default="black"):
     return default
 
 
+def box_shadow(value):
+    """Parse the first box-shadow layer to (dx, dy, color), or None.
+    Blur/spread are ignored (we paint a flat offset rect); `inset` and
+    `none` yield None."""
+    v = (value or "").split(",")[0].strip()
+    if not v or v == "none" or "inset" in v:
+        return None
+    color = ""
+    nums = []
+    for tok in v.split():
+        c = safe_color(tok, default="")
+        if c and not color:
+            color = c
+        elif tok.endswith("px") or _num_re.fullmatch(tok):
+            try:
+                nums.append(float(tok.rstrip("px")))
+            except ValueError:
+                pass
+    if len(nums) < 2:
+        return None
+    return nums[0], nums[1], color or "#000000"
+
+
+_num_re = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def gradient_color(value, default=""):
+    """A gradient can't be painted, but its first color stop is a good
+    solid-fill approximation (buttons/headers read almost the same)."""
+    if not value or "gradient(" not in value.casefold():
+        return default
+    # first #hex, rgb()/rgba(), or named color inside the parens
+    inner = value[value.find("(") + 1:]
+    for m in re.finditer(
+            r"#[0-9a-fA-F]{3,8}|rgba?\([^)]*\)|[a-zA-Z]+", inner):
+        c = safe_color(m.group(0), default="")
+        if c:
+            return c
+    return default
+
+
 def layout_mode(node):
     if isinstance(node, Text):
         return "inline"
@@ -263,8 +327,8 @@ def layout_mode(node):
             or child.style.get("display", "") in ("block", "flex"))
            for child in node.children):
         return "block"
-    if node.tag == "svg":
-        return "inline"  # replaced element (rasterized like an image)
+    if node.tag in ("svg", "::before", "::after"):
+        return "inline"  # replaced/synthesized: inline by nature
     if node.children or node.tag in ("br", "hr", "input", "img"):
         return "inline"
     return "block"
@@ -662,13 +726,30 @@ class BlockLayout:
                 # image handle — never lay out path/defs children
                 self.image(node)
                 return
+            elif node.tag in ("::before", "::after"):
+                # synthesized icon: a fixed-size inline box painted by
+                # its background layer; text content flows normally
+                w = parse_size(node.style.get("width", ""), self.width)
+                h = parse_size(node.style.get("height", ""))
+                if w and h and getattr(node, "_bg", None):
+                    if self.cursor_x + w > self.width \
+                            and self.cursor_x > 0:
+                        self.new_line()
+                    line = self.children[-1]
+                    prev = line.children[-1] if line.children else None
+                    line.children.append(
+                        ImageLayout(node, w, h, line, prev))
+                    self.cursor_x += w
+                    return
             for child in node.children:
                 self.recurse(child)
 
     def word(self, node, word):
         font = cached_font(node)
         w = measure(font, word)
-        if self.cursor_x + w > self.width and self.cursor_x > 0:
+        nowrap = node.style.get("white-space") in ("nowrap", "pre")
+        if not nowrap and self.cursor_x + w > self.width \
+                and self.cursor_x > 0:
             self.new_line()
         line = self.children[-1]
         prev = line.children[-1] if line.children else None
@@ -734,10 +815,26 @@ class BlockLayout:
                         bgcolor = token
                         break
             color = safe_color(bgcolor, default="") if bgcolor else ""
+            if not color:
+                # gradient background -> first stop as a solid fill
+                for prop in ("background-image", "background", "background-color"):
+                    color = gradient_color(
+                        self.node.style.get(prop, ""), default="")
+                    if color:
+                        break
             radius = corner_radius(self.node, x2 - x1, y2 - y1)
             b = self.bw
             bcolor = safe_color(
                 self.node.style.get("border-color", "#999999"))
+
+            # box-shadow: a flat offset rect behind the box (blur/spread
+            # approximated away)
+            shadow = box_shadow(self.node.style.get("box-shadow", ""))
+            if shadow:
+                dx, dy, scolor = shadow
+                cmds.append(DrawRect(
+                    x1 + dx, y1 + dy, x2 + dx, y2 + dy, scolor,
+                    radius=radius))
 
             if radius > 0 and b > 0 and color:
                 # rounded box: border ring = outer rounded fill,
@@ -785,7 +882,22 @@ class BlockLayout:
                     self.x, self.y + 4, self.x + self.width, self.y + 4,
                     "#cccccc", 1))
                 self.height = max(self.height, 9)
+
+            # overflow:hidden clips descendants to the padding box
+            if self._clips():
+                cmds.append(DrawClipPush(x1, y1, x2, y2))
         return cmds
+
+    def _clips(self):
+        if not isinstance(self.node, Element):
+            return False
+        for axis in ("overflow", "overflow-x", "overflow-y"):
+            if self.node.style.get(axis) in ("hidden", "clip", "scroll"):
+                return True
+        return False
+
+    def paint_after(self):
+        return [DrawClipPop()] if self._clips() else []
 
 
 class LineLayout:
@@ -824,11 +936,16 @@ class LineLayout:
             return child.font.gg_descent if child.font else 0
 
         max_ascent = max(ascent(w) for w in self.children)
-        baseline = self.y + 1.25 * max_ascent
+        # line-height (inherited): a taller line box centers the text
+        font_px = next((c.font.size for c in self.children if c.font),
+                       parse_px(self.node.style.get("font-size", "16px"),
+                                16.0))
+        factor = line_height_factor(self.node, font_px)
+        baseline = self.y + factor * max_ascent
         for word in self.children:
             word.y = baseline - ascent(word)
         max_descent = max(descent(w) for w in self.children)
-        self.height = 1.25 * (max_ascent + max_descent)
+        self.height = factor * (max_ascent + max_descent)
 
         # text-align
         align = self.node.style.get("text-align", "left")
@@ -877,7 +994,31 @@ class TextLayout:
         if effective_opacity(self.node) < 0.05:
             return []
         color = safe_color(self.node.style.get("color", "black"))
-        cmds = [DrawText(self.x, self.y, self.word, self.font, color)]
+        word = self.word
+        # text-overflow:ellipsis — truncate a single-line overflow and
+        # append "…". The property is not inherited, so read it off the
+        # nearest element ancestor (the block container).
+        anc = self.node.parent if isinstance(self.node, Text) else self.node
+        ancestor_to = ""
+        while anc is not None:
+            if isinstance(anc, Element):
+                ancestor_to = anc.style.get("text-overflow", "")
+                break
+            anc = anc.parent
+        if ancestor_to == "ellipsis" \
+                and self.node.style.get("white-space") == "nowrap":
+            avail = (self.parent.x + self.parent.width) - self.x
+            if avail > 0 and self.width > avail:
+                ell = measure(self.font, "…")
+                lo, hi = 0, len(word)
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    if measure(self.font, word[:mid]) + ell <= avail:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                word = word[:lo] + "…"
+        cmds = [DrawText(self.x, self.y, word, self.font, color)]
         decoration = self.node.style.get("text-decoration", "none")
         if "underline" in decoration:
             y = self.y + self.font.gg_ascent + 2
@@ -915,6 +1056,14 @@ class ImageLayout:
         if img:
             return [DrawImage(self.x, self.y, self.width, self.height,
                               img[0])]
+        # synthesized icon boxes paint their background layer
+        if getattr(self.node, "_bg", None):
+            cmd = paint_background_image(
+                self.node, self.x, self.y,
+                self.x + self.width, self.y + self.height)
+            return [cmd] if cmd else []
+        if self.node.tag in ("::before", "::after"):
+            return []
         # broken/unloaded image placeholder
         return [
             DrawRect(self.x, self.y, self.x + self.width,
@@ -932,10 +1081,43 @@ def _attr_px(node, name):
         return 0.0
 
 
+def _z_index(obj):
+    """Stacking level of a layout subtree for z-index ordering. Only
+    positioned boxes with an integer z-index leave 0; everything else
+    keeps document order."""
+    node = getattr(obj, "node", None)
+    if not isinstance(node, Element):
+        return 0
+    if node.style.get("position", "static") == "static":
+        return 0  # z-index has no effect on static boxes
+    try:
+        return int(node.style.get("z-index", "auto"))
+    except (ValueError, TypeError):
+        return 0
+
+
 def paint_tree(layout_object, display_list):
     display_list.extend(layout_object.paint())
-    for child in layout_object.children:
-        paint_tree(child, display_list)
+    # Paint each child subtree into its own group so positioned boxes
+    # with a z-index can be reordered. Sorting per container (not
+    # globally) approximates each positioned+z-index box establishing
+    # its own stacking context; equal z keeps document order (stable).
+    groups = []
+    reorder = False
+    for i, child in enumerate(layout_object.children):
+        sub = []
+        paint_tree(child, sub)
+        z = _z_index(child)
+        if z != 0:
+            reorder = True
+        groups.append((z, i, sub))
+    if reorder:
+        groups.sort(key=lambda g: (g[0], g[1]))
+    for _z, _i, sub in groups:
+        display_list.extend(sub)
+    after = getattr(layout_object, "paint_after", None)
+    if after is not None:
+        display_list.extend(after())
     return display_list
 
 

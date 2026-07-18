@@ -6,6 +6,7 @@ serialize itself into a flat tuple for the native Rust rasterizer:
 kind: 0=rect(aux=corner radius) 1=text(aux=font size)
 2=line(aux=thickness) 3=oval 4=image 5=background image
 (font_id=image id, text="off_x off_y tile_w tile_h rep_x rep_y")
+6=clip push (x1,y1,x2,y2 = clip rect) 7=clip pop
 """
 
 import re
@@ -199,6 +200,41 @@ class DrawBgImage:
         return (5, self.left - hscroll, self.top - scroll,
                 self.right - self.left, self.bottom - self.top,
                 (0, 0, 0), 0.0, self.image_id, params)
+
+
+class DrawClipPush:
+    """Intersect the clip region with this rect until the matching pop.
+    Always survives viewport culling (top/bottom span the page) so the
+    clip stack stays balanced."""
+
+    def __init__(self, x1, y1, x2, y2):
+        self.left = x1
+        self.right = x2
+        self.clip_top = y1
+        self.clip_bottom = y2
+        self.top = -1e9
+        self.bottom = 1e9
+
+    def execute(self, scroll, canvas):
+        pass  # tk fallback does not clip
+
+    def native(self, scroll, hscroll=0.0):
+        return (6, self.left - hscroll, self.clip_top - scroll,
+                self.right - hscroll, self.clip_bottom - scroll,
+                (0, 0, 0), 0.0, 0, "")
+
+
+class DrawClipPop:
+    def __init__(self):
+        self.left = self.right = 0
+        self.top = -1e9
+        self.bottom = 1e9
+
+    def execute(self, scroll, canvas):
+        pass
+
+    def native(self, scroll, hscroll=0.0):
+        return (7, 0.0, 0.0, 0.0, 0.0, (0, 0, 0), 0.0, 0, "")
 
 
 class DrawOval:

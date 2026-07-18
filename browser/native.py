@@ -45,7 +45,8 @@ def build_tree(flat):
     return root
 
 
-def load_document(html, fetch_css, fetch_js=None, js_budget=3.0):
+def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
+                  page_url=None):
     """Full native front half: parse -> scripts -> styles -> tree.
 
     fetch_css(hrefs) / fetch_js(srcs) -> {url: text} keep networking
@@ -59,6 +60,11 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=3.0):
     """
     import threading
     import time
+
+    # reader mode: app-shell pages carry their content as inline JSON;
+    # surface it as ordinary markup before parsing (no-op elsewhere)
+    from . import reader
+    html = reader.inject(html)
 
     doc = ggcore.parse_html(html)
 
@@ -92,6 +98,11 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=3.0):
         # has no interrupt — keep the size guard there.
         import os
         fuel_safe = os.environ.get("GGJS") == "1"
+        if page_url:
+            try:
+                doc.set_page_url(str(page_url))
+            except Exception:
+                pass  # older wheels have no set_page_url
         deadline = time.perf_counter() + js_budget
         for i, code in enumerate(sources):
             if not fuel_safe and len(code) > 400_000:
@@ -108,6 +119,13 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=3.0):
                         f"[gg] JS budget ({js_budget:.0f}s) exceeded - "
                         f"skipped {skipped} remaining script(s)")
                 break
+        # all scripts ran: fire DOMContentLoaded / load — app bundles
+        # bootstrap from these
+        if hasattr(doc, "fire_lifecycle"):
+            try:
+                logs.extend(doc.fire_lifecycle())
+            except Exception:
+                pass
 
     entries = doc.stylesheet_entries()
     hrefs = [value for kind, value in entries if kind == "link"]

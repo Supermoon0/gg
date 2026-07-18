@@ -33,6 +33,9 @@ pub struct Document {
     /// id -> candidate node indices in creation order, so
     /// getElementById is O(1) instead of an arena scan.
     pub id_map: HashMap<String, Vec<usize>>,
+    /// bumped on every structural/attribute mutation — the render
+    /// loop re-styles/re-lays-out only when this changes
+    pub version: u64,
 }
 
 impl Document {
@@ -41,6 +44,7 @@ impl Document {
             nodes: Vec::with_capacity(cap),
             root: 0,
             id_map: HashMap::new(),
+            version: 0,
         }
     }
 
@@ -69,6 +73,7 @@ impl Document {
         attrs: Vec<(String, String)>,
         parent: Option<usize>,
     ) -> usize {
+        self.version += 1;
         let classes = attrs
             .iter()
             .find(|(k, _)| k == "class")
@@ -95,6 +100,7 @@ impl Document {
     }
 
     pub fn set_attr(&mut self, idx: usize, name: &str, value: &str) {
+        self.version += 1;
         if name == "id" {
             if let Some(old) = self.nodes[idx].attr("id") {
                 let old = old.to_string();
@@ -117,6 +123,7 @@ impl Document {
     }
 
     pub fn remove_attr(&mut self, idx: usize, name: &str) {
+        self.version += 1;
         if name == "id" {
             if let Some(old) = self.nodes[idx].attr("id") {
                 let old = old.to_string();
@@ -150,6 +157,7 @@ impl Document {
 
     /// Detach a node from its parent (if any).
     pub fn detach(&mut self, idx: usize) {
+        self.version += 1;
         if let Some(p) = self.nodes[idx].parent {
             self.nodes[p].children.retain(|&c| c != idx);
             self.nodes[idx].parent = None;
@@ -158,6 +166,7 @@ impl Document {
 
     /// Deep-copy a node (and subtree) from another document into self.
     pub fn graft(&mut self, other: &Document, src: usize, parent: usize) {
+        self.version += 1;
         let node = &other.nodes[src];
         let new_idx = if node.is_element() {
             self.new_element(
@@ -174,6 +183,7 @@ impl Document {
     }
 
     pub fn new_text(&mut self, text: String, parent: usize) -> usize {
+        self.version += 1;
         let idx = self.nodes.len();
         self.nodes.push(Node {
             parent: Some(parent),

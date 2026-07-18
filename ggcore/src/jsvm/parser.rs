@@ -46,6 +46,12 @@ struct Parser {
     /// Number of binding decls the last top-level pattern emitted (so
     /// var_decl_list can splice the source temp in front of them).
     last_pattern_len: usize,
+    /// Inside a `class ... extends` body: the temp holding the parent
+    /// constructor, so `super` can be rewritten against it.
+    class_super: Option<String>,
+    /// Inside a `function*` body — `yield` parses as an expression
+    /// (a marker call the generator transform consumes).
+    in_generator: bool,
 }
 
 enum OpKind {
@@ -57,7 +63,8 @@ impl Parser {
     fn new(toks: Vec<Token>) -> Parser {
         Parser {
             toks, pos: 0, no_in: false, in_async: false, tmp_n: 0,
-            last_pattern_len: 0,
+            last_pattern_len: 0, class_super: None,
+            in_generator: false,
         }
     }
 
@@ -66,30 +73,237 @@ impl Parser {
         format!("__{}{}", prefix, self.tmp_n)
     }
 
-    /// Parse a class body into a constructor function. Methods attach as
-    /// own properties (`this.m = function(){...}`), so method calls bind
-    /// `this` to the instance. `extends`/`super`/static/get/set are not
-    /// supported yet.
+    /// Parse a class into an expression. Plain classes (no extends,
+    /// statics, or accessors) keep the legacy desugar: a constructor
+    /// that attaches methods as own properties. Classes with extends/
+    /// static/get/set desugar to an IIFE that builds the constructor,
+    /// wires `C.prototype = Object.create(parent.prototype)`, and
+    /// attaches prototype/static members; `super` is rewritten against
+    /// the captured parent (see `class_super`).
     fn class_lit(
         &mut self,
         name: Option<String>,
-    ) -> Result<FuncLit, ParseError> {
-        if self.eat_ident("extends") {
-            return Err(self.err("class extends not supported yet"));
+    ) -> Result<Expr, ParseError> {
+        let parent = if self.eat_ident("extends") {
+            Some(self.assign_expr()?)
+        } else {
+            None
+        };
+        let sup = if parent.is_some() {
+            Some(self.fresh_tmp("sup"))
+        } else {
+            None
+        };
+        let saved_super = self.class_super.take();
+        self.class_super = sup.clone();
+        let result = self.class_body(name.clone(), &sup);
+        self.class_super = saved_super;
+        let (ctor, methods, accessors, statics) = result?;
+        // Every class desugars to the IIFE form with methods on the
+        // prototype. (Instance-attached methods break inheritance: a
+        // parent ctor run via super() re-attaches ITS methods onto the
+        // child instance as own props, shadowing child overrides.)
+        let cname = name.unwrap_or_else(|| "__class".to_string());
+        let cident = || Expr::Ident(cname.clone());
+        let cproto = || Expr::Member {
+            obj: Box::new(Expr::Ident(cname.clone())),
+            prop: MemberProp::Static("prototype".to_string()),
+            optional: false,
+        };
+        let mut body: Vec<Stmt> = Vec::new();
+        body.push(Stmt::VarDecl {
+            kind: DeclKind::Var,
+            decls: vec![(cname.clone(), Some(Expr::Func(Box::new(ctor))))],
+        });
+        if let Some(supn) = &sup {
+            // C.prototype = Object.create(sup.prototype)
+            body.push(Stmt::Expr(Expr::Assign(
+                AssignOp::Plain,
+                Box::new(cproto()),
+                Box::new(Expr::Call {
+                    callee: Box::new(Expr::Member {
+                        obj: Box::new(Expr::Ident("Object".to_string())),
+                        prop: MemberProp::Static("create".to_string()),
+                        optional: false,
+                    }),
+                    args: vec![Expr::Member {
+                        obj: Box::new(Expr::Ident(supn.clone())),
+                        prop: MemberProp::Static("prototype".to_string()),
+                        optional: false,
+                    }],
+                    optional: false,
+                }),
+            )));
+            body.push(Stmt::Expr(Expr::Assign(
+                AssignOp::Plain,
+                Box::new(Expr::Member {
+                    obj: Box::new(cproto()),
+                    prop: MemberProp::Static("constructor".to_string()),
+                    optional: false,
+                }),
+                Box::new(cident()),
+            )));
         }
+        for (mname, f) in methods {
+            body.push(Stmt::Expr(Expr::Assign(
+                AssignOp::Plain,
+                Box::new(Expr::Member {
+                    obj: Box::new(cproto()),
+                    prop: MemberProp::Static(mname),
+                    optional: false,
+                }),
+                Box::new(Expr::Func(Box::new(f))),
+            )));
+        }
+        for (aname, getter, setter) in accessors {
+            // Object.defineProperty(C.prototype, name, {get, set})
+            let mut props = vec![Prop {
+                key: PropKey::Ident("configurable".to_string()),
+                value: Expr::Bool(true),
+            }];
+            if let Some(g) = getter {
+                props.push(Prop {
+                    key: PropKey::Ident("get".to_string()),
+                    value: Expr::Func(Box::new(g)),
+                });
+            }
+            if let Some(s) = setter {
+                props.push(Prop {
+                    key: PropKey::Ident("set".to_string()),
+                    value: Expr::Func(Box::new(s)),
+                });
+            }
+            body.push(Stmt::Expr(Expr::Call {
+                callee: Box::new(Expr::Member {
+                    obj: Box::new(Expr::Ident("Object".to_string())),
+                    prop: MemberProp::Static("defineProperty".to_string()),
+                    optional: false,
+                }),
+                args: vec![cproto(), Expr::Str(aname), Expr::Object(props)],
+                optional: false,
+            }));
+        }
+        for (sname, sval) in statics {
+            body.push(Stmt::Expr(Expr::Assign(
+                AssignOp::Plain,
+                Box::new(Expr::Member {
+                    obj: Box::new(cident()),
+                    prop: MemberProp::Static(sname),
+                    optional: false,
+                }),
+                Box::new(sval),
+            )));
+        }
+        body.push(Stmt::Return(Some(cident())));
+        let (params, args) = match (sup, parent) {
+            (Some(s), Some(p)) => (vec![s], vec![p]),
+            _ => (Vec::new(), Vec::new()),
+        };
+        Ok(Expr::Call {
+            callee: Box::new(Expr::Func(Box::new(FuncLit {
+                name: None,
+                params,
+                body,
+                is_async: false,
+            }))),
+            args,
+            optional: false,
+        })
+    }
+
+    /// Parse `{ ...members... }` of a class. Returns (ctor, methods,
+    /// accessors (name, get, set), statics). Field declarations become
+    /// `this.f = v` statements prepended to the ctor body.
+    #[allow(clippy::type_complexity)]
+    fn class_body(
+        &mut self,
+        name: Option<String>,
+        sup: &Option<String>,
+    ) -> Result<
+        (
+            FuncLit,
+            Vec<(String, FuncLit)>,
+            Vec<(String, Option<FuncLit>, Option<FuncLit>)>,
+            Vec<(String, Expr)>,
+        ),
+        ParseError,
+    > {
         self.expect_punct(P::LBrace)?;
-        let mut ctor_params: Vec<String> = Vec::new();
-        let mut ctor_prologue: Vec<Stmt> = Vec::new();
-        let mut method_stmts: Vec<Stmt> = Vec::new();
-        let mut ctor_body: Vec<Stmt> = Vec::new();
+        let mut ctor: Option<(Vec<String>, Vec<Stmt>)> = None;
+        let mut methods: Vec<(String, FuncLit)> = Vec::new();
+        let mut accessors: Vec<(String, Option<FuncLit>, Option<FuncLit>)> =
+            Vec::new();
+        let mut statics: Vec<(String, Expr)> = Vec::new();
+        let mut field_stmts: Vec<Stmt> = Vec::new();
         while !self.eat_punct(P::RBrace) {
             if self.eat_punct(P::Semi) {
                 continue;
             }
-            if matches!(self.kind(), Tok::Ident(k) if k == "static") {
-                return Err(self.err("static class members not supported yet"));
+            let is_static = matches!(self.kind(), Tok::Ident(k) if k == "static")
+                && !matches!(self.kind_at(1), Some(Tok::Punct(P::LParen)));
+            if is_static {
+                self.pos += 1;
             }
-            let mname = self.expect_ident()?;
+            // generator method: `*gen() {...}`
+            if self.at_punct(P::Star) {
+                self.pos += 1;
+                let mname = self.expect_ident()?;
+                let f =
+                    self.func_lit_g(Some(mname.clone()), false, true)?;
+                if is_static {
+                    statics.push((mname, Expr::Func(Box::new(f))));
+                } else {
+                    methods.push((mname, f));
+                }
+                continue;
+            }
+            // get/set accessor (unless it's a method literally named
+            // get/set, i.e. followed by `(`)
+            let acc = match self.kind() {
+                Tok::Ident(k) if (k == "get" || k == "set")
+                    && !matches!(
+                        self.kind_at(1),
+                        Some(Tok::Punct(P::LParen))
+                    ) =>
+                {
+                    let is_get = k == "get";
+                    self.pos += 1;
+                    Some(is_get)
+                }
+                _ => None,
+            };
+            let mname = match self.bump() {
+                Tok::Ident(n) => n,
+                Tok::Str(s) => s,
+                t => {
+                    return Err(
+                        self.err(format!("bad class member name: {t:?}"))
+                    )
+                }
+            };
+            // field: `name = expr;` or bare `name;`
+            if acc.is_none() && !self.at_punct(P::LParen) {
+                let value = if self.eat_punct(P::Assign) {
+                    self.assign_expr()?
+                } else {
+                    Expr::Ident("undefined".to_string())
+                };
+                self.eat_punct(P::Semi);
+                if is_static {
+                    statics.push((mname, value));
+                } else {
+                    field_stmts.push(Stmt::Expr(Expr::Assign(
+                        AssignOp::Plain,
+                        Box::new(Expr::Member {
+                            obj: Box::new(Expr::This),
+                            prop: MemberProp::Static(mname),
+                            optional: false,
+                        }),
+                        Box::new(value),
+                    )));
+                }
+                continue;
+            }
             let (params, prologue) = self.arrow_params()?;
             let saved = self.in_async;
             self.in_async = false;
@@ -101,36 +315,67 @@ impl Parser {
                 full.append(&mut body);
                 body = full;
             }
-            if mname == "constructor" {
-                ctor_params = params;
-                ctor_body = body;
+            let f = FuncLit {
+                name: Some(mname.clone()),
+                params,
+                body,
+                is_async: false,
+            };
+            if let Some(is_get) = acc {
+                if is_static {
+                    // static accessor: approximate as a plain static
+                    statics.push((mname, Expr::Func(Box::new(f))));
+                } else if let Some(slot) =
+                    accessors.iter_mut().find(|(n, _, _)| *n == mname)
+                {
+                    if is_get {
+                        slot.1 = Some(f);
+                    } else {
+                        slot.2 = Some(f);
+                    }
+                } else if is_get {
+                    accessors.push((mname, Some(f), None));
+                } else {
+                    accessors.push((mname, None, Some(f)));
+                }
+            } else if is_static {
+                statics.push((mname, Expr::Func(Box::new(f))));
+            } else if mname == "constructor" {
+                ctor = Some((f.params, f.body));
             } else {
-                // this.mname = function(params){ body };
-                method_stmts.push(Stmt::Expr(Expr::Assign(
-                    AssignOp::Plain,
-                    Box::new(Expr::Member {
-                        obj: Box::new(Expr::This),
-                        prop: MemberProp::Static(mname.clone()),
-                        optional: false,
-                    }),
-                    Box::new(Expr::Func(Box::new(FuncLit {
-                        name: Some(mname),
-                        params,
-                        body,
-                        is_async: false,
-                    }))),
-                )));
+                methods.push((mname, f));
             }
         }
-        // ctor body = attach methods first, then run constructor()
-        ctor_prologue.append(&mut method_stmts);
-        ctor_prologue.append(&mut ctor_body);
-        Ok(FuncLit {
-            name,
-            params: ctor_params,
-            body: ctor_prologue,
-            is_async: false,
-        })
+        let (params, mut cbody) = ctor.unwrap_or_else(|| {
+            // default ctor of a derived class forwards to the parent
+            let body = if let Some(supn) = sup {
+                vec![Stmt::Expr(Expr::Call {
+                    callee: Box::new(Expr::Member {
+                        obj: Box::new(Expr::Ident(supn.clone())),
+                        prop: MemberProp::Static("apply".to_string()),
+                        optional: false,
+                    }),
+                    args: vec![
+                        Expr::This,
+                        Expr::Ident("arguments".to_string()),
+                    ],
+                    optional: false,
+                })]
+            } else {
+                Vec::new()
+            };
+            (Vec::new(), body)
+        });
+        if !field_stmts.is_empty() {
+            field_stmts.append(&mut cbody);
+            cbody = field_stmts;
+        }
+        Ok((
+            FuncLit { name, params, body: cbody, is_async: false },
+            methods,
+            accessors,
+            statics,
+        ))
     }
 
     fn kind(&self) -> &Tok {
@@ -271,8 +516,10 @@ impl Parser {
                 "var" | "let" | "const" => self.var_decl_stmt(),
                 "function" => {
                     self.pos += 1;
+                    let is_gen = self.eat_punct(P::Star);
                     let name = self.expect_ident()?;
-                    let f = self.func_lit(Some(name), false)?;
+                    let f =
+                        self.func_lit_g(Some(name), false, is_gen)?;
                     Ok(Stmt::FuncDecl(Box::new(f)))
                 }
                 "async" if matches!(self.kind_at(1), Some(Tok::Ident(k))
@@ -285,8 +532,11 @@ impl Parser {
                 "class" => {
                     self.pos += 1;
                     let name = self.expect_ident()?;
-                    let f = self.class_lit(Some(name))?;
-                    Ok(Stmt::FuncDecl(Box::new(f)))
+                    let e = self.class_lit(Some(name.clone()))?;
+                    Ok(Stmt::VarDecl {
+                        kind: DeclKind::Var,
+                        decls: vec![(name, Some(e))],
+                    })
                 }
                 "return" => {
                     self.pos += 1;
@@ -449,8 +699,37 @@ impl Parser {
         out: &mut Vec<(String, Option<Expr>)>,
     ) -> Result<(), ParseError> {
         self.expect_punct(P::LBrace)?;
+        let mut seen: Vec<String> = Vec::new();
         while !self.at_punct(P::RBrace) {
+            if self.eat_punct(P::DotDotDot) {
+                // rest: copy the source, then drop already-bound keys
+                let name = self.expect_ident()?;
+                out.push((name.clone(), Some(Expr::Call {
+                    callee: Box::new(Expr::Member {
+                        obj: Box::new(Expr::Ident("Object".to_string())),
+                        prop: MemberProp::Static("assign".to_string()),
+                        optional: false,
+                    }),
+                    args: vec![
+                        Expr::Object(Vec::new()),
+                        Expr::Ident(tmp.to_string()),
+                    ],
+                    optional: false,
+                })));
+                for k in &seen {
+                    out.push((self.fresh_tmp("dl"), Some(Expr::Unary(
+                        UnOp::Delete,
+                        Box::new(Expr::Member {
+                            obj: Box::new(Expr::Ident(name.clone())),
+                            prop: MemberProp::Static(k.clone()),
+                            optional: false,
+                        }),
+                    ))));
+                }
+                break;
+            }
             let key = self.expect_ident()?;
+            seen.push(key.clone());
             let member = Expr::Member {
                 obj: Box::new(Expr::Ident(tmp.to_string())),
                 prop: MemberProp::Static(key.clone()),
@@ -571,6 +850,34 @@ impl Parser {
         {
             let kw = self.expect_ident()?;
             let kind = Parser::decl_kind(&kw);
+            // for (const [a, b] of pairs) / for (const {k} of items):
+            // bind a temp, unpack at the top of the body
+            if self.at_punct(P::LBrace) || self.at_punct(P::LBracket) {
+                let tmp = self.fresh_tmp("fi");
+                let mut binds: Vec<(String, Option<Expr>)> = Vec::new();
+                self.pattern_binds(&tmp, &mut binds, false)?;
+                let inof = self.expect_ident()?;
+                if inof != "in" && inof != "of" {
+                    return Err(self.err(format!(
+                        "expected in/of after for-pattern, found {inof}"
+                    )));
+                }
+                let of = inof == "of";
+                let obj = self.expr()?;
+                self.expect_punct(P::RParen)?;
+                let body = self.stmt()?;
+                let full = vec![
+                    Stmt::VarDecl { kind, decls: binds },
+                    body,
+                ];
+                return Ok(Stmt::ForIn {
+                    decl_kind: Some(kind),
+                    var: tmp,
+                    obj,
+                    body: Box::new(Stmt::Block(full)),
+                    of,
+                });
+            }
             if let (Some(Tok::Ident(_)), Some(Tok::Ident(inof))) =
                 (self.kind_at(0), self.kind_at(1))
             {
@@ -716,6 +1023,39 @@ impl Parser {
     }
 
     fn assign_expr(&mut self) -> Result<Expr, ParseError> {
+        // `yield [expr]` inside a generator: a marker call the
+        // generator transform turns into a state-machine suspension
+        if self.in_generator {
+            if let Tok::Ident(k) = self.kind() {
+                if k == "yield" {
+                    self.pos += 1;
+                    if self.eat_punct(P::Star) {
+                        return Err(self.err(
+                            "yield* delegation not yet supported",
+                        ));
+                    }
+                    let arg = if matches!(
+                        self.kind(),
+                        Tok::Punct(P::Semi) | Tok::Punct(P::RParen)
+                            | Tok::Punct(P::RBracket)
+                            | Tok::Punct(P::RBrace)
+                            | Tok::Punct(P::Comma) | Tok::Eof
+                    ) || self.nl_before()
+                    {
+                        Expr::Ident("undefined".to_string())
+                    } else {
+                        self.assign_expr()?
+                    };
+                    return Ok(Expr::Call {
+                        callee: Box::new(Expr::Ident(
+                            "__gg_yield".to_string(),
+                        )),
+                        args: vec![arg],
+                        optional: false,
+                    });
+                }
+            }
+        }
         // `async` prefix: async function expr / async arrow
         if let Tok::Ident(k) = self.kind() {
             if k == "async" && !self.nl_before_at(1) {
@@ -792,11 +1132,120 @@ impl Parser {
             _ => return Ok(left),
         };
         if !matches!(left, Expr::Ident(_) | Expr::Member { .. }) {
+            // destructuring assignment: `[a, b] = x` / `({k} = o)`
+            // desugars to ((__da) => { a = __da[0]; ...; return __da })(x)
+            if matches!(op, AssignOp::Plain)
+                && matches!(left, Expr::Array(_) | Expr::Object(_))
+            {
+                let tmp = self.fresh_tmp("da");
+                let mut stmts = Vec::new();
+                if Self::destr_into(
+                    &left,
+                    &Expr::Ident(tmp.clone()),
+                    &mut stmts,
+                ) {
+                    self.pos += 1;
+                    let right = self.assign_expr()?;
+                    stmts.push(Stmt::Return(Some(Expr::Ident(
+                        tmp.clone(),
+                    ))));
+                    return Ok(Expr::Call {
+                        callee: Box::new(Expr::Arrow(Box::new(FuncLit {
+                            name: None,
+                            params: vec![tmp],
+                            body: stmts,
+                            is_async: false,
+                        }))),
+                        args: vec![right],
+                        optional: false,
+                    });
+                }
+            }
             return Err(self.err("invalid assignment target"));
         }
         self.pos += 1;
         let right = self.assign_expr()?;
         Ok(Expr::Assign(op, Box::new(left), Box::new(right)))
+    }
+
+    /// Emit assignments unpacking `src` according to a literal used as
+    /// a destructuring pattern. Returns false on unsupported shapes
+    /// (the caller then reports the usual error).
+    fn destr_into(pat: &Expr, src: &Expr, out: &mut Vec<Stmt>) -> bool {
+        match pat {
+            Expr::Array(els) => els.iter().enumerate().all(|(i, el)| {
+                let item = Expr::Member {
+                    obj: Box::new(src.clone()),
+                    prop: MemberProp::Computed(Box::new(Expr::Num(
+                        i as f64,
+                    ))),
+                    optional: false,
+                };
+                Self::destr_target(el, item, out)
+            }),
+            Expr::Object(props) => props.iter().all(|p| {
+                let item = Expr::Member {
+                    obj: Box::new(src.clone()),
+                    prop: match &p.key {
+                        PropKey::Ident(k) | PropKey::Str(k) => {
+                            MemberProp::Static(k.clone())
+                        }
+                        PropKey::Num(k) => MemberProp::Computed(
+                            Box::new(Expr::Num(*k)),
+                        ),
+                        PropKey::Computed(k) => MemberProp::Computed(
+                            Box::new(k.clone()),
+                        ),
+                    },
+                    optional: false,
+                };
+                Self::destr_target(&p.value, item, out)
+            }),
+            _ => false,
+        }
+    }
+
+    fn destr_target(t: &Expr, item: Expr, out: &mut Vec<Stmt>) -> bool {
+        match t {
+            // an elision hole parses as `undefined` — skip it
+            Expr::Ident(n) if n == "undefined" => true,
+            Expr::Ident(_) | Expr::Member { .. } => {
+                out.push(Stmt::Expr(Expr::Assign(
+                    AssignOp::Plain,
+                    Box::new(t.clone()),
+                    Box::new(item),
+                )));
+                true
+            }
+            // `a = def` inside the pattern: default value
+            Expr::Assign(AssignOp::Plain, target, def)
+                if matches!(
+                    **target,
+                    Expr::Ident(_) | Expr::Member { .. }
+                ) =>
+            {
+                let picked = Expr::Cond(
+                    Box::new(Expr::Binary(
+                        BinOp::StrictEq,
+                        Box::new(item.clone()),
+                        Box::new(Expr::Ident("undefined".to_string())),
+                    )),
+                    Box::new((**def).clone()),
+                    Box::new(item),
+                );
+                out.push(Stmt::Expr(Expr::Assign(
+                    AssignOp::Plain,
+                    target.clone(),
+                    Box::new(picked),
+                )));
+                true
+            }
+            // nested pattern: unpack the member chain
+            Expr::Array(_) | Expr::Object(_) => {
+                Self::destr_into(t, &item, out)
+            }
+            _ => false,
+        }
     }
 
     /// At a `(`: does the matching `)` have `=>` right after it?
@@ -840,9 +1289,28 @@ impl Parser {
         if !self.eat_punct(P::RParen) {
             loop {
                 if self.eat_punct(P::DotDotDot) {
-                    return Err(self.err(
-                        "rest parameters (...args) not yet supported",
-                    ));
+                    // rest param: our `arguments` is a real array, so
+                    // `(...rest)` desugars to arguments.slice(n)
+                    let name = self.expect_ident()?;
+                    let n = params.len();
+                    prologue.push(Stmt::VarDecl {
+                        kind: DeclKind::Var,
+                        decls: vec![(name, Some(Expr::Call {
+                            callee: Box::new(Expr::Member {
+                                obj: Box::new(Expr::Ident(
+                                    "arguments".to_string(),
+                                )),
+                                prop: MemberProp::Static(
+                                    "slice".to_string(),
+                                ),
+                                optional: false,
+                            }),
+                            args: vec![Expr::Num(n as f64)],
+                            optional: false,
+                        }))],
+                    });
+                    self.expect_punct(P::RParen)?;
+                    break;
                 }
                 if self.at_punct(P::LBrace) || self.at_punct(P::LBracket) {
                     // destructuring param: bind a temp, unpack in body
@@ -1070,9 +1538,38 @@ impl Parser {
                 Tok::Punct(P::QuestionDot) => {
                     self.pos += 1;
                     if self.eat_punct(P::LParen) {
-                        let args = self.arguments()?;
-                        e = Expr::Call {
-                            callee: Box::new(e), args, optional: true,
+                        let (args, spread) = self.arguments_spread()?;
+                        e = if spread {
+                            // f?.(...a) -> f?.apply(this_arg, arr);
+                            // o.m?.(...a) keeps o as the receiver (o is
+                            // re-evaluated — fine for simple receivers)
+                            let this_arg = match &e {
+                                Expr::Member { obj, .. } => {
+                                    (**obj).clone()
+                                }
+                                _ => Expr::Ident(
+                                    "undefined".to_string(),
+                                ),
+                            };
+                            Expr::Call {
+                                callee: Box::new(Expr::Member {
+                                    obj: Box::new(e),
+                                    prop: MemberProp::Static(
+                                        "apply".to_string(),
+                                    ),
+                                    optional: true,
+                                }),
+                                args: {
+                                    let mut v = vec![this_arg];
+                                    v.extend(args);
+                                    v
+                                },
+                                optional: false,
+                            }
+                        } else {
+                            Expr::Call {
+                                callee: Box::new(e), args, optional: true,
+                            }
                         };
                     } else if self.eat_punct(P::LBracket) {
                         let k = self.expr()?;
@@ -1228,6 +1725,7 @@ impl Parser {
                 "false" => Ok(Expr::Bool(false)),
                 "null" => Ok(Expr::Null),
                 "function" => {
+                    let is_gen = self.eat_punct(P::Star);
                     let name = match self.kind() {
                         Tok::Ident(n) if !self.at_punct(P::LParen) => {
                             let n = n.clone();
@@ -1236,15 +1734,57 @@ impl Parser {
                         }
                         _ => None,
                     };
-                    Ok(Expr::Func(Box::new(self.func_lit(name, false)?)))
+                    Ok(Expr::Func(Box::new(
+                        self.func_lit_g(name, false, is_gen)?,
+                    )))
                 }
                 "new" => {
                     let callee = self.member_only_expr()?;
-                    let args = if self.eat_punct(P::LParen) {
-                        self.arguments()?
+                    let (args, spread) = if self.eat_punct(P::LParen) {
+                        self.arguments_spread()?
                     } else {
-                        Vec::new()
+                        (Vec::new(), false)
                     };
+                    if spread {
+                        // new C(...a) — the Babel _construct shape our
+                        // bound-constructor new already understands:
+                        // new (C.bind.apply(C, [null].concat(a)))()
+                        let arr = args.into_iter().next().unwrap();
+                        let bind_args = Expr::Call {
+                            callee: Box::new(Expr::Member {
+                                obj: Box::new(Expr::Array(vec![
+                                    Expr::Null,
+                                ])),
+                                prop: MemberProp::Static(
+                                    "concat".to_string(),
+                                ),
+                                optional: false,
+                            }),
+                            args: vec![arr],
+                            optional: false,
+                        };
+                        let bound = Expr::Call {
+                            callee: Box::new(Expr::Member {
+                                obj: Box::new(Expr::Member {
+                                    obj: Box::new(callee.clone()),
+                                    prop: MemberProp::Static(
+                                        "bind".to_string(),
+                                    ),
+                                    optional: false,
+                                }),
+                                prop: MemberProp::Static(
+                                    "apply".to_string(),
+                                ),
+                                optional: false,
+                            }),
+                            args: vec![callee, bind_args],
+                            optional: false,
+                        };
+                        return Ok(Expr::New {
+                            callee: Box::new(bound),
+                            args: Vec::new(),
+                        });
+                    }
                     Ok(Expr::New { callee: Box::new(callee), args })
                 }
                 "class" => {
@@ -1257,7 +1797,63 @@ impl Parser {
                         }
                         _ => None,
                     };
-                    Ok(Expr::Func(Box::new(self.class_lit(cname)?)))
+                    self.class_lit(cname)
+                }
+                "super" if self.class_super.is_some() => {
+                    let sup = self.class_super.clone().unwrap();
+                    let this_call = |target: Expr,
+                                     args: Vec<Expr>,
+                                     spread: bool| {
+                        // target(args) with `this` bound to the instance;
+                        // a spread arg list arrives as one assembled
+                        // array, which is exactly apply's shape
+                        let verb = if spread { "apply" } else { "call" };
+                        let mut full = vec![Expr::This];
+                        full.extend(args);
+                        Expr::Call {
+                            callee: Box::new(Expr::Member {
+                                obj: Box::new(target),
+                                prop: MemberProp::Static(verb.to_string()),
+                                optional: false,
+                            }),
+                            args: full,
+                            optional: false,
+                        }
+                    };
+                    if self.eat_punct(P::LParen) {
+                        // super(args) -> parent.call(this, args)
+                        let (args, spread) = self.arguments_spread()?;
+                        Ok(this_call(Expr::Ident(sup), args, spread))
+                    } else if self.eat_punct(P::Dot) {
+                        let pname = self.expect_ident()?;
+                        let target = Expr::Member {
+                            obj: Box::new(Expr::Member {
+                                obj: Box::new(Expr::Ident(sup)),
+                                prop: MemberProp::Static(
+                                    "prototype".to_string(),
+                                ),
+                                optional: false,
+                            }),
+                            prop: MemberProp::Static(pname),
+                            optional: false,
+                        };
+                        if self.eat_punct(P::LParen) {
+                            // super.m(args) -> parent.prototype.m.call(this)
+                            let (args, spread) = self.arguments_spread()?;
+                            Ok(this_call(target, args, spread))
+                        } else {
+                            Ok(target)
+                        }
+                    } else {
+                        // bare `super` (super['k'] etc.): the prototype
+                        Ok(Expr::Member {
+                            obj: Box::new(Expr::Ident(sup)),
+                            prop: MemberProp::Static(
+                                "prototype".to_string(),
+                            ),
+                            optional: false,
+                        })
+                    }
                 }
                 _ => Ok(Expr::Ident(name)),
             },
@@ -1368,7 +1964,85 @@ impl Parser {
     /// `{` already consumed.
     fn object_lit(&mut self) -> Result<Expr, ParseError> {
         let mut props = Vec::new();
+        // spread segments: `{a, ...b, c}` desugars to
+        // Object.assign({}, {a}, b, {c})
+        let mut segs: Vec<Expr> = Vec::new();
+        let mut has_spread = false;
+        // accessor entries: (key, getter, setter)
+        let mut accs: Vec<(String, Option<FuncLit>, Option<FuncLit>)> =
+            Vec::new();
         while !self.eat_punct(P::RBrace) {
+            // generator method: { *gen() {...} }
+            if self.at_punct(P::Star)
+                && matches!(self.kind_at(1),
+                    Some(Tok::Ident(_)) | Some(Tok::Str(_)))
+                && matches!(self.kind_at(2), Some(Tok::Punct(P::LParen)))
+            {
+                self.pos += 1;
+                let key = match self.bump() {
+                    Tok::Ident(n) => n,
+                    Tok::Str(s) => s,
+                    _ => unreachable!(),
+                };
+                let f =
+                    self.func_lit_g(Some(key.clone()), false, true)?;
+                props.push(Prop {
+                    key: PropKey::Ident(key),
+                    value: Expr::Func(Box::new(f)),
+                });
+                if !self.eat_punct(P::Comma) {
+                    self.expect_punct(P::RBrace)?;
+                    break;
+                }
+                continue;
+            }
+            // getter/setter shorthand: { get name() {...} }
+            if matches!(self.kind(), Tok::Ident(g)
+                    if g == "get" || g == "set")
+                && matches!(self.kind_at(1),
+                    Some(Tok::Ident(_)) | Some(Tok::Str(_)))
+                && matches!(self.kind_at(2), Some(Tok::Punct(P::LParen)))
+            {
+                let is_get =
+                    matches!(self.kind(), Tok::Ident(g) if g == "get");
+                self.pos += 1;
+                let key = match self.bump() {
+                    Tok::Ident(n) => n,
+                    Tok::Str(s) => s,
+                    _ => unreachable!(),
+                };
+                let f = self.func_lit(Some(key.clone()), false)?;
+                if let Some(slot) =
+                    accs.iter_mut().find(|(k, _, _)| *k == key)
+                {
+                    if is_get {
+                        slot.1 = Some(f);
+                    } else {
+                        slot.2 = Some(f);
+                    }
+                } else if is_get {
+                    accs.push((key, Some(f), None));
+                } else {
+                    accs.push((key, None, Some(f)));
+                }
+                if !self.eat_punct(P::Comma) {
+                    self.expect_punct(P::RBrace)?;
+                    break;
+                }
+                continue;
+            }
+            if self.eat_punct(P::DotDotDot) {
+                has_spread = true;
+                if !props.is_empty() {
+                    segs.push(Expr::Object(std::mem::take(&mut props)));
+                }
+                segs.push(self.assign_expr()?);
+                if !self.eat_punct(P::Comma) {
+                    self.expect_punct(P::RBrace)?;
+                    break;
+                }
+                continue;
+            }
             let prop = match self.bump() {
                 Tok::Ident(name) => {
                     if self.at_punct(P::LParen) {
@@ -1383,6 +2057,19 @@ impl Parser {
                             key: PropKey::Ident(name),
                             value: self.assign_expr()?,
                         }
+                    } else if self.eat_punct(P::Assign) {
+                        // shorthand default `{ a = 1 }` — meaningful as
+                        // a destructuring pattern; as a plain literal it
+                        // evaluates like `{ a: a = 1 }`
+                        let def = self.assign_expr()?;
+                        Prop {
+                            key: PropKey::Ident(name.clone()),
+                            value: Expr::Assign(
+                                AssignOp::Plain,
+                                Box::new(Expr::Ident(name)),
+                                Box::new(def),
+                            ),
+                        }
                     } else {
                         // shorthand: { a }
                         Prop {
@@ -1392,20 +2079,53 @@ impl Parser {
                     }
                 }
                 Tok::Str(s) => {
-                    self.expect_punct(P::Colon)?;
-                    Prop { key: PropKey::Str(s), value: self.assign_expr()? }
+                    if self.at_punct(P::LParen) {
+                        // string-keyed method: { "foo"() {...} }
+                        let f = self.func_lit(Some(s.clone()), false)?;
+                        Prop {
+                            key: PropKey::Str(s),
+                            value: Expr::Func(Box::new(f)),
+                        }
+                    } else {
+                        self.expect_punct(P::Colon)?;
+                        Prop {
+                            key: PropKey::Str(s),
+                            value: self.assign_expr()?,
+                        }
+                    }
                 }
                 Tok::Num(n) => {
-                    self.expect_punct(P::Colon)?;
-                    Prop { key: PropKey::Num(n), value: self.assign_expr()? }
+                    if self.at_punct(P::LParen) {
+                        // number-keyed method: { 0() {...} }
+                        let f = self.func_lit(None, false)?;
+                        Prop {
+                            key: PropKey::Num(n),
+                            value: Expr::Func(Box::new(f)),
+                        }
+                    } else {
+                        self.expect_punct(P::Colon)?;
+                        Prop {
+                            key: PropKey::Num(n),
+                            value: self.assign_expr()?,
+                        }
+                    }
                 }
                 Tok::Punct(P::LBracket) => {
                     let k = self.assign_expr()?;
                     self.expect_punct(P::RBracket)?;
-                    self.expect_punct(P::Colon)?;
-                    Prop {
-                        key: PropKey::Computed(k),
-                        value: self.assign_expr()?,
+                    if self.at_punct(P::LParen) {
+                        // computed method: { [k]() {...} }
+                        let f = self.func_lit(None, false)?;
+                        Prop {
+                            key: PropKey::Computed(k),
+                            value: Expr::Func(Box::new(f)),
+                        }
+                    } else {
+                        self.expect_punct(P::Colon)?;
+                        Prop {
+                            key: PropKey::Computed(k),
+                            value: self.assign_expr()?,
+                        }
                     }
                 }
                 t => {
@@ -1420,7 +2140,534 @@ impl Parser {
                 break;
             }
         }
-        Ok(Expr::Object(props))
+        let base = if !has_spread {
+            Expr::Object(props)
+        } else {
+            if !props.is_empty() {
+                segs.push(Expr::Object(props));
+            }
+            let mut args = vec![Expr::Object(Vec::new())];
+            args.extend(segs);
+            Expr::Call {
+                callee: Box::new(Expr::Member {
+                    obj: Box::new(Expr::Ident("Object".to_string())),
+                    prop: MemberProp::Static("assign".to_string()),
+                    optional: false,
+                }),
+                args,
+                optional: false,
+            }
+        };
+        if accs.is_empty() {
+            return Ok(base);
+        }
+        // accessors: (function(){ var o = base;
+        //   Object.defineProperty(o, k, {get, set}); ... return o })()
+        let tmp = self.fresh_tmp("obj");
+        let mut body = vec![Stmt::VarDecl {
+            kind: DeclKind::Var,
+            decls: vec![(tmp.clone(), Some(base))],
+        }];
+        for (key, getter, setter) in accs {
+            let mut dprops = vec![Prop {
+                key: PropKey::Ident("configurable".to_string()),
+                value: Expr::Bool(true),
+            }];
+            if let Some(g) = getter {
+                dprops.push(Prop {
+                    key: PropKey::Ident("get".to_string()),
+                    value: Expr::Func(Box::new(g)),
+                });
+            }
+            if let Some(s) = setter {
+                dprops.push(Prop {
+                    key: PropKey::Ident("set".to_string()),
+                    value: Expr::Func(Box::new(s)),
+                });
+            }
+            body.push(Stmt::Expr(Expr::Call {
+                callee: Box::new(Expr::Member {
+                    obj: Box::new(Expr::Ident("Object".to_string())),
+                    prop: MemberProp::Static("defineProperty".to_string()),
+                    optional: false,
+                }),
+                args: vec![
+                    Expr::Ident(tmp.clone()),
+                    Expr::Str(key),
+                    Expr::Object(dprops),
+                ],
+                optional: false,
+            }));
+        }
+        body.push(Stmt::Return(Some(Expr::Ident(tmp))));
+        Ok(Expr::Call {
+            callee: Box::new(Expr::Func(Box::new(FuncLit {
+                name: None,
+                params: Vec::new(),
+                body,
+                is_async: false,
+            }))),
+            args: Vec::new(),
+            optional: false,
+        })
+    }
+
+    /// The `yield E` marker the generator body parser emits.
+    fn yield_marker(e: &Expr) -> Option<Expr> {
+        if let Expr::Call { callee, args, .. } = e {
+            if matches!(&**callee, Expr::Ident(n) if n == "__gg_yield") {
+                return Some(args.first().cloned().unwrap_or_else(
+                    || Expr::Ident("undefined".to_string()),
+                ));
+            }
+        }
+        None
+    }
+
+    /// Canonical statement-level yields:
+    /// `yield E;` / `x = yield E;` (var-decl form arrives here already
+    /// converted to an assignment by hoist_gen_vars).
+    fn yield_shape(s: &Stmt) -> Option<(Option<Expr>, Expr)> {
+        if let Stmt::Expr(e) = s {
+            if let Some(v) = Self::yield_marker(e) {
+                if !Self::expr_has_marker(&v) {
+                    return Some((None, v));
+                }
+            }
+            if let Expr::Assign(AssignOp::Plain, t, val) = e {
+                if let Some(v) = Self::yield_marker(val) {
+                    if !Self::expr_has_marker(&v)
+                        && !Self::expr_has_marker(t)
+                    {
+                        return Some((Some((**t).clone()), v));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn expr_has_marker(e: &Expr) -> bool {
+        match e {
+            Expr::Call { callee, args, .. } => {
+                matches!(&**callee, Expr::Ident(n) if n == "__gg_yield")
+                    || Self::expr_has_marker(callee)
+                    || args.iter().any(Self::expr_has_marker)
+            }
+            Expr::Func(_) | Expr::Arrow(_) => false,
+            Expr::Unary(_, a) | Expr::Await(a) => {
+                Self::expr_has_marker(a)
+            }
+            Expr::Update { target, .. } => Self::expr_has_marker(target),
+            Expr::Binary(_, a, b) | Expr::Logical(_, a, b) => {
+                Self::expr_has_marker(a) || Self::expr_has_marker(b)
+            }
+            Expr::Assign(_, a, b) => {
+                Self::expr_has_marker(a) || Self::expr_has_marker(b)
+            }
+            Expr::Cond(c, a, b) => {
+                Self::expr_has_marker(c)
+                    || Self::expr_has_marker(a)
+                    || Self::expr_has_marker(b)
+            }
+            Expr::Member { obj, prop, .. } => {
+                Self::expr_has_marker(obj)
+                    || matches!(prop, MemberProp::Computed(k)
+                        if Self::expr_has_marker(k))
+            }
+            Expr::New { callee, args } => {
+                Self::expr_has_marker(callee)
+                    || args.iter().any(Self::expr_has_marker)
+            }
+            Expr::Array(v) | Expr::Seq(v) => {
+                v.iter().any(Self::expr_has_marker)
+            }
+            Expr::Object(props) => props.iter().any(|p| {
+                Self::expr_has_marker(&p.value)
+                    || matches!(&p.key, PropKey::Computed(k)
+                        if Self::expr_has_marker(k))
+            }),
+            Expr::Template(parts) => parts.iter().any(|p| {
+                matches!(p, TplPart::Expr(e)
+                    if Self::expr_has_marker(e))
+            }),
+            _ => false,
+        }
+    }
+
+    fn stmt_has_marker(s: &Stmt) -> bool {
+        match s {
+            Stmt::Expr(e) | Stmt::Throw(e) => Self::expr_has_marker(e),
+            Stmt::VarDecl { decls, .. } => decls.iter().any(|(_, i)| {
+                i.as_ref().is_some_and(Self::expr_has_marker)
+            }),
+            Stmt::Return(e) => {
+                e.as_ref().is_some_and(Self::expr_has_marker)
+            }
+            Stmt::If { test, cons, alt } => {
+                Self::expr_has_marker(test)
+                    || Self::stmt_has_marker(cons)
+                    || alt.as_deref().is_some_and(Self::stmt_has_marker)
+            }
+            Stmt::While { test, body } => {
+                Self::expr_has_marker(test) || Self::stmt_has_marker(body)
+            }
+            Stmt::DoWhile { body, test } => {
+                Self::expr_has_marker(test) || Self::stmt_has_marker(body)
+            }
+            Stmt::For { init, test, update, body } => {
+                init.as_deref().is_some_and(Self::stmt_has_marker)
+                    || test.as_ref().is_some_and(Self::expr_has_marker)
+                    || update
+                        .as_ref()
+                        .is_some_and(Self::expr_has_marker)
+                    || Self::stmt_has_marker(body)
+            }
+            Stmt::ForIn { obj, body, .. } => {
+                Self::expr_has_marker(obj) || Self::stmt_has_marker(body)
+            }
+            Stmt::Block(v) => v.iter().any(Self::stmt_has_marker),
+            Stmt::Labeled { body, .. } => Self::stmt_has_marker(body),
+            Stmt::Try { block, catch, finally } => {
+                block.iter().any(Self::stmt_has_marker)
+                    || catch.as_ref().is_some_and(|c| {
+                        c.body.iter().any(Self::stmt_has_marker)
+                    })
+                    || finally.as_ref().is_some_and(|f| {
+                        f.iter().any(Self::stmt_has_marker)
+                    })
+            }
+            Stmt::Switch { disc, cases } => {
+                Self::expr_has_marker(disc)
+                    || cases.iter().any(|c| {
+                        c.body.iter().any(Self::stmt_has_marker)
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    /// Hoist `var` names out of a generator body statement (locals
+    /// must live in the enclosing function so they survive across
+    /// next() calls); declarations become plain assignments.
+    fn hoist_gen_vars(s: Stmt, names: &mut Vec<String>) -> Stmt {
+        match s {
+            Stmt::VarDecl { decls, .. } => {
+                let mut assigns: Vec<Stmt> = Vec::new();
+                for (n, init) in decls {
+                    names.push(n.clone());
+                    if let Some(e) = init {
+                        assigns.push(Stmt::Expr(Expr::Assign(
+                            AssignOp::Plain,
+                            Box::new(Expr::Ident(n)),
+                            Box::new(e),
+                        )));
+                    }
+                }
+                match assigns.len() {
+                    0 => Stmt::Empty,
+                    1 => assigns.pop().unwrap(),
+                    _ => Stmt::Block(assigns),
+                }
+            }
+            Stmt::Block(v) => Stmt::Block(
+                v.into_iter()
+                    .map(|s| Self::hoist_gen_vars(s, names))
+                    .collect(),
+            ),
+            Stmt::If { test, cons, alt } => Stmt::If {
+                test,
+                cons: Box::new(Self::hoist_gen_vars(*cons, names)),
+                alt: alt
+                    .map(|a| Box::new(Self::hoist_gen_vars(*a, names))),
+            },
+            Stmt::While { test, body } => Stmt::While {
+                test,
+                body: Box::new(Self::hoist_gen_vars(*body, names)),
+            },
+            Stmt::DoWhile { body, test } => Stmt::DoWhile {
+                body: Box::new(Self::hoist_gen_vars(*body, names)),
+                test,
+            },
+            Stmt::For { init, test, update, body } => Stmt::For {
+                init: init
+                    .map(|i| Box::new(Self::hoist_gen_vars(*i, names))),
+                test,
+                update,
+                body: Box::new(Self::hoist_gen_vars(*body, names)),
+            },
+            Stmt::ForIn { decl_kind, var, obj, body, of } => {
+                if decl_kind.is_some() {
+                    names.push(var.clone());
+                }
+                Stmt::ForIn {
+                    decl_kind: None,
+                    var,
+                    obj,
+                    body: Box::new(Self::hoist_gen_vars(*body, names)),
+                    of,
+                }
+            }
+            Stmt::Labeled { label, body } => Stmt::Labeled {
+                label,
+                body: Box::new(Self::hoist_gen_vars(*body, names)),
+            },
+            Stmt::Try { block, catch, finally } => Stmt::Try {
+                block: block
+                    .into_iter()
+                    .map(|s| Self::hoist_gen_vars(s, names))
+                    .collect(),
+                catch: catch.map(|mut c| {
+                    c.body = c
+                        .body
+                        .into_iter()
+                        .map(|s| Self::hoist_gen_vars(s, names))
+                        .collect();
+                    c
+                }),
+                finally: finally.map(|f| {
+                    f.into_iter()
+                        .map(|s| Self::hoist_gen_vars(s, names))
+                        .collect()
+                }),
+            },
+            Stmt::Switch { disc, cases } => Stmt::Switch {
+                disc,
+                cases: cases
+                    .into_iter()
+                    .map(|mut c| {
+                        c.body = c
+                            .body
+                            .into_iter()
+                            .map(|s| Self::hoist_gen_vars(s, names))
+                            .collect();
+                        c
+                    })
+                    .collect(),
+            },
+            other => other,
+        }
+    }
+
+    /// `function*` body -> resumable state machine. Yields must sit at
+    /// statement level of the top-level body (`yield E;`,
+    /// `x = yield E;`, `var x = yield E;`); a yield nested inside
+    /// control flow is a clear error, never silently-wrong code.
+    fn generator_transform(
+        &mut self,
+        body: Vec<Stmt>,
+    ) -> Result<Vec<Stmt>, ParseError> {
+        let mut names: Vec<String> = Vec::new();
+        let body: Vec<Stmt> = body
+            .into_iter()
+            .map(|s| Self::hoist_gen_vars(s, &mut names))
+            .collect();
+        let st_name = self.fresh_tmp("gst");
+        let sent = self.fresh_tmp("gsent");
+        let done = self.fresh_tmp("gdone");
+        let step = self.fresh_tmp("gstep");
+        let it = self.fresh_tmp("git");
+        let undef = || Expr::Ident("undefined".to_string());
+        let iter_obj = |v: Expr, d: bool| {
+            Expr::Object(vec![
+                Prop {
+                    key: PropKey::Ident("value".to_string()),
+                    value: v,
+                },
+                Prop {
+                    key: PropKey::Ident("done".to_string()),
+                    value: Expr::Bool(d),
+                },
+            ])
+        };
+        let set_state = |name: &str, n: f64| {
+            Stmt::Expr(Expr::Assign(
+                AssignOp::Plain,
+                Box::new(Expr::Ident(name.to_string())),
+                Box::new(Expr::Num(n)),
+            ))
+        };
+        // segmentation at canonical yields
+        let mut segments: Vec<Vec<Stmt>> = Vec::new();
+        let mut cur: Vec<Stmt> = Vec::new();
+        for s in body {
+            if let Some((target, value)) = Self::yield_shape(&s) {
+                let next = (segments.len() + 1) as f64;
+                cur.push(set_state(&st_name, next));
+                cur.push(Stmt::Return(Some(iter_obj(value, false))));
+                segments.push(std::mem::take(&mut cur));
+                if let Some(t) = target {
+                    cur.push(Stmt::Expr(Expr::Assign(
+                        AssignOp::Plain,
+                        Box::new(t),
+                        Box::new(Expr::Ident(sent.clone())),
+                    )));
+                }
+            } else if Self::stmt_has_marker(&s) {
+                return Err(self.err(
+                    "yield inside nested control flow not yet \
+                     supported (statement-level yields only)",
+                ));
+            } else if let Stmt::Return(e) = s {
+                cur.push(set_state(&st_name, -1.0));
+                cur.push(Stmt::Return(Some(
+                    iter_obj(e.unwrap_or_else(undef), true),
+                )));
+                segments.push(std::mem::take(&mut cur));
+            } else {
+                cur.push(s);
+            }
+        }
+        cur.push(set_state(&st_name, -1.0));
+        cur.push(Stmt::Return(Some(iter_obj(undef(), true))));
+        segments.push(cur);
+        let cases: Vec<SwitchCase> = segments
+            .into_iter()
+            .enumerate()
+            .map(|(i, body)| SwitchCase {
+                test: Some(Expr::Num(i as f64)),
+                body,
+            })
+            .chain(std::iter::once(SwitchCase {
+                test: None,
+                body: vec![Stmt::Return(Some(iter_obj(undef(), true)))],
+            }))
+            .collect();
+        // assembled wrapper
+        let mut out: Vec<Stmt> = Vec::new();
+        if !names.is_empty() {
+            out.push(Stmt::VarDecl {
+                kind: DeclKind::Var,
+                decls: names.into_iter().map(|n| (n, None)).collect(),
+            });
+        }
+        out.push(Stmt::VarDecl {
+            kind: DeclKind::Var,
+            decls: vec![
+                (st_name.clone(), Some(Expr::Num(0.0))),
+                (sent.clone(), None),
+                (done.clone(), Some(Expr::Bool(false))),
+            ],
+        });
+        out.push(Stmt::FuncDecl(Box::new(FuncLit {
+            name: Some(step.clone()),
+            params: Vec::new(),
+            body: vec![Stmt::Switch {
+                disc: Expr::Ident(st_name.clone()),
+                cases,
+            }],
+            is_async: false,
+        })));
+        let next_fn = FuncLit {
+            name: None,
+            params: vec!["__v".to_string()],
+            body: vec![
+                Stmt::If {
+                    test: Expr::Ident(done.clone()),
+                    cons: Box::new(Stmt::Return(Some(
+                        iter_obj(undef(), true),
+                    ))),
+                    alt: None,
+                },
+                Stmt::Expr(Expr::Assign(
+                    AssignOp::Plain,
+                    Box::new(Expr::Ident(sent.clone())),
+                    Box::new(Expr::Ident("__v".to_string())),
+                )),
+                Stmt::VarDecl {
+                    kind: DeclKind::Var,
+                    decls: vec![(
+                        "__r".to_string(),
+                        Some(Expr::Call {
+                            callee: Box::new(Expr::Ident(step.clone())),
+                            args: Vec::new(),
+                            optional: false,
+                        }),
+                    )],
+                },
+                Stmt::If {
+                    test: Expr::Member {
+                        obj: Box::new(Expr::Ident("__r".to_string())),
+                        prop: MemberProp::Static("done".to_string()),
+                        optional: false,
+                    },
+                    cons: Box::new(Stmt::Expr(Expr::Assign(
+                        AssignOp::Plain,
+                        Box::new(Expr::Ident(done.clone())),
+                        Box::new(Expr::Bool(true)),
+                    ))),
+                    alt: None,
+                },
+                Stmt::Return(Some(Expr::Ident("__r".to_string()))),
+            ],
+            is_async: false,
+        };
+        let ret_fn = FuncLit {
+            name: None,
+            params: vec!["__v".to_string()],
+            body: vec![
+                Stmt::Expr(Expr::Assign(
+                    AssignOp::Plain,
+                    Box::new(Expr::Ident(done.clone())),
+                    Box::new(Expr::Bool(true)),
+                )),
+                Stmt::Return(Some(iter_obj(
+                    Expr::Ident("__v".to_string()),
+                    true,
+                ))),
+            ],
+            is_async: false,
+        };
+        let throw_fn = FuncLit {
+            name: None,
+            params: vec!["__e".to_string()],
+            body: vec![
+                Stmt::Expr(Expr::Assign(
+                    AssignOp::Plain,
+                    Box::new(Expr::Ident(done.clone())),
+                    Box::new(Expr::Bool(true)),
+                )),
+                Stmt::Throw(Expr::Ident("__e".to_string())),
+            ],
+            is_async: false,
+        };
+        out.push(Stmt::VarDecl {
+            kind: DeclKind::Var,
+            decls: vec![(
+                it.clone(),
+                Some(Expr::Object(vec![
+                    Prop {
+                        key: PropKey::Ident("next".to_string()),
+                        value: Expr::Func(Box::new(next_fn)),
+                    },
+                    Prop {
+                        key: PropKey::Str("return".to_string()),
+                        value: Expr::Func(Box::new(ret_fn)),
+                    },
+                    Prop {
+                        key: PropKey::Str("throw".to_string()),
+                        value: Expr::Func(Box::new(throw_fn)),
+                    },
+                ])),
+            )],
+        });
+        // it['@@iterator'] = function () { return it; }
+        out.push(Stmt::Expr(Expr::Assign(
+            AssignOp::Plain,
+            Box::new(Expr::Member {
+                obj: Box::new(Expr::Ident(it.clone())),
+                prop: MemberProp::Static("@@iterator".to_string()),
+                optional: false,
+            }),
+            Box::new(Expr::Func(Box::new(FuncLit {
+                name: None,
+                params: Vec::new(),
+                body: vec![Stmt::Return(Some(Expr::Ident(it.clone())))],
+                is_async: false,
+            }))),
+        )));
+        out.push(Stmt::Return(Some(Expr::Ident(it))));
+        Ok(out)
     }
 
     /// Parses `(params) { body }` (name handled by the caller).
@@ -1429,9 +2676,20 @@ impl Parser {
         name: Option<String>,
         is_async: bool,
     ) -> Result<FuncLit, ParseError> {
+        self.func_lit_g(name, is_async, false)
+    }
+
+    fn func_lit_g(
+        &mut self,
+        name: Option<String>,
+        is_async: bool,
+        is_gen: bool,
+    ) -> Result<FuncLit, ParseError> {
         let (params, prologue) = self.arrow_params()?;
         let saved = self.in_async;
         self.in_async = is_async;
+        let saved_gen = self.in_generator;
+        self.in_generator = is_gen;
         // the for-head no-in restriction never crosses a function
         // boundary (`for(var B=function(){..."x" in y...};;)`)
         let saved_no_in = self.no_in;
@@ -1439,11 +2697,15 @@ impl Parser {
         let body = self.block();
         self.no_in = saved_no_in;
         self.in_async = saved;
+        self.in_generator = saved_gen;
         let mut body = body?;
         if !prologue.is_empty() {
             let mut full = prologue;
             full.append(&mut body);
             body = full;
+        }
+        if is_gen {
+            body = self.generator_transform(body)?;
         }
         Ok(FuncLit { name, params, body, is_async })
     }

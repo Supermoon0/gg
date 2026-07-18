@@ -29,6 +29,10 @@ pub struct VmError {
     /// The JS value of an explicit `throw`; engine errors carry None
     /// and materialize as an Error-like object when a catch needs one.
     pub value: Option<Value>,
+    /// Error class an engine-raised error materializes as ("Error",
+    /// "TypeError", ...). Lets `catch (e)` see e.name/instanceof match
+    /// what real JS would throw.
+    pub kind: &'static str,
 }
 
 impl std::fmt::Debug for VmError {
@@ -38,7 +42,18 @@ impl std::fmt::Debug for VmError {
 }
 
 fn err<T>(msg: impl Into<String>) -> Result<T, VmError> {
-    Err(VmError { msg: msg.into(), value: None })
+    Err(VmError { msg: msg.into(), value: None, kind: "Error" })
+}
+
+/// An engine-raised error that real JS specifies as a TypeError
+/// (member access on nullish, calling a non-function, ...).
+fn type_err<T>(msg: impl Into<String>) -> Result<T, VmError> {
+    Err(VmError { msg: msg.into(), value: None, kind: "TypeError" })
+}
+
+/// As `type_err`, for ReferenceErrors (unresolved names, TDZ).
+fn ref_err<T>(msg: impl Into<String>) -> Result<T, VmError> {
+    Err(VmError { msg: msg.into(), value: None, kind: "ReferenceError" })
 }
 
 const MAX_FRAMES: usize = 4096;
@@ -51,6 +66,8 @@ const MAX_NATIVE_DEPTH: usize = 24;
 
 /// `document` is a DOM-node value with this sentinel index.
 pub(super) const DOC_NODE: u32 = u32::MAX;
+/// Listener key for `window.addEventListener` (load/resize/...).
+pub(super) const WINDOW_NODE: u32 = u32::MAX - 1;
 
 /// A compiled script plus its bindings into the shared VM namespace.
 pub(super) struct LoadedModule {
@@ -97,6 +114,12 @@ pub(super) enum ClosureRec {
         this_capture: Option<Value>,
     },
     Native(Native),
+    /// Function.prototype.bind: fixed this + partially applied args.
+    Bound {
+        target: Value,
+        this_val: Value,
+        bound: Vec<Value>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -107,6 +130,34 @@ pub(super) enum Native {
     /// accepts anything, returns undefined (window.addEventListener
     /// and friends — enough for feature-detecting bundles to proceed)
     Noop,
+    /// Web Storage op on localStorage (session=false) or sessionStorage
+    /// (session=true). op: 0=getItem 1=setItem 2=removeItem 3=clear
+    /// 4=key
+    Storage { session: bool, op: u8 },
+    /// RegExp(pattern, flags) — builds the same object as a literal
+    RegExpCtor,
+    /// requestAnimationFrame: a ~16ms one-shot timer whose callback
+    /// receives the (virtual) timestamp
+    Raf,
+    /// performance.now(): the virtual clock in ms
+    PerfNow,
+    /// element.classList.<op>; op: 0=add 1=remove 2=contains 3=toggle
+    ClassList { node: u32, op: u8 },
+    /// window.addEventListener / removeEventListener (listeners keyed
+    /// on WINDOW_NODE so lifecycle events can find them)
+    WinEvent { add: bool },
+    /// encodeURI(Component)/decodeURI(Component)
+    UriCoder { encode: bool, component: bool },
+    /// Map()/WeakMap() constructor (weak = no difference: no GC)
+    MapCtor,
+    /// Set()/WeakSet() constructor
+    SetCtor,
+    /// Map method bound to its instance. op: 0=get 1=set 2=has
+    /// 3=delete 4=clear 5=forEach 6=keys 7=values 8=entries
+    MapOp { obj: u32, op: u8 },
+    /// Set method bound to its instance. op: 0=add 1=has 2=delete
+    /// 3=clear 4=forEach 5=values
+    SetOp { obj: u32, op: u8 },
     /// the `Function` constructor stub: returns a function that
     /// returns the global (bundles call `Function("return this")()`
     /// to find the global object; real eval is out of scope)
@@ -175,6 +226,11 @@ pub(super) mod host {
     pub const O_ENTRIES: u16 = 42;
     pub const O_ASSIGN: u16 = 43;
     pub const O_FREEZE: u16 = 44;
+    pub const O_DEFINE_PROP: u16 = 45;
+    pub const O_GET_OWN_PD: u16 = 46;
+    pub const O_CREATE: u16 = 47;
+    pub const O_GET_PROTO: u16 = 48;
+    pub const O_SET_PROTO: u16 = 49;
     pub const A_ISARRAY: u16 = 60;
     pub const A_FROM: u16 = 61;
     pub const N_ISNAN: u16 = 80;
@@ -204,6 +260,9 @@ pub(super) struct Obj {
     /// [[Prototype]]: an object value, or UNDEFINED for none. Property
     /// reads that miss the own shape walk this chain.
     proto: Value,
+    /// this object has entries in St.accessors (checked before the
+    /// side-table lookup so plain objects pay nothing)
+    has_accessors: bool,
 }
 
 /// Sentinel: an Obj that is not a Promise.
@@ -342,6 +401,29 @@ pub(super) struct St {
     /// (closure index, name id) -> static properties on functions
     /// (Object.keys, Array.isArray, F.displayName = ...)
     pub(super) fn_props: HashMap<(u32, u32), Value>,
+    /// (object index, name id) -> (getter, setter) accessor pair
+    /// (Object.defineProperty with get/set; UNDEFINED = absent side)
+    pub(super) accessors: HashMap<(u32, u32), (Value, Value)>,
+    /// Web Storage backing maps (in-memory; not persisted to disk)
+    pub(super) local_storage: HashMap<String, String>,
+    pub(super) session_storage: HashMap<String, String>,
+    /// document.cookie pairs in insertion order (in-memory; not yet
+    /// wired to the network layer)
+    pub(super) cookies: Vec<(String, String)>,
+    /// Map/Set backing stores, keyed by the owning object's index
+    /// (entries in insertion order; lookups are linear strict-eq)
+    pub(super) map_data: HashMap<u32, Vec<(Value, Value)>>,
+    pub(super) set_data: HashMap<u32, Vec<Value>>,
+    /// el.style / el.dataset proxy objects -> their DOM node. Property
+    /// reads/writes on these route to the style / data-* attributes.
+    pub(super) style_nodes: HashMap<u32, u32>,
+    pub(super) dataset_nodes: HashMap<u32, u32>,
+    /// [[Prototype]] of function values (static inheritance:
+    /// `Object.setPrototypeOf(Sub, Sup)`); static reads walk this.
+    pub(super) fn_proto_chain: HashMap<u32, Value>,
+    /// document.readyState ("loading" until the loader fires the
+    /// lifecycle events, then "interactive"/"complete")
+    pub(super) ready_state: &'static str,
     ty_names: [Value; 6],
     /// Compiled RegExp records; an Obj.regex indexes here.
     pub(super) regexes: Vec<RegexRec>,
@@ -415,6 +497,16 @@ impl St {
             known: KnownCtors::default(),
             fn_protos: HashMap::new(),
             fn_props: HashMap::new(),
+            accessors: HashMap::new(),
+            local_storage: HashMap::new(),
+            session_storage: HashMap::new(),
+            cookies: Vec::new(),
+            map_data: HashMap::new(),
+            set_data: HashMap::new(),
+            style_nodes: HashMap::new(),
+            dataset_nodes: HashMap::new(),
+            fn_proto_chain: HashMap::new(),
+            ready_state: "loading",
             ty_names: [Value::UNDEFINED; 6],
             regexes: Vec::new(),
             promises: Vec::new(),
@@ -494,6 +586,7 @@ pub(super) fn new_plain_object(st: &mut St) -> Value {
         promise: PROMISE_NONE,
         regex: REGEX_NONE,
         proto: Value::UNDEFINED,
+        has_accessors: false,
     });
     Value::object((st.objects.len() - 1) as u32)
 }
@@ -507,6 +600,7 @@ fn new_array(st: &mut St, elems: Vec<Value>) -> Value {
         promise: PROMISE_NONE,
         regex: REGEX_NONE,
         proto: Value::UNDEFINED,
+        has_accessors: false,
     });
     Value::object((st.objects.len() - 1) as u32)
 }
@@ -543,9 +637,14 @@ fn new_regex(
     let re = match regex::Regex::new(&full) {
         Ok(re) => re,
         Err(_) => {
-            return err(format!(
-                "unsupported regex /{pattern}/{flags}"
-            ))
+            // JS-only syntax (lone surrogates, backrefs): degrade to a
+            // never-matching regex instead of killing the script —
+            // surrogate ranges cannot match UTF-8 text anyway
+            st.logs.push(format!(
+                "[gg] regex /{pattern}/{flags} unsupported - \
+                 treated as never-matching"
+            ));
+            regex::Regex::new("[^\\s\\S]").unwrap()
         }
     };
     st.regexes.push(RegexRec {
@@ -563,6 +662,7 @@ fn new_regex(
         promise: PROMISE_NONE,
         regex: ri,
         proto: Value::UNDEFINED,
+        has_accessors: false,
     });
     Ok(Value::object((st.objects.len() - 1) as u32))
 }
@@ -842,6 +942,57 @@ pub(super) fn pump(
     issued.into_iter().map(|p| (p.fetch_id, p.url)).collect()
 }
 
+/// Real-time slice of the event loop: fire only work due within the
+/// next `dt_ms` of virtual time, then advance the clock to that point.
+/// (Plain `pump` fast-forwards to quiescence — right for load-time
+/// settling, wrong for a live page where a rAF loop must run at frame
+/// pace, not spin to its budget.)
+pub(super) fn pump_bounded(
+    st: &mut St,
+    mods: &[LoadedModule],
+    budget_max: usize,
+    dt_ms: f64,
+) -> Vec<(u32, String)> {
+    let until = st.now_ms + dt_ms.max(0.0);
+    let mut budget = budget_max;
+    loop {
+        drain_microtasks(st, mods, &mut budget);
+        if budget == 0 {
+            break;
+        }
+        match next_due_timer(st) {
+            Some(i) if st.timers[i].due_ms <= until => {
+                let t = st.timers.remove(i);
+                st.now_ms = st.now_ms.max(t.due_ms);
+                if let Some(iv) = t.interval {
+                    st.timer_seq += 1;
+                    st.timers.push(Timer {
+                        id: t.id,
+                        callback: t.callback,
+                        args: t.args.clone(),
+                        due_ms: st.now_ms + iv.max(0.0),
+                        seq: st.timer_seq,
+                        interval: Some(iv),
+                    });
+                }
+                budget -= 1;
+                st.fuel = DEFAULT_FUEL;
+                if let Err(e) = call_value(st, mods, t.callback, &t.args)
+                {
+                    st.logs.push(format!("[gg-js error] {}", e.msg));
+                }
+            }
+            _ => break,
+        }
+    }
+    st.now_ms = st.now_ms.max(until);
+    let issued = std::mem::take(&mut st.pending_fetches);
+    for p in &issued {
+        st.awaiting.insert(p.fetch_id, p.promise);
+    }
+    issued.into_iter().map(|p| (p.fetch_id, p.url)).collect()
+}
+
 /// Host (driver) settles a fetch: fulfill its promise with a Response.
 pub(super) fn resolve_fetch(st: &mut St, fetch_id: u32, status: u16, body: String) {
     if let Some(pid) = st.awaiting.remove(&fetch_id) {
@@ -1036,8 +1187,19 @@ fn has_own_property(
     obj: Value,
     key: Value,
 ) -> Result<bool, VmError> {
+    if obj.is_function() {
+        // `'name' in fn` — statics, prototype, and callables
+        let name = to_display(st, key);
+        if matches!(name.as_str(),
+                    "prototype" | "call" | "apply" | "bind"
+                        | "length" | "name") {
+            return Ok(true);
+        }
+        let key_id = st.intern_name(&name);
+        return Ok(fn_static_lookup(st, obj.index(), key_id).is_some());
+    }
     if !obj.is_object() {
-        return err("'in' right-hand side is not an object");
+        return type_err("'in' right-hand side is not an object");
     }
     let oi = obj.index() as usize;
     let name = to_display(st, key);
@@ -1064,6 +1226,7 @@ fn has_own_property(
 /// itself in the error so the next gap is visible.
 fn method_ref_dispatch(
     st: &mut St,
+    mods: &[LoadedModule],
     recv: Value,
     key: u32,
     args: &[Value],
@@ -1097,6 +1260,113 @@ fn method_ref_dispatch(
                     .map(|p| p as i32)
                     .unwrap_or(-1);
                 return Ok(Value::int(found));
+            }
+            "join" | "toString" => {
+                let sep = if name == "join" {
+                    match args.first() {
+                        Some(v) if !v.is_undefined() => to_display(st, *v),
+                        _ => ",".to_string(),
+                    }
+                } else {
+                    ",".to_string()
+                };
+                let parts: Vec<String> = elems
+                    .iter()
+                    .map(|&e| {
+                        if e.is_nullish() {
+                            String::new()
+                        } else {
+                            to_display(st, e)
+                        }
+                    })
+                    .collect();
+                return Ok(make_string(st, parts.join(&sep)));
+            }
+            "concat" => {
+                let mut out = elems.clone();
+                for &a in args {
+                    if a.is_object()
+                        && st.objects[a.index() as usize].is_array
+                    {
+                        out.extend(
+                            st.objects[a.index() as usize].elems.clone(),
+                        );
+                    } else {
+                        out.push(a);
+                    }
+                }
+                return Ok(new_array(st, out));
+            }
+            "push" => {
+                let oi = recv.index() as usize;
+                st.objects[oi].elems.extend_from_slice(args);
+                return Ok(Value::int(
+                    st.objects[oi].elems.len() as i32,
+                ));
+            }
+            "pop" => {
+                let oi = recv.index() as usize;
+                return Ok(st.objects[oi]
+                    .elems
+                    .pop()
+                    .unwrap_or(Value::UNDEFINED));
+            }
+            "values" | "keys" | "entries" => {
+                let arr = match name.as_str() {
+                    "keys" => {
+                        let ks: Vec<Value> = (0..elems.len())
+                            .map(|i| Value::int(i as i32))
+                            .collect();
+                        new_array(st, ks)
+                    }
+                    "entries" => {
+                        let ps: Vec<Value> = elems
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &v)| {
+                                new_array(
+                                    st,
+                                    vec![Value::int(i as i32), v],
+                                )
+                            })
+                            .collect();
+                        new_array(st, ps)
+                    }
+                    _ => recv,
+                };
+                return Ok(make_array_iter(st, arr));
+            }
+            "forEach" | "map" | "filter" => {
+                let cb = args
+                    .first()
+                    .copied()
+                    .unwrap_or(Value::UNDEFINED);
+                if !cb.is_function() {
+                    return type_err(format!(
+                        ".{name} callback is not a function"
+                    ));
+                }
+                let mut out: Vec<Value> = Vec::new();
+                for (i, &el) in elems.iter().enumerate() {
+                    let r = call_value(
+                        st, mods, cb,
+                        &[el, Value::int(i as i32), recv],
+                    )?;
+                    match name.as_str() {
+                        "map" => out.push(r),
+                        "filter" => {
+                            if truthy(st, r) {
+                                out.push(el);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                return Ok(if name == "forEach" {
+                    Value::UNDEFINED
+                } else {
+                    new_array(st, out)
+                });
             }
             _ => {
                 return err(format!(
@@ -1165,6 +1435,51 @@ fn method_ref_dispatch(
                 None => -1,
             }))
         }
+        "toExponential" => {
+            let x = recv.to_number_raw();
+            if !x.is_finite() {
+                let d = to_display(st, recv);
+                return Ok(make_string(st, d));
+            }
+            let out = match nums.first().copied() {
+                Some(d) if !d.is_nan() => {
+                    let d = (d.max(0.0).min(100.0)) as usize;
+                    format!("{x:.d$e}")
+                }
+                _ => format!("{x:e}"),
+            };
+            // JS writes a plus on non-negative exponents ("1e+2")
+            let out = if let Some(pos) = out.find('e') {
+                let (m, e) = out.split_at(pos);
+                if e.as_bytes().get(1) == Some(&b'-') {
+                    out.clone()
+                } else {
+                    format!("{m}e+{}", &e[1..])
+                }
+            } else {
+                out
+            };
+            Ok(make_string(st, out))
+        }
+        "toPrecision" => {
+            let x = recv.to_number_raw();
+            let out = match nums.first().copied() {
+                Some(d) if d.is_finite() && d >= 1.0 => {
+                    let d = d as usize;
+                    // width-precision significant digits
+                    let s = format!("{x:.*}", d.saturating_sub(
+                        (x.abs().max(1e-300).log10().floor() as i64
+                            + 1).max(0) as usize,
+                    ));
+                    s
+                }
+                _ => {
+                    let d = to_display(st, recv);
+                    d
+                }
+            };
+            Ok(make_string(st, out))
+        }
         "toString" => {
             // number radix support: (255).toString(16) -> "ff"
             if recv.is_number() && !nums.is_empty() && !nums[0].is_nan() {
@@ -1201,16 +1516,481 @@ fn method_ref_dispatch(
         } else {
             recv
         }),
+        "replace" => {
+            let pat = args.first().copied().unwrap_or(Value::UNDEFINED);
+            let rep = args
+                .get(1)
+                .map(|&v| to_display(st, v))
+                .unwrap_or_default();
+            let out = if let Some(ri) = regex_index(st, pat) {
+                if st.regexes[ri].global {
+                    st.regexes[ri].re.replace_all(&s, rep.as_str())
+                        .into_owned()
+                } else {
+                    st.regexes[ri].re.replace(&s, rep.as_str())
+                        .into_owned()
+                }
+            } else {
+                let needle = to_display(st, pat);
+                s.replacen(&needle, &rep, 1)
+            };
+            Ok(make_string(st, out))
+        }
+        "split" => {
+            let pat = args.first().copied().unwrap_or(Value::UNDEFINED);
+            let parts: Vec<Value> = if let Some(ri) = regex_index(st, pat)
+            {
+                let raw: Vec<String> = st.regexes[ri]
+                    .re
+                    .split(&s)
+                    .map(|p| p.to_string())
+                    .collect();
+                raw.into_iter()
+                    .map(|p| make_string(st, p))
+                    .collect()
+            } else if pat.is_undefined() {
+                vec![make_string(st, s.clone())]
+            } else {
+                let needle = to_display(st, pat);
+                if needle.is_empty() {
+                    s.chars()
+                        .map(|c| make_string(st, c.to_string()))
+                        .collect()
+                } else {
+                    s.split(&needle)
+                        .map(|p| make_string(st, p.to_string()))
+                        .collect()
+                }
+            };
+            Ok(new_array(st, parts))
+        }
+        "propertyIsEnumerable" => {
+            let k = args.first().copied().unwrap_or(Value::UNDEFINED);
+            Ok(Value::boolean(
+                recv.is_object() && has_own_property(st, recv, k)?,
+            ))
+        }
+        "isPrototypeOf" => {
+            let x = args.first().copied().unwrap_or(Value::UNDEFINED);
+            if !recv.is_object() || !x.is_object() {
+                return Ok(Value::boolean(false));
+            }
+            let mut p = st.objects[x.index() as usize].proto;
+            for _ in 0..16 {
+                if !p.is_object() {
+                    return Ok(Value::boolean(false));
+                }
+                if p == recv {
+                    return Ok(Value::boolean(true));
+                }
+                p = st.objects[p.index() as usize].proto;
+            }
+            Ok(Value::boolean(false))
+        }
         "hasOwnProperty" => {
             let k = args.first().copied().unwrap_or(Value::UNDEFINED);
             Ok(Value::boolean(
                 recv.is_object() && has_own_property(st, recv, k)?,
             ))
         }
+        // array-iterator protocol (see make_array_iter)
+        "next" if recv.is_object() => {
+            let ii = recv.index() as usize;
+            let ka = st.intern_name("__it_arr");
+            let Some(arr) = raw_get_prop(st, ii, ka) else {
+                return type_err(".next() on a non-iterator");
+            };
+            let ki = st.intern_name("__it_i");
+            let i = raw_get_prop(st, ii, ki)
+                .map(|v| v.to_number_raw() as usize)
+                .unwrap_or(0);
+            let elems = &st.objects[arr.index() as usize].elems;
+            let (value, done) = if i < elems.len() {
+                (elems[i], false)
+            } else {
+                (Value::UNDEFINED, true)
+            };
+            raw_set_prop(st, ii, ki, Value::int(i as i32 + 1));
+            let out = new_plain_object(st);
+            let oi = out.index() as usize;
+            let kv = st.intern_name("value");
+            raw_set_prop(st, oi, kv, value);
+            let kd = st.intern_name("done");
+            raw_set_prop(st, oi, kd, Value::boolean(done));
+            Ok(out)
+        }
+        // @@iterator(): arrays/Sets/Maps hand out a fresh iterator;
+        // iterator objects return themselves
+        "@@iterator" if recv.is_object() => {
+            let oi = recv.index();
+            if st.objects[oi as usize].is_array {
+                return Ok(make_array_iter(st, recv));
+            }
+            if let Some(vals) = st.set_data.get(&oi) {
+                let vals = vals.clone();
+                let a = new_array(st, vals);
+                return Ok(make_array_iter(st, a));
+            }
+            if let Some(entries) = st.map_data.get(&oi) {
+                let entries = entries.clone();
+                let pairs: Vec<Value> = entries
+                    .iter()
+                    .map(|&(k, v)| new_array(st, vec![k, v]))
+                    .collect();
+                let a = new_array(st, pairs);
+                return Ok(make_array_iter(st, a));
+            }
+            Ok(recv)
+        }
+        // Array.prototype.values/keys/entries: real iterators
+        "values" | "keys" | "entries"
+            if recv.is_object()
+                && st.objects[recv.index() as usize].is_array =>
+        {
+            let name = st.names[key as usize].clone();
+            let elems =
+                st.objects[recv.index() as usize].elems.clone();
+            let arr = match name.as_str() {
+                "keys" => {
+                    let ks: Vec<Value> = (0..elems.len())
+                        .map(|i| Value::int(i as i32))
+                        .collect();
+                    new_array(st, ks)
+                }
+                "entries" => {
+                    let ps: Vec<Value> = elems
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &v)| {
+                            new_array(
+                                st,
+                                vec![Value::int(i as i32), v],
+                            )
+                        })
+                        .collect();
+                    new_array(st, ps)
+                }
+                _ => recv,
+            };
+            Ok(make_array_iter(st, arr))
+        }
+        // extracted Set/Map prototype methods re-applied to instances
+        _ if recv.is_object()
+            && (st.set_data.contains_key(&recv.index())
+                || st.map_data.contains_key(&recv.index())) =>
+        {
+            let name = st.names[key as usize].clone();
+            let is_set = st.set_data.contains_key(&recv.index());
+            let n = if is_set {
+                let op = match name.as_str() {
+                    "add" => 0u8,
+                    "has" => 1,
+                    "delete" => 2,
+                    "clear" => 3,
+                    "forEach" => 4,
+                    "values" | "keys" | "entries" => 5,
+                    _ => {
+                        return type_err(format!(
+                            "Set has no .{name}()"
+                        ))
+                    }
+                };
+                Native::SetOp { obj: recv.index(), op }
+            } else {
+                let op = match name.as_str() {
+                    "get" => 0u8,
+                    "set" => 1,
+                    "has" => 2,
+                    "delete" => 3,
+                    "clear" => 4,
+                    "forEach" => 5,
+                    "keys" => 6,
+                    "values" => 7,
+                    "entries" => 8,
+                    _ => {
+                        return type_err(format!(
+                            "Map has no .{name}()"
+                        ))
+                    }
+                };
+                Native::MapOp { obj: recv.index(), op }
+            };
+            let top = st.regs.len();
+            st.regs.extend_from_slice(args);
+            let r = do_native(st, mods, n, top, args.len() as u8);
+            st.regs.truncate(top);
+            r
+        }
+        // extracted RegExp.prototype.test/exec re-applied to a regex
+        // (core-js regexp-exec calls them via functionCall)
+        "test" if regex_index(st, recv).is_some() => {
+            let ri = regex_index(st, recv).unwrap();
+            let subject = args
+                .first()
+                .map(|&v| to_display(st, v))
+                .unwrap_or_default();
+            Ok(Value::boolean(st.regexes[ri].re.is_match(&subject)))
+        }
+        "exec" if regex_index(st, recv).is_some() => {
+            let ri = regex_index(st, recv).unwrap();
+            let subject = args
+                .first()
+                .map(|&v| to_display(st, v))
+                .unwrap_or_default();
+            let groups: Option<Vec<Option<String>>> = st.regexes[ri]
+                .re
+                .captures(&subject)
+                .map(|caps| {
+                    caps.iter()
+                        .map(|m| m.map(|mm| mm.as_str().to_string()))
+                        .collect()
+                });
+            Ok(match groups {
+                None => Value::NULL,
+                Some(gs) => {
+                    let vals: Vec<Value> = gs
+                        .into_iter()
+                        .map(|g| match g {
+                            Some(s) => push_str(st, s),
+                            None => Value::UNDEFINED,
+                        })
+                        .collect();
+                    new_array(st, vals)
+                }
+            })
+        }
+        // calling any method on nullish is a real TypeError (core-js
+        // feature tests rely on catching it)
+        other if recv.is_nullish() => type_err(format!(
+            "cannot call .{other}() of {}",
+            if recv.is_null() { "null" } else { "undefined" },
+        )),
         other => err(format!(
-            "extracted builtin .{other}() is not supported yet"
+            "extracted builtin .{other}() on {recv:?} is not \
+             supported yet"
         )),
     }
+}
+
+/// A property set on the window object (the global namespace's other
+/// half): `window.X = v` must be readable as bare `X`.
+fn window_prop(st: &St, key: u32) -> Option<Value> {
+    let w = st.known.window;
+    if !w.is_object() {
+        return None;
+    }
+    match lookup_prop(st, w.index() as usize, key) {
+        PropHit::Data(v) => Some(v),
+        _ => None,
+    }
+}
+
+/// A real JS iterator over an array's elements: a plain object with
+/// receiver-dispatched `next` (extraction-safe — core-js pulls `next`
+/// off one iterator and applies it to another).
+pub(super) fn make_array_iter(st: &mut St, arr: Value) -> Value {
+    let it = new_plain_object(st);
+    let ii = it.index() as usize;
+    let ka = st.intern_name("__it_arr");
+    raw_set_prop(st, ii, ka, arr);
+    let ki = st.intern_name("__it_i");
+    raw_set_prop(st, ii, ki, Value::int(0));
+    let kn = st.intern_name("next");
+    let f = make_native(st, Native::MethodRef(kn));
+    raw_set_prop(st, ii, kn, f);
+    let kit = st.intern_name("@@iterator");
+    let fit = make_native(st, Native::MethodRef(kit));
+    raw_set_prop(st, ii, kit, fit);
+    it
+}
+
+/// Static property lookup on a function, walking the function
+/// [[Prototype]] chain (`Object.setPrototypeOf(Sub, Sup)` statics).
+fn fn_static_lookup(st: &St, fidx: u32, key: u32) -> Option<Value> {
+    let mut cur = fidx;
+    for _ in 0..8 {
+        if let Some(&v) = st.fn_props.get(&(cur, key)) {
+            return Some(v);
+        }
+        match st.fn_proto_chain.get(&cur) {
+            Some(p) if p.is_function() => cur = p.index(),
+            Some(p) if p.is_object() => {
+                return match lookup_prop(st, p.index() as usize, key) {
+                    PropHit::Data(v) => Some(v),
+                    _ => None,
+                };
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// camelCase -> kebab-case (fontSize -> font-size)
+fn camel_to_kebab(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for c in s.chars() {
+        if c.is_ascii_uppercase() {
+            out.push('-');
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// One declaration's value out of an inline style string, or "".
+fn style_attr_get(style: &str, prop: &str) -> String {
+    for decl in style.split(';') {
+        if let Some((k, v)) = decl.split_once(':') {
+            if k.trim().eq_ignore_ascii_case(prop) {
+                return v.trim().to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Upsert (or remove, when `value` is empty) one declaration in an
+/// inline style string.
+fn style_attr_set(style: &str, prop: &str, value: &str) -> String {
+    let mut decls: Vec<(String, String)> = style
+        .split(';')
+        .filter_map(|d| {
+            d.split_once(':').map(|(k, v)| {
+                (k.trim().to_string(), v.trim().to_string())
+            })
+        })
+        .filter(|(k, _)| !k.is_empty())
+        .collect();
+    decls.retain(|(k, _)| !k.eq_ignore_ascii_case(prop));
+    if !value.is_empty() {
+        decls.push((prop.to_string(), value.to_string()));
+    }
+    decls
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The array a `for-of` walks. Real arrays pass through; Map/Set
+/// materialize from their backing store; anything with `@@iterator`
+/// (generator objects, custom iterables) has the protocol drained
+/// into a fresh array (budgeted — a non-terminating iterator errors
+/// instead of hanging).
+fn materialize_iterable(
+    st: &mut St,
+    mods: &[LoadedModule],
+    ov: Value,
+) -> Result<Value, VmError> {
+    if !ov.is_object() {
+        return Ok(ov); // strings keep the existing indexed walk
+    }
+    let oi = ov.index();
+    if st.objects[oi as usize].is_array {
+        return Ok(ov);
+    }
+    if let Some(entries) = st.map_data.get(&oi) {
+        let entries = entries.clone();
+        let pairs: Vec<Value> = entries
+            .iter()
+            .map(|&(k, v)| new_array(st, vec![k, v]))
+            .collect();
+        return Ok(new_array(st, pairs));
+    }
+    if let Some(vals) = st.set_data.get(&oi) {
+        let vals = vals.clone();
+        return Ok(new_array(st, vals));
+    }
+    let itk = st.intern_name("@@iterator");
+    let f = match lookup_prop(st, oi as usize, itk) {
+        PropHit::Data(f) if f.is_function() => f,
+        _ => return Ok(ov), // no protocol: existing behavior
+    };
+    let iter = call_value_this(st, mods, f, Some(ov), &[])?;
+    if !iter.is_object() {
+        return type_err("@@iterator did not return an object");
+    }
+    let nextk = st.intern_name("next");
+    let donek = st.intern_name("done");
+    let valuek = st.intern_name("value");
+    let mut out: Vec<Value> = Vec::new();
+    for _ in 0..100_000 {
+        let next_f = raw_get_prop(st, iter.index() as usize, nextk)
+            .unwrap_or(Value::UNDEFINED);
+        if !next_f.is_function() {
+            return type_err("iterator .next is not a function");
+        }
+        let r = call_value_this(st, mods, next_f, Some(iter), &[])?;
+        if !r.is_object() {
+            return type_err("iterator result is not an object");
+        }
+        let ri = r.index() as usize;
+        let done = raw_get_prop(st, ri, donek)
+            .unwrap_or(Value::UNDEFINED);
+        if truthy(st, done) {
+            return Ok(new_array(st, out));
+        }
+        out.push(
+            raw_get_prop(st, ri, valuek).unwrap_or(Value::UNDEFINED),
+        );
+    }
+    err("iterator did not terminate within the for-of budget")
+}
+
+/// Accessor-aware property lookup along the prototype chain.
+pub(super) enum PropHit {
+    Data(Value),
+    Getter(Value),
+    Missing,
+}
+
+pub(super) fn lookup_prop(st: &St, oi: usize, key: u32) -> PropHit {
+    let mut oi = oi;
+    for _ in 0..16 {
+        let o = &st.objects[oi];
+        if o.has_accessors {
+            if let Some(&(g, _s)) = st.accessors.get(&(oi as u32, key)) {
+                return PropHit::Getter(g);
+            }
+        }
+        if let Some(&slot) = st.shapes[o.shape as usize].props.get(&key) {
+            return PropHit::Data(o.slots[slot as usize]);
+        }
+        if !o.proto.is_object() {
+            return PropHit::Missing;
+        }
+        oi = o.proto.index() as usize;
+    }
+    PropHit::Missing
+}
+
+/// The setter for `key` visible from `oi` (own first, then the chain),
+/// unless an own data property shadows it.
+fn lookup_setter(st: &St, oi: usize, key: u32) -> Option<Value> {
+    let mut oi = oi;
+    for depth in 0..16 {
+        let o = &st.objects[oi];
+        if o.has_accessors {
+            if let Some(&(_g, s)) = st.accessors.get(&(oi as u32, key)) {
+                return if s.is_function() { Some(s) } else { None };
+            }
+        }
+        // a data property at any level means plain assignment wins
+        // (own level was already checked by the caller for depth 0)
+        if depth > 0
+            && st.shapes[o.shape as usize].props.contains_key(&key)
+        {
+            return None;
+        }
+        if !o.proto.is_object() {
+            return None;
+        }
+        oi = o.proto.index() as usize;
+    }
+    None
 }
 
 /// A function's .prototype object, created on first touch with a
@@ -1325,7 +2105,7 @@ fn instance_of(st: &St, x: Value, ctor: Value) -> Result<bool, VmError> {
         }
         return Ok(false);
     }
-    err("right-hand side of 'instanceof' is not callable")
+    Ok(false) // tolerate stub/non-callable RHS (spec: TypeError)
 }
 
 fn to_display(st: &mut St, v: Value) -> String {
@@ -1399,10 +2179,12 @@ fn concat(st: &mut St, x: Value, y: Value) -> Value {
 
 fn do_native(
     st: &mut St,
+    mods: &[LoadedModule],
     n: Native,
     args_base: usize,
     argc: u8,
 ) -> Result<Value, VmError> {
+    let _ = mods; // most natives don't call back into JS
     match n {
         Native::ConsoleLog => {
             let line = (0..argc as usize)
@@ -1413,12 +2195,317 @@ fn do_native(
             Ok(Value::UNDEFINED)
         }
         Native::Noop => Ok(Value::UNDEFINED),
+        Native::Storage { session, op } => {
+            let arg0 = |st: &mut St| -> String {
+                if argc > 0 {
+                    to_display(st, st.regs[args_base])
+                } else {
+                    String::new()
+                }
+            };
+            match op {
+                0 => {
+                    // getItem: present -> string, absent -> null
+                    let k = arg0(st);
+                    let store = if session {
+                        &st.session_storage
+                    } else {
+                        &st.local_storage
+                    };
+                    match store.get(&k) {
+                        Some(v) => {
+                            let v = v.clone();
+                            Ok(push_str(st, v))
+                        }
+                        None => Ok(Value::NULL),
+                    }
+                }
+                1 => {
+                    // setItem(key, value)
+                    let k = arg0(st);
+                    let v = if argc > 1 {
+                        to_display(st, st.regs[args_base + 1])
+                    } else {
+                        String::new()
+                    };
+                    if session {
+                        st.session_storage.insert(k, v);
+                    } else {
+                        st.local_storage.insert(k, v);
+                    }
+                    Ok(Value::UNDEFINED)
+                }
+                2 => {
+                    let k = arg0(st);
+                    if session {
+                        st.session_storage.remove(&k);
+                    } else {
+                        st.local_storage.remove(&k);
+                    }
+                    Ok(Value::UNDEFINED)
+                }
+                3 => {
+                    if session {
+                        st.session_storage.clear();
+                    } else {
+                        st.local_storage.clear();
+                    }
+                    Ok(Value::UNDEFINED)
+                }
+                _ => {
+                    // key(n): nth key in insertion order, or null
+                    let n = if argc > 0 {
+                        st.regs[args_base].to_number_raw() as usize
+                    } else {
+                        0
+                    };
+                    let store = if session {
+                        &st.session_storage
+                    } else {
+                        &st.local_storage
+                    };
+                    match store.keys().nth(n) {
+                        Some(k) => {
+                            let k = k.clone();
+                            Ok(push_str(st, k))
+                        }
+                        None => Ok(Value::NULL),
+                    }
+                }
+            }
+        }
+        Native::MapCtor | Native::SetCtor => {
+            let is_map = matches!(n, Native::MapCtor);
+            let obj = new_plain_object(st);
+            let oi = obj.index();
+            if is_map {
+                st.map_data.insert(oi, Vec::new());
+                for (m, op) in [("get", 0u8), ("set", 1), ("has", 2),
+                                ("delete", 3), ("clear", 4),
+                                ("forEach", 5), ("keys", 6),
+                                ("values", 7), ("entries", 8)] {
+                    let k = st.intern_name(m);
+                    let f = make_native(
+                        st, Native::MapOp { obj: oi, op });
+                    raw_set_prop(st, oi as usize, k, f);
+                }
+            } else {
+                st.set_data.insert(oi, Vec::new());
+                for (m, op) in [("add", 0u8), ("has", 1),
+                                ("delete", 2), ("clear", 3),
+                                ("forEach", 4), ("values", 5),
+                                ("keys", 5), ("entries", 5)] {
+                    let k = st.intern_name(m);
+                    let f = make_native(
+                        st, Native::SetOp { obj: oi, op });
+                    raw_set_prop(st, oi as usize, k, f);
+                }
+            }
+            let szk = st.intern_name("size");
+            raw_set_prop(st, oi as usize, szk, Value::int(0));
+            // optional iterable seed: array of pairs (Map) / values
+            if argc > 0 {
+                let seed = st.regs[args_base];
+                if seed.is_object()
+                    && st.objects[seed.index() as usize].is_array
+                {
+                    let items =
+                        st.objects[seed.index() as usize].elems.clone();
+                    if is_map {
+                        let mut entries = Vec::new();
+                        for it in items {
+                            if it.is_object()
+                                && st.objects[it.index() as usize]
+                                    .is_array
+                                && st.objects[it.index() as usize]
+                                    .elems
+                                    .len()
+                                    >= 2
+                            {
+                                let e = &st.objects
+                                    [it.index() as usize]
+                                    .elems;
+                                entries.push((e[0], e[1]));
+                            }
+                        }
+                        let sz = entries.len() as i32;
+                        st.map_data.insert(oi, entries);
+                        raw_set_prop(
+                            st, oi as usize, szk, Value::int(sz));
+                    } else {
+                        let mut vals: Vec<Value> = Vec::new();
+                        for it in items {
+                            if !vals
+                                .iter()
+                                .any(|&x| strict_eq(st, x, it))
+                            {
+                                vals.push(it);
+                            }
+                        }
+                        let sz = vals.len() as i32;
+                        st.set_data.insert(oi, vals);
+                        raw_set_prop(
+                            st, oi as usize, szk, Value::int(sz));
+                    }
+                }
+            }
+            Ok(obj)
+        }
+        Native::MapOp { obj, op } => {
+            let a0 = if argc > 0 {
+                st.regs[args_base]
+            } else {
+                Value::UNDEFINED
+            };
+            let a1 = if argc > 1 {
+                st.regs[args_base + 1]
+            } else {
+                Value::UNDEFINED
+            };
+            let entries = st.map_data.get(&obj).cloned()
+                .unwrap_or_default();
+            let szk = st.intern_name("size");
+            match op {
+                0 => Ok(entries
+                    .iter()
+                    .find(|(k, _)| strict_eq(st, *k, a0))
+                    .map(|&(_, v)| v)
+                    .unwrap_or(Value::UNDEFINED)),
+                1 => {
+                    let mut e = entries;
+                    if let Some(slot) =
+                        e.iter_mut().find(|(k, _)| strict_eq(st, *k, a0))
+                    {
+                        slot.1 = a1;
+                    } else {
+                        e.push((a0, a1));
+                    }
+                    let sz = e.len() as i32;
+                    st.map_data.insert(obj, e);
+                    raw_set_prop(st, obj as usize, szk, Value::int(sz));
+                    Ok(Value::object(obj))
+                }
+                2 => Ok(Value::boolean(
+                    entries.iter().any(|(k, _)| strict_eq(st, *k, a0)),
+                )),
+                3 => {
+                    let mut e = entries;
+                    let before = e.len();
+                    e.retain(|(k, _)| !strict_eq(st, *k, a0));
+                    let removed = e.len() != before;
+                    let sz = e.len() as i32;
+                    st.map_data.insert(obj, e);
+                    raw_set_prop(st, obj as usize, szk, Value::int(sz));
+                    Ok(Value::boolean(removed))
+                }
+                4 => {
+                    st.map_data.insert(obj, Vec::new());
+                    raw_set_prop(st, obj as usize, szk, Value::int(0));
+                    Ok(Value::UNDEFINED)
+                }
+                5 => {
+                    // forEach(cb): cb(value, key, map)
+                    for (k, v) in entries {
+                        call_value(
+                            st, mods, a0,
+                            &[v, k, Value::object(obj)],
+                        )?;
+                    }
+                    Ok(Value::UNDEFINED)
+                }
+                6 => {
+                    let ks: Vec<Value> =
+                        entries.iter().map(|&(k, _)| k).collect();
+                    let a = new_array(st, ks);
+                    Ok(make_array_iter(st, a))
+                }
+                7 => {
+                    let vs: Vec<Value> =
+                        entries.iter().map(|&(_, v)| v).collect();
+                    let a = new_array(st, vs);
+                    Ok(make_array_iter(st, a))
+                }
+                _ => {
+                    let pairs: Vec<Value> = entries
+                        .iter()
+                        .map(|&(k, v)| new_array(st, vec![k, v]))
+                        .collect();
+                    let a = new_array(st, pairs);
+                    Ok(make_array_iter(st, a))
+                }
+            }
+        }
+        Native::SetOp { obj, op } => {
+            let a0 = if argc > 0 {
+                st.regs[args_base]
+            } else {
+                Value::UNDEFINED
+            };
+            let vals = st.set_data.get(&obj).cloned().unwrap_or_default();
+            let szk = st.intern_name("size");
+            match op {
+                0 => {
+                    let mut v = vals;
+                    if !v.iter().any(|&x| strict_eq(st, x, a0)) {
+                        v.push(a0);
+                    }
+                    let sz = v.len() as i32;
+                    st.set_data.insert(obj, v);
+                    raw_set_prop(st, obj as usize, szk, Value::int(sz));
+                    Ok(Value::object(obj))
+                }
+                1 => Ok(Value::boolean(
+                    vals.iter().any(|&x| strict_eq(st, x, a0)),
+                )),
+                2 => {
+                    let mut v = vals;
+                    let before = v.len();
+                    v.retain(|&x| !strict_eq(st, x, a0));
+                    let removed = v.len() != before;
+                    let sz = v.len() as i32;
+                    st.set_data.insert(obj, v);
+                    raw_set_prop(st, obj as usize, szk, Value::int(sz));
+                    Ok(Value::boolean(removed))
+                }
+                3 => {
+                    st.set_data.insert(obj, Vec::new());
+                    raw_set_prop(st, obj as usize, szk, Value::int(0));
+                    Ok(Value::UNDEFINED)
+                }
+                4 => {
+                    for x in vals {
+                        call_value(
+                            st, mods, a0,
+                            &[x, x, Value::object(obj)],
+                        )?;
+                    }
+                    Ok(Value::UNDEFINED)
+                }
+                _ => {
+                    let a = new_array(st, vals);
+                    Ok(make_array_iter(st, a))
+                }
+            }
+        }
+        Native::RegExpCtor => {
+            let pat = if argc > 0 {
+                to_display(st, st.regs[args_base])
+            } else {
+                String::new()
+            };
+            let flags = if argc > 1 {
+                to_display(st, st.regs[args_base + 1])
+            } else {
+                String::new()
+            };
+            new_regex(st, &pat, &flags)
+        }
         Native::MethodRef(key) => {
             // called directly (no receiver): dispatch against undefined
             let args: Vec<Value> = (0..argc as usize)
                 .map(|k| st.regs[args_base + k])
                 .collect();
-            method_ref_dispatch(st, Value::UNDEFINED, key, &args)
+            method_ref_dispatch(st, mods, Value::UNDEFINED, key, &args)
         }
         Native::FunctionCtor => Ok(make_native(st, Native::ReturnGlobal)),
         Native::ObjectCtor => {
@@ -1505,7 +2592,9 @@ fn do_native(
                 // spec: invalid radix -> NaN (and is_digit(r>36) panics)
                 return Ok(Value::number(f64::NAN));
             }
-            let t = s.trim();
+            let t = s.trim_matches(|c: char| {
+                c.is_whitespace() || c == '\u{feff}'
+            });
             let (neg, digits) = match t.strip_prefix('-') {
                 Some(r) => (true, r),
                 None => (false, t.strip_prefix('+').unwrap_or(t)),
@@ -1523,12 +2612,16 @@ fn do_native(
                 return Ok(Value::number(f64::NAN));
             }
             let s = to_display(st, st.regs[args_base]);
-            let t = s.trim();
-            // longest numeric prefix that parses
+            // JS whitespace includes the BOM (Rust's trim doesn't)
+            let t = s.trim_matches(|c: char| {
+                c.is_whitespace() || c == '\u{feff}'
+            });
+            // longest numeric prefix that parses (char-boundary safe)
             let mut end = 0;
-            for (i, _) in t.char_indices() {
-                if t[..=i].parse::<f64>().is_ok() {
-                    end = i + 1;
+            for (i, ch) in t.char_indices() {
+                let e = i + ch.len_utf8();
+                if t[..e].parse::<f64>().is_ok() {
+                    end = e;
                 }
             }
             Ok(if end == 0 {
@@ -1575,6 +2668,152 @@ fn do_native(
                 interval,
             });
             Ok(Value::int(id as i32))
+        }
+        Native::WinEvent { add } => {
+            let ty = if argc > 0 {
+                to_display(st, st.regs[args_base]).to_lowercase()
+            } else {
+                return Ok(Value::UNDEFINED);
+            };
+            let handler = if argc > 1 {
+                st.regs[args_base + 1]
+            } else {
+                Value::UNDEFINED
+            };
+            if add {
+                if handler.is_function() {
+                    st.listeners
+                        .entry((WINDOW_NODE, ty))
+                        .or_default()
+                        .push(handler);
+                }
+            } else if let Some(v) =
+                st.listeners.get_mut(&(WINDOW_NODE, ty))
+            {
+                v.retain(|&h| h != handler);
+            }
+            Ok(Value::UNDEFINED)
+        }
+        Native::UriCoder { encode, component } => {
+            let s = if argc > 0 {
+                to_display(st, st.regs[args_base])
+            } else {
+                return Ok(push_str(st, "undefined".to_string()));
+            };
+            let out = if encode {
+                let keep = |c: u8| -> bool {
+                    c.is_ascii_alphanumeric()
+                        || matches!(c, b'-' | b'_' | b'.' | b'!' | b'~'
+                            | b'*' | b'\'' | b'(' | b')')
+                        || (!component
+                            && matches!(c, b'#' | b'$' | b'&' | b'+'
+                                | b',' | b'/' | b':' | b';' | b'='
+                                | b'?' | b'@'))
+                };
+                let mut o = String::new();
+                for &b in s.as_bytes() {
+                    if keep(b) {
+                        o.push(b as char);
+                    } else {
+                        o.push_str(&format!("%{b:02X}"));
+                    }
+                }
+                o
+            } else {
+                let bytes = s.as_bytes();
+                let mut o: Vec<u8> = Vec::with_capacity(bytes.len());
+                let mut i = 0;
+                while i < bytes.len() {
+                    let decoded = if bytes[i] == b'%' {
+                        bytes
+                            .get(i + 1..i + 3)
+                            .and_then(|h| std::str::from_utf8(h).ok())
+                            .and_then(|h| u8::from_str_radix(h, 16).ok())
+                    } else {
+                        None
+                    };
+                    match decoded {
+                        Some(b) => {
+                            o.push(b);
+                            i += 3;
+                        }
+                        None => {
+                            o.push(bytes[i]);
+                            i += 1;
+                        }
+                    }
+                }
+                String::from_utf8_lossy(&o).into_owned()
+            };
+            Ok(push_str(st, out))
+        }
+        Native::Raf => {
+            if argc == 0 || !st.regs[args_base].is_function() {
+                return Ok(Value::int(0));
+            }
+            let cb = st.regs[args_base];
+            st.next_timer_id += 1;
+            st.timer_seq += 1;
+            let id = st.next_timer_id;
+            let due = st.now_ms + 16.0;
+            st.timers.push(Timer {
+                id,
+                callback: cb,
+                args: vec![Value::number(due)],
+                due_ms: due,
+                seq: st.timer_seq,
+                interval: None,
+            });
+            Ok(Value::int(id as i32))
+        }
+        Native::PerfNow => Ok(Value::number(st.now_ms)),
+        Native::ClassList { node, op } => {
+            let doc = need_doc(st)?;
+            let current = doc
+                .borrow()
+                .nodes[node as usize]
+                .attr("class")
+                .unwrap_or("")
+                .to_string();
+            let mut classes: Vec<String> = current
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            let args: Vec<String> = (0..argc as usize)
+                .map(|k| to_display(st, st.regs[args_base + k]))
+                .collect();
+            let mut result = Value::UNDEFINED;
+            match op {
+                0 => {
+                    for a in &args {
+                        if !classes.iter().any(|c| c == a) {
+                            classes.push(a.clone());
+                        }
+                    }
+                }
+                1 => classes.retain(|c| !args.iter().any(|a| a == c)),
+                2 => {
+                    let a = args.first().cloned().unwrap_or_default();
+                    return Ok(Value::boolean(
+                        classes.iter().any(|c| *c == a),
+                    ));
+                }
+                _ => {
+                    let a = args.first().cloned().unwrap_or_default();
+                    if let Some(i) =
+                        classes.iter().position(|c| *c == a)
+                    {
+                        classes.remove(i);
+                        result = Value::boolean(false);
+                    } else {
+                        classes.push(a);
+                        result = Value::boolean(true);
+                    }
+                }
+            }
+            let joined = classes.join(" ");
+            doc.borrow_mut().set_attr(node as usize, "class", &joined);
+            Ok(result)
         }
         Native::ClearTimeout => {
             if argc > 0 {
@@ -1781,6 +3020,202 @@ fn host_fn(
             Ok(target)
         }
         O_FREEZE => Ok(argv!(0)), // no-op (we don't enforce immutability)
+        O_DEFINE_PROP => {
+            let obj = argv!(0);
+            if obj.is_function() {
+                // defineProperty on a function: value descriptors land
+                // in the static-props table ("prototype" swaps the
+                // prototype); accessors are accepted and ignored
+                let key_name = to_display(st, argv!(1));
+                let key = st.intern_name(&key_name);
+                let desc = argv!(2);
+                if desc.is_object() {
+                    let val_id = st.intern_name("value");
+                    if let Some(v) = raw_get_prop(
+                        st, desc.index() as usize, val_id)
+                    {
+                        if key == st.ids.prototype {
+                            st.fn_protos.insert(obj.index(), v);
+                        } else {
+                            st.fn_props.insert((obj.index(), key), v);
+                        }
+                    }
+                }
+                return Ok(obj);
+            }
+            if !obj.is_object() {
+                return err("defineProperty needs an object");
+            }
+            let oi = obj.index() as usize;
+            let key_name = to_display(st, argv!(1));
+            let key = st.intern_name(&key_name);
+            let desc = argv!(2);
+            if !desc.is_object() {
+                return err("defineProperty needs a descriptor object");
+            }
+            let di = desc.index() as usize;
+            let get_id = st.intern_name("get");
+            let set_id = st.intern_name("set");
+            let val_id = st.intern_name("value");
+            let g = raw_get_prop(st, di, get_id)
+                .unwrap_or(Value::UNDEFINED);
+            let s = raw_get_prop(st, di, set_id)
+                .unwrap_or(Value::UNDEFINED);
+            if g.is_function() || s.is_function() {
+                st.accessors.insert((oi as u32, key), (g, s));
+                st.objects[oi].has_accessors = true;
+            } else if let Some(v) = raw_get_prop(st, di, val_id) {
+                raw_set_prop(st, oi, key, v);
+            }
+            Ok(obj)
+        }
+        O_GET_OWN_PD => {
+            let obj = argv!(0);
+            if obj.is_function() {
+                // builtin-constructor property copying (core-js):
+                // answer for statics; prototype only on user functions
+                let key_name = to_display(st, argv!(1));
+                let Some(&key) = st.name_ids.get(&key_name) else {
+                    return Ok(Value::UNDEFINED);
+                };
+                let v = if key == st.ids.prototype {
+                    match st.closures[obj.index() as usize] {
+                        ClosureRec::User { .. } => {
+                            Some(fn_prototype(st, obj))
+                        }
+                        _ => None, // native bind etc: spec says none
+                    }
+                } else {
+                    st.fn_props.get(&(obj.index(), key)).copied()
+                };
+                let Some(v) = v else {
+                    return Ok(Value::UNDEFINED);
+                };
+                let out = new_plain_object(st);
+                let pi = out.index() as usize;
+                let t = Value::boolean(true);
+                let vid = st.intern_name("value");
+                let wid = st.intern_name("writable");
+                let eid = st.intern_name("enumerable");
+                let cid = st.intern_name("configurable");
+                raw_set_prop(st, pi, vid, v);
+                raw_set_prop(st, pi, wid, t);
+                raw_set_prop(st, pi, eid, t);
+                raw_set_prop(st, pi, cid, t);
+                return Ok(out);
+            }
+            if !obj.is_object() {
+                return Ok(Value::UNDEFINED);
+            }
+            let oi = obj.index() as usize;
+            let key_name = to_display(st, argv!(1));
+            let Some(&key) = st.name_ids.get(&key_name) else {
+                return Ok(Value::UNDEFINED);
+            };
+            let acc = if st.objects[oi].has_accessors {
+                st.accessors.get(&(oi as u32, key)).copied()
+            } else {
+                None
+            };
+            let own = {
+                let o = &st.objects[oi];
+                st.shapes[o.shape as usize]
+                    .props
+                    .get(&key)
+                    .map(|&slot| o.slots[slot as usize])
+            };
+            let out = new_plain_object(st);
+            let pi = out.index() as usize;
+            let t = Value::boolean(true);
+            if let Some((g, s)) = acc {
+                let gid = st.intern_name("get");
+                let sid = st.intern_name("set");
+                raw_set_prop(st, pi, gid, g);
+                raw_set_prop(st, pi, sid, s);
+            } else if let Some(v) = own {
+                let vid = st.intern_name("value");
+                let wid = st.intern_name("writable");
+                raw_set_prop(st, pi, vid, v);
+                raw_set_prop(st, pi, wid, t);
+            } else {
+                return Ok(Value::UNDEFINED);
+            }
+            let eid = st.intern_name("enumerable");
+            let cid = st.intern_name("configurable");
+            raw_set_prop(st, pi, eid, t);
+            raw_set_prop(st, pi, cid, t);
+            Ok(out)
+        }
+        O_CREATE => {
+            let proto = argv!(0);
+            let out = new_plain_object(st);
+            if proto.is_object() {
+                st.objects[out.index() as usize].proto = proto;
+            }
+            // optional property-descriptor map (Babel _inherits):
+            // plain {value} descriptors become data properties
+            let descs = argv!(1);
+            if descs.is_object() {
+                let di = descs.index() as usize;
+                let shape = st.objects[di].shape;
+                let props: Vec<(u32, u16)> = st.shapes[shape as usize]
+                    .props
+                    .iter()
+                    .map(|(&a, &s)| (a, s))
+                    .collect();
+                for (atom, slot) in props {
+                    let desc = st.objects[di].slots[slot as usize];
+                    if desc.is_object() {
+                        let vk = st.intern_name("value");
+                        if let Some(v) = raw_get_prop(
+                            st, desc.index() as usize, vk)
+                        {
+                            raw_set_prop(
+                                st, out.index() as usize, atom, v);
+                        }
+                    }
+                }
+            }
+            Ok(out)
+        }
+        O_GET_PROTO => {
+            let v = argv!(0);
+            Ok(if v.is_object() {
+                let p = st.objects[v.index() as usize].proto;
+                if !p.is_object() && st.known.object.is_function() {
+                    // a plain object's [[Prototype]] is
+                    // Object.prototype (ours store UNDEFINED); the
+                    // canonical prototype itself ends the chain
+                    let op = fn_prototype(st, st.known.object);
+                    if v == op {
+                        Value::NULL
+                    } else {
+                        op
+                    }
+                } else {
+                    p
+                }
+            } else if v.is_function() {
+                st.fn_proto_chain
+                    .get(&v.index())
+                    .copied()
+                    .unwrap_or(Value::UNDEFINED)
+            } else {
+                Value::UNDEFINED
+            })
+        }
+        O_SET_PROTO => {
+            let v = argv!(0);
+            let p = argv!(1);
+            if v.is_object() {
+                st.objects[v.index() as usize].proto =
+                    if p.is_object() { p } else { Value::UNDEFINED };
+            } else if v.is_function() {
+                // static inheritance (Babel: setPrototypeOf(Sub, Sup))
+                st.fn_proto_chain.insert(v.index(), p);
+            }
+            Ok(v)
+        }
         A_ISARRAY => {
             let v = argv!(0);
             Ok(Value::boolean(
@@ -2134,11 +3569,13 @@ fn need_doc(st: &St) -> Result<Rc<RefCell<dom::Document>>, VmError> {
 /// DOM method dispatch (`document.x(...)` and element methods).
 fn dom_method(
     st: &mut St,
+    mods: &[LoadedModule],
     key: u32,
     node: u32,
     args_base: usize,
     argc: u8,
 ) -> Result<Value, VmError> {
+    let _ = mods; // only event dispatch re-enters JS
     let ids = st.ids;
     let doc = need_doc(st)?;
     // addEventListener works on document too (listeners are keyed by
@@ -2169,6 +3606,33 @@ fn dom_method(
             let idx =
                 doc.borrow_mut().new_element(tag, Vec::new(), None);
             return Ok(Value::dom_node(idx as u32));
+        }
+        match st.names[key as usize].as_str() {
+            "createTextNode" | "createComment" => {
+                let text = if argc > 0 {
+                    arg_string(st, args_base, argc, 0)?
+                } else {
+                    String::new()
+                };
+                let idx = {
+                    let mut d = doc.borrow_mut();
+                    let root = d.root;
+                    let i = d.new_text(text, root);
+                    d.detach(i);
+                    i
+                };
+                return Ok(Value::dom_node(idx as u32));
+            }
+            "createDocumentFragment" => {
+                // a detached element works as a fragment in our model
+                let idx = doc.borrow_mut().new_element(
+                    "#fragment".to_string(),
+                    Vec::new(),
+                    None,
+                );
+                return Ok(Value::dom_node(idx as u32));
+            }
+            _ => {}
         }
         if key == ids.query_selector || key == ids.query_selector_all {
             let sel = arg_string(st, args_base, argc, 0)?;
@@ -2267,8 +3731,203 @@ fn dom_method(
             return Ok(Value::UNDEFINED);
         }
     }
+    // Layout-dependent and no-op-ish element methods. Layout runs in
+    // Python *after* JS, so geometry reads return a zero-rect here
+    // (enough for defensive scripts not to throw); focus/blur/scroll
+    // are accepted and ignored.
+    match st.names[key as usize].as_str() {
+        "getBoundingClientRect" | "getClientRects" => {
+            let rect = new_plain_object(st);
+            let ri = rect.index() as usize;
+            for field in ["top", "left", "right", "bottom", "width",
+                          "height", "x", "y"] {
+                let fk = st.intern_name(field);
+                raw_set_prop(st, ri, fk, Value::int(0));
+            }
+            return Ok(rect);
+        }
+        "scrollIntoView" | "focus" | "blur" | "scrollTo" | "scrollBy"
+        | "setAttributeNS" | "closest" => {
+            return Ok(Value::UNDEFINED);
+        }
+        "removeEventListener" => {
+            let ty = arg_string(st, args_base, argc, 0)?.to_lowercase();
+            let handler = if argc >= 2 {
+                st.regs[args_base + 1]
+            } else {
+                Value::UNDEFINED
+            };
+            if let Some(v) = st.listeners.get_mut(&(node, ty)) {
+                v.retain(|&h| h != handler);
+            }
+            return Ok(Value::UNDEFINED);
+        }
+        "insertBefore" => {
+            let newn = st.regs[args_base];
+            let refn = if argc > 1 {
+                st.regs[args_base + 1]
+            } else {
+                Value::NULL
+            };
+            if !newn.is_dom_node() {
+                return type_err("insertBefore: not a node");
+            }
+            let ni = newn.index() as usize;
+            let mut d = doc.borrow_mut();
+            d.detach(ni);
+            let pu = node as usize;
+            let pos = if refn.is_dom_node() {
+                d.nodes[pu]
+                    .children
+                    .iter()
+                    .position(|&c| c == refn.index() as usize)
+            } else {
+                None
+            };
+            match pos {
+                Some(i) => d.nodes[pu].children.insert(i, ni),
+                None => d.nodes[pu].children.push(ni),
+            }
+            d.nodes[ni].parent = Some(pu);
+            return Ok(newn);
+        }
+        "removeChild" => {
+            let child = st.regs[args_base];
+            if child.is_dom_node() {
+                doc.borrow_mut().detach(child.index() as usize);
+            }
+            return Ok(child);
+        }
+        "replaceChild" => {
+            let newn = st.regs[args_base];
+            let oldn = if argc > 1 {
+                st.regs[args_base + 1]
+            } else {
+                Value::UNDEFINED
+            };
+            if !newn.is_dom_node() || !oldn.is_dom_node() {
+                return type_err("replaceChild: not a node");
+            }
+            let (ni, oi_) = (newn.index() as usize,
+                             oldn.index() as usize);
+            let mut d = doc.borrow_mut();
+            d.detach(ni);
+            let pu = node as usize;
+            if let Some(i) =
+                d.nodes[pu].children.iter().position(|&c| c == oi_)
+            {
+                d.nodes[pu].children[i] = ni;
+                d.nodes[ni].parent = Some(pu);
+                d.nodes[oi_].parent = None;
+            }
+            return Ok(oldn);
+        }
+        "contains" => {
+            let other = st.regs[args_base];
+            if !other.is_dom_node() {
+                return Ok(Value::boolean(false));
+            }
+            let d = doc.borrow();
+            let mut cur = Some(other.index() as usize);
+            while let Some(c) = cur {
+                if c == node as usize {
+                    return Ok(Value::boolean(true));
+                }
+                cur = d.nodes[c].parent;
+            }
+            return Ok(Value::boolean(false));
+        }
+        "cloneNode" => {
+            let deep = argc > 0 && truthy(st, st.regs[args_base]);
+            let mut d = doc.borrow_mut();
+            fn clone_rec(
+                d: &mut crate::dom::Document,
+                src: usize,
+                parent: Option<usize>,
+                deep: bool,
+            ) -> usize {
+                let (tag, attrs, text, kids) = {
+                    let n = &d.nodes[src];
+                    (n.tag.clone(), n.attrs.clone(), n.text.clone(),
+                     n.children.clone())
+                };
+                let idx = match tag {
+                    Some(t) => d.new_element(t, attrs, parent),
+                    None => {
+                        let p = parent.unwrap_or(d.root);
+                        d.new_text(text, p)
+                    }
+                };
+                if deep {
+                    for k in kids {
+                        clone_rec(d, k, Some(idx), true);
+                    }
+                }
+                idx
+            }
+            let idx = clone_rec(&mut d, node as usize, None, deep);
+            // a fresh clone is detached
+            d.detach(idx);
+            return Ok(Value::dom_node(idx as u32));
+        }
+        "dispatchEvent" => {
+            let evt = st.regs[args_base];
+            if !evt.is_object() {
+                return type_err("dispatchEvent: not an event");
+            }
+            let ei = evt.index() as usize;
+            let tyk = st.intern_name("type");
+            let ty = match raw_get_prop(st, ei, tyk) {
+                Some(v) => to_display(st, v).to_lowercase(),
+                None => return type_err("event has no type"),
+            };
+            let tgt = st.intern_name("target");
+            let curk = st.intern_name("currentTarget");
+            let node_v = Value::dom_node(node);
+            raw_set_prop(st, ei, tgt, node_v);
+            let bubk = st.intern_name("bubbles");
+            let bubbles = raw_get_prop(st, ei, bubk)
+                .map(|v| truthy(st, v))
+                .unwrap_or(false);
+            let stopk = st.intern_name("__stopped");
+            let mut cur = Some(node as usize);
+            while let Some(c) = cur {
+                raw_set_prop(
+                    st, ei, curk, Value::dom_node(c as u32));
+                let cbs = st
+                    .listeners
+                    .get(&(c as u32, ty.clone()))
+                    .cloned()
+                    .unwrap_or_default();
+                for cb in cbs {
+                    call_value_this(
+                        st, mods, cb,
+                        Some(Value::dom_node(c as u32)), &[evt],
+                    )?;
+                    if raw_get_prop(st, ei, stopk)
+                        .map(|v| truthy(st, v))
+                        .unwrap_or(false)
+                    {
+                        cur = None;
+                        break;
+                    }
+                }
+                if !bubbles || cur.is_none() {
+                    break;
+                }
+                cur = doc.borrow().nodes[c].parent;
+            }
+            let dpk = st.intern_name("defaultPrevented");
+            let dp = raw_get_prop(st, ei, dpk)
+                .map(|v| truthy(st, v))
+                .unwrap_or(false);
+            return Ok(Value::boolean(!dp));
+        }
+        _ => {}
+    }
     err(format!(
-        "unsupported DOM method (name id {key}) on node {node}"
+        "unsupported DOM method .{}() on node {node}",
+        st.names[key as usize]
     ))
 }
 
@@ -2291,6 +3950,19 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
             };
             return Ok(push_str(st, text));
         }
+        if st.names[key as usize] == "cookie" {
+            let joined = st
+                .cookies
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Ok(push_str(st, joined));
+        }
+        if st.names[key as usize] == "readyState" {
+            let rs = st.ready_state;
+            return Ok(push_str(st, rs.to_string()));
+        }
         return Ok(Value::UNDEFINED);
     }
     let node_us = node as usize;
@@ -2309,6 +3981,81 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
             .unwrap_or("")
             .to_string();
         return Ok(push_str(st, out));
+    }
+    match st.names[key as usize].as_str() {
+        "classList" => {
+            // a fresh object whose methods carry the node id
+            let obj = new_plain_object(st);
+            let oi = obj.index() as usize;
+            for (m, op) in [("add", 0u8), ("remove", 1),
+                            ("contains", 2), ("toggle", 3)] {
+                let mk = st.intern_name(m);
+                let f = make_native(st, Native::ClassList { node, op });
+                raw_set_prop(st, oi, mk, f);
+            }
+            return Ok(obj);
+        }
+        "style" => {
+            // proxy: property access routes to the style attribute
+            let obj = new_plain_object(st);
+            st.style_nodes.insert(obj.index(), node);
+            return Ok(obj);
+        }
+        "dataset" => {
+            let obj = new_plain_object(st);
+            st.dataset_nodes.insert(obj.index(), node);
+            return Ok(obj);
+        }
+        "parentNode" | "parentElement" => {
+            return Ok(match doc.borrow().nodes[node_us].parent {
+                Some(p) => Value::dom_node(p as u32),
+                None => Value::NULL,
+            });
+        }
+        "tagName" | "nodeName" => {
+            let tag = doc.borrow().nodes[node_us]
+                .tag
+                .clone()
+                .unwrap_or_default()
+                .to_uppercase();
+            return Ok(push_str(st, tag));
+        }
+        "firstChild" => {
+            return Ok(match doc
+                .borrow()
+                .nodes[node_us]
+                .children
+                .first()
+            {
+                Some(&c) => Value::dom_node(c as u32),
+                None => Value::NULL,
+            });
+        }
+        "children" => {
+            let kids: Vec<Value> = {
+                let d = doc.borrow();
+                d.nodes[node_us]
+                    .children
+                    .iter()
+                    .filter(|&&c| d.nodes[c].is_element())
+                    .map(|&c| Value::dom_node(c as u32))
+                    .collect()
+            };
+            return Ok(new_array(st, kids));
+        }
+        "childNodes" => {
+            let kids: Vec<Value> = doc.borrow().nodes[node_us]
+                .children
+                .iter()
+                .map(|&c| Value::dom_node(c as u32))
+                .collect();
+            return Ok(new_array(st, kids));
+        }
+        "nodeType" => {
+            let is_el = doc.borrow().nodes[node_us].is_element();
+            return Ok(Value::int(if is_el { 1 } else { 3 }));
+        }
+        _ => {}
     }
     Ok(Value::UNDEFINED)
 }
@@ -2335,6 +4082,28 @@ fn dom_set_prop(
             };
             d.nodes[t].children.clear();
             d.new_text(text, t);
+            return Ok(());
+        }
+        if st.names[key as usize] == "cookie" {
+            // "k=v; Path=/; ..." — the first pair is the cookie,
+            // attributes are accepted and ignored (in-memory store)
+            let text = to_display(st, v);
+            let first = text.split(';').next().unwrap_or("");
+            if let Some((k, val)) = first.split_once('=') {
+                let (k, val) = (k.trim().to_string(),
+                                val.trim().to_string());
+                if !k.is_empty() {
+                    if let Some(slot) = st
+                        .cookies
+                        .iter_mut()
+                        .find(|(ck, _)| *ck == k)
+                    {
+                        slot.1 = val;
+                    } else {
+                        st.cookies.push((k, val));
+                    }
+                }
+            }
             return Ok(());
         }
         return err("cannot set that property on document (yet)");
@@ -2367,7 +4136,40 @@ fn dom_set_prop(
         doc.borrow_mut().set_attr(node_us, attr, &value);
         return Ok(());
     }
-    err("cannot set that DOM property (yet)")
+    // common element properties map to attributes; on* handlers and
+    // unknown-but-plausible props are accepted (expando-style writes
+    // land as attributes so re-reads via getAttribute see them)
+    let name = st.names[key as usize].clone();
+    match name.as_str() {
+        "src" | "href" | "value" | "type" | "title" | "alt" | "name"
+        | "rel" | "target" | "placeholder" | "content" | "lang"
+        | "dir" | "role" | "width" | "height" | "tabIndex" => {
+            let value = to_display(st, v);
+            let attr = if name == "tabIndex" {
+                "tabindex".to_string()
+            } else {
+                name
+            };
+            doc.borrow_mut().set_attr(node_us, &attr, &value);
+            Ok(())
+        }
+        n if n.starts_with("on") => Ok(()), // handler props: accepted
+        "nodeValue" | "data" => {
+            let value = to_display(st, v);
+            let mut d = doc.borrow_mut();
+            if d.nodes[node_us].tag.is_none() {
+                d.nodes[node_us].text = value;
+                d.version += 1;
+            }
+            Ok(())
+        }
+        "scrollTop" | "scrollLeft" | "selected" | "checked"
+        | "disabled" | "hidden" | "draggable"
+        | "contentEditable" | "async" | "defer" | "crossOrigin"
+        | "charset" | "referrerPolicy" | "integrity"
+        | "loading" | "decoding" => Ok(()),
+        _ => err(format!("cannot set DOM property .{name} (yet)")),
+    }
 }
 
 /// Call a JS function value from native code (sort comparators, DOM
@@ -2392,19 +4194,165 @@ pub(super) fn call_value_this(
     args: &[Value],
 ) -> Result<Value, VmError> {
     if !fv.is_function() {
-        return err(format!("{fv:?} is not a function"));
+        return type_err(format!("{fv:?} is not a function"));
     }
     let idx = fv.index();
+    if let ClosureRec::Bound { target, this_val, bound } =
+        &st.closures[idx as usize]
+    {
+        let (t, tv) = (*target, *this_val);
+        let mut full = bound.clone();
+        full.extend_from_slice(args);
+        // a nullish bound this yields to the call-site receiver —
+        // this is what makes `new (C.bind(null, ...args))` construct
+        // real instances (Babel _construct)
+        let eff = if tv.is_nullish() {
+            this_explicit.unwrap_or(tv)
+        } else {
+            tv
+        };
+        return call_value_this(st, mods, t, Some(eff), &full);
+    }
     match &st.closures[idx as usize] {
+        ClosureRec::Bound { .. } => unreachable!("handled above"),
         ClosureRec::Native(n) => {
             let n = *n;
             if let Native::MethodRef(key) = n {
                 let recv = this_explicit.unwrap_or(Value::UNDEFINED);
-                return method_ref_dispatch(st, recv, key, args);
+                // extracted call/apply/bind invoked ON a function
+                // (core-js uncurry: `FP.apply.call(fn, this, args)`)
+                if recv.is_function() {
+                    let name = st.names[key as usize].clone();
+                    match name.as_str() {
+                        "apply" => {
+                            let t = args
+                                .first()
+                                .copied()
+                                .unwrap_or(Value::UNDEFINED);
+                            let list: Vec<Value> = match args.get(1) {
+                                Some(a)
+                                    if a.is_object()
+                                        && st.objects
+                                            [a.index() as usize]
+                                            .is_array =>
+                                {
+                                    st.objects[a.index() as usize]
+                                        .elems
+                                        .clone()
+                                }
+                                _ => Vec::new(),
+                            };
+                            return call_value_this(
+                                st, mods, recv, Some(t), &list,
+                            );
+                        }
+                        "call" => {
+                            let t = args
+                                .first()
+                                .copied()
+                                .unwrap_or(Value::UNDEFINED);
+                            let rest =
+                                if args.len() > 1 { &args[1..] } else { &[] };
+                            return call_value_this(
+                                st, mods, recv, Some(t), rest,
+                            );
+                        }
+                        "bind" => {
+                            let t = args
+                                .first()
+                                .copied()
+                                .unwrap_or(Value::UNDEFINED);
+                            let bound = if args.len() > 1 {
+                                args[1..].to_vec()
+                            } else {
+                                Vec::new()
+                            };
+                            st.closures.push(ClosureRec::Bound {
+                                target: recv,
+                                this_val: t,
+                                bound,
+                            });
+                            return Ok(Value::function(
+                                (st.closures.len() - 1) as u32,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                // uncurried tolerance: call/apply/bind reached with a
+                // non-function receiver but a function first argument
+                // (`c(fn, t, ...)` through any route) — treat args[0]
+                // as the target. The strict form would TypeError anyway.
+                if !recv.is_function() {
+                    let name = st.names[key as usize].clone();
+                    if matches!(name.as_str(), "call" | "apply" | "bind")
+                    {
+                        if let Some(&f0) = args.first() {
+                            if f0.is_function() {
+                                let t = args
+                                    .get(1)
+                                    .copied()
+                                    .unwrap_or(Value::UNDEFINED);
+                                match name.as_str() {
+                                    "call" => {
+                                        let rest = if args.len() > 2 {
+                                            &args[2..]
+                                        } else {
+                                            &[]
+                                        };
+                                        return call_value_this(
+                                            st, mods, f0, Some(t), rest,
+                                        );
+                                    }
+                                    "apply" => {
+                                        let list: Vec<Value> =
+                                            match args.get(2) {
+                                                Some(a)
+                                                    if a.is_object()
+                                                        && st.objects[a
+                                                            .index()
+                                                            as usize]
+                                                            .is_array =>
+                                                {
+                                                    st.objects[a.index()
+                                                        as usize]
+                                                        .elems
+                                                        .clone()
+                                                }
+                                                _ => Vec::new(),
+                                            };
+                                        return call_value_this(
+                                            st, mods, f0, Some(t), &list,
+                                        );
+                                    }
+                                    _ => {
+                                        let bound = if args.len() > 2 {
+                                            args[2..].to_vec()
+                                        } else {
+                                            Vec::new()
+                                        };
+                                        st.closures.push(
+                                            ClosureRec::Bound {
+                                                target: f0,
+                                                this_val: t,
+                                                bound,
+                                            },
+                                        );
+                                        return Ok(Value::function(
+                                            (st.closures.len() - 1)
+                                                as u32,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                return method_ref_dispatch(st, mods, recv, key, args);
             }
             let top = st.regs.len();
             st.regs.extend_from_slice(args);
-            let r = do_native(st, n, top, args.len() as u8);
+            let r = do_native(st, mods, n, top, args.len() as u8);
             st.regs.truncate(top);
             r
         }
@@ -2553,7 +4501,10 @@ pub(super) fn exec(
 }
 
 /// The JS value a `catch` binds: the thrown value itself, or an
-/// Error-like `{name, message}` object for engine-raised errors.
+/// Error-like `{name, message}` object for engine-raised errors. The
+/// object's [[Prototype]] is wired to the global constructor of the
+/// error's kind (TypeError etc.) so `instanceof` and inherited methods
+/// behave like a real thrown error.
 fn exception_value(st: &mut St, e: VmError) -> Value {
     if let Some(v) = e.value {
         return v;
@@ -2562,10 +4513,17 @@ fn exception_value(st: &mut St, e: VmError) -> Value {
     let oi = obj.index() as usize;
     let name_id = st.intern_name("name");
     let msg_id = st.intern_name("message");
-    let n = intern(st, "Error");
+    let n = intern(st, e.kind);
     raw_set_prop(st, oi, name_id, n);
     let m = push_str(st, e.msg);
     raw_set_prop(st, oi, msg_id, m);
+    let ctor_id = st.intern_name(e.kind);
+    if let Some(&ctor) = st.globals.get(ctor_id as usize) {
+        if ctor.is_function() {
+            let proto = fn_prototype(st, ctor);
+            st.objects[oi].proto = proto;
+        }
+    }
     obj
 }
 
@@ -2687,7 +4645,14 @@ fn exec_loop(
             Instr::GetGlobal { dst, atom } => {
                 let key = name!(atom) as usize;
                 if !st.gdef[key] {
-                    return err(format!(
+                    // `window.X = v; X` — the window object doubles as
+                    // the global namespace (core-js installs polyfills
+                    // through it)
+                    if let Some(v) = window_prop(st, key as u32) {
+                        reg!(dst) = v;
+                        continue;
+                    }
+                    return ref_err(format!(
                         "{} is not defined",
                         st.names[key]
                     ));
@@ -2699,13 +4664,14 @@ fn exec_loop(
                 reg!(dst) = if st.gdef[key] {
                     st.globals[key]
                 } else {
-                    Value::UNDEFINED
+                    window_prop(st, key as u32)
+                        .unwrap_or(Value::UNDEFINED)
                 };
             }
             Instr::TdzCheck { src, atom } => {
                 if reg!(src).is_tdz() {
                     let key = name!(atom) as usize;
-                    return err(format!(
+                    return ref_err(format!(
                         "cannot access '{}' before initialization",
                         st.names[key]
                     ));
@@ -2730,7 +4696,7 @@ fn exec_loop(
             Instr::Throw { src } => {
                 let v = reg!(src);
                 let msg = throw_msg(st, v);
-                return Err(VmError { msg, value: Some(v) });
+                return Err(VmError { msg, value: Some(v), kind: "Error" });
             }
             Instr::SetGlobal { atom, src } => {
                 let key = name!(atom) as usize;
@@ -2857,7 +4823,18 @@ fn exec_loop(
                 reg!(dst) = new_array(st, vals);
             }
             Instr::NewInstance { dst, ctor } => {
-                let cv = reg!(ctor);
+                let mut cv = reg!(ctor);
+                // a bound constructor builds instances of its TARGET
+                // (Babel _construct: `new (Function.bind.apply(C,...))`)
+                for _ in 0..8 {
+                    if !cv.is_function() {
+                        break;
+                    }
+                    match &st.closures[cv.index() as usize] {
+                        ClosureRec::Bound { target, .. } => cv = *target,
+                        _ => break,
+                    }
+                }
                 let obj = new_plain_object(st);
                 if cv.is_function() {
                     let proto = fn_prototype(st, cv);
@@ -2908,7 +4885,46 @@ fn exec_loop(
             Instr::Call { func, argc } => {
                 let fv = reg!(func);
                 if !fv.is_function() {
-                    return err(format!("{fv:?} is not a function"));
+                    return type_err(format!("{fv:?} is not a function"));
+                }
+                if matches!(
+                    st.closures[fv.index() as usize],
+                    ClosureRec::Bound { .. }
+                ) {
+                    let args: Vec<Value> = (0..argc as usize)
+                        .map(|k| st.regs[base + func as usize + 1 + k])
+                        .collect();
+                    let r = call_value_this(st, mods, fv, None, &args)?;
+                    reg!(func) = r;
+                    continue;
+                }
+                // extracted call/apply/bind invoked directly:
+                // `c(fn, t, ...)` behaves as the uncurried form
+                // (core-js: `var call = FP.call; call(fn, ...)`)
+                if let ClosureRec::Native(Native::MethodRef(k)) =
+                    st.closures[fv.index() as usize]
+                {
+                    if matches!(
+                        st.names[k as usize].as_str(),
+                        "call" | "apply" | "bind"
+                    ) {
+                        let args: Vec<Value> = (0..argc as usize)
+                            .map(|j| {
+                                st.regs[base + func as usize + 1 + j]
+                            })
+                            .collect();
+                        let t = args
+                            .first()
+                            .copied()
+                            .unwrap_or(Value::UNDEFINED);
+                        let rest =
+                            if args.len() > 1 { &args[1..] } else { &[] };
+                        let r = call_value_this(
+                            st, mods, fv, Some(t), rest,
+                        )?;
+                        reg!(func) = r;
+                        continue;
+                    }
                 }
                 if st.frames.len() >= MAX_FRAMES {
                     return err("stack overflow");
@@ -2919,11 +4935,14 @@ fn exec_loop(
                         module, proto, this_capture, ..
                     } => Ok((*module, *proto, *this_capture)),
                     ClosureRec::Native(n) => Err(*n),
+                    ClosureRec::Bound { .. } => {
+                        unreachable!("bound pre-checked")
+                    }
                 };
                 match kind {
                     Err(n) => {
                         let r =
-                            do_native(st, n, base + func as usize + 1, argc)?;
+                            do_native(st, mods, n, base + func as usize + 1, argc)?;
                         reg!(func) = r;
                     }
                     Ok((cm, cp, this_cap)) => {
@@ -2968,7 +4987,22 @@ fn exec_loop(
             Instr::CallThis { func, recv, argc } => {
                 let fv = reg!(func);
                 if !fv.is_function() {
-                    return err(format!("{fv:?} is not a function"));
+                    return type_err(format!("{fv:?} is not a function"));
+                }
+                if matches!(
+                    st.closures[fv.index() as usize],
+                    ClosureRec::Bound { .. }
+                        | ClosureRec::Native(Native::MethodRef(_))
+                ) {
+                    let receiver = reg!(recv);
+                    let args: Vec<Value> = (0..argc as usize)
+                        .map(|k| st.regs[base + func as usize + 1 + k])
+                        .collect();
+                    let r = call_value_this(
+                        st, mods, fv, Some(receiver), &args,
+                    )?;
+                    reg!(func) = r;
+                    continue;
                 }
                 if st.frames.len() >= MAX_FRAMES {
                     return err("stack overflow");
@@ -2980,11 +5014,14 @@ fn exec_loop(
                         module, proto, this_capture, ..
                     } => Ok((*module, *proto, *this_capture)),
                     ClosureRec::Native(n) => Err(*n),
+                    ClosureRec::Bound { .. } => {
+                        unreachable!("bound pre-checked")
+                    }
                 };
                 match kind {
                     Err(n) => {
                         let r =
-                            do_native(st, n, base + func as usize + 1, argc)?;
+                            do_native(st, mods, n, base + func as usize + 1, argc)?;
                         reg!(func) = r;
                     }
                     Ok((cm, cp, this_cap)) => {
@@ -3031,6 +5068,27 @@ fn exec_loop(
                 let key = name!(atom);
                 // Function.prototype.call / apply (backs spread calls)
                 if ov.is_function() {
+                    // Function.prototype.bind: package this + partials
+                    if st.names[key as usize] == "bind" {
+                        let a0 = base + obj as usize + 1;
+                        let this_val = if argc > 0 {
+                            st.regs[a0]
+                        } else {
+                            Value::UNDEFINED
+                        };
+                        let bound: Vec<Value> = (1..argc as usize)
+                            .map(|k| st.regs[a0 + k])
+                            .collect();
+                        st.closures.push(ClosureRec::Bound {
+                            target: ov,
+                            this_val,
+                            bound,
+                        });
+                        reg!(obj) = Value::function(
+                            (st.closures.len() - 1) as u32,
+                        );
+                        continue;
+                    }
                     let is_apply = st.names[key as usize] == "apply";
                     let is_call = st.names[key as usize] == "call";
                     if is_apply || is_call {
@@ -3065,9 +5123,10 @@ fn exec_loop(
                         continue;
                     }
                     // static methods on callable builtins
-                    // (Object.keys, Array.isArray) and user statics
-                    if let Some(&mv) =
-                        st.fn_props.get(&(ov.index(), key))
+                    // (Object.keys, Array.isArray) and user statics —
+                    // including inherited ones (fn [[Prototype]] chain)
+                    if let Some(mv) =
+                        fn_static_lookup(st, ov.index(), key)
                     {
                         let args: Vec<Value> = (0..argc as usize)
                             .map(|k| st.regs[base + obj as usize + 1 + k])
@@ -3178,7 +5237,12 @@ fn exec_loop(
                         }
                     }
                     let is_array = st.objects[oi].is_array;
-                    if is_array && key == st.ids.push {
+                    if is_array
+                        && key == st.ids.push
+                        && raw_get_prop(st, oi, key).is_none()
+                    {
+                        // fast path — unless push was replaced
+                        // (webpack's chunk-loading global does that)
                         for k in 0..argc as usize {
                             let v = st.regs[base + obj as usize + 1 + k];
                             st.objects[oi].elems.push(v);
@@ -3199,6 +5263,31 @@ fn exec_loop(
                         reg!(obj) = ov;
                     } else {
                         if is_array {
+                            // An own function property SHADOWS the
+                            // builtin (webpack replaces chunk-array
+                            // .push with its runtime loader — that
+                            // override must win)
+                            if let Some(ov_fn) = raw_get_prop(
+                                st, oi, key)
+                            {
+                                if ov_fn.is_function() {
+                                    let args: Vec<Value> = (0..argc
+                                        as usize)
+                                        .map(|k| {
+                                            st.regs[base
+                                                + obj as usize
+                                                + 1
+                                                + k]
+                                        })
+                                        .collect();
+                                    let r = call_value_this(
+                                        st, mods, ov_fn, Some(ov),
+                                        &args,
+                                    )?;
+                                    reg!(obj) = r;
+                                    continue;
+                                }
+                            }
                             // Array builtins dispatched by name. Callback
                             // forms reuse call_value (as sort does). An
                             // unrecognized name falls through to a stored
@@ -3235,6 +5324,38 @@ fn exec_loop(
                                     Value::int(
                                         st.objects[oi].elems.len() as i32,
                                     )
+                                }
+                                "splice" => {
+                                    let len =
+                                        st.objects[oi].elems.len() as f64;
+                                    let s = if argc > 0 {
+                                        let v = arg0.to_number_raw();
+                                        if v < 0.0 {
+                                            (len + v).max(0.0)
+                                        } else {
+                                            v.min(len)
+                                        }
+                                    } else {
+                                        0.0
+                                    } as usize;
+                                    let dc = if argc > 1 {
+                                        arg1.to_number_raw()
+                                            .max(0.0)
+                                            .min(len - s as f64)
+                                            as usize
+                                    } else {
+                                        len as usize - s
+                                    };
+                                    let inserted: Vec<Value> = (2..argc
+                                        as usize)
+                                        .map(|k| st.regs[a0 + k])
+                                        .collect();
+                                    let removed: Vec<Value> = st.objects
+                                        [oi]
+                                        .elems
+                                        .splice(s..s + dc, inserted)
+                                        .collect();
+                                    new_array(st, removed)
                                 }
                                 "reverse" => {
                                     st.objects[oi].elems.reverse();
@@ -3381,6 +5502,30 @@ fn exec_loop(
                                     }
                                     new_array(st, out)
                                 }
+                                "some" | "every" => {
+                                    let want_all = method == "every";
+                                    let elems =
+                                        st.objects[oi].elems.clone();
+                                    let mut result = want_all;
+                                    for (i, &e) in
+                                        elems.iter().enumerate()
+                                    {
+                                        let v = call_value(
+                                            st, mods, arg0,
+                                            &[e, Value::int(i as i32), ov],
+                                        )?;
+                                        let tv = truthy(st, v);
+                                        if want_all && !tv {
+                                            result = false;
+                                            break;
+                                        }
+                                        if !want_all && tv {
+                                            result = true;
+                                            break;
+                                        }
+                                    }
+                                    Value::boolean(result)
+                                }
                                 "forEach" => {
                                     let elems =
                                         st.objects[oi].elems.clone();
@@ -3497,18 +5642,67 @@ fn exec_loop(
                                 continue;
                             }
                         }
-                        let m = raw_get_prop(st, oi, key);
+                        let mut m = raw_get_prop(st, oi, key);
+                        // window.parseInt(...) — global fns are
+                        // reachable as window methods
+                        if m.is_none()
+                            && ov == st.known.window
+                            && st.gdef[key as usize]
+                            && st.globals[key as usize].is_function()
+                        {
+                            m = Some(st.globals[key as usize]);
+                        }
                         let Some(m) = m else {
-                            return err(format!(
+                            // universal Object.prototype methods
+                            // (hasOwnProperty, propertyIsEnumerable,
+                            // isPrototypeOf, ...) share the extraction
+                            // dispatcher
+                            if matches!(
+                                st.names[key as usize].as_str(),
+                                "hasOwnProperty"
+                                    | "propertyIsEnumerable"
+                                    | "isPrototypeOf"
+                            ) {
+                                let args: Vec<Value> = (0..argc as usize)
+                                    .map(|k| {
+                                        st.regs
+                                            [base + obj as usize + 1 + k]
+                                    })
+                                    .collect();
+                                let r = method_ref_dispatch(
+                                    st, mods, ov, key, &args,
+                                )?;
+                                reg!(obj) = r;
+                                continue;
+                            }
+                            return type_err(format!(
                                 ".{}() is not a function",
                                 st.names[key as usize]
                             ));
                         };
                         if !m.is_function() {
-                            return err(format!(
+                            return type_err(format!(
                                 ".{} is not a function",
                                 st.names[key as usize]
                             ));
+                        }
+                        if matches!(
+                            st.closures[m.index() as usize],
+                            ClosureRec::Bound { .. }
+                                | ClosureRec::Native(
+                                    Native::MethodRef(_),
+                                )
+                        ) {
+                            let args: Vec<Value> = (0..argc as usize)
+                                .map(|k| {
+                                    st.regs[base + obj as usize + 1 + k]
+                                })
+                                .collect();
+                            let r = call_value_this(
+                                st, mods, m, Some(ov), &args,
+                            )?;
+                            reg!(obj) = r;
+                            continue;
                         }
                         if st.frames.len() >= MAX_FRAMES {
                             return err("stack overflow");
@@ -3519,11 +5713,15 @@ fn exec_loop(
                                 module, proto, this_capture, ..
                             } => Ok((*module, *proto, *this_capture)),
                             ClosureRec::Native(n) => Err(*n),
+                            ClosureRec::Bound { .. } => {
+                                unreachable!("bound pre-checked")
+                            }
                         };
                         match kind {
                             Err(n) => {
                                 let r = do_native(
-                                    st, n, base + obj as usize + 1, argc,
+                                    st, mods, n,
+                                    base + obj as usize + 1, argc,
                                 )?;
                                 reg!(obj) = r;
                             }
@@ -3778,8 +5976,46 @@ fn exec_loop(
                             let other = to_display(st, av0);
                             push_str(st, format!("{s}{other}"))
                         }
+                        "substr" => {
+                            let units: Vec<u16> =
+                                s.encode_utf16().collect();
+                            let len = units.len() as f64;
+                            let start = av0.to_number_raw();
+                            let start = if start < 0.0 {
+                                (len + start).max(0.0)
+                            } else {
+                                start.min(len)
+                            } as usize;
+                            let count = if av1.is_undefined() {
+                                units.len() - start
+                            } else {
+                                (av1.to_number_raw().max(0.0) as usize)
+                                    .min(units.len() - start)
+                            };
+                            let out = String::from_utf16_lossy(
+                                &units[start..start + count],
+                            );
+                            push_str(st, out)
+                        }
+                        "propertyIsEnumerable" => {
+                            let k = to_display(st, av0);
+                            Value::boolean(
+                                k.parse::<usize>()
+                                    .map(|i| i < s.chars().count())
+                                    .unwrap_or(false),
+                            )
+                        }
+                        "hasOwnProperty" => {
+                            let k = to_display(st, av0);
+                            Value::boolean(
+                                k == "length"
+                                    || k.parse::<usize>()
+                                        .map(|i| i < s.chars().count())
+                                        .unwrap_or(false),
+                            )
+                        }
                         _ => {
-                            return err(format!(
+                            return type_err(format!(
                                 "cannot call .{}() on a string (yet)",
                                 method
                             ))
@@ -3789,6 +6025,7 @@ fn exec_loop(
                 } else if ov.is_dom_node() {
                     let r = dom_method(
                         st,
+                        mods,
                         key,
                         ov.index(),
                         base + obj as usize + 1,
@@ -3800,10 +6037,16 @@ fn exec_loop(
                     let args: Vec<Value> = (0..argc as usize)
                         .map(|k| st.regs[base + obj as usize + 1 + k])
                         .collect();
-                    let r = method_ref_dispatch(st, ov, key, &args)?;
+                    let r = method_ref_dispatch(st, mods, ov, key, &args)?;
                     reg!(obj) = r;
+                } else if ov.is_nullish() {
+                    return type_err(format!(
+                        "cannot call .{}() of {}",
+                        st.names[key as usize],
+                        if ov.is_null() { "null" } else { "undefined" },
+                    ));
                 } else {
-                    return err(format!(
+                    return type_err(format!(
                         "cannot call .{}() on {ov:?} (yet)",
                         st.names[key as usize]
                     ));
@@ -3869,7 +6112,7 @@ fn exec_loop(
                                 ClosureRec::User { upvals, .. } => {
                                     upvals[i as usize]
                                 }
-                                ClosureRec::Native(_) => unreachable!(),
+                                ClosureRec::Native(_) | ClosureRec::Bound { .. } => unreachable!(),
                             }
                         }
                     });
@@ -3903,14 +6146,14 @@ fn exec_loop(
             Instr::GetUpval { dst, idx } => {
                 let cell = match &st.closures[cur_cl as usize] {
                     ClosureRec::User { upvals, .. } => upvals[idx as usize],
-                    ClosureRec::Native(_) => unreachable!(),
+                    ClosureRec::Native(_) | ClosureRec::Bound { .. } => unreachable!(),
                 };
                 reg!(dst) = st.cells[cell as usize];
             }
             Instr::SetUpval { idx, src } => {
                 let cell = match &st.closures[cur_cl as usize] {
                     ClosureRec::User { upvals, .. } => upvals[idx as usize],
-                    ClosureRec::Native(_) => unreachable!(),
+                    ClosureRec::Native(_) | ClosureRec::Bound { .. } => unreachable!(),
                 };
                 st.cells[cell as usize] = reg!(src);
             }
@@ -3966,6 +6209,17 @@ fn exec_loop(
                             let s = intern(st, &k.to_string());
                             keys.push(s);
                         }
+                    } else {
+                        // numeric keys on plain objects also live in
+                        // elems (sparse — skip the undefined gaps).
+                        // Webpack module maps ({90805: fn, ...}) are
+                        // exactly this shape.
+                        for k in 0..nelems {
+                            if !st.objects[oi].elems[k].is_undefined() {
+                                let s = intern(st, &k.to_string());
+                                keys.push(s);
+                            }
+                        }
                     }
                     // named props in slot (= insertion) order
                     let mut pairs: Vec<(u16, u32)> = st.shapes
@@ -3983,20 +6237,58 @@ fn exec_loop(
                 }
                 reg!(dst) = new_array(st, keys);
             }
+            Instr::IterMaterialize { dst, obj } => {
+                let ov = reg!(obj);
+                reg!(dst) = materialize_iterable(st, mods, ov)?;
+            }
             Instr::GetIndex { dst, obj, key } => {
                 let (ov, kv) = (reg!(obj), reg!(key));
                 if ov.is_object() && kv.is_number() {
-                    let o = &st.objects[ov.index() as usize];
+                    let oi = ov.index() as usize;
                     let k = kv.to_number_raw();
-                    reg!(dst) = if k >= 0.0 && (k as usize) < o.elems.len() {
-                        o.elems[k as usize]
-                    } else {
-                        Value::UNDEFINED
-                    };
+                    let mut hit = Value::UNDEFINED;
+                    let in_elems = k >= 0.0
+                        && k.fract() == 0.0
+                        && (k as usize) < st.objects[oi].elems.len();
+                    if in_elems {
+                        hit = st.objects[oi].elems[k as usize];
+                    }
+                    if hit.is_undefined() {
+                        // gap or out-of-range: the value may live as a
+                        // named (possibly accessor) property — string
+                        // and number keys are one namespace in JS
+                        let text = to_display(st, kv);
+                        let key_id = st.intern_name(&text);
+                        hit = match lookup_prop(st, oi, key_id) {
+                            PropHit::Data(v) => v,
+                            PropHit::Getter(g) if g.is_function() => {
+                                call_value_this(
+                                    st, mods, g, Some(ov), &[],
+                                )?
+                            }
+                            _ => Value::UNDEFINED,
+                        };
+                    }
+                    reg!(dst) = hit;
                 } else if ov.is_object() && kv.is_string() {
                     // dynamic property read: `o[key]`, `o[i]` from for-in
                     let text = str_ref(st, kv.index()).to_string();
                     let oi = ov.index() as usize;
+                    // integer-string keys hit dense elems on ANY object
+                    // (numeric literal keys live there); gaps fall
+                    // through to the named lookup below
+                    if let Ok(n) = text.parse::<usize>() {
+                        if let Some(&v) = st.objects[oi].elems.get(n) {
+                            if !v.is_undefined() {
+                                reg!(dst) = v;
+                                continue;
+                            }
+                        }
+                        if st.objects[oi].is_array {
+                            reg!(dst) = Value::UNDEFINED;
+                            continue;
+                        }
+                    }
                     if st.objects[oi].is_array {
                         if let Ok(n) = text.parse::<usize>() {
                             let o = &st.objects[oi];
@@ -4011,8 +6303,76 @@ fn exec_loop(
                         }
                     }
                     let key_id = st.intern_name(&text);
+                    reg!(dst) = match raw_get_prop(st, oi, key_id) {
+                        Some(v) => v,
+                        // window doubles as the global namespace
+                        None if ov == st.known.window
+                            && st.gdef[key_id as usize] =>
+                        {
+                            st.globals[key_id as usize]
+                        }
+                        None => Value::UNDEFINED,
+                    };
+                } else if ov.is_function() {
+                    // fn["prop"]: same surface as static GetProp
+                    let text = to_display(st, kv);
+                    let key_id = st.intern_name(&text);
+                    reg!(dst) = if key_id == st.ids.prototype {
+                        fn_prototype(st, ov)
+                    } else if let Some(v) =
+                        fn_static_lookup(st, ov.index(), key_id)
+                    {
+                        v
+                    } else if matches!(
+                        text.as_str(),
+                        "call" | "apply" | "bind"
+                    ) {
+                        make_native(st, Native::MethodRef(key_id))
+                    } else {
+                        Value::UNDEFINED
+                    };
+                } else if ov.is_object() {
+                    // odd key type (null/undefined/bool/object): JS
+                    // stringifies the key
+                    let text = to_display(st, kv);
+                    let oi = ov.index() as usize;
+                    let key_id = st.intern_name(&text);
                     reg!(dst) = raw_get_prop(st, oi, key_id)
                         .unwrap_or(Value::UNDEFINED);
+                } else if ov.is_dom_node() {
+                    // document[key] / el[key]: same surface as GetProp
+                    let text = to_display(st, kv);
+                    let key_id = st.intern_name(&text);
+                    let r = dom_get_prop(st, key_id, ov.index())?;
+                    reg!(dst) = r;
+                } else if ov.is_string() {
+                    // s[i] / s["length"] / s["slice"] (extraction)
+                    let text = to_display(st, kv);
+                    let sref = str_ref(st, ov.index()).to_string();
+                    reg!(dst) = if let Ok(i) = text.parse::<usize>() {
+                        match sref.encode_utf16().nth(i) {
+                            Some(u) => {
+                                let ch = String::from_utf16_lossy(&[u]);
+                                push_str(st, ch)
+                            }
+                            None => Value::UNDEFINED,
+                        }
+                    } else if text == "length" {
+                        Value::int(
+                            sref.encode_utf16().count() as i32)
+                    } else {
+                        let key_id = st.intern_name(&text);
+                        make_native(st, Native::MethodRef(key_id))
+                    };
+                } else if ov.is_nullish() {
+                    let text = to_display(st, kv);
+                    return type_err(format!(
+                        "cannot read [{text}] of {}",
+                        if ov.is_null() { "null" } else { "undefined" },
+                    ));
+                } else if ov.is_number() || ov.is_boolean() {
+                    // primitives have no own indexed props in our model
+                    reg!(dst) = Value::UNDEFINED;
                 } else {
                     return err(format!(
                         "unsupported indexing {ov:?}[{kv:?}] (yet)"
@@ -4022,11 +6382,15 @@ fn exec_loop(
             Instr::SetIndex { obj, key, src } => {
                 let (ov, kv, v) = (reg!(obj), reg!(key), reg!(src));
                 if ov.is_object() && kv.is_number() {
-                    let elems = &mut st.objects[ov.index() as usize].elems;
                     let k = kv.to_number_raw();
                     if k < 0.0 || k.fract() != 0.0 {
-                        return err("negative/fractional array index (yet)");
+                        // JS: not an element — a plain named property
+                        let text = to_display(st, kv);
+                        let key_id = st.intern_name(&text);
+                        raw_set_prop(st, ov.index() as usize, key_id, v);
+                        continue;
                     }
+                    let elems = &mut st.objects[ov.index() as usize].elems;
                     let k = k as usize;
                     if k < elems.len() {
                         elems[k] = v;
@@ -4052,6 +6416,25 @@ fn exec_loop(
                     }
                     let key_id = st.intern_name(&text);
                     raw_set_prop(st, oi, key_id, v);
+                } else if ov.is_function() {
+                    let text = to_display(st, kv);
+                    let key_id = st.intern_name(&text);
+                    if key_id == st.ids.prototype {
+                        st.fn_protos.insert(ov.index(), v);
+                    } else {
+                        st.fn_props.insert((ov.index(), key_id), v);
+                    }
+                } else if ov.is_object() {
+                    // odd key type: JS stringifies it
+                    let text = to_display(st, kv);
+                    let key_id = st.intern_name(&text);
+                    raw_set_prop(st, ov.index() as usize, key_id, v);
+                } else if ov.is_nullish() {
+                    let text = to_display(st, kv);
+                    return type_err(format!(
+                        "cannot set [{text}] of {}",
+                        if ov.is_null() { "null" } else { "undefined" },
+                    ));
                 } else {
                     return err(format!(
                         "unsupported indexing {ov:?}[{kv:?}] (yet)"
@@ -4061,6 +6444,44 @@ fn exec_loop(
             Instr::GetProp { dst, obj, atom, ic } => {
                 let ov = reg!(obj);
                 let key = name!(atom);
+                if ov.is_object() && !st.style_nodes.is_empty()
+                    || ov.is_object() && !st.dataset_nodes.is_empty()
+                {
+                    // el.style.prop / el.dataset.k proxy reads
+                    if let Some(&node) = st.style_nodes.get(&ov.index())
+                    {
+                        let name = st.names[key as usize].clone();
+                        let doc = need_doc(st)?;
+                        let cur = doc.borrow().nodes[node as usize]
+                            .attr("style")
+                            .unwrap_or("")
+                            .to_string();
+                        let out = if name == "cssText" {
+                            cur
+                        } else {
+                            style_attr_get(
+                                &cur, &camel_to_kebab(&name))
+                        };
+                        reg!(dst) = push_str(st, out);
+                        continue;
+                    }
+                    if let Some(&node) =
+                        st.dataset_nodes.get(&ov.index())
+                    {
+                        let name = st.names[key as usize].clone();
+                        let attr =
+                            format!("data-{}", camel_to_kebab(&name));
+                        let doc = need_doc(st)?;
+                        let out = doc.borrow().nodes[node as usize]
+                            .attr(&attr)
+                            .map(str::to_string);
+                        reg!(dst) = match out {
+                            Some(s) => push_str(st, s),
+                            None => Value::UNDEFINED,
+                        };
+                        continue;
+                    }
+                }
                 if ov.is_object() {
                     let oi = ov.index() as usize;
                     let (is_arr, shape, elen) = {
@@ -4074,42 +6495,81 @@ fn exec_loop(
                     let slot_ic = ic!(ic);
                     let e = st.ics[slot_ic];
                     let hit = if e.shape == shape {
-                        Some(st.objects[oi].slots[e.slot as usize])
+                        PropHit::Data(st.objects[oi].slots[e.slot as usize])
                     } else {
                         match st.shapes[shape as usize].props.get(&key) {
                             Some(&slot) => {
                                 st.ics[slot_ic] = IcEntry { shape, slot };
-                                Some(st.objects[oi].slots[slot as usize])
+                                PropHit::Data(
+                                    st.objects[oi].slots[slot as usize],
+                                )
                             }
-                            // own miss: walk the prototype chain
-                            None => raw_get_prop(st, oi, key),
+                            // own miss: accessor-aware chain walk
+                            None => lookup_prop(st, oi, key),
                         }
                     };
                     reg!(dst) = match hit {
-                        Some(v) => v,
+                        PropHit::Data(v) => v,
+                        PropHit::Getter(g) => {
+                            if g.is_function() {
+                                call_value_this(
+                                    st, mods, g, Some(ov), &[],
+                                )?
+                            } else {
+                                Value::UNDEFINED
+                            }
+                        }
                         // arrays expose known builtins as extractable
                         // methods (`[].slice` — the core-js pattern)
-                        None if is_arr
-                            && matches!(
+                        PropHit::Missing
+                            if is_arr
+                                && matches!(
+                                    st.names[key as usize].as_str(),
+                                    "slice" | "concat" | "join"
+                                        | "indexOf" | "push" | "pop"
+                                        | "map" | "filter" | "forEach"
+                                ) =>
+                        {
+                            make_native(st, Native::MethodRef(key))
+                        }
+                        // Object.prototype staples on any object
+                        // (`{}.hasOwnProperty` — core-js hasOwn)
+                        PropHit::Missing
+                            if matches!(
                                 st.names[key as usize].as_str(),
-                                "slice" | "concat" | "join" | "indexOf"
-                                    | "push" | "pop" | "map" | "filter"
-                                    | "forEach"
+                                "hasOwnProperty" | "toString" | "valueOf"
+                                    | "propertyIsEnumerable"
+                                    | "isPrototypeOf"
                             ) =>
                         {
                             make_native(st, Native::MethodRef(key))
                         }
-                        None => Value::UNDEFINED,
+                        // the window object doubles as the global
+                        // namespace: `window.Number`/`window.parseInt`
+                        PropHit::Missing if ov == st.known.window => {
+                            let k = key as usize;
+                            if st.gdef[k] {
+                                st.globals[k]
+                            } else {
+                                Value::UNDEFINED
+                            }
+                        }
+                        PropHit::Missing => Value::UNDEFINED,
                     };
                 } else if ov.is_function() {
-                    // functions expose a lazily-created .prototype and
-                    // any static props (Object.keys, F.displayName)
+                    // functions expose a lazily-created .prototype,
+                    // static props, and extractable call/apply/bind
                     reg!(dst) = if key == st.ids.prototype {
                         fn_prototype(st, ov)
-                    } else if let Some(&v) =
-                        st.fn_props.get(&(ov.index(), key))
+                    } else if let Some(v) =
+                        fn_static_lookup(st, ov.index(), key)
                     {
                         v
+                    } else if matches!(
+                        st.names[key as usize].as_str(),
+                        "call" | "apply" | "bind"
+                    ) {
+                        make_native(st, Native::MethodRef(key))
                     } else {
                         Value::UNDEFINED
                     };
@@ -4125,6 +6585,12 @@ fn exec_loop(
                 } else if ov.is_dom_node() {
                     let r = dom_get_prop(st, key, ov.index())?;
                     reg!(dst) = r;
+                } else if ov.is_nullish() {
+                    return type_err(format!(
+                        "cannot read .{} of {}",
+                        st.names[key as usize],
+                        if ov.is_null() { "null" } else { "undefined" },
+                    ));
                 } else {
                     return err(format!(
                         "cannot read .{} of {ov:?} (yet)",
@@ -4140,6 +6606,44 @@ fn exec_loop(
                     dom_set_prop(st, key, ov.index(), v)?;
                     continue;
                 }
+                if ov.is_object() {
+                    // el.style.prop = / el.dataset.k = proxies
+                    if let Some(&node) = st.style_nodes.get(&ov.index())
+                    {
+                        let v = reg!(src);
+                        let name = st.names[key as usize].clone();
+                        let val = to_display(st, v);
+                        let doc = need_doc(st)?;
+                        if name == "cssText" {
+                            doc.borrow_mut().set_attr(
+                                node as usize, "style", &val);
+                        } else {
+                            let prop = camel_to_kebab(&name);
+                            let cur = doc.borrow().nodes[node as usize]
+                                .attr("style")
+                                .unwrap_or("")
+                                .to_string();
+                            let next =
+                                style_attr_set(&cur, &prop, &val);
+                            doc.borrow_mut().set_attr(
+                                node as usize, "style", &next);
+                        }
+                        continue;
+                    }
+                    if let Some(&node) =
+                        st.dataset_nodes.get(&ov.index())
+                    {
+                        let v = reg!(src);
+                        let name = st.names[key as usize].clone();
+                        let val = to_display(st, v);
+                        let attr =
+                            format!("data-{}", camel_to_kebab(&name));
+                        let doc = need_doc(st)?;
+                        doc.borrow_mut().set_attr(
+                            node as usize, &attr, &val);
+                        continue;
+                    }
+                }
                 if ov.is_function() {
                     // F.prototype = {...} replaces the lazy prototype;
                     // anything else lands in the static-props table
@@ -4149,6 +6653,11 @@ fn exec_loop(
                     } else {
                         st.fn_props.insert((ov.index(), key), v);
                     }
+                    continue;
+                }
+                if ov.is_nullish() {
+                    // polyfills patch natives we do not have
+                    // (`NativeProto.constructor = C`); ignore the write
                     continue;
                 }
                 if !ov.is_object() {
@@ -4170,6 +6679,10 @@ fn exec_loop(
                     {
                         st.objects[oi].slots[slot as usize] = v;
                         st.ics[slot_ic] = IcEntry { shape: shape_id, slot };
+                    } else if let Some(setter) =
+                        lookup_setter(st, oi, key)
+                    {
+                        call_value_this(st, mods, setter, Some(ov), &[v])?;
                     } else {
                         raw_set_prop(st, oi, key, v);
                     }
