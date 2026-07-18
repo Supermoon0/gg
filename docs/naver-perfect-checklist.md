@@ -557,4 +557,6 @@ postMessage/scrollTo/getComputedStyle/XHR은 코드에 이미 있었는데 문�
 항목을 완료하면 [x]로 바꾸고 날짜를 적을 것. cargo 156/156, smoke 141종
 (엔진 파트; 실네트워크 관문은 egress 제한 환경에서 측정 불가) 기준.
 검증 체인: cargo test → maturin build → pip 재설치 → smoke_test.py →
-basket_test.py (네이버 단건은 scratchpad diag 스크립트).*
+**golden_test.py**(픽스처 7종 렌더 골든 — 리눅스 폰트 기준, 의도적
+렌더 변경 시 `--update`로 재생성·diff 검토) → basket_test.py
+(네이버 단건은 scratchpad diag 스크립트).*

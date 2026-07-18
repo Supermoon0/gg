@@ -1,0 +1,27 @@
+<html><head><style>
+body { margin: 0; }
+.round { width: 160px; height: 60px; background-color: #03c75a;
+         border-radius: 30px; margin: 8px; }
+.shadow { width: 160px; height: 40px; background-color: #ffffff;
+          box-shadow: 4px 4px 6px #888888; margin: 12px;
+          border-width: 1px; border-color: #dddddd; }
+.clipper { width: 200px; height: 50px; overflow: hidden;
+           background-color: #ffe4b5; margin: 8px; }
+.clipper .inner { width: 400px; }
+.stack { position: relative; height: 90px; }
+.z1 { position: absolute; left: 20px; top: 10px; width: 120px;
+      height: 50px; background-color: #aaaaaa; z-index: 1; }
+.z2 { position: absolute; left: 60px; top: 30px; width: 120px;
+      height: 50px; background-color: #d9534f; z-index: 2; }
+.faded { opacity: 0.02; }
+.grad { width: 200px; height: 30px; margin: 8px;
+        background: linear-gradient(#4a90d9, #ffffff); }
+</style></head><body>
+<div class="round"></div>
+<div class="shadow">shadowed</div>
+<div class="clipper"><div class="inner">clipped content that runs far
+  past the box edge and must not paint outside</div></div>
+<div class="stack"><div class="z1"></div><div class="z2"></div></div>
+<div class="faded">invisible via opacity</div>
+<div class="grad"></div>
+</body></html>

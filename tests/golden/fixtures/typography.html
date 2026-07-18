@@ -1,0 +1,24 @@
+<html><head><style>
+body { margin: 0; width: 640px; }
+h1 { color: #2b5aa6; }
+.lh { line-height: 2; }
+.nowrap { white-space: nowrap; width: 220px;
+          text-overflow: ellipsis; border-width: 1px;
+          border-color: #eeeeee; }
+blockquote { color: #444444; }
+.mono { font-family: monospace; background-color: #f2f2f2; }
+.serif { font-family: serif; font-size: 20px; }
+</style></head><body>
+<h1>타이포그래피 픽스처</h1>
+<p>Regular paragraph with <b>bold</b>, <i>italic</i> and
+   <code class="mono">inline code</code> plus 한글 텍스트 혼합.</p>
+<p class="lh">Double line-height paragraph that should wrap across
+   multiple lines to exercise the line box math consistently over a
+   fixed width container.</p>
+<p class="nowrap">This single line is far too long and must clip with
+   an ellipsis</p>
+<blockquote>인용문 블록 — margin과 색상 상속 확인용.</blockquote>
+<p class="serif">Serif family paragraph, twenty pixels.</p>
+<pre>  preformatted
+    keeps   spaces</pre>
+</body></html>
