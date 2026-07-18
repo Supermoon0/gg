@@ -6,7 +6,7 @@
 |---|---|---|---|
 | **A. 크롬 JS-off 동급** | 로고·둥근 검색창·아이콘이 픽셀 수준으로 같음 | M1 | **사실상 달성** (M1 주요 항목 완료, 웹폰트·flex 심화 등 소품 잔여) |
 | **B. 첫 화면 완성** | 뉴스·쇼핑·피드가 실제로 그려짐 | M2 + M3 + M4 | M2 95% (문법 완료, 런타임 롱테일) · M3 스텁 표면 완료(07-18, 잔여: getBoundingClientRect 실측) · M4 라이브 루프 v1 |
-| **C. 사용 가능** | 스크롤·호버·검색 타이핑·클릭 이동 | M5 | 스크롤 + **검색창 타이핑·GET 제출**(07-18) · 잔여: hover·IME |
+| **C. 사용 가능** | 스크롤·호버·검색 타이핑·클릭 이동 | M5 | 스크롤·타이핑·GET 제출·**hover/focus 재스타일**(07-18) · 잔여: IME |
 | **D. 크롬급 속도** | 재방문 1초 내 첫 화면, 스크롤 60fps | M6 | 재방문 0.18s ✅ · 60fps 미측정 |
 
 **진도 측정 도구**: `python basket_test.py` — 대표 사이트 8개 헤드리스 렌더
@@ -355,7 +355,16 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
       (맨 input 높이 0 → 클릭 불가 버그 수정). 잔여: **IME 한글
       조합**(tkinter 캔버스 IME — 로컬 윈도우에서 검증 필요),
       캐럿 이동/선택, native(winit) 셸 배선
-- [ ] `:hover`/`:focus` 동적 재스타일 (×231/×28)
+- [x] **`:hover`/`:focus` 동적 재스타일** (×231/×28) — 07-18:
+      Python·Rust 양 CSS 파서가 :hover/:focus 셀렉터 수용(클래스급
+      명시도), 매칭은 상태 기반 — Python은 node.is_hovered/is_focused
+      마크, Rust는 Document.hover_chain(요소+조상)/focused를
+      셸이 set_hover/set_focus로 세팅. on_motion(30ms 스로틀)이
+      hover 요소 변화 시에만, 시트에 :hover 룰이 있을 때만 재스타일
+      (없는 사이트는 무비용). 조상-hover 자손 룰(`.m:hover .sub`)
+      동작. **재스타일이 트리를 재구축해도 포커스·hover를 Rust 인덱스로
+      리맵** — 라이브 틱 중 타이핑도 이제 살아남음. 잔여: 전체
+      재스타일이라 네이버 규모에선 M4 부분 무효화와 합류 필요
 - [x] **폼 제출 (GET 쿼리 조립)** — 07-18: `browser/forms.py` —
       Enter → 조상 <form> 탐색, input 필드 직렬화(name 있는 것만,
       submit/button류 제외, checkbox/radio는 checked만, 한글
@@ -482,7 +491,7 @@ postMessage/scrollTo/getComputedStyle/XHR은 코드에 이미 있었는데 문�
 오후: **M6 lazy 컴파일 가동** — 지연 배분 실측용 프로파일 하니스
 `cargo test --release -- --ignored profile_phases --nocapture` 상설화.
 저녁: lazy parse + M4 transform — smoke 111종).
-항목을 완료하면 [x]로 바꾸고 날짜를 적을 것. cargo 150/150, smoke 108종
+항목을 완료하면 [x]로 바꾸고 날짜를 적을 것. cargo 151/151, smoke 121종
 (엔진 파트; 실네트워크 관문은 egress 제한 환경에서 측정 불가) 기준.
 검증 체인: cargo test → maturin build → pip 재설치 → smoke_test.py →
 basket_test.py (네이버 단건은 scratchpad diag 스크립트).*

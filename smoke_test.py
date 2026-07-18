@@ -5,7 +5,8 @@ import tkinter
 from browser import net
 from browser.html_parser import Element, HTMLParser, Text, tree_to_list
 from browser.css_parser import CSSParser
-from browser.style import cascade_priority, default_rules, style
+from browser.style import (RuleIndex, cascade_priority, default_rules,
+                           style)
 from browser.layout import (HSTEP, VSTEP, BlockLayout, DocumentLayout,
                             layout_tree_to_list, paint_tree)
 from browser.pages import DEMO_PAGE
@@ -74,10 +75,44 @@ rules = CSSParser(
     "@media (max-width: 5px) { p { color: blue; } }"
     "a:hover { color: green; } div { margin: 8px 16px; }"
 ).parse()
-check("CSS rule count (non-matching @media + :hover excluded)",
-      len(rules) == 4, f"got {len(rules)}")
+check("CSS rule count (non-matching @media excluded, :hover kept)",
+      len(rules) == 5, f"got {len(rules)}")
 ua = default_rules()
 check("UA stylesheet parses", len(ua) > 20, f"{len(ua)} rules")
+
+# :hover / :focus match only while the shell marks the node
+hov_dom = HTMLParser(
+    "<div class=m><p>x</p><span>s</span></div><input>").parse()
+hov_rules = sorted(
+    default_rules() + CSSParser(
+        "p { color: black; } p:hover { color: red; }"
+        ".m:hover span { color: green; }"
+        "input:focus { color: blue; }").parse(),
+    key=cascade_priority)
+_hp = next(n for n in tree_to_list(hov_dom, [])
+           if isinstance(n, Element) and n.tag == "p")
+_hs = next(n for n in tree_to_list(hov_dom, [])
+           if isinstance(n, Element) and n.tag == "span")
+_hi = next(n for n in tree_to_list(hov_dom, [])
+           if isinstance(n, Element) and n.tag == "input")
+style(hov_dom, RuleIndex(hov_rules))
+check(":hover rules stay inert without hover state",
+      _hp.style["color"] == "black"
+      and _hs.style.get("color") != "green")
+# hover chain: the element and its ancestors
+cur = _hp
+while cur is not None:
+    if isinstance(cur, Element):
+        cur.is_hovered = True
+    cur = cur.parent
+_hi.is_focused = True
+style(hov_dom, RuleIndex(hov_rules))
+check(":hover matches the hovered element",
+      _hp.style["color"] == "red", _hp.style.get("color"))
+check("ancestor :hover fires descendant rules",
+      _hs.style.get("color") == "green", _hs.style.get("color"))
+check(":focus matches the focused input",
+      _hi.style.get("color") == "blue", _hi.style.get("color"))
 
 # --- Style + layout (needs a tk root for font metrics) ---
 root = tkinter.Tk()

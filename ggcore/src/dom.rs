@@ -36,6 +36,11 @@ pub struct Document {
     /// bumped on every structural/attribute mutation — the render
     /// loop re-styles/re-lays-out only when this changes
     pub version: u64,
+    /// :hover state — the element under the pointer and its ancestors
+    /// (the shell sets this before a hover restyle)
+    pub hover_chain: Vec<usize>,
+    /// :focus state — the focused element, if any
+    pub focused: Option<usize>,
 }
 
 impl Document {
@@ -45,6 +50,8 @@ impl Document {
             root: 0,
             id_map: HashMap::new(),
             version: 0,
+            hover_chain: Vec::new(),
+            focused: None,
         }
     }
 

@@ -427,6 +427,27 @@ impl Doc {
         out
     }
 
+    /// Shell-side hover update: mark the element under the pointer
+    /// and its ancestors so `:hover` rules match on the next
+    /// compute_styles. Pass None when the pointer leaves the page.
+    #[pyo3(signature = (node_idx=None))]
+    fn set_hover(&mut self, node_idx: Option<usize>) {
+        let mut d = self.doc.borrow_mut();
+        d.hover_chain.clear();
+        let mut cur = node_idx.filter(|&i| i < d.nodes.len());
+        while let Some(i) = cur {
+            d.hover_chain.push(i);
+            cur = d.nodes[i].parent;
+        }
+    }
+
+    /// Shell-side focus update for `:focus` rules.
+    #[pyo3(signature = (node_idx=None))]
+    fn set_focus(&mut self, node_idx: Option<usize>) {
+        let mut d = self.doc.borrow_mut();
+        d.focused = node_idx.filter(|&i| i < d.nodes.len());
+    }
+
     /// Shell-side attribute write (typed input values): mirror the
     /// change into the DOM so page JS reads what the user typed.
     fn set_attr(&mut self, node_idx: usize, name: String, value: String) {

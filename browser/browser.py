@@ -139,6 +139,7 @@ class Browser:
     def render_page(self, url, body):
         self.url = url
         self.url_var.set(str(url))
+        self._reset_interaction()
 
         if native.available():
             # Rust fast path: parse + JS + cascade + style in ggcore.
@@ -161,7 +162,10 @@ class Browser:
             # drive fetch/timer-driven SPA content, then rebuild the tree
             if native.settle_async(self._doc, self._css_sources, url):
                 self.nodes = native.refresh(self._doc, self._css_sources)
-            self._drop_focus()
+            self._hover_rules = any(
+                ":hover" in s for s in self._css_sources)
+            self._focus_rules = any(
+                ":focus" in s for s in self._css_sources)
             for line in js_logs:
                 print(f"[js console] {line}")
             if js_logs:
@@ -175,7 +179,12 @@ class Browser:
             rules = sorted(rules, key=cascade_priority)
             # Style depends only on the DOM and CSS, not on window size:
             # compute it once per page load, never on resize.
-            style(self.nodes, RuleIndex(rules))
+            self._py_rule_index = RuleIndex(rules)
+            style(self.nodes, self._py_rule_index)
+            self._hover_rules = any(
+                ":hover" in repr(sel) for sel, _ in rules)
+            self._focus_rules = any(
+                ":focus" in repr(sel) for sel, _ in rules)
 
         title = "GG Browser"
         for node in tree_to_list(self.nodes, []):
@@ -250,7 +259,7 @@ class Browser:
                 self._dom_version = version
                 self._live_idle = 0
                 self.nodes = native.refresh(self._doc, self._css_sources)
-                self._drop_focus()
+                self._remap_marks()
                 self.load_images(self.nodes, self.url, keep_cache=True)
                 self.relayout()
             else:
@@ -513,7 +522,7 @@ class Browser:
         # a click handler may have scheduled fetch/timers — settle them
         native.settle_async(self._doc, self._css_sources, self.url)
         self.nodes = native.refresh(self._doc, self._css_sources)
-        self._drop_focus()
+        self._remap_marks()
         self.load_images(self.nodes, self.url, keep_cache=True)
         for node in tree_to_list(self.nodes, []):
             if isinstance(node, Element) and node.tag == "title":
@@ -565,11 +574,87 @@ class Browser:
 
     # ---------- text input focus / typing ----------
 
+    def _reset_interaction(self):
+        """New page: no focus, no hover, no stale rule flags."""
+        self.focus_node = None
+        self._focus_ridx = None
+        self._hover_node = None
+        self._hover_ridx = None
+        self._hover_marks = []
+        self._hover_rules = False
+        self._focus_rules = False
+        self._py_rule_index = None
+
     def _drop_focus(self):
         """The node tree was rebuilt: the focused node is orphaned."""
         if self.focus_node is not None:
             self.focus_node.is_focused = False
             self.focus_node = None
+
+    def _remap_marks(self):
+        """After a native tree rebuild, re-find the focused/hovered
+        nodes by their Rust indices so the caret survives live ticks
+        and hover restyles (the Rust document keeps the real state)."""
+        focus_ridx = getattr(self, "_focus_ridx", None)
+        hover_ridx = getattr(self, "_hover_ridx", None)
+        self.focus_node = None
+        self._hover_node = None
+        self._hover_marks = []
+        if focus_ridx is None and hover_ridx is None:
+            return
+        for n in tree_to_list(self.nodes, []):
+            r = getattr(n, "_ridx", None)
+            if r is None:
+                continue
+            if r == focus_ridx:
+                n.is_focused = True
+                self.focus_node = n
+            if r == hover_ridx:
+                self._hover_node = n
+
+    @staticmethod
+    def _ridx_of(node):
+        while node is not None:
+            r = getattr(node, "_ridx", None)
+            if r is not None:
+                return r
+            node = node.parent
+        return None
+
+    def set_hover(self, el):
+        """Pointer moved onto a (possibly new) element: update the
+        hover chain marks and restyle if the page has :hover rules."""
+        if el is self._hover_node:
+            return
+        self._hover_node = el
+        self._hover_ridx = self._ridx_of(el)
+        for n in self._hover_marks:
+            n.is_hovered = False
+        marks = []
+        cur = el
+        while cur is not None:
+            if isinstance(cur, Element):
+                cur.is_hovered = True
+                marks.append(cur)
+            cur = cur.parent
+        self._hover_marks = marks
+        doc = getattr(self, "_doc", None)
+        if doc is not None and hasattr(doc, "set_hover"):
+            doc.set_hover(self._hover_ridx)
+        if self._hover_rules:
+            self.restyle()
+
+    def restyle(self):
+        """Re-run style with the current hover/focus state, then
+        relayout. (Full-page for now — partial invalidation is the
+        M4 follow-up.)"""
+        if self._doc is not None:
+            self.nodes = native.refresh(self._doc, self._css_sources)
+            self._remap_marks()
+            self.load_images(self.nodes, self.url, keep_cache=True)
+        elif self._py_rule_index is not None:
+            style(self.nodes, self._py_rule_index)
+        self.relayout()
 
     def set_focus(self, node):
         if self.focus_node is node:
@@ -577,9 +662,16 @@ class Browser:
         if self.focus_node is not None:
             self.focus_node.is_focused = False
         self.focus_node = node
+        self._focus_ridx = self._ridx_of(node)
         if node is not None:
             node.is_focused = True
-        self.repaint()
+        doc = getattr(self, "_doc", None)
+        if doc is not None and hasattr(doc, "set_focus"):
+            doc.set_focus(self._focus_ridx)
+        if self._focus_rules:
+            self.restyle()
+        else:
+            self.repaint()
 
     def repaint(self):
         """Rebuild the display list without restyling or relayout —
@@ -643,6 +735,10 @@ class Browser:
             return
         self._last_motion = now
         obj = self.hit_test(event.x, event.y + self.scroll)
+        el = obj.node if obj else None
+        while el is not None and not isinstance(el, Element):
+            el = el.parent
+        self.set_hover(el)
         href = self.find_link(obj.node) if obj else None
         if href:
             self.canvas.config(cursor="hand2")
