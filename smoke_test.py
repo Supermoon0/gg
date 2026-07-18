@@ -696,6 +696,9 @@ if native.available():
                                         "size": [], "repeat": "no-repeat"})
     import tkinter as _tk3
     _r3 = _tk3.Tk(); _r3.withdraw()
+    # tk-fallback fonts died with the old root; force re-creation
+    from browser import layout as _layout
+    _layout._FONT_CACHE.clear()
     from browser.draw import DrawBgImage as _DrawBg2
     ps_doc = DocumentLayout(ps_dom)
     ps_doc.layout(400)
@@ -723,6 +726,8 @@ if native.available():
               and img[1] == 50 and img[2] == 50, str(img))
         import tkinter as _tk
         _r2 = _tk.Tk(); _r2.withdraw()
+        from browser import layout as _layout2
+        _layout2._FONT_CACHE.clear()
         svg_doc = DocumentLayout(svg_dom)
         svg_doc.layout(400)
         svg_cmds = paint_tree(svg_doc, [])

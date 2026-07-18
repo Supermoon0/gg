@@ -628,8 +628,12 @@ impl PageVm {
                 ("assign", Native::HostFn(host::O_ASSIGN)),
                 ("freeze", Native::HostFn(host::O_FREEZE)),
                 ("defineProperty", Native::HostFn(host::O_DEFINE_PROP)),
+                ("defineProperties",
+                 Native::HostFn(host::O_DEFINE_PROPS)),
                 ("getOwnPropertyDescriptor",
                  Native::HostFn(host::O_GET_OWN_PD)),
+                ("getOwnPropertyNames",
+                 Native::HostFn(host::O_GET_OWN_NAMES)),
                 ("create", Native::HostFn(host::O_CREATE)),
                 ("getPrototypeOf", Native::HostFn(host::O_GET_PROTO)),
                 ("setPrototypeOf", Native::HostFn(host::O_SET_PROTO)),
@@ -1289,6 +1293,25 @@ mod tests {
         assert_eq!(
             n("Object.getOwnPropertyDescriptor({}, 'nope') === \
                undefined ? 1 : 0"), 1.0);
+        // defineProperties: batch of data + accessor descriptors
+        assert_eq!(
+            n("var o = {}; Object.defineProperties(o, { \
+                 a: {value: 4}, \
+                 b: {get: function() { return this.a * 10; }} }); \
+               o.a + o.b"), 44.0);
+        // getOwnPropertyNames sees data props AND accessor-only keys
+        // (Object.keys skips the accessor side-table)
+        assert_eq!(
+            n("var o = {x: 1}; Object.defineProperty(o, 'y', \
+               {get: function() { return 2; }}); \
+               var names = Object.getOwnPropertyNames(o); \
+               (names.indexOf('x') >= 0 ? 1 : 0) + \
+               (names.indexOf('y') >= 0 ? 2 : 0) + \
+               (Object.keys(o).indexOf('y') < 0 ? 4 : 0)"), 7.0);
+        // array: index keys come first
+        assert_eq!(
+            n("Object.getOwnPropertyNames([7, 8]).join(',') === '0,1' \
+               ? 1 : 0"), 1.0);
     }
 
     #[test]
@@ -1970,6 +1993,35 @@ console.log('B typeof it: ' + typeof it);
             n("matchMedia('(min-width: 0px)').matches === false \
                ? 1 : 0"),
             1.0);
+    }
+
+    #[test]
+    fn canvas_2d_stub_context() {
+        // drawing calls are swallowed, readbacks return zeros, and
+        // unsupported context kinds answer null (feature detection)
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<canvas id=c width=300></canvas>"),
+        ))));
+        let logs = vm.run_scripts(&["\
+            var el = document.getElementById('c');\n\
+            var ctx = el.getContext('2d');\n\
+            ctx.fillStyle = '#fff';\n\
+            ctx.fillRect(0, 0, 10, 10);\n\
+            ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(5, 5);\n\
+            ctx.stroke();\n\
+            var g = ctx.createLinearGradient(0, 0, 1, 1);\n\
+            g.addColorStop(0, 'red');\n\
+            console.log('w ' + ctx.measureText('hi').width);\n\
+            console.log('img ' + ctx.getImageData(0, 0, 1, 1).data.length);\n\
+            console.log('gl ' + (el.getContext('webgl') === null));\n\
+            console.log('cv ' + (ctx.canvas === el));\n\
+            console.log('url ' + el.toDataURL());\n"
+            .to_string()]);
+        assert!(logs.contains(&"w 0".to_string()), "{logs:?}");
+        assert!(logs.contains(&"img 0".to_string()), "{logs:?}");
+        assert!(logs.contains(&"gl true".to_string()), "{logs:?}");
+        assert!(logs.contains(&"cv true".to_string()), "{logs:?}");
+        assert!(logs.contains(&"url data:,".to_string()), "{logs:?}");
     }
 
     #[test]

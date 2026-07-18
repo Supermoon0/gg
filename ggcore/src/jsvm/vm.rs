@@ -231,12 +231,18 @@ pub(super) mod host {
     pub const O_CREATE: u16 = 47;
     pub const O_GET_PROTO: u16 = 48;
     pub const O_SET_PROTO: u16 = 49;
+    pub const O_DEFINE_PROPS: u16 = 50;
+    pub const O_GET_OWN_NAMES: u16 = 51;
     pub const A_ISARRAY: u16 = 60;
     pub const A_FROM: u16 = 61;
     pub const N_ISNAN: u16 = 80;
     pub const N_ISFINITE: u16 = 81;
     pub const N_ISINTEGER: u16 = 82;
     pub const S_FROMCHARCODE: u16 = 100;
+    // canvas-2d stub context (crash prevention; no real rasterizing)
+    pub const CV_MEASURE_TEXT: u16 = 120;
+    pub const CV_IMAGE_DATA: u16 = 121;
+    pub const CV_GRADIENT: u16 = 122;
 }
 
 /// Hidden class: property layout shared by every object that acquired
@@ -2882,6 +2888,50 @@ fn do_native(
 }
 
 /// Math/Object/Array/Number/String static methods (Native::HostFn).
+/// One property-descriptor application, shared by Object.defineProperty
+/// and Object.defineProperties. Function targets store value
+/// descriptors in the static-props table ("prototype" swaps the
+/// prototype); accessors on functions are accepted and ignored.
+fn define_one_prop(
+    st: &mut St,
+    obj: Value,
+    key: u32,
+    desc: Value,
+) -> Result<(), VmError> {
+    if obj.is_function() {
+        if desc.is_object() {
+            let val_id = st.intern_name("value");
+            if let Some(v) =
+                raw_get_prop(st, desc.index() as usize, val_id)
+            {
+                if key == st.ids.prototype {
+                    st.fn_protos.insert(obj.index(), v);
+                } else {
+                    st.fn_props.insert((obj.index(), key), v);
+                }
+            }
+        }
+        return Ok(());
+    }
+    let oi = obj.index() as usize;
+    if !desc.is_object() {
+        return err("defineProperty needs a descriptor object");
+    }
+    let di = desc.index() as usize;
+    let get_id = st.intern_name("get");
+    let set_id = st.intern_name("set");
+    let val_id = st.intern_name("value");
+    let g = raw_get_prop(st, di, get_id).unwrap_or(Value::UNDEFINED);
+    let s = raw_get_prop(st, di, set_id).unwrap_or(Value::UNDEFINED);
+    if g.is_function() || s.is_function() {
+        st.accessors.insert((oi as u32, key), (g, s));
+        st.objects[oi].has_accessors = true;
+    } else if let Some(v) = raw_get_prop(st, di, val_id) {
+        raw_set_prop(st, oi, key, v);
+    }
+    Ok(())
+}
+
 fn host_fn(
     st: &mut St,
     id: u16,
@@ -3022,52 +3072,122 @@ fn host_fn(
         O_FREEZE => Ok(argv!(0)), // no-op (we don't enforce immutability)
         O_DEFINE_PROP => {
             let obj = argv!(0);
-            if obj.is_function() {
-                // defineProperty on a function: value descriptors land
-                // in the static-props table ("prototype" swaps the
-                // prototype); accessors are accepted and ignored
-                let key_name = to_display(st, argv!(1));
-                let key = st.intern_name(&key_name);
-                let desc = argv!(2);
-                if desc.is_object() {
-                    let val_id = st.intern_name("value");
-                    if let Some(v) = raw_get_prop(
-                        st, desc.index() as usize, val_id)
-                    {
-                        if key == st.ids.prototype {
-                            st.fn_protos.insert(obj.index(), v);
-                        } else {
-                            st.fn_props.insert((obj.index(), key), v);
-                        }
-                    }
-                }
-                return Ok(obj);
-            }
-            if !obj.is_object() {
+            if !obj.is_object() && !obj.is_function() {
                 return err("defineProperty needs an object");
             }
-            let oi = obj.index() as usize;
             let key_name = to_display(st, argv!(1));
             let key = st.intern_name(&key_name);
-            let desc = argv!(2);
-            if !desc.is_object() {
-                return err("defineProperty needs a descriptor object");
+            define_one_prop(st, obj, key, argv!(2))?;
+            Ok(obj)
+        }
+        O_DEFINE_PROPS => {
+            let obj = argv!(0);
+            if !obj.is_object() && !obj.is_function() {
+                return err("defineProperties needs an object");
             }
-            let di = desc.index() as usize;
-            let get_id = st.intern_name("get");
-            let set_id = st.intern_name("set");
-            let val_id = st.intern_name("value");
-            let g = raw_get_prop(st, di, get_id)
-                .unwrap_or(Value::UNDEFINED);
-            let s = raw_get_prop(st, di, set_id)
-                .unwrap_or(Value::UNDEFINED);
-            if g.is_function() || s.is_function() {
-                st.accessors.insert((oi as u32, key), (g, s));
-                st.objects[oi].has_accessors = true;
-            } else if let Some(v) = raw_get_prop(st, di, val_id) {
-                raw_set_prop(st, oi, key, v);
+            let descs = argv!(1);
+            if !descs.is_object() {
+                return err("defineProperties needs a descriptor map");
+            }
+            let di = descs.index() as usize;
+            let shape = st.objects[di].shape;
+            let mut pairs: Vec<(u16, u32)> = st.shapes[shape as usize]
+                .props.iter().map(|(&a, &s)| (s, a)).collect();
+            pairs.sort_by_key(|&(slot, _)| slot);
+            for (slot, atom) in pairs {
+                let desc = st.objects[di].slots[slot as usize];
+                define_one_prop(st, obj, atom, desc)?;
             }
             Ok(obj)
+        }
+        O_GET_OWN_NAMES => {
+            // own names = index keys + shape props + accessor-only
+            // keys (Object.keys skips the accessor side-table)
+            let v = argv!(0);
+            if v.is_function() {
+                let fidx = v.index();
+                let mut keys: Vec<u32> = st.fn_props.keys()
+                    .filter(|&&(f, _)| f == fidx)
+                    .map(|&(_, k)| k).collect();
+                keys.sort_unstable();
+                if matches!(st.closures[fidx as usize],
+                            ClosureRec::User { .. }) {
+                    keys.push(st.ids.prototype);
+                }
+                let mut out = Vec::new();
+                for k in keys {
+                    let name = st.names[k as usize].clone();
+                    out.push(intern(st, &name));
+                }
+                return Ok(new_array(st, out));
+            }
+            if !v.is_object() {
+                return Ok(new_array(st, Vec::new()));
+            }
+            let oi = v.index() as usize;
+            let (nelems, shape, has_acc) = {
+                let o = &st.objects[oi];
+                (o.elems.len(), o.shape, o.has_accessors)
+            };
+            let mut out = Vec::new();
+            for k in 0..nelems {
+                out.push(intern(st, &k.to_string()));
+            }
+            let mut pairs: Vec<(u16, u32)> = st.shapes[shape as usize]
+                .props.iter().map(|(&a, &s)| (s, a)).collect();
+            pairs.sort_by_key(|&(slot, _)| slot);
+            let mut seen: Vec<u32> = Vec::new();
+            for (_, atom) in pairs {
+                seen.push(atom);
+                let name = st.names[atom as usize].clone();
+                out.push(intern(st, &name));
+            }
+            if has_acc {
+                let mut acc: Vec<u32> = st.accessors.keys()
+                    .filter(|&&(o, _)| o == oi as u32)
+                    .map(|&(_, k)| k)
+                    .filter(|k| !seen.contains(k))
+                    .collect();
+                acc.sort_unstable();
+                for k in acc {
+                    let name = st.names[k as usize].clone();
+                    out.push(intern(st, &name));
+                }
+            }
+            Ok(new_array(st, out))
+        }
+        CV_MEASURE_TEXT => {
+            // canvas-2d stub: zero metrics (layout runs after JS)
+            let m = new_plain_object(st);
+            let mi = m.index() as usize;
+            for f in ["width", "actualBoundingBoxAscent",
+                      "actualBoundingBoxDescent",
+                      "actualBoundingBoxLeft",
+                      "actualBoundingBoxRight"] {
+                let k = st.intern_name(f);
+                raw_set_prop(st, mi, k, Value::int(0));
+            }
+            Ok(m)
+        }
+        CV_IMAGE_DATA => {
+            let m = new_plain_object(st);
+            let mi = m.index() as usize;
+            let data = new_array(st, Vec::new());
+            let dk = st.intern_name("data");
+            raw_set_prop(st, mi, dk, data);
+            for f in ["width", "height"] {
+                let k = st.intern_name(f);
+                raw_set_prop(st, mi, k, Value::int(0));
+            }
+            Ok(m)
+        }
+        CV_GRADIENT => {
+            let g = new_plain_object(st);
+            let gi = g.index() as usize;
+            let noop = make_native(st, Native::Noop);
+            let k = st.intern_name("addColorStop");
+            raw_set_prop(st, gi, k, noop);
+            Ok(g)
         }
         O_GET_OWN_PD => {
             let obj = argv!(0);
@@ -3749,6 +3869,60 @@ fn dom_method(
         "scrollIntoView" | "focus" | "blur" | "scrollTo" | "scrollBy"
         | "setAttributeNS" | "closest" => {
             return Ok(Value::UNDEFINED);
+        }
+        "getContext" => {
+            // canvas-2d stub context: every drawing call is accepted
+            // and ignored (no rasterizing); readbacks return zeros.
+            // Non-2d kinds (webgl...) answer null so feature detection
+            // takes its unsupported path honestly.
+            let kind = arg_string(st, args_base, argc, 0)?
+                .to_lowercase();
+            if kind != "2d" {
+                return Ok(Value::NULL);
+            }
+            let ctx = new_plain_object(st);
+            let ci = ctx.index() as usize;
+            for m in ["fillRect", "clearRect", "strokeRect",
+                      "beginPath", "closePath", "moveTo", "lineTo",
+                      "bezierCurveTo", "quadraticCurveTo", "arc",
+                      "arcTo", "ellipse", "rect", "fill", "stroke",
+                      "clip", "save", "restore", "translate", "scale",
+                      "rotate", "transform", "setTransform",
+                      "resetTransform", "drawImage", "fillText",
+                      "strokeText", "putImageData", "setLineDash"] {
+                let k = st.intern_name(m);
+                let f = make_native(st, Native::Noop);
+                raw_set_prop(st, ci, k, f);
+            }
+            for (m, id) in [
+                ("measureText", host::CV_MEASURE_TEXT),
+                ("getImageData", host::CV_IMAGE_DATA),
+                ("createImageData", host::CV_IMAGE_DATA),
+                ("createLinearGradient", host::CV_GRADIENT),
+                ("createRadialGradient", host::CV_GRADIENT),
+                ("createPattern", host::CV_GRADIENT),
+            ] {
+                let k = st.intern_name(m);
+                let f = make_native(st, Native::HostFn(id));
+                raw_set_prop(st, ci, k, f);
+            }
+            let ck = st.intern_name("canvas");
+            raw_set_prop(st, ci, ck, Value::dom_node(node));
+            for p in ["lineWidth", "globalAlpha"] {
+                let k = st.intern_name(p);
+                raw_set_prop(st, ci, k, Value::int(1));
+            }
+            for p in ["fillStyle", "strokeStyle", "font", "textAlign",
+                      "textBaseline", "globalCompositeOperation"] {
+                let k = st.intern_name(p);
+                let empty = intern(st, "");
+                raw_set_prop(st, ci, k, empty);
+            }
+            return Ok(ctx);
+        }
+        "toDataURL" => {
+            // empty image, the smallest legal data URL
+            return Ok(intern(st, "data:,"));
         }
         "removeEventListener" => {
             let ty = arg_string(st, args_base, argc, 0)?.to_lowercase();

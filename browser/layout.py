@@ -49,6 +49,9 @@ def get_font(size, weight, slant, family="default"):
                 size=-size,  # negative = pixels
                 weight=weight, slant=slant, family=resolved,
             )
+            # px size under the same name NativeFont exposes
+            # (line-height reads font.size on both paths)
+            font.size = size
             # A hidden Label keeps the font object alive and fast.
             label = tkinter.Label(font=font)
             # Metrics are Tcl calls; compute once and cache on the font.

@@ -5,7 +5,7 @@
 | 단계 | 기준 | 필요한 마일스톤 | 상태 (07-16) |
 |---|---|---|---|
 | **A. 크롬 JS-off 동급** | 로고·둥근 검색창·아이콘이 픽셀 수준으로 같음 | M1 | **사실상 달성** (M1 주요 항목 완료, 웹폰트·flex 심화 등 소품 잔여) |
-| **B. 첫 화면 완성** | 뉴스·쇼핑·피드가 실제로 그려짐 | M2 + M3 + M4 | M2 95% (문법 완료, 런타임 롱테일) · M3 착수 · M4 미착수 |
+| **B. 첫 화면 완성** | 뉴스·쇼핑·피드가 실제로 그려짐 | M2 + M3 + M4 | M2 95% (문법 완료, 런타임 롱테일) · M3 스텁 표면 완료(07-18, 잔여: getBoundingClientRect 실측) · M4 라이브 루프 v1 |
 | **C. 사용 가능** | 스크롤·호버·검색 타이핑·클릭 이동 | M5 | 스크롤만 (가로/세로) |
 | **D. 크롬급 속도** | 재방문 1초 내 첫 화면, 스크롤 60fps | M6 | 재방문 0.18s ✅ · 60fps 미측정 |
 
@@ -215,7 +215,11 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
       typed-array 스텁 11종, nullish 쓰기 관용.
       **polyfill: 엔진 관문 소진 — 남은 건 JS 레벨 TypeError 2종**
       (bound 생성자 new 시맨틱, anObject 감지 — 메모리에 수정안 기록)
-- [ ] `Object.defineProperties/getOwnPropertyNames` 잔여
+- [x] **`Object.defineProperties`/`getOwnPropertyNames`** — 07-18:
+      defineProperties는 defineProperty와 적용 로직 공유(define_one_prop
+      추출), getOwnPropertyNames는 인덱스 키 + shape 프로퍼티 +
+      **접근자 사이드테이블 키**(Object.keys가 못 보는 accessor-only 키
+      포함), 함수 타깃은 정적 프로퍼티 + prototype
 - [x] **`Symbol`(페이크)** — 07-16: 문자열 기반(프렐류드 JS) — 유일값·
       well-known 6종·for/keyFor. 갭: typeof가 'string'
 - [x] **이터레이터 프로토콜 (for-of)** — 07-16: IterMaterialize 명령 —
@@ -266,8 +270,9 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
 - [x] **트리 API** — 07-16: insertBefore/removeChild/replaceChild/
       cloneNode(deep)/contains + parentNode/children/childNodes/
       firstChild/tagName/nodeType 게터. innerHTML get/set은 기존 동작
-- [ ] **`getBoundingClientRect`** (×4) — JS가 레이아웃 결과를 읽는 다리 (설계 필요)
-- [ ] `getComputedStyle`
+- [ ] **`getBoundingClientRect`** (×4) — JS가 레이아웃 결과를 읽는 다리
+      (설계 필요; 현재는 제로렉트 스텁 — 크래시 방지)
+- [x] `getComputedStyle` — 스텁(el.style 프록시 반환, 프렐류드) 확인 07-18
 
 ### 브라우저 객체
 - [x] **`location.*`(×19), `history.*`(×2), `navigator.*`(×2),
@@ -285,10 +290,21 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
 - [x] **`requestAnimationFrame`(×13)** — 07-16: 16ms 가상 타이머
       (Native::Raf, 콜백에 타임스탬프). cancelAF/requestIdleCallback 포함.
       프레임 "루프"(M4 렌더 통합)는 별도
-- [ ] `IntersectionObserver`(×1)/`ResizeObserver`(×2) — 최소 스텁 + 발화
-- [ ] `matchMedia` (×2), `postMessage` (×8), `scrollTo` (×11)
-- [ ] canvas 2D (×9 — 크래시 방지 스텁 먼저, 실렌더 후순위)
-- [ ] `fetch`/XHR 마무리 (main 번들엔 0회 — 데이터는 EAGER-DATA 인라인이라 후순위)
+- [x] `IntersectionObserver`(×1)/`ResizeObserver`(×2) — 스텁 + 발화
+      구현돼 있음 확인 07-18 (프렐류드: IO는 "모두 가시"로 즉시 발화 —
+      lazy 콘텐츠가 즉시 로드됨. MutationObserver·customElements·
+      AbortController 포함)
+- [x] `matchMedia` (×2), `postMessage` (×8), `scrollTo` (×11) —
+      구현돼 있음 확인 07-18 (matchMedia는 matches:false 객체,
+      postMessage/scrollTo는 window noop)
+- [x] **canvas 2D 크래시 방지 스텁** (×9) — 07-18: `getContext('2d')`가
+      스텁 컨텍스트 반환 — 드로잉 호출 28종 noop 수용, measureText/
+      getImageData/createImageData는 제로 메트릭·빈 데이터 객체,
+      그라디언트/패턴은 addColorStop noop 객체, canvas 역참조·
+      fillStyle 등 상태 프로퍼티 보유. webgl 등 비-2d는 null(정직한
+      피처 디텍션), `toDataURL()`은 `"data:,"`. 실렌더는 후순위
+- [x] `fetch`/XHR — fetch는 가상 시계 서비스 네이티브, XHR은 fetch 위에
+      랩(GET, onload/onreadystatechange) — 확인 07-18. main 번들엔 0회
 
 ---
 
@@ -424,7 +440,12 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
 7. M5 입력/호버 — "쓸 수 있는 브라우저". 제너레이터·ES 모듈은 필요 사이트가
    나타날 때. M6 잔여(JIT·레이아웃 이식·GC)는 B단계 도달 후 측정해서 결정.
 
-*갱신: 2026-07-16 (M1 완료·바스켓 상설화·모던 JS 라운드 반영).
-항목을 완료하면 [x]로 바꾸고 날짜를 적을 것. cargo 132/132, smoke 111종 기준.
+*갱신: 2026-07-18 (canvas 2D 스텁·Object.defineProperties/
+getOwnPropertyNames 추가, M3 스텁류 실태 반영 — Observer/matchMedia/
+postMessage/scrollTo/getComputedStyle/XHR은 코드에 이미 있었는데 문서만
+미갱신이었음. + tkinter 폴백 폰트에 .size 부재 버그 수정 — line-height가
+NativeFont에만 있던 속성을 읽어 폴백 경로에서 크래시).
+항목을 완료하면 [x]로 바꾸고 날짜를 적을 것. cargo 148/148, smoke 108종
+(엔진 파트; 실네트워크 관문은 egress 제한 환경에서 측정 불가) 기준.
 검증 체인: cargo test → maturin build → pip 재설치 → smoke_test.py →
 basket_test.py (네이버 단건은 scratchpad diag 스크립트).*
