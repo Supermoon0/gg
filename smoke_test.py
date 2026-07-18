@@ -672,6 +672,45 @@ check("flex row placement", fa.y == fb.y == fc.y and fa.x < fb.x < fc.x,
 check("flex grow shares space", abs(fb.width - (774 - 100) / 2) < 1,
       f"fb.width={fb.width:.0f}")
 
+# --- float + clear (v1: width-bearing floats, block sidestep) ---
+FLOAT_PAGE = """<html><body style="margin: 0">
+<div id=wrap style="width:400px">
+  <div id=fl style="float:left; width:100px; height:80px">img</div>
+  <p id=txt style="margin:0">text beside the thumbnail</p>
+  <div id=fr style="float:right; width:50px; height:30px">r</div>
+  <p id=txt2 style="margin:0">second paragraph</p>
+  <div id=cl style="clear:both; height:10px">below</div>
+</div>
+</body></html>"""
+fl_dom = HTMLParser(FLOAT_PAGE).parse()
+style(fl_dom, sorted(ua, key=cascade_priority))
+fl_doc = DocumentLayout(fl_dom)
+fl_doc.layout(800)
+fb3 = {}
+for b in layout_tree_to_list(fl_doc, []):
+    if isinstance(b, BlockLayout) and isinstance(b.node, Element):
+        node_id = b.node.attributes.get("id")
+        if node_id:
+            fb3[node_id] = b
+_w = fb3["wrap"]
+check("float:left sits at the container edge, top of flow",
+      abs(fb3["fl"].x - _w.x) < 1 and abs(fb3["fl"].y - _w.y) < 1,
+      f"({fb3['fl'].x:.0f},{fb3['fl'].y:.0f}) vs ({_w.x:.0f},{_w.y:.0f})")
+check("in-flow text shifts right of the float and narrows",
+      abs(fb3["txt"].x - (_w.x + 100)) < 1
+      and abs(fb3["txt"].width - 300) < 1,
+      f"x={fb3['txt'].x:.0f} w={fb3['txt'].width:.0f}")
+check("in-flow text keeps the float's y (no push-down)",
+      abs(fb3["txt"].y - _w.y) < 1, f"y={fb3['txt'].y:.0f}")
+check("float:right hugs the right edge",
+      abs((fb3["fr"].x + fb3["fr"].width) - (_w.x + 400)) < 1,
+      f"right={fb3['fr'].x + fb3['fr'].width:.0f}")
+check("clear:both drops below the tallest float",
+      fb3["cl"].y >= _w.y + 80 - 1,
+      f"cl.y={fb3['cl'].y:.0f} float bottom={_w.y + 80:.0f}")
+check("container height contains its floats",
+      _w.height >= 80 + 10 - 1, f"h={_w.height:.0f}")
+
 # --- flex deep-dive: justify/align/shrink/basis/flex shorthand ---
 FLEX2_PAGE = """<html><body style="margin: 0">
 <div id=jc style="display:flex; justify-content:center; width:300px">

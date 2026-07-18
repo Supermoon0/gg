@@ -562,6 +562,33 @@ class BlockLayout:
             else:
                 self.y = (self.parent.y + self.margin_top
                           + self.bw + self.pt)
+            # clear: drop below the matching floats (set by the parent)
+            floor = getattr(self, "clear_y_floor", None)
+            if floor is not None:
+                self.y = max(
+                    self.y, floor + self.margin_top + self.bw + self.pt)
+            # floats in the containing block carve the line area:
+            # auto-width in-flow blocks shift and narrow around any
+            # float overlapping their top edge (line-box granularity
+            # is out of scope — the whole block sidesteps)
+            pf = getattr(self.parent, "_floats", None)
+            if pf and spec is None and self.forced_width is None \
+                    and getattr(self, "float_side", None) is None:
+                left_edge = self.parent.x
+                right_edge = self.parent.x + self.parent.width
+                for (s, fx, fy, fw2, fh) in pf:
+                    if not (fy <= self.y < fy + fh):
+                        continue
+                    if s == "left":
+                        left_edge = max(left_edge, fx + fw2)
+                    else:
+                        right_edge = min(right_edge, fx)
+                shift = left_edge - self.parent.x
+                narrow = (self.parent.x + self.parent.width) \
+                    - right_edge
+                if shift or narrow:
+                    self.x += shift
+                    box_w = max(box_w - shift - narrow, edge)
         self.width = max(box_w - edge, 0)
 
         # resolve a specified height before children lay out so they
@@ -575,20 +602,68 @@ class BlockLayout:
         if mode == "flex":
             self._layout_flex(node, em)
         elif mode == "block":
+            # incremental placement: floats registered by earlier
+            # children must be visible while later siblings lay out
             previous = None
+            self._floats = []  # (side, x, y, outer_w, outer_h)
             for child in node.children:
                 if not is_visible(child):
                     continue
                 if is_out_of_flow(child):
                     self._document().abs_queue.append(child)
                     continue
+                fside = "none"
+                fw = None
+                if isinstance(child, Element):
+                    fside = child.style.get(
+                        "float", "none").strip().casefold()
+                    if fside in ("left", "right"):
+                        fw = parse_size(
+                            child.style.get("width"), self.width, em)
+                if fside in ("left", "right") and fw is not None:
+                    # float: out of normal flow, anchored where the
+                    # flow currently ends (auto-width floats fall back
+                    # to normal flow — v1 gate)
+                    cur_y = self.y if previous is None else (
+                        previous.y + previous.height + previous.pb
+                        + previous.bw + previous.margin_bottom)
+                    box = BlockLayout(child, self, None)
+                    box.forced_width = fw
+                    box.float_side = fside
+                    box.flex_origin = (
+                        self._float_x(fside, cur_y, fw), cur_y)
+                    self.children.append(box)
+                    box.layout()
+                    self._floats.append((
+                        fside,
+                        box.x - box.ml - box.bw - box.pl,
+                        cur_y,
+                        box.outer_width(),
+                        box.outer_height(),
+                    ))
+                    continue  # previous unchanged: out of flow
                 nxt = BlockLayout(child, self, previous)
+                if isinstance(child, Element) and self._floats:
+                    cl = child.style.get(
+                        "clear", "none").strip().casefold()
+                    if cl in ("left", "right", "both"):
+                        ys = [fy + fh
+                              for (s, _, fy, _, fh) in self._floats
+                              if cl == "both" or s == cl]
+                        if ys:
+                            nxt.clear_y_floor = max(ys)
                 self.children.append(nxt)
+                nxt.layout()
                 previous = nxt
-            for child in self.children:
-                child.layout()
-            self.height = sum(
-                child.outer_height() for child in self.children)
+            # content height: bottom edge of the flow, extended to
+            # cover float bottoms (clearfix-style containment)
+            flow_bottom = self.y if previous is None else (
+                previous.y + previous.height + previous.pb
+                + previous.bw + previous.margin_bottom)
+            float_bottom = max(
+                (fy + fh for (_, _, fy, _, fh) in self._floats),
+                default=self.y)
+            self.height = max(flow_bottom, float_bottom) - self.y
             apply_relative_offsets(self.children)
         else:
             self.new_line()
@@ -630,6 +705,22 @@ class BlockLayout:
             base = self.parent.definite_height
             return parse_size(raw, base, em) if base is not None else None
         return parse_size(raw, 0, em)
+
+    def _float_x(self, side, y, w):
+        """Margin-edge x for a new float: after the floats already
+        occupying this y, from the matching side."""
+        left_edge = self.x
+        right_edge = self.x + self.width
+        for (s, fx, fy, fw, fh) in self._floats:
+            if not (fy <= y < fy + fh):
+                continue
+            if s == "left":
+                left_edge = max(left_edge, fx + fw)
+            else:
+                right_edge = min(right_edge, fx)
+        if side == "left":
+            return left_edge
+        return max(right_edge - w, left_edge)
 
     def _layout_flex(self, node, em):
         """Simplified flexbox: row direction, optional wrap, grow."""
