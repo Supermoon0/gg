@@ -413,9 +413,18 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
       (lex 12.5 + parse 11.5 + 스텁 6). 웜 실행 저하 없음.
       네이버 웜 로드 1,003ms 재실측은 로컬에서 (이 세션은 egress
       제한).
-- [ ] **스크롤 60fps** — 07-16 실측: 재직렬화 13ms + 래스터 26ms = 25fps.
-      ① 스크롤은 재직렬화 없이 래스터 단에서 오프셋 처리(=13ms 제거),
-      ② 더티 타일/디스플레이 리스트 캐시(M4와 합류)로 60fps 사정권
+- [x] **스크롤 60fps (native 셸 기준)** — 07-18: 디스플레이 리스트를
+      **Rust에 상주**(set_display_list — 페인트 변화 시에만 문서좌표·
+      기기픽셀로 1회 직렬화), 스크롤 프레임은 오프셋만 전달
+      (render_frame/render_frame_raw) — 뷰포트 컬링(클립 브래킷은
+      생존)·시프트·래스터 전부 Rust 안. 3.5k노드/4.2k cmd 페이지
+      실측(리눅스 컨테이너): **native 셸 경로 2.0ms/frame(≈488fps)**
+      — 07-16의 재직렬화 13ms 항목 자체가 소멸. tkinter 셸은
+      rust 2.2ms + tk PhotoImage 스왑 25.5ms = 잔여 병목이 tk 고유
+      한계(탈 tkinter 방향 그대로). 윈도우 실기 재실측 필요.
+      + **리눅스 폰트 폴백**(DejaVu/WQY 테이블, 로드된 테이블 기준
+      변형·한글 폴백 체인) — headless CI에서 네이티브 렌더 경로가
+      처음으로 실검증 가능해짐(P5 headless Linux 빌드의 전초)
 - [x] 파이프라인 오버랩 — 07-11: load_document가 JS 페치·실행과 병렬로
       스타일시트를 프리페치(스레드), JS가 주입한 링크만 후속 페치
 - [ ] 시작 시간 — 파이썬 기동+창 생성+폰트 로드 수백 ms (프로파일 후 캐시)
@@ -502,7 +511,7 @@ postMessage/scrollTo/getComputedStyle/XHR은 코드에 이미 있었는데 문�
 오후: **M6 lazy 컴파일 가동** — 지연 배분 실측용 프로파일 하니스
 `cargo test --release -- --ignored profile_phases --nocapture` 상설화.
 저녁: lazy parse + M4 transform — smoke 111종).
-항목을 완료하면 [x]로 바꾸고 날짜를 적을 것. cargo 151/151, smoke 121종
+항목을 완료하면 [x]로 바꾸고 날짜를 적을 것. cargo 151/151, smoke 123종
 (엔진 파트; 실네트워크 관문은 egress 제한 환경에서 측정 불가) 기준.
 검증 체인: cargo test → maturin build → pip 재설치 → smoke_test.py →
 basket_test.py (네이버 단건은 scratchpad diag 스크립트).*

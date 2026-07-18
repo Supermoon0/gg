@@ -27,6 +27,10 @@ struct TextEngine {
     store: fonts::FontStore,
     images: std::collections::HashMap<u32, (u32, u32, Vec<u8>)>,
     next_image: u32,
+    /// The page display list in document coordinates, stored once per
+    /// layout/paint change so scroll frames pass only offsets instead
+    /// of re-serializing and re-transferring every command (M6).
+    display_list: Vec<Cmd>,
 }
 
 #[pymethods]
@@ -38,6 +42,7 @@ impl TextEngine {
                 store,
                 images: std::collections::HashMap::new(),
                 next_image: 1,
+                display_list: Vec::new(),
             })
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
@@ -107,6 +112,47 @@ impl TextEngine {
         PyBytes::new(py, &r.to_ppm())
     }
 
+    /// Store the page display list (document coordinates; device px
+    /// if the shell pre-scales). Call on layout/paint changes only.
+    fn set_display_list(&mut self, cmds: Vec<Cmd>) {
+        self.display_list = cmds;
+    }
+
+    /// Rasterize the stored list at a scroll offset, then draw the
+    /// overlay (chrome — already in viewport coordinates) on top.
+    /// Off-viewport commands are culled here; clip brackets always
+    /// survive so push/pop stay balanced. Returns a binary PPM.
+    #[allow(clippy::too_many_arguments)]
+    fn render_frame<'py>(
+        &mut self,
+        py: Python<'py>,
+        width: u32,
+        height: u32,
+        bg: (u8, u8, u8),
+        dx: f64,
+        dy: f64,
+        overlay: Vec<Cmd>,
+    ) -> Bound<'py, PyBytes> {
+        let r = self.rasterize_at(width, height, bg, dx, dy, &overlay);
+        PyBytes::new(py, &r.to_ppm())
+    }
+
+    /// As render_frame, returning raw RGB bytes (native shell).
+    #[allow(clippy::too_many_arguments)]
+    fn render_frame_raw<'py>(
+        &mut self,
+        py: Python<'py>,
+        width: u32,
+        height: u32,
+        bg: (u8, u8, u8),
+        dx: f64,
+        dy: f64,
+        overlay: Vec<Cmd>,
+    ) -> Bound<'py, PyBytes> {
+        let r = self.rasterize_at(width, height, bg, dx, dy, &overlay);
+        PyBytes::new(py, &r.buf)
+    }
+
     /// Rasterize a display list; returns raw RGB bytes (no header).
     fn render_raw<'py>(
         &mut self,
@@ -122,6 +168,93 @@ impl TextEngine {
 }
 
 impl TextEngine {
+    /// Shift a command into viewport space and report whether any of
+    /// it can be visible. x2/y2 shift only when they are coordinates
+    /// (rect/line/oval/clip) — for images and background layers they
+    /// are width/height. Clip brackets are never culled.
+    fn shift_cull(
+        cmd: &Cmd,
+        dx: f64,
+        dy: f64,
+        width: f64,
+        height: f64,
+    ) -> Option<Cmd> {
+        let (kind, x1, y1, x2, y2, color, aux, font, text) = cmd;
+        let (kind, x1, y1, x2, y2) = (*kind, *x1, *y1, *x2, *y2);
+        match kind {
+            6 | 7 => Some((
+                kind,
+                x1 - dx,
+                y1 - dy,
+                x2 - dx,
+                y2 - dy,
+                *color,
+                *aux,
+                *font,
+                text.clone(),
+            )),
+            _ => {
+                let (top, bottom, left, right) = match kind {
+                    // text: y extent from the font size (linespace is
+                    // ~1.3x; 2x keeps the cull conservative)
+                    1 => (y1, y1 + aux * 2.0, x1, f64::INFINITY),
+                    // image / background layer: x2/y2 are w/h
+                    4 | 5 => (y1, y1 + y2, x1, x1 + x2),
+                    _ => (
+                        y1.min(y2),
+                        y1.max(y2),
+                        x1.min(x2),
+                        x1.max(x2),
+                    ),
+                };
+                if bottom < dy
+                    || top > dy + height
+                    || right < dx
+                    || left > dx + width
+                {
+                    return None;
+                }
+                let shifts_wh = !matches!(kind, 4 | 5);
+                Some((
+                    kind,
+                    x1 - dx,
+                    y1 - dy,
+                    if shifts_wh { x2 - dx } else { x2 },
+                    if shifts_wh { y2 - dy } else { y2 },
+                    *color,
+                    *aux,
+                    *font,
+                    text.clone(),
+                ))
+            }
+        }
+    }
+
+    fn rasterize_at(
+        &mut self,
+        width: u32,
+        height: u32,
+        bg: (u8, u8, u8),
+        dx: f64,
+        dy: f64,
+        overlay: &[Cmd],
+    ) -> raster::Raster {
+        let list = std::mem::take(&mut self.display_list);
+        let mut cmds: Vec<Cmd> =
+            Vec::with_capacity(list.len() / 4 + overlay.len());
+        for cmd in &list {
+            if let Some(c) = Self::shift_cull(
+                cmd, dx, dy, width as f64, height as f64,
+            ) {
+                cmds.push(c);
+            }
+        }
+        cmds.extend_from_slice(overlay);
+        let r = self.rasterize(width, height, bg, &cmds);
+        self.display_list = list;
+        r
+    }
+
     fn rasterize(
         &mut self,
         width: u32,

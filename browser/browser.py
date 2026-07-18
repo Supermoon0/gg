@@ -390,6 +390,7 @@ class Browser:
         self.document.layout(width, height if height > 50 else None)
         self.layout_list = layout_tree_to_list(self.document, [])
         self.display_list = paint_tree(self.document, [])
+        self._push_display_list()
         self.clamp_scroll()
         self.draw()
 
@@ -418,25 +419,28 @@ class Browser:
 
     # ---------- drawing ----------
 
+    def _push_display_list(self):
+        """Hand the display list to Rust once per paint change, in
+        document coordinates — scroll frames then pass only offsets
+        (no per-frame Python serialization, M6)."""
+        if textengine.available():
+            textengine.engine().set_display_list(
+                [cmd.native(0) for cmd in self.display_list])
+
     def draw(self):
         height = self.canvas.winfo_height()
         width = self.canvas.winfo_width()
         if textengine.available():
-            # Native path: Rust rasterizes the frame; tkinter just
-            # displays the resulting image.
-            cmds = []
-            for cmd in self.display_list:
-                if cmd.top > self.scroll + height:
-                    continue
-                if cmd.bottom < self.scroll:
-                    continue
-                cmds.append(cmd.native(self.scroll))
+            # Native path: Rust culls + rasterizes the stored list at
+            # this scroll offset; tkinter just displays the image.
+            overlay = []
             bar = self.scrollbar_rect(width, height)
             if bar:
-                cmds.append((0, bar[0], bar[1], bar[2], bar[3],
-                             (192, 192, 192), 0.0, 0, ""))
-            ppm = textengine.engine().render(
-                max(width, 1), max(height, 1), (255, 255, 255), cmds)
+                overlay.append((0, bar[0], bar[1], bar[2], bar[3],
+                                (192, 192, 192), 0.0, 0, ""))
+            ppm = textengine.engine().render_frame(
+                max(width, 1), max(height, 1), (255, 255, 255),
+                0.0, float(self.scroll), overlay)
             self._frame = tkinter.PhotoImage(data=ppm)
             self.canvas.delete("all")
             self.canvas.create_image(0, 0, image=self._frame, anchor="nw")
@@ -689,6 +693,7 @@ class Browser:
         if getattr(self, "document", None) is None:
             return
         self.display_list = paint_tree(self.document, [])
+        self._push_display_list()
         self.draw()
 
     def on_key(self, event):

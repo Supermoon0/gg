@@ -64,6 +64,8 @@ class Shell:
         self.document = None
         self.layout_list = []
         self.display_list = []
+        self._list_dirty = True
+        self._pushed_scale = None
         self.nodes = None
         self._doc = None
         self._css_sources = []
@@ -197,6 +199,7 @@ class Shell:
                              viewport_h if viewport_h > 50 else None)
         self.layout_list = layout_tree_to_list(self.document, [])
         self.display_list = paint_tree(self.document, [])
+        self._list_dirty = True
         # widest painted extent: absolute boxes (naver's 1190px design)
         # can stick out past the window even though layout used w
         self.content_width = max(
@@ -397,18 +400,11 @@ class Shell:
         max_hscroll = max(self.content_width + HSTEP - w, 0)
         self.hscroll = min(max(0, self.hscroll), max_hscroll)
 
-    def frame_cmds(self, w, h):
+    def chrome_cmds(self, w, h):
+        """Toolbar, status bar, and scrollbars — viewport-coordinate
+        overlay drawn on top of the scrolled page content."""
         content_h = h - TOOLBAR_H - STATUS_H
         cmds = []
-
-        # page content (shifted below the toolbar)
-        offset = self.scroll - TOOLBAR_H
-        for cmd in self.display_list:
-            if cmd.top > self.scroll + content_h:
-                continue
-            if cmd.bottom < self.scroll:
-                continue
-            cmds.append(cmd.native(offset, self.hscroll))
 
         # scrollbar
         if self.document:
@@ -484,9 +480,21 @@ class Shell:
         w, h = self.logical_size()
         if w < 50 or h < TOOLBAR_H + STATUS_H + 10:
             return
-        cmds = scale_cmds(self.frame_cmds(w, h),
-                          self.win.scale_factor())
-        buf = self.engine.render_raw(pw, ph, (255, 255, 255), cmds)
+        scale = self.win.scale_factor()
+        # the page list lives in Rust (device px, document coords);
+        # re-push only when paint or DPI changed — scroll frames just
+        # pass offsets (M6: no per-frame serialization)
+        if self._list_dirty or scale != self._pushed_scale:
+            self.engine.set_display_list(scale_cmds(
+                [cmd.native(0, 0.0) for cmd in self.display_list],
+                scale))
+            self._pushed_scale = scale
+            self._list_dirty = False
+        overlay = scale_cmds(self.chrome_cmds(w, h), scale)
+        buf = self.engine.render_frame_raw(
+            pw, ph, (255, 255, 255),
+            self.hscroll * scale, (self.scroll - TOOLBAR_H) * scale,
+            overlay)
         self.win.present(pw, ph, buf)
         self.dirty = False
 
