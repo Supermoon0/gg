@@ -870,8 +870,14 @@ class BlockLayout:
     def image(self, node):
         img = getattr(node, "_img", None)  # (image_id, w, h) or None
         natural_w, natural_h = (img[1], img[2]) if img else (24, 24)
-        w = _attr_px(node, "width")
-        h = _attr_px(node, "height")
+        # CSS width/height outrank the HTML attributes on replaced
+        # elements (% width against the containing block; % height has
+        # no definite base here and falls through to the attr/ratio)
+        em = parse_px(node.style.get("font-size", "16px"), 16.0)
+        w = parse_size(node.style.get("width"), self.width, em)
+        h = parse_size(node.style.get("height"), 0.0, em)
+        w = w if w is not None else _attr_px(node, "width")
+        h = h if h is not None else _attr_px(node, "height")
         if w and not h:
             h = w * natural_h / natural_w if natural_w else w
         elif h and not w:

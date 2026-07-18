@@ -139,7 +139,11 @@ class 2회) 문법 갭이 좁고, `display:grid`·`position:sticky`도 **0회**�
       "nowrap"`이 참이라 **모든 flex 컨테이너가 랩 모드였음** — 이제
       정확 매칭(스펙 기본 nowrap + shrink; 기존에 우연히 랩에 의존한
       렌더는 달라질 수 있음 — 바스켓 재검증 필요)
-- [ ] CSS `width/height`가 대체 요소(img·svg·input)에 적용 (지금은 HTML 속성만)
+- [x] **CSS `width/height`가 대체 요소에 적용** — 07-18: img/svg의
+      인라인 이미지 박스가 CSS 크기를 HTML 속성보다 우선 사용(% 폭은
+      컨테이닝 블록 기준, 한쪽만 지정 시 고유 비율 유지; % 높이는
+      기준 없음 → 속성/비율 폴백). input은 블록 박스 모델이라 기존에
+      이미 적용됨
 - [ ] `float` + `clear` (×25)
 - [ ] inline-block 정식 배치 (지금은 근사)
 - [ ] margin collapsing
@@ -249,7 +253,10 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
       지속, sent 값은 세그먼트 시작 대입). 문장 레벨 yield·객체/클래스
       `*gen()`·next/return/throw·@@iterator. **루프/조건 안 yield와
       `yield*`는 명시 에러**(조용한 오답 금지 원칙). VM 무수술
-- [ ] private 필드 `#x` (연합 "bad class member name: Assign" ×2 추정)
+- [x] **private 필드 `#x`** — 07-18: 렉서가 `#`+식별자를 '#x' 이름의
+      Ident로 — 필드/메서드가 '#x' 키 프로퍼티로 디슈가되고 일반 멤버
+      문법으로는 그 이름을 쓸 수 없어 구성상 프라이빗. 인스턴스별
+      상태 분리·프라이빗 메서드 검증. 갭: `#x in obj` 브랜드 체크
 - [x] **런타임 yet → JS TypeError 전환 캠페인** — 07-16: VmError.kind
       (TypeError/ReferenceError 분류) + exception_value가 프렐류드
       프로토타입 체인에 연결(instanceof·name·toString 실물). 동작화:
@@ -280,8 +287,15 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
 - [x] **트리 API** — 07-16: insertBefore/removeChild/replaceChild/
       cloneNode(deep)/contains + parentNode/children/childNodes/
       firstChild/tagName/nodeType 게터. innerHTML get/set은 기존 동작
-- [ ] **`getBoundingClientRect`** (×4) — JS가 레이아웃 결과를 읽는 다리
-      (설계 필요; 현재는 제로렉트 스텁 — 크래시 방지)
+- [x] **`getBoundingClientRect` 실측** (×4) — 07-18: 셸이 레이아웃
+      직후 주요 박스(Block/Image)의 (x,y,w,h)를 `Doc.set_layout_rects`
+      로 Rust VM에 푸시(St.layout_rects) → 이후 이벤트 핸들러의 gBCR이
+      실제 지오메트리 반환(E2E: 클릭 핸들러가 200×40 @21 읽음).
+      문서좌표 근사(스크롤 미반영 — 뷰포트 상대는 후속), 첫 레이아웃
+      전엔 기존 제로렉트. **덤 버그 수정: addEventListener 핸들러의
+      this가 undefined였음** → click/라이프사이클 디스패치가 this=노드
+      (window 센티널은 실제 window 객체 — 가짜 dom_node면 아레나 밖
+      인덱싱 패닉)로 호출
 - [x] `getComputedStyle` — 스텁(el.style 프록시 반환, 프렐류드) 확인 07-18
 
 ### 브라우저 객체
@@ -521,7 +535,7 @@ postMessage/scrollTo/getComputedStyle/XHR은 코드에 이미 있었는데 문�
 오후: **M6 lazy 컴파일 가동** — 지연 배분 실측용 프로파일 하니스
 `cargo test --release -- --ignored profile_phases --nocapture` 상설화.
 저녁: lazy parse + M4 transform — smoke 111종).
-항목을 완료하면 [x]로 바꾸고 날짜를 적을 것. cargo 152/152, smoke 128종
+항목을 완료하면 [x]로 바꾸고 날짜를 적을 것. cargo 155/155, smoke 131종
 (엔진 파트; 실네트워크 관문은 egress 제한 환경에서 측정 불가) 기준.
 검증 체인: cargo test → maturin build → pip 재설치 → smoke_test.py →
 basket_test.py (네이버 단건은 scratchpad diag 스크립트).*

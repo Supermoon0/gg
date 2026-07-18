@@ -8,7 +8,7 @@ from browser.css_parser import CSSParser
 from browser.style import (RuleIndex, cascade_priority, default_rules,
                            style)
 from browser.layout import (HSTEP, VSTEP, BlockLayout, DocumentLayout,
-                            layout_tree_to_list, paint_tree)
+                            ImageLayout, layout_tree_to_list, paint_tree)
 from browser.pages import DEMO_PAGE
 
 passed = 0
@@ -334,6 +334,26 @@ _sdoc.layout(400)
 _scmds = paint_tree(_sdoc, [])
 check("box-shadow paints an offset rect behind the box",
       any(getattr(c, "color", "") == "#888888" for c in _scmds))
+
+# CSS width/height outrank HTML attributes on replaced elements
+ri_dom = _styled("img.big{width:100px; height:50px} "
+                 "img.half{width:48px}",
+                 '<img class=big width=10 height=10>'
+                 '<img class=half>'
+                 '<img width=30 height=20>')
+_ridoc = DocumentLayout(ri_dom)
+_ridoc.layout(400)
+_ims = [o for o in layout_tree_to_list(_ridoc, [])
+        if isinstance(o, ImageLayout)]
+check("CSS size wins over img attributes",
+      abs(_ims[0].width - 100) < 1 and abs(_ims[0].height - 50) < 1,
+      f"{_ims[0].width:.0f}x{_ims[0].height:.0f}")
+check("CSS width alone keeps the intrinsic ratio",
+      abs(_ims[1].width - 48) < 1 and abs(_ims[1].height - 48) < 1,
+      f"{_ims[1].width:.0f}x{_ims[1].height:.0f}")
+check("attrs still size an unstyled img",
+      abs(_ims[2].width - 30) < 1 and abs(_ims[2].height - 20) < 1,
+      f"{_ims[2].width:.0f}x{_ims[2].height:.0f}")
 
 # transform: translate shifts the painted subtree, layout unaffected
 tf_dom = _styled(

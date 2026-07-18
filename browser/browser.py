@@ -11,7 +11,8 @@ from . import forms, native, net, textengine
 from .html_parser import Element, HTMLParser, Text, tree_to_list
 from .css_parser import CSSParser
 from .style import RuleIndex, cascade_priority, default_rules, style
-from .layout import (VSTEP, DocumentLayout, layout_tree_to_list, paint_tree)
+from .layout import (VSTEP, BlockLayout, DocumentLayout, ImageLayout,
+                     layout_tree_to_list, paint_tree)
 from .pages import error_page
 
 SCROLL_STEP = 90
@@ -391,6 +392,7 @@ class Browser:
         self.layout_list = layout_tree_to_list(self.document, [])
         self.display_list = paint_tree(self.document, [])
         self._push_display_list()
+        self._push_layout_rects()
         self.clamp_scroll()
         self.draw()
 
@@ -418,6 +420,26 @@ class Browser:
             if self.history_index < len(self.history) - 1 else "disabled")
 
     # ---------- drawing ----------
+
+    def _push_layout_rects(self):
+        """Feed layout geometry back to the JS engine so
+        getBoundingClientRect answers real rects (document
+        coordinates) from the next event handler on."""
+        doc = getattr(self, "_doc", None)
+        if doc is None or not hasattr(doc, "set_layout_rects"):
+            return
+        rects = []
+        seen = set()
+        for o in self.layout_list:
+            if not isinstance(o, (BlockLayout, ImageLayout)):
+                continue  # line/text boxes share their element's node
+            r = getattr(getattr(o, "node", None), "_ridx", None)
+            if r is None or r in seen:
+                continue
+            seen.add(r)
+            rects.append((r, float(o.x), float(o.y),
+                          float(o.width), float(o.height)))
+        doc.set_layout_rects(rects)
 
     def _push_display_list(self):
         """Hand the display list to Rust once per paint change, in

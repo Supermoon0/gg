@@ -651,6 +651,17 @@ impl Doc {
         (1, patches)
     }
 
+    /// Push layout results so page JS reading getBoundingClientRect
+    /// gets real geometry (document coordinates). Call after layout.
+    fn set_layout_rects(
+        &mut self,
+        rects: Vec<(u32, f64, f64, f64, f64)>,
+    ) {
+        if self.use_ggjs {
+            self.ggvm().set_layout_rects(rects);
+        }
+    }
+
     /// Shell-side hover update: mark the element under the pointer
     /// and its ancestors so `:hover` rules match on the next
     /// compute_styles. Pass None when the pointer leaves the page.

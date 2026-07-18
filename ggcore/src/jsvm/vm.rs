@@ -505,6 +505,11 @@ pub(super) struct St {
     /// document.cookie pairs in insertion order (in-memory; not yet
     /// wired to the network layer)
     pub(super) cookies: Vec<(String, String)>,
+    /// node index -> (x, y, w, h) in document coordinates, pushed by
+    /// the shell after each layout so getBoundingClientRect answers
+    /// real geometry (document-origin approximation: scroll offset is
+    /// not subtracted)
+    pub(super) layout_rects: HashMap<u32, (f64, f64, f64, f64)>,
     /// Map/Set backing stores, keyed by the owning object's index
     /// (entries in insertion order; lookups are linear strict-eq)
     pub(super) map_data: HashMap<u32, Vec<(Value, Value)>>,
@@ -596,6 +601,7 @@ impl St {
             local_storage: HashMap::new(),
             session_storage: HashMap::new(),
             cookies: Vec::new(),
+            layout_rects: HashMap::new(),
             map_data: HashMap::new(),
             set_data: HashMap::new(),
             style_nodes: HashMap::new(),
@@ -3946,12 +3952,27 @@ fn dom_method(
     // are accepted and ignored.
     match st.names[key as usize].as_str() {
         "getBoundingClientRect" | "getClientRects" => {
+            // real geometry when the shell has pushed layout rects
+            // (document-origin; zero-rect before the first layout)
+            let (x, y, w, h) = st
+                .layout_rects
+                .get(&node)
+                .copied()
+                .unwrap_or((0.0, 0.0, 0.0, 0.0));
             let rect = new_plain_object(st);
             let ri = rect.index() as usize;
-            for field in ["top", "left", "right", "bottom", "width",
-                          "height", "x", "y"] {
+            for (field, v) in [
+                ("x", x),
+                ("left", x),
+                ("y", y),
+                ("top", y),
+                ("width", w),
+                ("height", h),
+                ("right", x + w),
+                ("bottom", y + h),
+            ] {
                 let fk = st.intern_name(field);
-                raw_set_prop(st, ri, fk, Value::int(0));
+                raw_set_prop(st, ri, fk, Value::number(v));
             }
             return Ok(rect);
         }

@@ -13,9 +13,9 @@ use super::compiler;
 use super::parser;
 use super::value::Value;
 use super::vm::{
-    self, call_value, exec, has_pending_work, host, make_native,
-    new_plain_object, pump, raw_set_prop, reject_fetch, resolve_fetch, Ids,
-    ModStore, Native, St, DOC_NODE,
+    self, call_value, call_value_this, exec, has_pending_work, host,
+    make_native, new_plain_object, pump, raw_set_prop, reject_fetch,
+    resolve_fetch, Ids, ModStore, Native, St, DOC_NODE,
 };
 
 /// Event-loop budget per settle turn (total microtasks + timers fired).
@@ -940,6 +940,17 @@ impl PageVm {
 
     /// Parse + compile + run one script; returns its last expression
     /// statement value.
+    /// Shell push after layout: real getBoundingClientRect geometry.
+    pub fn set_layout_rects(
+        &mut self,
+        rects: Vec<(u32, f64, f64, f64, f64)>,
+    ) {
+        self.st.layout_rects.clear();
+        for (idx, x, y, w, h) in rects {
+            self.st.layout_rects.insert(idx, (x, y, w, h));
+        }
+    }
+
     pub fn run_source(&mut self, src: &str) -> Result<Value, String> {
         let ast =
             parser::parse_program(src).map_err(|e| format!("{e:?}"))?;
@@ -1051,9 +1062,15 @@ impl PageVm {
             for h in handlers {
                 handled = true;
                 self.st.fuel = vm::DEFAULT_FUEL; // fresh budget per handler
-                if let Err(e) =
-                    call_value(&mut self.st, &self.mods, h, &[ev])
-                {
+                // this = the node whose listener is running (the
+                // currentTarget), matching dispatchEvent's behavior
+                if let Err(e) = call_value_this(
+                    &mut self.st,
+                    &self.mods,
+                    h,
+                    Some(Value::dom_node(node)),
+                    &[ev],
+                ) {
                     self.st.logs.push(format!("[gg-js error] {}", e.msg));
                 }
             }
@@ -1093,10 +1110,23 @@ impl PageVm {
         let tk = self.name_id("type");
         let tv = vm::intern(&mut self.st, ty);
         raw_set_prop(&mut self.st, evt.index() as usize, tk, tv);
+        // this = the registration target. The window "node" is a
+        // sentinel index with no arena entry — hand those handlers the
+        // real JS window object instead (a fake dom node would panic
+        // on the first property access).
+        let this_v = if node == vm::WINDOW_NODE {
+            self.st.known.window
+        } else {
+            Value::dom_node(node)
+        };
         for cb in cbs {
-            if let Err(e) =
-                call_value(&mut self.st, &self.mods, cb, &[evt])
-            {
+            if let Err(e) = call_value_this(
+                &mut self.st,
+                &self.mods,
+                cb,
+                Some(this_v),
+                &[evt],
+            ) {
                 self.st
                     .logs
                     .push(format!("[gg-js error] {}", e.msg));
@@ -2873,6 +2903,92 @@ console.log('B typeof it: ' + typeof it);
             n("function fib(n) { \
                return n < 2 ? n : fib(n - 1) + fib(n - 2); } \
                fib(10)"), 55.0);
+    }
+
+    #[test]
+    fn event_handler_this_binding() {
+        // lifecycle handlers: this = registration target; the window
+        // sentinel must map to the real window object (a fake dom
+        // node would panic on any property access)
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<div id=t>x</div>"),
+        ))));
+        let logs = vm.run_scripts(&["\
+            window.addEventListener('load', function () {\n\
+              console.log('w ' + (this === window));\n\
+            });\n\
+            document.addEventListener('DOMContentLoaded', \
+            function () {\n\
+              console.log('d ' + (this === document));\n\
+            });\n\
+            document.getElementById('t').addEventListener('click', \
+            function () {\n\
+              console.log('n ' + this.id);\n\
+            });\n"
+            .to_string()]);
+        assert!(logs.is_empty(), "{logs:?}");
+        let logs = vm.fire_lifecycle();
+        assert!(logs.contains(&"w true".to_string()), "{logs:?}");
+        assert!(logs.contains(&"d true".to_string()), "{logs:?}");
+        // click dispatch: this = the node whose listener runs
+        let t = {
+            let d = vm.st.doc.as_ref().unwrap().borrow();
+            (0..d.nodes.len())
+                .find(|&i| d.nodes[i].attr("id") == Some("t"))
+                .unwrap()
+        };
+        let (logs, handled, _) = vm.dispatch_click(t);
+        assert!(handled);
+        assert!(logs.contains(&"n t".to_string()), "{logs:?}");
+    }
+
+    #[test]
+    fn private_class_fields() {
+        // #x fields/methods work through the class desugar
+        assert_eq!(
+            n("class Counter { \
+                 #n = 0; \
+                 inc() { this.#n += 1; return this.#n; } \
+                 #twice() { return this.#n * 2; } \
+                 read() { return this.#twice(); } } \
+               var c = new Counter(); c.inc(); c.inc(); \
+               c.read() * 10 + c.inc()"), 43.0);
+        // two instances keep separate private state
+        assert_eq!(
+            n("class B { #v = 0; set(x) { this.#v = x; } \
+                 get() { return this.#v; } } \
+               var a = new B(), b = new B(); \
+               a.set(4); b.set(2); a.get() * 10 + b.get()"), 42.0);
+    }
+
+    #[test]
+    fn layout_rects_feed_gbcr() {
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<div id=t>x</div>"),
+        ))));
+        // before any push: zero-rect (crash prevention as before)
+        let logs = vm.run_scripts(&["\
+            var r = document.getElementById('t')\
+                .getBoundingClientRect();\n\
+            console.log('pre ' + r.width + ' ' + r.height);\n"
+            .to_string()]);
+        assert!(logs.contains(&"pre 0 0".to_string()), "{logs:?}");
+        // find the div's node index and push a rect for it
+        let div = {
+            let d = vm.st.doc.as_ref().unwrap().borrow();
+            (0..d.nodes.len())
+                .find(|&i| d.nodes[i].tag.as_deref() == Some("div"))
+                .unwrap() as u32
+        };
+        vm.set_layout_rects(vec![(div, 13.0, 26.0, 774.0, 20.0)]);
+        let logs = vm.run_scripts(&["\
+            var r = document.getElementById('t')\
+                .getBoundingClientRect();\n\
+            console.log('post ' + r.x + ' ' + r.top + ' ' + r.width \
+                + ' ' + r.bottom);\n"
+            .to_string()]);
+        assert!(logs.contains(&"post 13 26 774 46".to_string()),
+                "{logs:?}");
     }
 
     #[test]
