@@ -481,6 +481,54 @@ check("input placeholder is painted",
       and all(c.color == "#9e9e9e" for c in _ptexts
               if "search here" in c.text), str(_ptexts))
 
+# focused input paints a caret after the typed value; typed value
+# replaces the placeholder
+foc_dom = _styled(
+    "", '<input value="gg" placeholder="search here">')
+_finput = next(n for n in tree_to_list(foc_dom, [])
+               if isinstance(n, Element) and n.tag == "input")
+_finput.is_focused = True
+_fdoc = DocumentLayout(foc_dom)
+_fdoc.layout(400)
+_fcmds = paint_tree(_fdoc, [])
+from browser.draw import DrawLine as _DrawLine
+_carets = [c for c in _fcmds
+           if isinstance(c, _DrawLine) and c.color == "#333333"]
+_ftexts = [c.text for c in _fcmds if hasattr(c, "text")]
+check("focused input paints a caret", len(_carets) == 1,
+      str([type(c).__name__ for c in _fcmds]))
+check("typed value replaces placeholder",
+      "gg" in _ftexts and "search here" not in _ftexts, str(_ftexts))
+check("caret sits after the typed text",
+      _carets and _carets[0].left > HSTEP, str(_carets and (
+          _carets[0].left, _carets[0].top)))
+
+# form GET submit assembles the query from named fields
+from browser import forms as _forms
+form_dom = HTMLParser(
+    '<form action="https://search.example/search?old=1" method="get">'
+    '<input name="query" value="한글 검색">'
+    '<input type="hidden" name="where" value="nexearch">'
+    '<input name="ignored-unnamed-type" type="submit" value="go">'
+    '<input value="no-name-skipped">'
+    '<input type="checkbox" name="unchecked" value="x">'
+    '<input type="checkbox" name="checked" value="y" checked>'
+    '</form>').parse()
+_form = next(n for n in tree_to_list(form_dom, [])
+             if isinstance(n, Element) and n.tag == "form")
+_href = _forms.submit_href(_form)
+check("form GET submit builds query (drops action's old query)",
+      _href == "https://search.example/search?"
+      "query=%ED%95%9C%EA%B8%80+%EA%B2%80%EC%83%89"
+      "&where=nexearch&checked=y", str(_href))
+_inp = next(n for n in tree_to_list(form_dom, [])
+            if isinstance(n, Element)
+            and n.attributes.get("name") == "query")
+check("find_form walks up from an input",
+      _forms.find_form(_inp) is _form)
+_form.attributes["method"] = "post"
+check("POST form yields no GET href", _forms.submit_href(_form) is None)
+
 check("background shorthand parses url/pos/repeat",
       parse_background({"background":
                         "url('s.png') no-repeat -366px -282px #fff"})

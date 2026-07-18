@@ -427,6 +427,15 @@ impl Doc {
         out
     }
 
+    /// Shell-side attribute write (typed input values): mirror the
+    /// change into the DOM so page JS reads what the user typed.
+    fn set_attr(&mut self, node_idx: usize, name: String, value: String) {
+        let mut d = self.doc.borrow_mut();
+        if node_idx < d.nodes.len() {
+            d.set_attr(node_idx, &name, &value);
+        }
+    }
+
     /// Tell the JS engine the page URL so `location.*` is real.
     /// Call before run_scripts. No-op on the Boa path.
     fn set_page_url(&mut self, url: String) {

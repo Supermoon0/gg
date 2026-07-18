@@ -28,6 +28,7 @@ INHERITED_PROPERTIES = {
 DEFAULT_STYLE_SHEET = """
 head, script, style, title, meta, link, template, noscript { display: none; }
 input[type=hidden] { display: none; }
+input { height: 1.5em; }
 
 html { display: block; }
 body { display: block; margin: 8px; }

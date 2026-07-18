@@ -7,7 +7,7 @@ import tkinter.font
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from . import native, net, textengine
+from . import forms, native, net, textengine
 from .html_parser import Element, HTMLParser, Text, tree_to_list
 from .css_parser import CSSParser
 from .style import RuleIndex, cascade_priority, default_rules, style
@@ -42,6 +42,7 @@ class Browser:
         self.document = None
         self.layout_list = []
         self.display_list = []
+        self.focus_node = None
         self.history = []
         self.history_index = -1
         self.url = None
@@ -53,6 +54,7 @@ class Browser:
         self._resize_job = None
 
         self.canvas.bind("<Button-1>", self.on_click)
+        self.canvas.bind("<Key>", self.on_key)
         self.canvas.bind("<Motion>", self.on_motion)
         self.canvas.bind("<MouseWheel>", self.on_mousewheel)
         self.canvas.bind("<Configure>", self.on_configure)
@@ -159,6 +161,7 @@ class Browser:
             # drive fetch/timer-driven SPA content, then rebuild the tree
             if native.settle_async(self._doc, self._css_sources, url):
                 self.nodes = native.refresh(self._doc, self._css_sources)
+            self._drop_focus()
             for line in js_logs:
                 print(f"[js console] {line}")
             if js_logs:
@@ -167,6 +170,7 @@ class Browser:
             # Pure-Python fallback
             self._doc = None
             self.nodes = HTMLParser(body).parse()
+            self._drop_focus()
             rules = self.default_rules + self.collect_styles(self.nodes, url)
             rules = sorted(rules, key=cascade_priority)
             # Style depends only on the DOM and CSS, not on window size:
@@ -246,6 +250,7 @@ class Browser:
                 self._dom_version = version
                 self._live_idle = 0
                 self.nodes = native.refresh(self._doc, self._css_sources)
+                self._drop_focus()
                 self.load_images(self.nodes, self.url, keep_cache=True)
                 self.relayout()
             else:
@@ -508,6 +513,7 @@ class Browser:
         # a click handler may have scheduled fetch/timers — settle them
         native.settle_async(self._doc, self._css_sources, self.url)
         self.nodes = native.refresh(self._doc, self._css_sources)
+        self._drop_focus()
         self.load_images(self.nodes, self.url, keep_cache=True)
         for node in tree_to_list(self.nodes, []):
             if isinstance(node, Element) and node.tag == "title":
@@ -522,6 +528,7 @@ class Browser:
         self.canvas.focus_set()
         obj = self.hit_test(event.x, event.y + self.scroll)
         if not obj:
+            self.set_focus(None)
             return
         if self._doc is not None:
             target = obj.node
@@ -553,6 +560,80 @@ class Browser:
                 self.load(self.url.resolve(href))
             except Exception as e:
                 self.set_status(f"이동 실패: {e}")
+            return
+        self.set_focus(forms.find_input(obj.node))
+
+    # ---------- text input focus / typing ----------
+
+    def _drop_focus(self):
+        """The node tree was rebuilt: the focused node is orphaned."""
+        if self.focus_node is not None:
+            self.focus_node.is_focused = False
+            self.focus_node = None
+
+    def set_focus(self, node):
+        if self.focus_node is node:
+            return
+        if self.focus_node is not None:
+            self.focus_node.is_focused = False
+        self.focus_node = node
+        if node is not None:
+            node.is_focused = True
+        self.repaint()
+
+    def repaint(self):
+        """Rebuild the display list without restyling or relayout —
+        enough for focus caret and typed-text changes."""
+        if getattr(self, "document", None) is None:
+            return
+        self.display_list = paint_tree(self.document, [])
+        self.draw()
+
+    def on_key(self, event):
+        node = self.focus_node
+        if node is None:
+            return None
+        if event.keysym == "Return":
+            self.submit_form(node)
+            return "break"
+        if event.keysym == "Escape":
+            self.set_focus(None)
+            return "break"
+        value = node.attributes.get("value", "")
+        if event.keysym == "BackSpace":
+            if not value:
+                return "break"
+            value = value[:-1]
+        elif event.char and event.char >= " " and event.char != "\x7f":
+            value = value + event.char
+        else:
+            return None  # arrows etc. keep their scroll bindings
+        node.attributes["value"] = value
+        self.sync_attr(node, "value", value)
+        self.repaint()
+        return "break"
+
+    def submit_form(self, node):
+        form = forms.find_form(node)
+        if form is None:
+            return
+        href = forms.submit_href(form)
+        if href is None:
+            self.set_status("POST 폼은 아직 지원하지 않습니다")
+            return
+        try:
+            self.load(self.url.resolve(href))
+        except Exception as e:
+            self.set_status(f"이동 실패: {e}")
+
+    def sync_attr(self, node, name, value):
+        """Mirror a Python-side attribute change into the Rust DOM so
+        page JS reading the input sees the typed value."""
+        doc = getattr(self, "_doc", None)
+        ridx = getattr(node, "_ridx", None)
+        if doc is not None and ridx is not None \
+                and hasattr(doc, "set_attr"):
+            doc.set_attr(ridx, name, value)
 
     def on_motion(self, event):
         # Hit-testing walks the layout tree; 30ms throttle keeps

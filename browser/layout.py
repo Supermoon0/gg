@@ -866,13 +866,19 @@ class BlockLayout:
             if self.node.tag == "input":
                 value = self.node.attributes.get("value", "")
                 text = value or self.node.attributes.get("placeholder", "")
+                font = cached_font(self.node)
+                ty = self.y + max(
+                    0.0, (self.height - font.metrics("linespace")) / 2)
                 if text.strip():
-                    font = cached_font(self.node)
-                    ty = self.y + max(
-                        0.0, (self.height - font.metrics("linespace")) / 2)
                     tcolor = (safe_color(self.node.style.get("color"))
                               if value else "#9e9e9e")
                     cmds.append(DrawText(self.x, ty, text, font, tcolor))
+                if getattr(self.node, "is_focused", False):
+                    # caret after the typed value (not the placeholder)
+                    cx = self.x + (measure(font, value) if value else 0)
+                    ch = font.metrics("linespace")
+                    cmds.append(DrawLine(
+                        cx, ty, cx, ty + ch, "#333333", 1))
 
             if self.node.tag == "li":
                 font = cached_font(self.node)
