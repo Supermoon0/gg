@@ -658,17 +658,69 @@ class BlockLayout:
             apply_relative_offsets(self.children)
             return
 
+        # main size: flex-basis wins over width; None = content-sized
         specs = []
+        grows = []
+        shrinks = []
         for child in kid_nodes:
-            spec = parse_size(child.style.get("width"), self.width, em)
+            basis = child.style.get("flex-basis", "")
+            spec = parse_size(basis, self.width, em) \
+                if basis else None
+            if spec is None:
+                spec = parse_size(
+                    child.style.get("width"), self.width, em)
             specs.append(spec)
+
+            def _num(v, default):
+                try:
+                    return max(float(v), 0.0)
+                except (TypeError, ValueError):
+                    return default
+            grows.append(_num(child.style.get("flex-grow"), 0.0))
+            shrinks.append(_num(child.style.get("flex-shrink"), 1.0))
+
         fixed_total = sum(s for s in specs if s is not None)
         n_flex = sum(1 for s in specs if s is None)
+        # note: match exact keywords — "wrap" is a substring of
+        # "nowrap", which silently forced every container to wrap
+        wrap_v = node.style.get("flex-wrap", "nowrap").strip().casefold()
+        wrap = wrap_v in ("wrap", "wrap-reverse")
+        total_grow = sum(grows)
+
+        if total_grow > 0 and not wrap:
+            # spec-style grow: positive free space distributed by
+            # factor. Content-sized items keep the legacy equal share
+            # so mixed rows still work.
+            legacy = 0.0
+            if n_flex:
+                legacy = max((self.width - fixed_total) / n_flex, 40.0)
+            widths = [s if s is not None else legacy for s in specs]
+            free = self.width - sum(widths)
+            if free > 0:
+                for i, g in enumerate(grows):
+                    widths[i] += free * g / total_grow
+            specs = widths
+            fixed_total = sum(specs)
+            n_flex = 0
         grow = 0.0
         if n_flex:
             grow = max((self.width - fixed_total) / n_flex, 40.0)
 
-        wrap = "wrap" in node.style.get("flex-wrap", "nowrap")
+        if not wrap:
+            # flex-shrink: a single overflowing line gives space back
+            # in proportion to shrink-factor x main size
+            sized = [s if s is not None else grow for s in specs]
+            overflow = sum(sized) - self.width
+            weights = [shrinks[i] * sized[i] for i in range(len(sized))]
+            wsum = sum(weights)
+            if overflow > 0 and wsum > 0:
+                specs = [
+                    max(sized[i] - overflow * weights[i] / wsum, 0.0)
+                    for i in range(len(sized))
+                ]
+                fixed_total = sum(specs)
+                n_flex = 0
+                grow = 0.0
 
         # auto margins on flex items split the line's leftover space;
         # when grow items consume it (or items overflow into wrapping)
@@ -685,9 +737,13 @@ class BlockLayout:
             auto_px = max(free / n_auto, 0.0)
 
         cx, row_y, row_h = self.x, self.y, 0.0
+        rows = []      # [(boxes, row_height)]
+        row_boxes = []
         for child, spec in zip(kid_nodes, specs):
             w = spec if spec is not None else grow
             if wrap and cx + w > self.x + self.width and cx > self.x:
+                rows.append((row_boxes, row_h))
+                row_boxes = []
                 row_y += row_h
                 cx, row_h = self.x, 0.0
             box = BlockLayout(child, self, None)
@@ -696,9 +752,59 @@ class BlockLayout:
             box.flex_origin = (cx, row_y)
             self.children.append(box)
             box.layout()
+            row_boxes.append(box)
             cx += box.outer_width()
             row_h = max(row_h, box.outer_height())
+        if row_boxes:
+            rows.append((row_boxes, row_h))
         self.height = (row_y + row_h) - self.y
+
+        # justify-content: distribute each row's leftover main-axis
+        # space (unless auto margins already absorbed it);
+        # align-items/align-self: cross-axis position within the row.
+        # Both are post-placement subtree shifts — no relayout.
+        justify = node.style.get("justify-content",
+                                 "flex-start").strip().casefold()
+        align = node.style.get("align-items",
+                               "stretch").strip().casefold()
+        for boxes, height in rows:
+            if not boxes:
+                continue
+            if justify not in ("", "flex-start", "start", "normal",
+                               "left") and not n_auto:
+                used = sum(b.outer_width() for b in boxes)
+                free = max(self.width - used, 0.0)
+                lead, gap = 0.0, 0.0
+                if justify in ("center",):
+                    lead = free / 2
+                elif justify in ("flex-end", "end", "right"):
+                    lead = free
+                elif justify == "space-between":
+                    gap = free / (len(boxes) - 1) if len(boxes) > 1 \
+                        else 0.0
+                elif justify in ("space-around", "space-evenly"):
+                    n = len(boxes)
+                    if justify == "space-around":
+                        gap = free / n
+                        lead = gap / 2
+                    else:
+                        gap = free / (n + 1)
+                        lead = gap
+                if lead or gap:
+                    for i, b in enumerate(boxes):
+                        translate(b, lead + gap * i, 0)
+            for b in boxes:
+                mode = b.node.style.get("align-self",
+                                        "").strip().casefold() or align
+                if mode in ("center",):
+                    dy = (height - b.outer_height()) / 2
+                elif mode in ("flex-end", "end"):
+                    dy = height - b.outer_height()
+                else:  # stretch/flex-start/baseline: top (no
+                    #     cross-size stretching yet)
+                    dy = 0.0
+                if dy > 0:
+                    translate(b, 0, dy)
         apply_relative_offsets(self.children)
 
     # ----- inline layout -----

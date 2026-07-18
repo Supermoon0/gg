@@ -128,7 +128,17 @@ class 2회) 문법 갭이 좁고, `display:grid`·`position:sticky`도 **0회**�
 - [x] **`white-space: nowrap`** (×83) — 07-16: word()에서 줄바꿈 억제 +
       **`text-overflow: ellipsis`** (×84) — 단일 라인 오버플로를 잘라 "…"
       (비상속 속성이라 요소 조상에서 읽음; measure 이분탐색 절단)
-- [ ] flex 심화: `flex-shrink/basis`, `align-items`, `justify-content` (×104)
+- [x] **flex 심화** (×104) — 07-18: `justify-content`(center/flex-end/
+      space-between/space-around/space-evenly — 행별 잔여 공간 분배,
+      auto 마진이 흡수했으면 무동작), `align-items`/`align-self`
+      (center/flex-end — 교차축은 배치 후 서브트리 시프트, 재레이아웃
+      없음; stretch 크기 늘림은 미지원), `flex-shrink`(nowrap 단일
+      행 오버플로를 shrink×크기 비례로 반납, min-content 바닥 없음),
+      `flex-basis` + **`flex` 축약형**(1 / 0 0 200px / none — 양 엔진
+      미러, `flex:1`은 스펙대로 basis 0). 덤 버그 수정: `"wrap" in
+      "nowrap"`이 참이라 **모든 flex 컨테이너가 랩 모드였음** — 이제
+      정확 매칭(스펙 기본 nowrap + shrink; 기존에 우연히 랩에 의존한
+      렌더는 달라질 수 있음 — 바스켓 재검증 필요)
 - [ ] CSS `width/height`가 대체 요소(img·svg·input)에 적용 (지금은 HTML 속성만)
 - [ ] `float` + `clear` (×25)
 - [ ] inline-block 정식 배치 (지금은 근사)
@@ -511,7 +521,7 @@ postMessage/scrollTo/getComputedStyle/XHR은 코드에 이미 있었는데 문�
 오후: **M6 lazy 컴파일 가동** — 지연 배분 실측용 프로파일 하니스
 `cargo test --release -- --ignored profile_phases --nocapture` 상설화.
 저녁: lazy parse + M4 transform — smoke 111종).
-항목을 완료하면 [x]로 바꾸고 날짜를 적을 것. cargo 151/151, smoke 123종
+항목을 완료하면 [x]로 바꾸고 날짜를 적을 것. cargo 152/152, smoke 128종
 (엔진 파트; 실네트워크 관문은 egress 제한 환경에서 측정 불가) 기준.
 검증 체인: cargo test → maturin build → pip 재설치 → smoke_test.py →
 basket_test.py (네이버 단건은 scratchpad diag 스크립트).*

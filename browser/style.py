@@ -363,6 +363,30 @@ def _apply(styles, prop, value):
             styles["border-width"] = "1px"
         if color:
             styles["border-color"] = color
+    elif prop == "flex":
+        # flex: none | <grow> <shrink>? <basis>?
+        v = value.casefold()
+        if v == "none":
+            styles["flex-grow"] = "0"
+            styles["flex-shrink"] = "0"
+            styles["flex-basis"] = "auto"
+        else:
+            nums = []
+            basis = None
+            for part in value.split():
+                try:
+                    nums.append(float(part))
+                except ValueError:
+                    basis = part
+            if nums:
+                styles["flex-grow"] = str(nums[0])
+            if len(nums) > 1:
+                styles["flex-shrink"] = str(nums[1])
+            if basis is not None:
+                styles["flex-basis"] = basis
+            elif nums:
+                # "flex: 1" means basis 0 per spec
+                styles["flex-basis"] = "0"
     elif prop == "font":
         # Too complex to fully parse; ignore rather than misrender.
         pass

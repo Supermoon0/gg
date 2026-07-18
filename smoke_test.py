@@ -638,6 +638,68 @@ check("flex row placement", fa.y == fb.y == fc.y and fa.x < fb.x < fc.x,
       f"x: {fa.x:.0f},{fb.x:.0f},{fc.x:.0f}")
 check("flex grow shares space", abs(fb.width - (774 - 100) / 2) < 1,
       f"fb.width={fb.width:.0f}")
+
+# --- flex deep-dive: justify/align/shrink/basis/flex shorthand ---
+FLEX2_PAGE = """<html><body style="margin: 0">
+<div id=jc style="display:flex; justify-content:center; width:300px">
+  <div id=jca style="width:50px; height:10px">a</div>
+  <div id=jcb style="width:50px; height:10px">b</div>
+</div>
+<div id=sb style="display:flex; justify-content:space-between;
+     width:300px">
+  <div id=sba style="width:50px; height:10px">a</div>
+  <div id=sbb style="width:50px; height:10px">b</div>
+  <div id=sbc style="width:50px; height:10px">c</div>
+</div>
+<div id=ai style="display:flex; align-items:center; width:300px">
+  <div id=aia style="width:50px; height:40px">tall</div>
+  <div id=aib style="width:50px; height:10px">short</div>
+</div>
+<div id=sh style="display:flex; width:300px">
+  <div id=sha style="width:400px; height:10px">a</div>
+  <div id=shb style="width:200px; height:10px">b</div>
+</div>
+<div id=gr style="display:flex; width:300px">
+  <div id=gra style="flex: 1; height:10px">a</div>
+  <div id=grb style="flex: 2; height:10px">b</div>
+  <div id=grc style="width:60px; height:10px">c</div>
+</div>
+</body></html>"""
+fdom = HTMLParser(FLEX2_PAGE).parse()
+style(fdom, sorted(ua, key=cascade_priority))
+fdoc = DocumentLayout(fdom)
+fdoc.layout(800)
+fb2 = {}
+for b in layout_tree_to_list(fdoc, []):
+    if isinstance(b, BlockLayout) and isinstance(b.node, Element):
+        node_id = b.node.attributes.get("id")
+        if node_id:
+            fb2[node_id] = b
+_j = fb2["jc"]
+check("justify-content:center leads with half the free space",
+      abs(fb2["jca"].x - (_j.x + 100)) < 1
+      and abs(fb2["jcb"].x - (_j.x + 150)) < 1,
+      f"a={fb2['jca'].x - _j.x:.0f} b={fb2['jcb'].x - _j.x:.0f}")
+_s = fb2["sb"]
+check("justify-content:space-between pins ends, splits middle",
+      abs(fb2["sba"].x - _s.x) < 1
+      and abs(fb2["sbb"].x - (_s.x + 125)) < 1
+      and abs(fb2["sbc"].x - (_s.x + 250)) < 1,
+      f"{fb2['sba'].x - _s.x:.0f},{fb2['sbb'].x - _s.x:.0f},"
+      f"{fb2['sbc'].x - _s.x:.0f}")
+check("align-items:center centers the short item",
+      abs(fb2["aib"].y - (fb2["aia"].y + 15)) < 1,
+      f"tall.y={fb2['aia'].y:.0f} short.y={fb2['aib'].y:.0f}")
+check("flex-shrink returns overflow proportionally",
+      abs(fb2["sha"].width - 200) < 1
+      and abs(fb2["shb"].width - 100) < 1,
+      f"a={fb2['sha'].width:.0f} b={fb2['shb'].width:.0f}")
+check("flex shorthand: grow factors split the remainder 1:2",
+      abs(fb2["gra"].width - 80) < 1
+      and abs(fb2["grb"].width - 160) < 1
+      and abs(fb2["grc"].width - 60) < 1,
+      f"a={fb2['gra'].width:.0f} b={fb2['grb'].width:.0f} "
+      f"c={fb2['grc'].width:.0f}")
 absbox = boxes["abs"]
 check("absolute positioning", abs(absbox.x - (HSTEP + 50)) < 1
       and abs(absbox.y - (VSTEP + 300)) < 1,
