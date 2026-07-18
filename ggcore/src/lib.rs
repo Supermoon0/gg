@@ -90,6 +90,22 @@ impl TextEngine {
         self.store.variant_id(family, bold, italic)
     }
 
+    /// Register a web font (@font-face) under a family name.
+    /// TTF/OTF only (fontdue); returns false on unparsable data.
+    fn load_font(
+        &mut self,
+        family: &str,
+        bold: bool,
+        italic: bool,
+        data: &[u8],
+    ) -> bool {
+        self.store.add_font(family, bold, italic, data.to_vec())
+    }
+
+    fn has_family(&self, family: &str) -> bool {
+        self.store.has_family(family)
+    }
+
     /// (ascent, descent, linespace) at a pixel size.
     fn metrics(&mut self, font_id: u32, size: f32) -> (f32, f32, f32) {
         self.store.metrics(font_id, size)

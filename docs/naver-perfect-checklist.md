@@ -107,7 +107,17 @@ class 2회) 문법 갭이 좁고, `display:grid`·`position:sticky`도 **0회**�
       뒤로는 못 감(근사)
 - [x] **`linear-gradient`** (×36) — 07-16: 첫 색 스톱을 단색 배경으로
       근사(gradient_color — #hex/rgb/named 추출). 실제 그라디언트 미지원
-- [ ] `@font-face` 웹폰트 로드 (×4)
+- [x] **`@font-face` 웹폰트 로드** (×4) — 07-18: CSS 소스에서
+      디스크립터 추출(`browser/webfonts.py` — family/src/weight/style,
+      data: URL의 `;base64` 포함) → 로더블 소스(ttf/otf/data:)만 페치
+      (request_raw, 페이지 URL 기준 resolve) → FontStore 동적 등록
+      (`add_font` — 정적 테이블보다 우선, 볼드/이탤릭 변형 매칭,
+      memo만 무효화해 기존 variant id 유지) → 폰트 캐시 클리어 후
+      첫 레이아웃. 미지 패밀리도 등록돼 있으면 통과(has_family).
+      E2E: file:// 웹폰트가 p에 실적용·실측 폭 차이 확인.
+      갭: **woff/woff2 미지원**(fontdue에 인플레이터 없음 — 실사이트
+      대부분이 woff2라 로컬 검증 필요, 스킵은 무해), CSS 파일 기준
+      상대경로(지금은 페이지 기준), unicode-range
 - [x] input `placeholder` 표시 — 07-11 ("검색어를 입력해 주세요." 회색 렌더,
       `input[type=hidden]` UA 룰 포함)
 
@@ -535,7 +545,7 @@ postMessage/scrollTo/getComputedStyle/XHR은 코드에 이미 있었는데 문�
 오후: **M6 lazy 컴파일 가동** — 지연 배분 실측용 프로파일 하니스
 `cargo test --release -- --ignored profile_phases --nocapture` 상설화.
 저녁: lazy parse + M4 transform — smoke 111종).
-항목을 완료하면 [x]로 바꾸고 날짜를 적을 것. cargo 155/155, smoke 131종
+항목을 완료하면 [x]로 바꾸고 날짜를 적을 것. cargo 156/156, smoke 135종
 (엔진 파트; 실네트워크 관문은 egress 제한 환경에서 측정 불가) 기준.
 검증 체인: cargo test → maturin build → pip 재설치 → smoke_test.py →
 basket_test.py (네이버 단건은 scratchpad diag 스크립트).*

@@ -20,6 +20,12 @@ def engine():
     return _engine
 
 
+def has_family(name):
+    """Is this font family resolvable (built-in table or a
+    registered @font-face web font)?"""
+    return _engine is not None and _engine.has_family(name)
+
+
 def load_svgs(nodes):
     """Rasterize every inline <svg> to an image handle (node._img),
     so layout/paint treat it exactly like an <img>. Fill resolution:

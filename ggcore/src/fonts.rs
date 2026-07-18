@@ -25,6 +25,9 @@ pub struct FontStore {
     /// the font table that actually loaded (Windows or Linux) — all
     /// family/variant lookups go through it
     table: &'static [(&'static str, bool, bool, &'static str)],
+    /// runtime-registered web fonts (@font-face):
+    /// (family, bold, italic) -> font slot; wins over the table
+    dynamic: Vec<(String, bool, bool, usize)>,
     variants: Vec<Variant>,
     variant_ids: HashMap<(String, bool, bool), u32>,
     glyph_cache: HashMap<(usize, u32, char), CachedGlyph>,
@@ -101,6 +104,7 @@ impl FontStore {
                     fonts,
                     file_ids,
                     table,
+                    dynamic: Vec::new(),
                     variants: Vec::new(),
                     variant_ids: HashMap::new(),
                     glyph_cache: HashMap::new(),
@@ -109,6 +113,43 @@ impl FontStore {
             }
         }
         Err("no usable font table (Windows or Linux)".to_string())
+    }
+
+    /// Register a web font (@font-face). Existing variant ids keep
+    /// their old resolution; only the memo is cleared so future
+    /// lookups (post-load relayout) see the new font.
+    pub fn add_font(
+        &mut self,
+        family: &str,
+        bold: bool,
+        italic: bool,
+        data: Vec<u8>,
+    ) -> bool {
+        let Ok(font) = fontdue::Font::from_bytes(
+            data,
+            fontdue::FontSettings::default(),
+        ) else {
+            return false;
+        };
+        let slot = self.fonts.len();
+        self.fonts.push(font);
+        self.dynamic.push((
+            family.to_ascii_lowercase(),
+            bold,
+            italic,
+            slot,
+        ));
+        self.variant_ids.clear();
+        true
+    }
+
+    /// Is this family resolvable (table or web font)? The shell uses
+    /// it to decide whether an author font-family passes through or
+    /// collapses to the default family.
+    pub fn has_family(&self, family: &str) -> bool {
+        let f = family.to_ascii_lowercase();
+        self.dynamic.iter().any(|(fam, ..)| fam == &f)
+            || self.table.iter().any(|(fam, ..)| *fam == f)
     }
 
     fn file_font(&self, file: &str) -> usize {
@@ -152,8 +193,24 @@ impl FontStore {
         if let Some(&id) = self.variant_ids.get(&key) {
             return id;
         }
-        let primary =
-            self.file_font(self.lookup_variant_file(&family, bold, italic));
+        // web fonts win: exact variant, then same family
+        let dyn_hit = self
+            .dynamic
+            .iter()
+            .find(|(f, b, i, _)| f == &family && *b == bold && *i == italic)
+            .or_else(|| {
+                self.dynamic
+                    .iter()
+                    .find(|(f, b, _, _)| f == &family && *b == bold)
+            })
+            .or_else(|| {
+                self.dynamic.iter().find(|(f, _, _, _)| f == &family)
+            });
+        let primary = match dyn_hit {
+            Some(&(_, _, _, slot)) => slot,
+            None => self
+                .file_font(self.lookup_variant_file(&family, bold, italic)),
+        };
         // Hangul/symbol fallbacks; prefer bold Malgun for bold variants
         let mut fallbacks = Vec::new();
         if bold {
@@ -285,5 +342,35 @@ impl FontStore {
         self.fonts[font_idx]
             .horizontal_kern(a, b, size)
             .unwrap_or(0.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn web_font_registration_dispatches() {
+        let Ok(mut store) = FontStore::new() else {
+            return; // no system fonts in this environment: skip
+        };
+        let serif = "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf";
+        let Ok(data) = fs::read(serif) else {
+            return; // Windows CI: table differs, skip
+        };
+        assert!(!store.has_family("myface"));
+        assert!(store.add_font("MyFace", false, false, data));
+        assert!(store.has_family("myface"));
+        assert!(store.has_family("MyFace")); // case-insensitive
+        // the web font actually renders: same text measures
+        // differently than the default (sans) family
+        let sans = store.variant_id("segoe ui", false, false);
+        let web = store.variant_id("myface", false, false);
+        let a = store.measure(sans, 16.0, "illustration");
+        let b = store.measure(web, 16.0, "illustration");
+        assert!((a - b).abs() > 0.5, "sans {a} vs web {b}");
+        // unparsable data is rejected, store stays sane
+        assert!(!store.add_font("bad", false, false, vec![1, 2, 3]));
+        assert!(store.has_family("myface"));
     }
 }

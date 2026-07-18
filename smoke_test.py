@@ -335,6 +335,19 @@ _scmds = paint_tree(_sdoc, [])
 check("box-shadow paints an offset rect behind the box",
       any(getattr(c, "color", "") == "#888888" for c in _scmds))
 
+# @font-face descriptor extraction (loadable sources only)
+from browser.webfonts import parse_font_faces
+_faces = parse_font_faces(["""@font-face { font-family: 'My Face'; src: url('fonts/a.woff2') format('woff2'), url(fonts/a.ttf) format('truetype'); }@font-face { font-family: IconFont; font-weight: 700; src: url(icons.otf); }@font-face { font-family: WoffOnly; src: url(x.woff2); }@font-face { font-family: DataFont; src: url(data:font/ttf;base64,AAAA); }"""])
+check("@font-face picks the loadable source",
+      ("my face", False, False, "fonts/a.ttf") in _faces, str(_faces))
+check("@font-face numeric weight maps to bold",
+      ("iconfont", True, False, "icons.otf") in _faces, str(_faces))
+check("woff2-only faces are skipped",
+      not any(f[0] == "woffonly" for f in _faces), str(_faces))
+check("data: font sources are accepted",
+      any(f[0] == "datafont" and f[3].startswith("data:")
+          for f in _faces), str(_faces))
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px}",

@@ -7,7 +7,7 @@ import tkinter.font
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from . import forms, native, net, textengine
+from . import forms, native, net, textengine, webfonts
 from .html_parser import Element, HTMLParser, Text, tree_to_list
 from .css_parser import CSSParser
 from .style import RuleIndex, cascade_priority, default_rules, style
@@ -198,6 +198,7 @@ class Browser:
         self.window.title(title)
 
         self.load_images(self.nodes, url)
+        self._load_web_fonts(url)
 
         self.scroll = 0
         self.relayout()
@@ -420,6 +421,27 @@ class Browser:
             if self.history_index < len(self.history) - 1 else "disabled")
 
     # ---------- drawing ----------
+
+    def _load_web_fonts(self, url):
+        """Register loadable @font-face fonts before the first
+        layout; a hit invalidates the font cache so the new family
+        resolves."""
+        css_texts = list(self._css_sources)
+        if not css_texts:
+            for n in tree_to_list(self.nodes, []):
+                if isinstance(n, Element) and n.tag == "style":
+                    css_texts.append(" ".join(
+                        c.text for c in n.children if isinstance(c, Text)))
+        def fetch(u):
+            _, body = net.request_raw(url.resolve(u))
+            return body
+        try:
+            loaded = webfonts.load_web_fonts(css_texts, fetch)
+        except Exception:
+            loaded = 0
+        if loaded:
+            from . import layout as _layout
+            _layout._FONT_CACHE.clear()
 
     def _push_layout_rects(self):
         """Feed layout geometry back to the JS engine so

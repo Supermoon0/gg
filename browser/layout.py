@@ -99,8 +99,8 @@ def font_for(style):
     if family not in FONT_FAMILIES:
         known = {"consolas", "courier new", "georgia", "times new roman",
                  "arial", "verdana", "tahoma", "segoe ui", "malgun gothic"}
-        if family not in known:
-            family = "default"
+        if family not in known and not textengine.has_family(family):
+            family = "default"  # unknown and no web font registered
     return get_font(size, weight, slant, family)
 
 
