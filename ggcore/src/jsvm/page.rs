@@ -2876,6 +2876,43 @@ console.log('B typeof it: ' + typeof it);
     }
 
     #[test]
+    fn lazy_parse_semantics() {
+        // bodies >= 24 tokens skip AST building at load; the token
+        // range parses at first call. Captures must still work.
+        assert_eq!(
+            n("var a = 30, b = 12; \
+               function big() { \
+                 var x = 0; var y = 0; var z = 0; \
+                 x = a; y = b; z = x + y; \
+                 return z + 0 + 0 + 0 + 0 + 0; } \
+               big()"), 42.0);
+        // template ${holes} in a skipped body still capture
+        assert_eq!(
+            n("var w = 'world'; \
+               function greet() { \
+                 var a = 1; var b = 2; var c = 3; var d = 4; \
+                 var s = `hi ${w}`; \
+                 return s.length + a + b + c + d; } \
+               greet()"), 18.0);
+        // a parse error inside a lazy body surfaces at call, catchable
+        assert_eq!(
+            n("function broken() { \
+                 var a = 1; var b = 2; var c = 3; var d = 4; \
+                 var e = 5; var f = 6; var g = 7; \
+                 return a + ; } \
+               var r = 0; try { broken(); } catch (e) { r = 1; } r"),
+            1.0);
+        // mutation of a captured var from a lazy-parsed body sticks
+        assert_eq!(
+            n("var n0 = 0; \
+               function bump() { \
+                 var a = 1; var b = 2; var c = 3; var d = 4; \
+                 var e = 5; var f = 6; \
+                 n0 = n0 + a + b + c + d + e + f; } \
+               bump(); bump(); n0"), 42.0);
+    }
+
+    #[test]
     fn tdz_use_before_declaration_errors() {
         assert!(eval("{ x; let x = 1; }").is_err());
         assert!(eval("{ x = 5; let x; }").is_err());

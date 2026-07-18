@@ -27,7 +27,7 @@ impl From<LexError> for ParseError {
 }
 
 pub fn parse_program(src: &str) -> Result<Vec<Stmt>, ParseError> {
-    let mut p = Parser::new(tokenize(src)?);
+    let mut p = Parser::new(Rc::new(tokenize(src)?));
     let mut out = Vec::new();
     while !p.at_eof() {
         out.push(p.stmt()?);
@@ -35,8 +35,23 @@ pub fn parse_program(src: &str) -> Result<Vec<Stmt>, ParseError> {
     Ok(out)
 }
 
+/// Parse a lazily-captured function body (first call). The token
+/// stream is the original file's; positions stay absolute so error
+/// lines match the source.
+pub fn parse_lazy_body(
+    lz: &LazyTokens,
+) -> Result<Vec<Stmt>, ParseError> {
+    let mut p = Parser::new(lz.toks.clone());
+    p.pos = lz.start;
+    let mut out = Vec::new();
+    while p.pos < lz.end {
+        out.push(p.stmt()?);
+    }
+    Ok(out)
+}
+
 struct Parser {
-    toks: Vec<Token>,
+    toks: Rc<Vec<Token>>,
     pos: usize,
     /// Disables the `in` binary operator (inside a for-loop head).
     no_in: bool,
@@ -61,7 +76,7 @@ enum OpKind {
 }
 
 impl Parser {
-    fn new(toks: Vec<Token>) -> Parser {
+    fn new(toks: Rc<Vec<Token>>) -> Parser {
         Parser {
             toks, pos: 0, no_in: false, in_async: false, tmp_n: 0,
             last_pattern_len: 0, class_super: None,
@@ -206,6 +221,7 @@ impl Parser {
                 params,
                 body,
                 is_async: false,
+                lazy_body: None,
             }))),
             args,
             optional: false,
@@ -321,6 +337,7 @@ impl Parser {
                 params,
                 body,
                 is_async: false,
+                lazy_body: None,
             };
             if let Some(is_get) = acc {
                 if is_static {
@@ -372,7 +389,8 @@ impl Parser {
             cbody = field_stmts;
         }
         Ok((
-            FuncLit { name, params, body: cbody, is_async: false },
+            FuncLit { name, params, body: cbody, is_async: false,
+                      lazy_body: None },
             methods,
             accessors,
             statics,
@@ -1156,6 +1174,7 @@ impl Parser {
                             params: vec![tmp],
                             body: stmts,
                             is_async: false,
+                lazy_body: None,
                         }))),
                         args: vec![right],
                         optional: false,
@@ -1359,6 +1378,19 @@ impl Parser {
         prologue: Vec<Stmt>,
         is_async: bool,
     ) -> Result<Expr, ParseError> {
+        if !is_async && prologue.is_empty()
+            && self.class_super.is_none() && self.at_punct(P::LBrace)
+        {
+            if let Some(lz) = self.try_lazy_body()? {
+                return Ok(Expr::Arrow(Rc::new(FuncLit {
+                    name: None,
+                    params,
+                    body: Vec::new(),
+                    is_async: false,
+                    lazy_body: Some(lz),
+                })));
+            }
+        }
         let saved = self.in_async;
         self.in_async = is_async;
         let body = if self.at_punct(P::LBrace) {
@@ -1378,6 +1410,7 @@ impl Parser {
             params,
             body,
             is_async,
+            lazy_body: None,
         })))
     }
 
@@ -1707,7 +1740,7 @@ impl Parser {
                     out.push(match part {
                         TplElem::Chunk(s) => TplPart::Chunk(s),
                         TplElem::ExprSrc(src) => {
-                            let mut sub = Parser::new(tokenize(&src)?);
+                            let mut sub = Parser::new(Rc::new(tokenize(&src)?));
                             let e = sub.expr()?;
                             if !sub.at_eof() {
                                 return Err(self.err(
@@ -2207,6 +2240,7 @@ impl Parser {
                 params: Vec::new(),
                 body,
                 is_async: false,
+                lazy_body: None,
             }))),
             args: Vec::new(),
             optional: false,
@@ -2558,6 +2592,7 @@ impl Parser {
                 cases,
             }],
             is_async: false,
+                lazy_body: None,
         })));
         let next_fn = FuncLit {
             name: None,
@@ -2602,6 +2637,7 @@ impl Parser {
                 Stmt::Return(Some(Expr::Ident("__r".to_string()))),
             ],
             is_async: false,
+                lazy_body: None,
         };
         let ret_fn = FuncLit {
             name: None,
@@ -2618,6 +2654,7 @@ impl Parser {
                 ))),
             ],
             is_async: false,
+                lazy_body: None,
         };
         let throw_fn = FuncLit {
             name: None,
@@ -2631,6 +2668,7 @@ impl Parser {
                 Stmt::Throw(Expr::Ident("__e".to_string())),
             ],
             is_async: false,
+                lazy_body: None,
         };
         out.push(Stmt::VarDecl {
             kind: DeclKind::Var,
@@ -2665,10 +2703,81 @@ impl Parser {
                 params: Vec::new(),
                 body: vec![Stmt::Return(Some(Expr::Ident(it.clone())))],
                 is_async: false,
+                lazy_body: None,
             }))),
         )));
         out.push(Stmt::Return(Some(Expr::Ident(it))));
         Ok(out)
+    }
+
+    /// Lazy parsing: capture the upcoming `{...}` body as a token
+    /// range without building an AST, collecting candidate free
+    /// identifiers on the way. Returns None (position restored) for
+    /// bodies too small to be worth a stub. Call with pos at `{`.
+    fn try_lazy_body(
+        &mut self,
+    ) -> Result<Option<LazyTokens>, ParseError> {
+        let brace = self.pos;
+        self.expect_punct(P::LBrace)?;
+        let start = self.pos;
+        let mut depth = 1usize;
+        let mut free = std::collections::HashSet::new();
+        let mut prev_dot = false;
+        loop {
+            let t = &self.toks[self.pos];
+            match &t.kind {
+                Tok::Eof => {
+                    return Err(self.err(
+                        "unexpected end of input in function body",
+                    ));
+                }
+                Tok::Punct(P::LBrace) => {
+                    depth += 1;
+                    prev_dot = false;
+                }
+                Tok::Punct(P::RBrace) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                    prev_dot = false;
+                }
+                Tok::Punct(P::Dot | P::QuestionDot) => prev_dot = true,
+                Tok::Ident(s) => {
+                    // everything counts — even keyword-shaped names
+                    // just resolve to nothing at deferral time
+                    if !prev_dot {
+                        free.insert(s.clone());
+                    }
+                    prev_dot = false;
+                }
+                Tok::Template(parts) => {
+                    for p in parts {
+                        if let TplElem::ExprSrc(hole) = p {
+                            collect_words(hole, &mut free);
+                        }
+                    }
+                    prev_dot = false;
+                }
+                _ => prev_dot = false,
+            }
+            self.pos += 1;
+        }
+        let end = self.pos;
+        self.pos += 1; // the closing `}`
+        if end - start < 24 {
+            // tiny body: eager parse+compile beats stub bookkeeping
+            self.pos = brace;
+            return Ok(None);
+        }
+        let mut free_ids: Vec<String> = free.into_iter().collect();
+        free_ids.sort(); // deterministic capture order
+        Ok(Some(LazyTokens {
+            toks: self.toks.clone(),
+            start,
+            end,
+            free_ids,
+        }))
     }
 
     /// Parses `(params) { body }` (name handled by the caller).
@@ -2687,6 +2796,22 @@ impl Parser {
         is_gen: bool,
     ) -> Result<FuncLit, ParseError> {
         let (params, prologue) = self.arrow_params()?;
+        // lazy-parse eligible: no parse-time body rewrites pending
+        // (async/generator desugar, destructured/default/rest param
+        // prologue, class `super` rewriting)
+        if !is_async && !is_gen && prologue.is_empty()
+            && self.class_super.is_none() && self.at_punct(P::LBrace)
+        {
+            if let Some(lz) = self.try_lazy_body()? {
+                return Ok(FuncLit {
+                    name,
+                    params,
+                    body: Vec::new(),
+                    is_async: false,
+                    lazy_body: Some(lz),
+                });
+            }
+        }
         let saved = self.in_async;
         self.in_async = is_async;
         let saved_gen = self.in_generator;
@@ -2708,7 +2833,30 @@ impl Parser {
         if is_gen {
             body = self.generator_transform(body)?;
         }
-        Ok(FuncLit { name, params, body, is_async })
+        Ok(FuncLit { name, params, body, is_async, lazy_body: None })
+    }
+}
+
+/// Identifier-shaped words in a template hole's raw source. Purely
+/// conservative: property names and string contents get in too, which
+/// only ever adds an unused capture candidate.
+fn collect_words(
+    src: &str,
+    out: &mut std::collections::HashSet<String>,
+) {
+    let mut cur = String::new();
+    for ch in src.chars() {
+        if ch.is_alphanumeric() || ch == '_' || ch == '$' {
+            cur.push(ch);
+        } else if !cur.is_empty() {
+            let w = std::mem::take(&mut cur);
+            if !w.chars().next().unwrap().is_ascii_digit() {
+                out.insert(w);
+            }
+        }
+    }
+    if !cur.is_empty() && !cur.chars().next().unwrap().is_ascii_digit() {
+        out.insert(cur);
     }
 }
 
@@ -2861,6 +3009,7 @@ mod tests {
                     b(num(1.0)),
                 )))],
                 is_async: false,
+                lazy_body: None,
             }))
         );
         let Expr::Arrow(f) = expr("(a, b) => { return a; }") else {

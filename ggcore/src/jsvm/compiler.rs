@@ -58,7 +58,22 @@ pub fn compile_lazy(src: &LazySrc) -> Result<Module, CompileError> {
         fns: Vec::new(),
         const_globals: HashSet::new(),
     };
-    let idx = c.compile_func_now(&src.lit, src.is_arrow, Some(src))?;
+    let lit = if let Some(lz) = &src.lit.lazy_body {
+        // lazy-parsed: build the body AST now, from the original
+        // token stream
+        let body = super::parser::parse_lazy_body(lz)
+            .map_err(|e| CompileError { msg: format!("{e:?}") })?;
+        Rc::new(FuncLit {
+            name: src.lit.name.clone(),
+            params: src.lit.params.clone(),
+            body,
+            is_async: false,
+            lazy_body: None,
+        })
+    } else {
+        src.lit.clone()
+    };
+    let idx = c.compile_func_now(&lit, src.is_arrow, Some(src))?;
     c.module.main = idx;
     Ok(c.module)
 }
@@ -615,6 +630,19 @@ fn lexical_names(stmts: &[Stmt], out: &mut HashSet<String>) {
 /// Names a function references that it does not bind itself
 /// (conservatively includes what its nested functions reference).
 fn free_vars(lit: &FuncLit) -> HashSet<String> {
+    if let Some(lz) = &lit.lazy_body {
+        // lazy-parsed body: token-level over-approximation (locals and
+        // even keyword-shaped words included). Names that aren't real
+        // enclosing bindings resolve to Global at deferral and cost
+        // nothing; a missed real reference would mis-bind, so the scan
+        // errs wide.
+        let mut ids: HashSet<String> =
+            lz.free_ids.iter().cloned().collect();
+        for p in &lit.params {
+            ids.remove(p);
+        }
+        return ids;
+    }
     let mut ids = HashSet::new();
     let mut lits = Vec::new();
     for s in &lit.body {
@@ -779,6 +807,7 @@ fn lower_new_expr(e: &mut Expr, n: &mut usize) {
     ];
     let iife = Expr::Func(Rc::new(FuncLit {
         name: None, params: Vec::new(), body, is_async: false,
+        lazy_body: None,
     }));
     *e = Expr::Call {
         callee: Box::new(iife), args: Vec::new(), optional: false,
@@ -887,6 +916,7 @@ fn ast_call(callee: Expr, args: Vec<Expr>) -> Expr {
 fn ast_arrow(params: Vec<String>, body: Vec<Stmt>) -> Expr {
     Expr::Arrow(Rc::new(FuncLit {
         name: None, params, body, is_async: false,
+        lazy_body: None,
     }))
 }
 
@@ -1456,6 +1486,7 @@ fn chain_async(stmts: &[Stmt], n: &mut usize) -> Vec<Stmt> {
                         params: Vec::new(),
                         body: lf,
                         is_async: false,
+                lazy_body: None,
                     }))),
                 )],
             });
@@ -1526,6 +1557,7 @@ fn chain_async(stmts: &[Stmt], n: &mut usize) -> Vec<Stmt> {
                         params: Vec::new(),
                         body: lf,
                         is_async: false,
+                lazy_body: None,
                     }))),
                 )],
             });
@@ -1950,6 +1982,7 @@ impl Compiler {
                 params: lit.params.clone(),
                 body: desugar_async(&lit.body),
                 is_async: false,
+                lazy_body: None,
             });
             return self.compile_func(&desugared, is_arrow);
         }
@@ -1958,8 +1991,9 @@ impl Compiler {
         }
         // Lazy compilation: most bundle functions are never called, so
         // defer body codegen to first call. Trivial bodies compile now
-        // (a stub would cost more than the codegen it saves).
-        if lit.body.len() > 1 {
+        // (a stub would cost more than the codegen it saves). A
+        // lazy-PARSED body has no AST yet, so it always defers.
+        if lit.lazy_body.is_some() || lit.body.len() > 1 {
             return self.defer_func(lit, is_arrow);
         }
         self.compile_func_now(lit, is_arrow, None)

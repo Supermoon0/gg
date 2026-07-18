@@ -64,6 +64,27 @@ pub struct FuncLit {
     /// `async function` — the compiler desugars the body to a promise
     /// chain (no suspendable VM).
     pub is_async: bool,
+    /// Lazy parsing: Some = `body` is empty and the real body is this
+    /// token range, parsed at first call (together with lazy
+    /// compilation). Only plain functions qualify — async/generator
+    /// bodies and `super`-rewritten class methods parse eagerly.
+    pub lazy_body: Option<LazyTokens>,
+}
+
+/// A function body captured as a token range instead of an AST.
+/// `free_ids` conservatively over-approximates every identifier the
+/// body references (only property names after `.`/`?.` are excluded;
+/// template `${}` holes are word-scanned from their raw source) —
+/// the compiler pre-resolves captures from it, where naming too much
+/// is harmless and missing a real reference would mis-bind a global.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LazyTokens {
+    pub toks: std::rc::Rc<Vec<super::lexer::Token>>,
+    /// token index just after the body's `{`
+    pub start: usize,
+    /// token index of the matching `}`
+    pub end: usize,
+    pub free_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
