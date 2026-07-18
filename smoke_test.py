@@ -5,9 +5,10 @@ import tkinter
 from browser import net
 from browser.html_parser import Element, HTMLParser, Text, tree_to_list
 from browser.css_parser import CSSParser
-from browser.style import cascade_priority, default_rules, style
+from browser.style import (RuleIndex, cascade_priority, default_rules,
+                           style)
 from browser.layout import (HSTEP, VSTEP, BlockLayout, DocumentLayout,
-                            layout_tree_to_list, paint_tree)
+                            ImageLayout, layout_tree_to_list, paint_tree)
 from browser.pages import DEMO_PAGE
 
 passed = 0
@@ -74,10 +75,44 @@ rules = CSSParser(
     "@media (max-width: 5px) { p { color: blue; } }"
     "a:hover { color: green; } div { margin: 8px 16px; }"
 ).parse()
-check("CSS rule count (non-matching @media + :hover excluded)",
-      len(rules) == 4, f"got {len(rules)}")
+check("CSS rule count (non-matching @media excluded, :hover kept)",
+      len(rules) == 5, f"got {len(rules)}")
 ua = default_rules()
 check("UA stylesheet parses", len(ua) > 20, f"{len(ua)} rules")
+
+# :hover / :focus match only while the shell marks the node
+hov_dom = HTMLParser(
+    "<div class=m><p>x</p><span>s</span></div><input>").parse()
+hov_rules = sorted(
+    default_rules() + CSSParser(
+        "p { color: black; } p:hover { color: red; }"
+        ".m:hover span { color: green; }"
+        "input:focus { color: blue; }").parse(),
+    key=cascade_priority)
+_hp = next(n for n in tree_to_list(hov_dom, [])
+           if isinstance(n, Element) and n.tag == "p")
+_hs = next(n for n in tree_to_list(hov_dom, [])
+           if isinstance(n, Element) and n.tag == "span")
+_hi = next(n for n in tree_to_list(hov_dom, [])
+           if isinstance(n, Element) and n.tag == "input")
+style(hov_dom, RuleIndex(hov_rules))
+check(":hover rules stay inert without hover state",
+      _hp.style["color"] == "black"
+      and _hs.style.get("color") != "green")
+# hover chain: the element and its ancestors
+cur = _hp
+while cur is not None:
+    if isinstance(cur, Element):
+        cur.is_hovered = True
+    cur = cur.parent
+_hi.is_focused = True
+style(hov_dom, RuleIndex(hov_rules))
+check(":hover matches the hovered element",
+      _hp.style["color"] == "red", _hp.style.get("color"))
+check("ancestor :hover fires descendant rules",
+      _hs.style.get("color") == "green", _hs.style.get("color"))
+check(":focus matches the focused input",
+      _hi.style.get("color") == "blue", _hi.style.get("color"))
 
 # --- Style + layout (needs a tk root for font metrics) ---
 root = tkinter.Tk()
@@ -300,6 +335,85 @@ _scmds = paint_tree(_sdoc, [])
 check("box-shadow paints an offset rect behind the box",
       any(getattr(c, "color", "") == "#888888" for c in _scmds))
 
+# @font-face descriptor extraction (loadable sources only)
+from browser.webfonts import parse_font_faces
+_faces = parse_font_faces(["""@font-face { font-family: 'My Face'; src: url('fonts/a.woff2') format('woff2'), url(fonts/a.ttf) format('truetype'); }@font-face { font-family: IconFont; font-weight: 700; src: url(icons.otf); }@font-face { font-family: WoffOnly; src: url(x.woff2); }@font-face { font-family: DataFont; src: url(data:font/ttf;base64,AAAA); }"""])
+check("@font-face picks the loadable source",
+      ("my face", False, False, "fonts/a.ttf") in _faces, str(_faces))
+check("@font-face numeric weight maps to bold",
+      ("iconfont", True, False, "icons.otf") in _faces, str(_faces))
+check("woff2-only faces are skipped",
+      not any(f[0] == "woffonly" for f in _faces), str(_faces))
+check("data: font sources are accepted",
+      any(f[0] == "datafont" and f[3].startswith("data:")
+          for f in _faces), str(_faces))
+
+# CSS width/height outrank HTML attributes on replaced elements
+ri_dom = _styled("img.big{width:100px; height:50px} "
+                 "img.half{width:48px}",
+                 '<img class=big width=10 height=10>'
+                 '<img class=half>'
+                 '<img width=30 height=20>')
+_ridoc = DocumentLayout(ri_dom)
+_ridoc.layout(400)
+_ims = [o for o in layout_tree_to_list(_ridoc, [])
+        if isinstance(o, ImageLayout)]
+check("CSS size wins over img attributes",
+      abs(_ims[0].width - 100) < 1 and abs(_ims[0].height - 50) < 1,
+      f"{_ims[0].width:.0f}x{_ims[0].height:.0f}")
+check("CSS width alone keeps the intrinsic ratio",
+      abs(_ims[1].width - 48) < 1 and abs(_ims[1].height - 48) < 1,
+      f"{_ims[1].width:.0f}x{_ims[1].height:.0f}")
+check("attrs still size an unstyled img",
+      abs(_ims[2].width - 30) < 1 and abs(_ims[2].height - 20) < 1,
+      f"{_ims[2].width:.0f}x{_ims[2].height:.0f}")
+
+# transform: translate shifts the painted subtree, layout unaffected
+tf_dom = _styled(
+    "", '<div style="width:50px; height:20px; background-color:#c0ffee;'
+    ' transform: translate(30px, 10px)">t</div>'
+    '<div style="height:20px; background-color:#123123">after</div>')
+_tdoc = DocumentLayout(tf_dom)
+_tdoc.layout(400)
+_tcmds = paint_tree(_tdoc, [])
+_tbox = next(c for c in _tcmds if getattr(c, "color", "") == "#c0ffee")
+_abox = next(c for c in _tcmds if getattr(c, "color", "") == "#123123")
+# the untransformed sibling anchors the expected geometry: without
+# the transform the first div would sit directly above it
+check("transform:translate shifts the painted box",
+      _tbox.left == _abox.left + 30 and _tbox.top == _abox.top - 10,
+      f"box=({_tbox.left}, {_tbox.top}) anchor=({_abox.left}, "
+      f"{_abox.top})")
+
+# percentage translate resolves against the element's own border box
+tp_dom = _styled(
+    "", '<div style="width:60px; height:40px; background-color:#facade;'
+    ' transform: translate(-50%, -50%)">p</div>'
+    '<div style="height:20px; background-color:#123123">anchor</div>')
+_tpdoc = DocumentLayout(tp_dom)
+_tpdoc.layout(400)
+_tpcmds = paint_tree(_tpdoc, [])
+_tpbox = next(c for c in _tpcmds
+              if getattr(c, "color", "") == "#facade")
+_tpanchor = next(c for c in _tpcmds
+                 if getattr(c, "color", "") == "#123123")
+check("transform % translate uses own border box",
+      _tpbox.left == _tpanchor.left - 30
+      and _tpbox.top == _tpanchor.top - 40 - 20,
+      f"box=({_tpbox.left}, {_tpbox.top}) anchor=({_tpanchor.left}, "
+      f"{_tpanchor.top})")
+
+# scale(0) hides the subtree
+ts_dom = _styled(
+    "", '<div style="height:20px; background-color:#dead00;'
+    ' transform: scale(0)">gone</div>')
+_tsdoc = DocumentLayout(ts_dom)
+_tsdoc.layout(400)
+_tscmds = paint_tree(_tsdoc, [])
+check("transform scale(0) hides the subtree",
+      not any(getattr(c, "color", "") == "#dead00" for c in _tscmds)
+      and not any(getattr(c, "text", "") == "gone" for c in _tscmds))
+
 # z-index reorders positioned siblings (lower z paints first = below)
 z_dom = _styled(
     "", '<div>'
@@ -435,6 +549,54 @@ check("input placeholder is painted",
       and all(c.color == "#9e9e9e" for c in _ptexts
               if "search here" in c.text), str(_ptexts))
 
+# focused input paints a caret after the typed value; typed value
+# replaces the placeholder
+foc_dom = _styled(
+    "", '<input value="gg" placeholder="search here">')
+_finput = next(n for n in tree_to_list(foc_dom, [])
+               if isinstance(n, Element) and n.tag == "input")
+_finput.is_focused = True
+_fdoc = DocumentLayout(foc_dom)
+_fdoc.layout(400)
+_fcmds = paint_tree(_fdoc, [])
+from browser.draw import DrawLine as _DrawLine
+_carets = [c for c in _fcmds
+           if isinstance(c, _DrawLine) and c.color == "#333333"]
+_ftexts = [c.text for c in _fcmds if hasattr(c, "text")]
+check("focused input paints a caret", len(_carets) == 1,
+      str([type(c).__name__ for c in _fcmds]))
+check("typed value replaces placeholder",
+      "gg" in _ftexts and "search here" not in _ftexts, str(_ftexts))
+check("caret sits after the typed text",
+      _carets and _carets[0].left > HSTEP, str(_carets and (
+          _carets[0].left, _carets[0].top)))
+
+# form GET submit assembles the query from named fields
+from browser import forms as _forms
+form_dom = HTMLParser(
+    '<form action="https://search.example/search?old=1" method="get">'
+    '<input name="query" value="한글 검색">'
+    '<input type="hidden" name="where" value="nexearch">'
+    '<input name="ignored-unnamed-type" type="submit" value="go">'
+    '<input value="no-name-skipped">'
+    '<input type="checkbox" name="unchecked" value="x">'
+    '<input type="checkbox" name="checked" value="y" checked>'
+    '</form>').parse()
+_form = next(n for n in tree_to_list(form_dom, [])
+             if isinstance(n, Element) and n.tag == "form")
+_href = _forms.submit_href(_form)
+check("form GET submit builds query (drops action's old query)",
+      _href == "https://search.example/search?"
+      "query=%ED%95%9C%EA%B8%80+%EA%B2%80%EC%83%89"
+      "&where=nexearch&checked=y", str(_href))
+_inp = next(n for n in tree_to_list(form_dom, [])
+            if isinstance(n, Element)
+            and n.attributes.get("name") == "query")
+check("find_form walks up from an input",
+      _forms.find_form(_inp) is _form)
+_form.attributes["method"] = "post"
+check("POST form yields no GET href", _forms.submit_href(_form) is None)
+
 check("background shorthand parses url/pos/repeat",
       parse_background({"background":
                         "url('s.png') no-repeat -366px -282px #fff"})
@@ -509,6 +671,107 @@ check("flex row placement", fa.y == fb.y == fc.y and fa.x < fb.x < fc.x,
       f"x: {fa.x:.0f},{fb.x:.0f},{fc.x:.0f}")
 check("flex grow shares space", abs(fb.width - (774 - 100) / 2) < 1,
       f"fb.width={fb.width:.0f}")
+
+# --- float + clear (v1: width-bearing floats, block sidestep) ---
+FLOAT_PAGE = """<html><body style="margin: 0">
+<div id=wrap style="width:400px">
+  <div id=fl style="float:left; width:100px; height:80px">img</div>
+  <p id=txt style="margin:0">text beside the thumbnail</p>
+  <div id=fr style="float:right; width:50px; height:30px">r</div>
+  <p id=txt2 style="margin:0">second paragraph</p>
+  <div id=cl style="clear:both; height:10px">below</div>
+</div>
+</body></html>"""
+fl_dom = HTMLParser(FLOAT_PAGE).parse()
+style(fl_dom, sorted(ua, key=cascade_priority))
+fl_doc = DocumentLayout(fl_dom)
+fl_doc.layout(800)
+fb3 = {}
+for b in layout_tree_to_list(fl_doc, []):
+    if isinstance(b, BlockLayout) and isinstance(b.node, Element):
+        node_id = b.node.attributes.get("id")
+        if node_id:
+            fb3[node_id] = b
+_w = fb3["wrap"]
+check("float:left sits at the container edge, top of flow",
+      abs(fb3["fl"].x - _w.x) < 1 and abs(fb3["fl"].y - _w.y) < 1,
+      f"({fb3['fl'].x:.0f},{fb3['fl'].y:.0f}) vs ({_w.x:.0f},{_w.y:.0f})")
+check("in-flow text shifts right of the float and narrows",
+      abs(fb3["txt"].x - (_w.x + 100)) < 1
+      and abs(fb3["txt"].width - 300) < 1,
+      f"x={fb3['txt'].x:.0f} w={fb3['txt'].width:.0f}")
+check("in-flow text keeps the float's y (no push-down)",
+      abs(fb3["txt"].y - _w.y) < 1, f"y={fb3['txt'].y:.0f}")
+check("float:right hugs the right edge",
+      abs((fb3["fr"].x + fb3["fr"].width) - (_w.x + 400)) < 1,
+      f"right={fb3['fr'].x + fb3['fr'].width:.0f}")
+check("clear:both drops below the tallest float",
+      fb3["cl"].y >= _w.y + 80 - 1,
+      f"cl.y={fb3['cl'].y:.0f} float bottom={_w.y + 80:.0f}")
+check("container height contains its floats",
+      _w.height >= 80 + 10 - 1, f"h={_w.height:.0f}")
+
+# --- flex deep-dive: justify/align/shrink/basis/flex shorthand ---
+FLEX2_PAGE = """<html><body style="margin: 0">
+<div id=jc style="display:flex; justify-content:center; width:300px">
+  <div id=jca style="width:50px; height:10px">a</div>
+  <div id=jcb style="width:50px; height:10px">b</div>
+</div>
+<div id=sb style="display:flex; justify-content:space-between;
+     width:300px">
+  <div id=sba style="width:50px; height:10px">a</div>
+  <div id=sbb style="width:50px; height:10px">b</div>
+  <div id=sbc style="width:50px; height:10px">c</div>
+</div>
+<div id=ai style="display:flex; align-items:center; width:300px">
+  <div id=aia style="width:50px; height:40px">tall</div>
+  <div id=aib style="width:50px; height:10px">short</div>
+</div>
+<div id=sh style="display:flex; width:300px">
+  <div id=sha style="width:400px; height:10px">a</div>
+  <div id=shb style="width:200px; height:10px">b</div>
+</div>
+<div id=gr style="display:flex; width:300px">
+  <div id=gra style="flex: 1; height:10px">a</div>
+  <div id=grb style="flex: 2; height:10px">b</div>
+  <div id=grc style="width:60px; height:10px">c</div>
+</div>
+</body></html>"""
+fdom = HTMLParser(FLEX2_PAGE).parse()
+style(fdom, sorted(ua, key=cascade_priority))
+fdoc = DocumentLayout(fdom)
+fdoc.layout(800)
+fb2 = {}
+for b in layout_tree_to_list(fdoc, []):
+    if isinstance(b, BlockLayout) and isinstance(b.node, Element):
+        node_id = b.node.attributes.get("id")
+        if node_id:
+            fb2[node_id] = b
+_j = fb2["jc"]
+check("justify-content:center leads with half the free space",
+      abs(fb2["jca"].x - (_j.x + 100)) < 1
+      and abs(fb2["jcb"].x - (_j.x + 150)) < 1,
+      f"a={fb2['jca'].x - _j.x:.0f} b={fb2['jcb'].x - _j.x:.0f}")
+_s = fb2["sb"]
+check("justify-content:space-between pins ends, splits middle",
+      abs(fb2["sba"].x - _s.x) < 1
+      and abs(fb2["sbb"].x - (_s.x + 125)) < 1
+      and abs(fb2["sbc"].x - (_s.x + 250)) < 1,
+      f"{fb2['sba'].x - _s.x:.0f},{fb2['sbb'].x - _s.x:.0f},"
+      f"{fb2['sbc'].x - _s.x:.0f}")
+check("align-items:center centers the short item",
+      abs(fb2["aib"].y - (fb2["aia"].y + 15)) < 1,
+      f"tall.y={fb2['aia'].y:.0f} short.y={fb2['aib'].y:.0f}")
+check("flex-shrink returns overflow proportionally",
+      abs(fb2["sha"].width - 200) < 1
+      and abs(fb2["shb"].width - 100) < 1,
+      f"a={fb2['sha'].width:.0f} b={fb2['shb'].width:.0f}")
+check("flex shorthand: grow factors split the remainder 1:2",
+      abs(fb2["gra"].width - 80) < 1
+      and abs(fb2["grb"].width - 160) < 1
+      and abs(fb2["grc"].width - 60) < 1,
+      f"a={fb2['gra'].width:.0f} b={fb2['grb'].width:.0f} "
+      f"c={fb2['grc'].width:.0f}")
 absbox = boxes["abs"]
 check("absolute positioning", abs(absbox.x - (HSTEP + 50)) < 1
       and abs(absbox.y - (VSTEP + 300)) < 1,
@@ -696,6 +959,9 @@ if native.available():
                                         "size": [], "repeat": "no-repeat"})
     import tkinter as _tk3
     _r3 = _tk3.Tk(); _r3.withdraw()
+    # tk-fallback fonts died with the old root; force re-creation
+    from browser import layout as _layout
+    _layout._FONT_CACHE.clear()
     from browser.draw import DrawBgImage as _DrawBg2
     ps_doc = DocumentLayout(ps_dom)
     ps_doc.layout(400)
@@ -723,6 +989,8 @@ if native.available():
               and img[1] == 50 and img[2] == 50, str(img))
         import tkinter as _tk
         _r2 = _tk.Tk(); _r2.withdraw()
+        from browser import layout as _layout2
+        _layout2._FONT_CACHE.clear()
         svg_doc = DocumentLayout(svg_dom)
         svg_doc.layout(400)
         svg_cmds = paint_tree(svg_doc, [])

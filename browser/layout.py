@@ -10,7 +10,8 @@ import tkinter.font
 from . import textengine
 from .colors import NAMED
 from .draw import (DrawBgImage, DrawClipPop, DrawClipPush, DrawImage,
-                   DrawLine, DrawOval, DrawRect, DrawText)
+                   DrawLine, DrawOval, DrawRect, DrawText,
+                   translate_cmds)
 from .html_parser import Element, Text
 from .style import parse_px, parse_size
 
@@ -49,6 +50,9 @@ def get_font(size, weight, slant, family="default"):
                 size=-size,  # negative = pixels
                 weight=weight, slant=slant, family=resolved,
             )
+            # px size under the same name NativeFont exposes
+            # (line-height reads font.size on both paths)
+            font.size = size
             # A hidden Label keeps the font object alive and fast.
             label = tkinter.Label(font=font)
             # Metrics are Tcl calls; compute once and cache on the font.
@@ -95,8 +99,8 @@ def font_for(style):
     if family not in FONT_FAMILIES:
         known = {"consolas", "courier new", "georgia", "times new roman",
                  "arial", "verdana", "tahoma", "segoe ui", "malgun gothic"}
-        if family not in known:
-            family = "default"
+        if family not in known and not textengine.has_family(family):
+            family = "default"  # unknown and no web font registered
     return get_font(size, weight, slant, family)
 
 
@@ -558,6 +562,33 @@ class BlockLayout:
             else:
                 self.y = (self.parent.y + self.margin_top
                           + self.bw + self.pt)
+            # clear: drop below the matching floats (set by the parent)
+            floor = getattr(self, "clear_y_floor", None)
+            if floor is not None:
+                self.y = max(
+                    self.y, floor + self.margin_top + self.bw + self.pt)
+            # floats in the containing block carve the line area:
+            # auto-width in-flow blocks shift and narrow around any
+            # float overlapping their top edge (line-box granularity
+            # is out of scope — the whole block sidesteps)
+            pf = getattr(self.parent, "_floats", None)
+            if pf and spec is None and self.forced_width is None \
+                    and getattr(self, "float_side", None) is None:
+                left_edge = self.parent.x
+                right_edge = self.parent.x + self.parent.width
+                for (s, fx, fy, fw2, fh) in pf:
+                    if not (fy <= self.y < fy + fh):
+                        continue
+                    if s == "left":
+                        left_edge = max(left_edge, fx + fw2)
+                    else:
+                        right_edge = min(right_edge, fx)
+                shift = left_edge - self.parent.x
+                narrow = (self.parent.x + self.parent.width) \
+                    - right_edge
+                if shift or narrow:
+                    self.x += shift
+                    box_w = max(box_w - shift - narrow, edge)
         self.width = max(box_w - edge, 0)
 
         # resolve a specified height before children lay out so they
@@ -571,20 +602,68 @@ class BlockLayout:
         if mode == "flex":
             self._layout_flex(node, em)
         elif mode == "block":
+            # incremental placement: floats registered by earlier
+            # children must be visible while later siblings lay out
             previous = None
+            self._floats = []  # (side, x, y, outer_w, outer_h)
             for child in node.children:
                 if not is_visible(child):
                     continue
                 if is_out_of_flow(child):
                     self._document().abs_queue.append(child)
                     continue
+                fside = "none"
+                fw = None
+                if isinstance(child, Element):
+                    fside = child.style.get(
+                        "float", "none").strip().casefold()
+                    if fside in ("left", "right"):
+                        fw = parse_size(
+                            child.style.get("width"), self.width, em)
+                if fside in ("left", "right") and fw is not None:
+                    # float: out of normal flow, anchored where the
+                    # flow currently ends (auto-width floats fall back
+                    # to normal flow — v1 gate)
+                    cur_y = self.y if previous is None else (
+                        previous.y + previous.height + previous.pb
+                        + previous.bw + previous.margin_bottom)
+                    box = BlockLayout(child, self, None)
+                    box.forced_width = fw
+                    box.float_side = fside
+                    box.flex_origin = (
+                        self._float_x(fside, cur_y, fw), cur_y)
+                    self.children.append(box)
+                    box.layout()
+                    self._floats.append((
+                        fside,
+                        box.x - box.ml - box.bw - box.pl,
+                        cur_y,
+                        box.outer_width(),
+                        box.outer_height(),
+                    ))
+                    continue  # previous unchanged: out of flow
                 nxt = BlockLayout(child, self, previous)
+                if isinstance(child, Element) and self._floats:
+                    cl = child.style.get(
+                        "clear", "none").strip().casefold()
+                    if cl in ("left", "right", "both"):
+                        ys = [fy + fh
+                              for (s, _, fy, _, fh) in self._floats
+                              if cl == "both" or s == cl]
+                        if ys:
+                            nxt.clear_y_floor = max(ys)
                 self.children.append(nxt)
+                nxt.layout()
                 previous = nxt
-            for child in self.children:
-                child.layout()
-            self.height = sum(
-                child.outer_height() for child in self.children)
+            # content height: bottom edge of the flow, extended to
+            # cover float bottoms (clearfix-style containment)
+            flow_bottom = self.y if previous is None else (
+                previous.y + previous.height + previous.pb
+                + previous.bw + previous.margin_bottom)
+            float_bottom = max(
+                (fy + fh for (_, _, fy, _, fh) in self._floats),
+                default=self.y)
+            self.height = max(flow_bottom, float_bottom) - self.y
             apply_relative_offsets(self.children)
         else:
             self.new_line()
@@ -627,6 +706,22 @@ class BlockLayout:
             return parse_size(raw, base, em) if base is not None else None
         return parse_size(raw, 0, em)
 
+    def _float_x(self, side, y, w):
+        """Margin-edge x for a new float: after the floats already
+        occupying this y, from the matching side."""
+        left_edge = self.x
+        right_edge = self.x + self.width
+        for (s, fx, fy, fw, fh) in self._floats:
+            if not (fy <= y < fy + fh):
+                continue
+            if s == "left":
+                left_edge = max(left_edge, fx + fw)
+            else:
+                right_edge = min(right_edge, fx)
+        if side == "left":
+            return left_edge
+        return max(right_edge - w, left_edge)
+
     def _layout_flex(self, node, em):
         """Simplified flexbox: row direction, optional wrap, grow."""
         kid_nodes = []
@@ -654,17 +749,69 @@ class BlockLayout:
             apply_relative_offsets(self.children)
             return
 
+        # main size: flex-basis wins over width; None = content-sized
         specs = []
+        grows = []
+        shrinks = []
         for child in kid_nodes:
-            spec = parse_size(child.style.get("width"), self.width, em)
+            basis = child.style.get("flex-basis", "")
+            spec = parse_size(basis, self.width, em) \
+                if basis else None
+            if spec is None:
+                spec = parse_size(
+                    child.style.get("width"), self.width, em)
             specs.append(spec)
+
+            def _num(v, default):
+                try:
+                    return max(float(v), 0.0)
+                except (TypeError, ValueError):
+                    return default
+            grows.append(_num(child.style.get("flex-grow"), 0.0))
+            shrinks.append(_num(child.style.get("flex-shrink"), 1.0))
+
         fixed_total = sum(s for s in specs if s is not None)
         n_flex = sum(1 for s in specs if s is None)
+        # note: match exact keywords — "wrap" is a substring of
+        # "nowrap", which silently forced every container to wrap
+        wrap_v = node.style.get("flex-wrap", "nowrap").strip().casefold()
+        wrap = wrap_v in ("wrap", "wrap-reverse")
+        total_grow = sum(grows)
+
+        if total_grow > 0 and not wrap:
+            # spec-style grow: positive free space distributed by
+            # factor. Content-sized items keep the legacy equal share
+            # so mixed rows still work.
+            legacy = 0.0
+            if n_flex:
+                legacy = max((self.width - fixed_total) / n_flex, 40.0)
+            widths = [s if s is not None else legacy for s in specs]
+            free = self.width - sum(widths)
+            if free > 0:
+                for i, g in enumerate(grows):
+                    widths[i] += free * g / total_grow
+            specs = widths
+            fixed_total = sum(specs)
+            n_flex = 0
         grow = 0.0
         if n_flex:
             grow = max((self.width - fixed_total) / n_flex, 40.0)
 
-        wrap = "wrap" in node.style.get("flex-wrap", "nowrap")
+        if not wrap:
+            # flex-shrink: a single overflowing line gives space back
+            # in proportion to shrink-factor x main size
+            sized = [s if s is not None else grow for s in specs]
+            overflow = sum(sized) - self.width
+            weights = [shrinks[i] * sized[i] for i in range(len(sized))]
+            wsum = sum(weights)
+            if overflow > 0 and wsum > 0:
+                specs = [
+                    max(sized[i] - overflow * weights[i] / wsum, 0.0)
+                    for i in range(len(sized))
+                ]
+                fixed_total = sum(specs)
+                n_flex = 0
+                grow = 0.0
 
         # auto margins on flex items split the line's leftover space;
         # when grow items consume it (or items overflow into wrapping)
@@ -681,9 +828,13 @@ class BlockLayout:
             auto_px = max(free / n_auto, 0.0)
 
         cx, row_y, row_h = self.x, self.y, 0.0
+        rows = []      # [(boxes, row_height)]
+        row_boxes = []
         for child, spec in zip(kid_nodes, specs):
             w = spec if spec is not None else grow
             if wrap and cx + w > self.x + self.width and cx > self.x:
+                rows.append((row_boxes, row_h))
+                row_boxes = []
                 row_y += row_h
                 cx, row_h = self.x, 0.0
             box = BlockLayout(child, self, None)
@@ -692,9 +843,59 @@ class BlockLayout:
             box.flex_origin = (cx, row_y)
             self.children.append(box)
             box.layout()
+            row_boxes.append(box)
             cx += box.outer_width()
             row_h = max(row_h, box.outer_height())
+        if row_boxes:
+            rows.append((row_boxes, row_h))
         self.height = (row_y + row_h) - self.y
+
+        # justify-content: distribute each row's leftover main-axis
+        # space (unless auto margins already absorbed it);
+        # align-items/align-self: cross-axis position within the row.
+        # Both are post-placement subtree shifts — no relayout.
+        justify = node.style.get("justify-content",
+                                 "flex-start").strip().casefold()
+        align = node.style.get("align-items",
+                               "stretch").strip().casefold()
+        for boxes, height in rows:
+            if not boxes:
+                continue
+            if justify not in ("", "flex-start", "start", "normal",
+                               "left") and not n_auto:
+                used = sum(b.outer_width() for b in boxes)
+                free = max(self.width - used, 0.0)
+                lead, gap = 0.0, 0.0
+                if justify in ("center",):
+                    lead = free / 2
+                elif justify in ("flex-end", "end", "right"):
+                    lead = free
+                elif justify == "space-between":
+                    gap = free / (len(boxes) - 1) if len(boxes) > 1 \
+                        else 0.0
+                elif justify in ("space-around", "space-evenly"):
+                    n = len(boxes)
+                    if justify == "space-around":
+                        gap = free / n
+                        lead = gap / 2
+                    else:
+                        gap = free / (n + 1)
+                        lead = gap
+                if lead or gap:
+                    for i, b in enumerate(boxes):
+                        translate(b, lead + gap * i, 0)
+            for b in boxes:
+                mode = b.node.style.get("align-self",
+                                        "").strip().casefold() or align
+                if mode in ("center",):
+                    dy = (height - b.outer_height()) / 2
+                elif mode in ("flex-end", "end"):
+                    dy = height - b.outer_height()
+                else:  # stretch/flex-start/baseline: top (no
+                    #     cross-size stretching yet)
+                    dy = 0.0
+                if dy > 0:
+                    translate(b, 0, dy)
         apply_relative_offsets(self.children)
 
     # ----- inline layout -----
@@ -760,8 +961,14 @@ class BlockLayout:
     def image(self, node):
         img = getattr(node, "_img", None)  # (image_id, w, h) or None
         natural_w, natural_h = (img[1], img[2]) if img else (24, 24)
-        w = _attr_px(node, "width")
-        h = _attr_px(node, "height")
+        # CSS width/height outrank the HTML attributes on replaced
+        # elements (% width against the containing block; % height has
+        # no definite base here and falls through to the attr/ratio)
+        em = parse_px(node.style.get("font-size", "16px"), 16.0)
+        w = parse_size(node.style.get("width"), self.width, em)
+        h = parse_size(node.style.get("height"), 0.0, em)
+        w = w if w is not None else _attr_px(node, "width")
+        h = h if h is not None else _attr_px(node, "height")
         if w and not h:
             h = w * natural_h / natural_w if natural_w else w
         elif h and not w:
@@ -862,13 +1069,19 @@ class BlockLayout:
             if self.node.tag == "input":
                 value = self.node.attributes.get("value", "")
                 text = value or self.node.attributes.get("placeholder", "")
+                font = cached_font(self.node)
+                ty = self.y + max(
+                    0.0, (self.height - font.metrics("linespace")) / 2)
                 if text.strip():
-                    font = cached_font(self.node)
-                    ty = self.y + max(
-                        0.0, (self.height - font.metrics("linespace")) / 2)
                     tcolor = (safe_color(self.node.style.get("color"))
                               if value else "#9e9e9e")
                     cmds.append(DrawText(self.x, ty, text, font, tcolor))
+                if getattr(self.node, "is_focused", False):
+                    # caret after the typed value (not the placeholder)
+                    cx = self.x + (measure(font, value) if value else 0)
+                    ch = font.metrics("linespace")
+                    cmds.append(DrawLine(
+                        cx, ty, cx, ty + ch, "#333333", 1))
 
             if self.node.tag == "li":
                 font = cached_font(self.node)
@@ -1096,7 +1309,72 @@ def _z_index(obj):
         return 0
 
 
+def parse_transform(value, w, h):
+    """CSS transform -> (dx, dy, hidden). The translate components of
+    translate/translateX/translateY/translate3d/matrix are honored
+    (percentages resolve against the element's own border box, the
+    spec's reference box for translate); a zero scale hides the
+    subtree. Rotation, skew, and non-zero scales are ignored —
+    sprite sheets position with translate, which is what ×646 of
+    naver's usage is."""
+    dx = dy = 0.0
+    hidden = False
+
+    def px(v, base):
+        v = v.strip()
+        try:
+            if v.endswith("%"):
+                return float(v[:-1]) / 100.0 * base
+            if v.endswith("px"):
+                return float(v[:-2])
+            return float(v)
+        except ValueError:
+            return 0.0
+
+    for m in re.finditer(r"([a-zA-Z0-9]+)\s*\(([^)]*)\)", value):
+        fn = m.group(1).lower()
+        args = [a for a in m.group(2).split(",") if a.strip()]
+        if not args:
+            continue
+        if fn in ("translate", "translate3d"):
+            dx += px(args[0], w)
+            if len(args) > 1:
+                dy += px(args[1], h)
+        elif fn == "translatex":
+            dx += px(args[0], w)
+        elif fn == "translatey":
+            dy += px(args[0], h)
+        elif fn == "matrix" and len(args) == 6:
+            dx += px(args[4], w)
+            dy += px(args[5], h)
+            if px(args[0], 1) == 0 and px(args[3], 1) == 0:
+                hidden = True
+        elif fn in ("scale", "scale3d", "scalex", "scaley"):
+            if all(px(a, 1) == 0 for a in args[:2]):
+                hidden = True
+    return dx, dy, hidden
+
+
 def paint_tree(layout_object, display_list):
+    # transform applies to an element's principal box (blocks only —
+    # line/text boxes share their block's node and must not re-apply)
+    if isinstance(layout_object, BlockLayout):
+        style = getattr(layout_object.node, "style", None)
+        tf = style.get("transform") if style else None
+        if tf and tf != "none":
+            dx, dy, hidden = parse_transform(
+                tf, layout_object.width, layout_object.height)
+            if hidden:
+                return display_list
+            if dx or dy:
+                sub = _paint_tree_inner(layout_object, [])
+                translate_cmds(sub, dx, dy)
+                display_list.extend(sub)
+                return display_list
+    return _paint_tree_inner(layout_object, display_list)
+
+
+def _paint_tree_inner(layout_object, display_list):
     display_list.extend(layout_object.paint())
     # Paint each child subtree into its own group so positioned boxes
     # with a z-index can be reordered. Sorting per container (not

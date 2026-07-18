@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use super::ast::*;
-use super::bytecode::{CapSrc, FuncProto, Instr, Module};
+use super::bytecode::{CapSrc, FuncProto, Instr, LazySrc, Module};
 use super::value::Value;
 
 pub struct CompileError {
@@ -38,6 +38,44 @@ impl std::fmt::Debug for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "compile error: {}", self.msg)
     }
+}
+
+/// Compile a deferred function body (first call). Produces a fresh
+/// single-root Module whose `main` is the compiled body; the VM loads
+/// it and redirects calls of the stub proto to it. Nested function
+/// literals inside the body defer again, so deep bundles stay lazy.
+pub fn compile_lazy(src: &LazySrc) -> Result<Module, CompileError> {
+    let mut c = Compiler {
+        module: Module {
+            protos: Vec::new(),
+            atoms: Vec::new(),
+            strings: Vec::new(),
+            main: 0,
+            n_ics: 0,
+        },
+        atom_map: HashMap::new(),
+        string_map: HashMap::new(),
+        fns: Vec::new(),
+        const_globals: HashSet::new(),
+    };
+    let lit = if let Some(lz) = &src.lit.lazy_body {
+        // lazy-parsed: build the body AST now, from the original
+        // token stream
+        let body = super::parser::parse_lazy_body(lz)
+            .map_err(|e| CompileError { msg: format!("{e:?}") })?;
+        Rc::new(FuncLit {
+            name: src.lit.name.clone(),
+            params: src.lit.params.clone(),
+            body,
+            is_async: false,
+            lazy_body: None,
+        })
+    } else {
+        src.lit.clone()
+    };
+    let idx = c.compile_func_now(&lit, src.is_arrow, Some(src))?;
+    c.module.main = idx;
+    Ok(c.module)
 }
 
 pub fn compile(stmts: &[Stmt]) -> Result<Module, CompileError> {
@@ -140,6 +178,10 @@ struct FnCtx {
     spill_name: Option<String>,
     /// overflow local -> property atom on the %spillN object
     spilled: HashMap<String, u16>,
+    /// lazy-session root only: free names that live in an *enclosing*
+    /// (already-compiled) function's spill object, recorded at deferral
+    /// time — name -> that spill object's %spillN upval name
+    lazy_spills: HashMap<String, String>,
     /// captures of *this* function from its parent, in upvalue order
     upvals: Vec<CapSrc>,
     upval_map: HashMap<String, u16>,
@@ -220,6 +262,7 @@ impl FnCtx {
             uses_arguments: false,
             spill_name: None,
             spilled: HashMap::new(),
+            lazy_spills: HashMap::new(),
             upvals: Vec::new(),
             upval_map: HashMap::new(),
             locals_end: nparams,
@@ -587,6 +630,19 @@ fn lexical_names(stmts: &[Stmt], out: &mut HashSet<String>) {
 /// Names a function references that it does not bind itself
 /// (conservatively includes what its nested functions reference).
 fn free_vars(lit: &FuncLit) -> HashSet<String> {
+    if let Some(lz) = &lit.lazy_body {
+        // lazy-parsed body: token-level over-approximation (locals and
+        // even keyword-shaped words included). Names that aren't real
+        // enclosing bindings resolve to Global at deferral and cost
+        // nothing; a missed real reference would mis-bind, so the scan
+        // errs wide.
+        let mut ids: HashSet<String> =
+            lz.free_ids.iter().cloned().collect();
+        for p in &lit.params {
+            ids.remove(p);
+        }
+        return ids;
+    }
     let mut ids = HashSet::new();
     let mut lits = Vec::new();
     for s in &lit.body {
@@ -688,7 +744,7 @@ fn lower_new_expr(e: &mut Expr, n: &mut usize) {
             }
         }
         Expr::Func(f) | Expr::Arrow(f) => {
-            for s in &mut f.body {
+            for s in &mut Rc::make_mut(f).body {
                 lower_new_stmt(s, n);
             }
         }
@@ -749,8 +805,9 @@ fn lower_new_expr(e: &mut Expr, n: &mut usize) {
         }),
         Stmt::Return(Some(Expr::Ident(o))),
     ];
-    let iife = Expr::Func(Box::new(FuncLit {
+    let iife = Expr::Func(Rc::new(FuncLit {
         name: None, params: Vec::new(), body, is_async: false,
+        lazy_body: None,
     }));
     *e = Expr::Call {
         callee: Box::new(iife), args: Vec::new(), optional: false,
@@ -773,7 +830,7 @@ fn lower_new_stmt(s: &mut Stmt, n: &mut usize) {
             }
         }
         Stmt::FuncDecl(f) => {
-            for s in &mut f.body {
+            for s in &mut Rc::make_mut(f).body {
                 lower_new_stmt(s, n);
             }
         }
@@ -857,8 +914,9 @@ fn ast_call(callee: Expr, args: Vec<Expr>) -> Expr {
     Expr::Call { callee: Box::new(callee), args, optional: false }
 }
 fn ast_arrow(params: Vec<String>, body: Vec<Stmt>) -> Expr {
-    Expr::Arrow(Box::new(FuncLit {
+    Expr::Arrow(Rc::new(FuncLit {
         name: None, params, body, is_async: false,
+        lazy_body: None,
     }))
 }
 
@@ -1423,11 +1481,12 @@ fn chain_async(stmts: &[Stmt], n: &mut usize) -> Vec<Stmt> {
                 kind: DeclKind::Var,
                 decls: vec![(
                     loop_name.clone(),
-                    Some(Expr::Func(Box::new(FuncLit {
+                    Some(Expr::Func(Rc::new(FuncLit {
                         name: None,
                         params: Vec::new(),
                         body: lf,
                         is_async: false,
+                lazy_body: None,
                     }))),
                 )],
             });
@@ -1493,11 +1552,12 @@ fn chain_async(stmts: &[Stmt], n: &mut usize) -> Vec<Stmt> {
                 kind: DeclKind::Var,
                 decls: vec![(
                     loop_name.clone(),
-                    Some(Expr::Func(Box::new(FuncLit {
+                    Some(Expr::Func(Rc::new(FuncLit {
                         name: None,
                         params: Vec::new(),
                         body: lf,
                         is_async: false,
+                lazy_body: None,
                     }))),
                 )],
             });
@@ -1655,6 +1715,7 @@ impl Compiler {
             captures: f.upvals,
             is_arrow: f.is_arrow,
             uses_arguments: f.uses_arguments,
+            lazy: None,
         });
         (self.module.protos.len() - 1) as u32
     }
@@ -1681,11 +1742,22 @@ impl Compiler {
         if let Some(&u) = self.fns[top].upval_map.get(name) {
             return Place::Up(u);
         }
+        if let Some(sn) = self.fns[top].lazy_spills.get(name).cloned() {
+            // deferral recorded this name as living in an enclosing
+            // function's spill object; route through that object
+            let a = self.atom(name);
+            return match self.resolve(&sn) {
+                Place::Up(u) => Place::SpillUp(u, a),
+                Place::Cell(r) => Place::SpillCell(r, a),
+                _ => unreachable!("lazy spill object is a cell/upval"),
+            };
+        }
         let mut found = None;
         for i in (0..top).rev() {
             if self.fns[i].lookup(name).is_some()
                 || self.fns[i].upval_map.contains_key(name)
                 || self.fns[i].spilled.contains_key(name)
+                || self.fns[i].lazy_spills.contains_key(name)
             {
                 found = Some(i);
                 break;
@@ -1704,6 +1776,17 @@ impl Compiler {
                 Place::Up(u) => Place::SpillUp(u, a),
                 Place::Cell(r) => Place::SpillCell(r, a),
                 _ => unreachable!("spill object resolves to cell/upval"),
+            };
+        }
+        if let Some(sn) = self.fns[level].lazy_spills.get(name).cloned()
+        {
+            // same, but the spill object arrived through a lazy
+            // session root's recorded capture environment
+            let a = self.atom(name);
+            return match self.resolve(&sn) {
+                Place::Up(u) => Place::SpillUp(u, a),
+                Place::Cell(r) => Place::SpillCell(r, a),
+                _ => unreachable!("lazy spill object is a cell/upval"),
             };
         }
         for i in (level + 1)..=top {
@@ -1889,25 +1972,121 @@ impl Compiler {
 
     fn compile_func(
         &mut self,
-        lit: &FuncLit,
+        lit: &Rc<FuncLit>,
         is_arrow: bool,
     ) -> Result<u32, CompileError> {
         // async fn -> a plain fn whose body returns a promise chain
         if lit.is_async {
-            let desugared = FuncLit {
+            let desugared = Rc::new(FuncLit {
                 name: lit.name.clone(),
                 params: lit.params.clone(),
                 body: desugar_async(&lit.body),
                 is_async: false,
-            };
+                lazy_body: None,
+            });
             return self.compile_func(&desugared, is_arrow);
         }
-        let name = lit.name.clone().unwrap_or_else(|| "<anon>".to_string());
         if lit.params.len() > 200 {
             return self.err("too many parameters");
         }
+        // Lazy compilation: most bundle functions are never called, so
+        // defer body codegen to first call. Trivial bodies compile now
+        // (a stub would cost more than the codegen it saves). A
+        // lazy-PARSED body has no AST yet, so it always defers.
+        if lit.lazy_body.is_some() || lit.body.len() > 1 {
+            return self.defer_func(lit, is_arrow);
+        }
+        self.compile_func_now(lit, is_arrow, None)
+    }
+
+    /// The lazy path: skip body codegen entirely. Free variables are
+    /// resolved against the enclosing scopes NOW (threading upvalues
+    /// through intermediate functions exactly as eager compilation
+    /// would at first reference), so the emitted Closure instruction
+    /// and the enclosing function's cell layout are identical to the
+    /// eager result. The VM compiles the stashed AST on first call.
+    fn defer_func(
+        &mut self,
+        lit: &Rc<FuncLit>,
+        is_arrow: bool,
+    ) -> Result<u32, CompileError> {
+        let name =
+            lit.name.clone().unwrap_or_else(|| "<anon>".to_string());
+        let mut free: Vec<String> = free_vars(lit).into_iter().collect();
+        free.sort(); // deterministic capture order
+        self.fns.push(FnCtx::new(name.clone(),
+                                 lit.params.len() as u8, false));
+        let mut spill_names: Vec<(String, String)> = Vec::new();
+        for n in &free {
+            match self.resolve(n) {
+                Place::Up(_) | Place::Global(_) => {}
+                Place::SpillUp(u, _) => {
+                    // the %spillN object itself became an upval of the
+                    // deferred fn; remember which name routes through it
+                    let top = self.fns.len() - 1;
+                    let sn = self.fns[top]
+                        .upval_map
+                        .iter()
+                        .find(|&(_, &i)| i == u)
+                        .map(|(k, _)| k.clone())
+                        .expect("captured spill object has a name");
+                    spill_names.push((n.clone(), sn));
+                }
+                _ => unreachable!(
+                    "an empty deferred ctx resolves no locals"
+                ),
+            }
+        }
+        let f = self.fns.pop().unwrap();
+        // upval names in capture order (parallel to f.upvals)
+        let mut upval_names = vec![String::new(); f.upvals.len()];
+        for (n, &i) in &f.upval_map {
+            upval_names[i as usize] = n.clone();
+        }
+        self.module.protos.push(FuncProto {
+            name,
+            nparams: lit.params.len() as u8,
+            nregs: 0,
+            code: Vec::new(),
+            consts: Vec::new(),
+            captures: f.upvals,
+            is_arrow,
+            // conservative until the body is compiled and says
+            // otherwise; callers re-read the compiled proto anyway
+            uses_arguments: true,
+            lazy: Some(Box::new(LazySrc {
+                lit: lit.clone(),
+                is_arrow,
+                upval_names,
+                spill_names,
+            })),
+        });
+        Ok((self.module.protos.len() - 1) as u32)
+    }
+
+    fn compile_func_now(
+        &mut self,
+        lit: &Rc<FuncLit>,
+        is_arrow: bool,
+        seed: Option<&LazySrc>,
+    ) -> Result<u32, CompileError> {
+        let name = lit.name.clone().unwrap_or_else(|| "<anon>".to_string());
         let mut f = FnCtx::new(name, lit.params.len() as u8, false);
         f.is_arrow = is_arrow;
+        if let Some(sd) = seed {
+            // lazy-session root: recreate the capture environment
+            // recorded at deferral time. The CapSrc entries are
+            // placeholders — the closure already exists (built from
+            // the stub proto); only the name -> upval index mapping
+            // matters here.
+            for (i, n) in sd.upval_names.iter().enumerate() {
+                f.upvals.push(CapSrc::Upval(i as u16));
+                f.upval_map.insert(n.clone(), i as u16);
+            }
+            for (n, sn) in &sd.spill_names {
+                f.lazy_spills.insert(n.clone(), sn.clone());
+            }
+        }
         for (i, p) in lit.params.iter().enumerate() {
             // duplicate params overwrite: last one wins, like sloppy JS
             f.scopes[0].bindings.insert(
@@ -2027,7 +2206,7 @@ impl Compiler {
 
     fn make_closure(
         &mut self,
-        lit: &FuncLit,
+        lit: &Rc<FuncLit>,
         is_arrow: bool,
     ) -> Result<u8, CompileError> {
         let idx = self.compile_func(lit, is_arrow)?;

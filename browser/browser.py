@@ -7,11 +7,12 @@ import tkinter.font
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from . import native, net, textengine
+from . import forms, native, net, textengine, webfonts
 from .html_parser import Element, HTMLParser, Text, tree_to_list
 from .css_parser import CSSParser
 from .style import RuleIndex, cascade_priority, default_rules, style
-from .layout import (VSTEP, DocumentLayout, layout_tree_to_list, paint_tree)
+from .layout import (VSTEP, BlockLayout, DocumentLayout, ImageLayout,
+                     layout_tree_to_list, paint_tree)
 from .pages import error_page
 
 SCROLL_STEP = 90
@@ -42,6 +43,7 @@ class Browser:
         self.document = None
         self.layout_list = []
         self.display_list = []
+        self.focus_node = None
         self.history = []
         self.history_index = -1
         self.url = None
@@ -53,6 +55,7 @@ class Browser:
         self._resize_job = None
 
         self.canvas.bind("<Button-1>", self.on_click)
+        self.canvas.bind("<Key>", self.on_key)
         self.canvas.bind("<Motion>", self.on_motion)
         self.canvas.bind("<MouseWheel>", self.on_mousewheel)
         self.canvas.bind("<Configure>", self.on_configure)
@@ -137,6 +140,7 @@ class Browser:
     def render_page(self, url, body):
         self.url = url
         self.url_var.set(str(url))
+        self._reset_interaction()
 
         if native.available():
             # Rust fast path: parse + JS + cascade + style in ggcore.
@@ -159,6 +163,10 @@ class Browser:
             # drive fetch/timer-driven SPA content, then rebuild the tree
             if native.settle_async(self._doc, self._css_sources, url):
                 self.nodes = native.refresh(self._doc, self._css_sources)
+            self._hover_rules = any(
+                ":hover" in s for s in self._css_sources)
+            self._focus_rules = any(
+                ":focus" in s for s in self._css_sources)
             for line in js_logs:
                 print(f"[js console] {line}")
             if js_logs:
@@ -167,11 +175,17 @@ class Browser:
             # Pure-Python fallback
             self._doc = None
             self.nodes = HTMLParser(body).parse()
+            self._drop_focus()
             rules = self.default_rules + self.collect_styles(self.nodes, url)
             rules = sorted(rules, key=cascade_priority)
             # Style depends only on the DOM and CSS, not on window size:
             # compute it once per page load, never on resize.
-            style(self.nodes, RuleIndex(rules))
+            self._py_rule_index = RuleIndex(rules)
+            style(self.nodes, self._py_rule_index)
+            self._hover_rules = any(
+                ":hover" in repr(sel) for sel, _ in rules)
+            self._focus_rules = any(
+                ":focus" in repr(sel) for sel, _ in rules)
 
         title = "GG Browser"
         for node in tree_to_list(self.nodes, []):
@@ -184,6 +198,7 @@ class Browser:
         self.window.title(title)
 
         self.load_images(self.nodes, url)
+        self._load_web_fonts(url)
 
         self.scroll = 0
         self.relayout()
@@ -246,6 +261,7 @@ class Browser:
                 self._dom_version = version
                 self._live_idle = 0
                 self.nodes = native.refresh(self._doc, self._css_sources)
+                self._remap_marks()
                 self.load_images(self.nodes, self.url, keep_cache=True)
                 self.relayout()
             else:
@@ -376,6 +392,8 @@ class Browser:
         self.document.layout(width, height if height > 50 else None)
         self.layout_list = layout_tree_to_list(self.document, [])
         self.display_list = paint_tree(self.document, [])
+        self._push_display_list()
+        self._push_layout_rects()
         self.clamp_scroll()
         self.draw()
 
@@ -404,25 +422,69 @@ class Browser:
 
     # ---------- drawing ----------
 
+    def _load_web_fonts(self, url):
+        """Register loadable @font-face fonts before the first
+        layout; a hit invalidates the font cache so the new family
+        resolves."""
+        css_texts = list(self._css_sources)
+        if not css_texts:
+            for n in tree_to_list(self.nodes, []):
+                if isinstance(n, Element) and n.tag == "style":
+                    css_texts.append(" ".join(
+                        c.text for c in n.children if isinstance(c, Text)))
+        def fetch(u):
+            _, body = net.request_raw(url.resolve(u))
+            return body
+        try:
+            loaded = webfonts.load_web_fonts(css_texts, fetch)
+        except Exception:
+            loaded = 0
+        if loaded:
+            from . import layout as _layout
+            _layout._FONT_CACHE.clear()
+
+    def _push_layout_rects(self):
+        """Feed layout geometry back to the JS engine so
+        getBoundingClientRect answers real rects (document
+        coordinates) from the next event handler on."""
+        doc = getattr(self, "_doc", None)
+        if doc is None or not hasattr(doc, "set_layout_rects"):
+            return
+        rects = []
+        seen = set()
+        for o in self.layout_list:
+            if not isinstance(o, (BlockLayout, ImageLayout)):
+                continue  # line/text boxes share their element's node
+            r = getattr(getattr(o, "node", None), "_ridx", None)
+            if r is None or r in seen:
+                continue
+            seen.add(r)
+            rects.append((r, float(o.x), float(o.y),
+                          float(o.width), float(o.height)))
+        doc.set_layout_rects(rects)
+
+    def _push_display_list(self):
+        """Hand the display list to Rust once per paint change, in
+        document coordinates — scroll frames then pass only offsets
+        (no per-frame Python serialization, M6)."""
+        if textengine.available():
+            textengine.engine().set_display_list(
+                [cmd.native(0) for cmd in self.display_list])
+
     def draw(self):
         height = self.canvas.winfo_height()
         width = self.canvas.winfo_width()
         if textengine.available():
-            # Native path: Rust rasterizes the frame; tkinter just
-            # displays the resulting image.
-            cmds = []
-            for cmd in self.display_list:
-                if cmd.top > self.scroll + height:
-                    continue
-                if cmd.bottom < self.scroll:
-                    continue
-                cmds.append(cmd.native(self.scroll))
+            # Native path: Rust culls + rasterizes the stored list at
+            # this scroll offset; tkinter just displays the image.
+            overlay = []
             bar = self.scrollbar_rect(width, height)
             if bar:
-                cmds.append((0, bar[0], bar[1], bar[2], bar[3],
-                             (192, 192, 192), 0.0, 0, ""))
-            ppm = textengine.engine().render(
-                max(width, 1), max(height, 1), (255, 255, 255), cmds)
+                overlay.append((0, bar[0], bar[1], bar[2], bar[3],
+                                (192, 192, 192), 0.0, 0, ""))
+            ppm = textengine.engine().render_frame(
+                max(width, 1), max(height, 1), (255, 255, 255),
+                0.0, float(self.scroll), overlay)
             self._frame = tkinter.PhotoImage(data=ppm)
             self.canvas.delete("all")
             self.canvas.create_image(0, 0, image=self._frame, anchor="nw")
@@ -508,6 +570,7 @@ class Browser:
         # a click handler may have scheduled fetch/timers — settle them
         native.settle_async(self._doc, self._css_sources, self.url)
         self.nodes = native.refresh(self._doc, self._css_sources)
+        self._remap_marks()
         self.load_images(self.nodes, self.url, keep_cache=True)
         for node in tree_to_list(self.nodes, []):
             if isinstance(node, Element) and node.tag == "title":
@@ -522,6 +585,7 @@ class Browser:
         self.canvas.focus_set()
         obj = self.hit_test(event.x, event.y + self.scroll)
         if not obj:
+            self.set_focus(None)
             return
         if self._doc is not None:
             target = obj.node
@@ -553,6 +617,174 @@ class Browser:
                 self.load(self.url.resolve(href))
             except Exception as e:
                 self.set_status(f"이동 실패: {e}")
+            return
+        self.set_focus(forms.find_input(obj.node))
+
+    # ---------- text input focus / typing ----------
+
+    def _reset_interaction(self):
+        """New page: no focus, no hover, no stale rule flags."""
+        self.focus_node = None
+        self._focus_ridx = None
+        self._hover_node = None
+        self._hover_ridx = None
+        self._hover_marks = []
+        self._hover_rules = False
+        self._focus_rules = False
+        self._py_rule_index = None
+
+    def _drop_focus(self):
+        """The node tree was rebuilt: the focused node is orphaned."""
+        if self.focus_node is not None:
+            self.focus_node.is_focused = False
+            self.focus_node = None
+
+    def _remap_marks(self):
+        """After a native tree rebuild, re-find the focused/hovered
+        nodes by their Rust indices so the caret survives live ticks
+        and hover restyles (the Rust document keeps the real state)."""
+        focus_ridx = getattr(self, "_focus_ridx", None)
+        hover_ridx = getattr(self, "_hover_ridx", None)
+        self.focus_node = None
+        self._hover_node = None
+        self._hover_marks = []
+        if focus_ridx is None and hover_ridx is None:
+            return
+        for n in tree_to_list(self.nodes, []):
+            r = getattr(n, "_ridx", None)
+            if r is None:
+                continue
+            if r == focus_ridx:
+                n.is_focused = True
+                self.focus_node = n
+            if r == hover_ridx:
+                self._hover_node = n
+
+    @staticmethod
+    def _ridx_of(node):
+        while node is not None:
+            r = getattr(node, "_ridx", None)
+            if r is not None:
+                return r
+            node = node.parent
+        return None
+
+    def set_hover(self, el):
+        """Pointer moved onto a (possibly new) element: update the
+        hover chain marks and restyle if the page has :hover rules."""
+        if el is self._hover_node:
+            return
+        self._hover_node = el
+        self._hover_ridx = self._ridx_of(el)
+        for n in self._hover_marks:
+            n.is_hovered = False
+        marks = []
+        cur = el
+        while cur is not None:
+            if isinstance(cur, Element):
+                cur.is_hovered = True
+                marks.append(cur)
+            cur = cur.parent
+        self._hover_marks = marks
+        doc = getattr(self, "_doc", None)
+        if doc is not None and hasattr(doc, "set_hover"):
+            doc.set_hover(self._hover_ridx)
+        if self._hover_rules:
+            self.restyle()
+
+    def restyle(self):
+        """Re-run style with the current hover/focus state, doing
+        the least work the damage requires: paint-only changes patch
+        styles in place and skip relayout entirely (M4 partial
+        invalidation — the common case for hover/focus)."""
+        if self._doc is not None:
+            outcome = native.restyle_patch(
+                self._doc, self._css_sources, self.nodes)
+            if outcome == "none":
+                return
+            if outcome == "paint":
+                self.repaint()
+                return
+            # geometry or structure changed: re-export (styles are
+            # already fresh in Rust) and relayout
+            self.nodes = native.build_tree(self._doc.export())
+            self._remap_marks()
+            self.load_images(self.nodes, self.url, keep_cache=True)
+        elif self._py_rule_index is not None:
+            style(self.nodes, self._py_rule_index)
+        self.relayout()
+
+    def set_focus(self, node):
+        if self.focus_node is node:
+            return
+        if self.focus_node is not None:
+            self.focus_node.is_focused = False
+        self.focus_node = node
+        self._focus_ridx = self._ridx_of(node)
+        if node is not None:
+            node.is_focused = True
+        doc = getattr(self, "_doc", None)
+        if doc is not None and hasattr(doc, "set_focus"):
+            doc.set_focus(self._focus_ridx)
+        if self._focus_rules:
+            self.restyle()
+        else:
+            self.repaint()
+
+    def repaint(self):
+        """Rebuild the display list without restyling or relayout —
+        enough for focus caret and typed-text changes."""
+        if getattr(self, "document", None) is None:
+            return
+        self.display_list = paint_tree(self.document, [])
+        self._push_display_list()
+        self.draw()
+
+    def on_key(self, event):
+        node = self.focus_node
+        if node is None:
+            return None
+        if event.keysym == "Return":
+            self.submit_form(node)
+            return "break"
+        if event.keysym == "Escape":
+            self.set_focus(None)
+            return "break"
+        value = node.attributes.get("value", "")
+        if event.keysym == "BackSpace":
+            if not value:
+                return "break"
+            value = value[:-1]
+        elif event.char and event.char >= " " and event.char != "\x7f":
+            value = value + event.char
+        else:
+            return None  # arrows etc. keep their scroll bindings
+        node.attributes["value"] = value
+        self.sync_attr(node, "value", value)
+        self.repaint()
+        return "break"
+
+    def submit_form(self, node):
+        form = forms.find_form(node)
+        if form is None:
+            return
+        href = forms.submit_href(form)
+        if href is None:
+            self.set_status("POST 폼은 아직 지원하지 않습니다")
+            return
+        try:
+            self.load(self.url.resolve(href))
+        except Exception as e:
+            self.set_status(f"이동 실패: {e}")
+
+    def sync_attr(self, node, name, value):
+        """Mirror a Python-side attribute change into the Rust DOM so
+        page JS reading the input sees the typed value."""
+        doc = getattr(self, "_doc", None)
+        ridx = getattr(node, "_ridx", None)
+        if doc is not None and ridx is not None \
+                and hasattr(doc, "set_attr"):
+            doc.set_attr(ridx, name, value)
 
     def on_motion(self, event):
         # Hit-testing walks the layout tree; 30ms throttle keeps
@@ -562,6 +794,10 @@ class Browser:
             return
         self._last_motion = now
         obj = self.hit_test(event.x, event.y + self.scroll)
+        el = obj.node if obj else None
+        while el is not None and not isinstance(el, Element):
+            el = el.parent
+        self.set_hover(el)
         href = self.find_link(obj.node) if obj else None
         if href:
             self.canvas.config(cursor="hand2")

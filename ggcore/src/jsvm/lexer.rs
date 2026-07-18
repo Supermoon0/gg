@@ -174,6 +174,16 @@ impl<'a> Lexer<'a> {
                 self.lex_template()?
             } else if is_ident_start(c) {
                 self.lex_ident()?
+            } else if c == b'#' && is_ident_start(self.peek(1)) {
+                // private name (#x): an identifier that keeps its '#'.
+                // Fields/methods desugar to ordinary '#x'-keyed
+                // properties, which normal member syntax can never
+                // name — privacy by construction, no brand checks.
+                self.pos += 1;
+                match self.lex_ident()? {
+                    Tok::Ident(s) => Tok::Ident(format!("#{s}")),
+                    _ => unreachable!("lex_ident yields Ident"),
+                }
             } else if c >= 0x80 {
                 // Non-ASCII: identifier if alphanumeric, else a clean
                 // error — never stall without consuming input.

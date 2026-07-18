@@ -616,6 +616,55 @@ mod tests {
     }
 
     #[test]
+    fn flex_shorthand_expands() {
+        let doc = styled(
+            "p{flex: 1} span{flex: 0 0 200px} b{flex: none}",
+            "<p>x</p><span>y</span><b>z</b>",
+        );
+        let p = tag_style(&doc, "p");
+        assert_eq!(p["flex-grow"], "1");
+        assert_eq!(p["flex-basis"], "0");
+        let s = tag_style(&doc, "span");
+        assert_eq!(s["flex-grow"], "0");
+        assert_eq!(s["flex-shrink"], "0");
+        assert_eq!(s["flex-basis"], "200px");
+        let b = tag_style(&doc, "b");
+        assert_eq!(b["flex-grow"], "0");
+        assert_eq!(b["flex-basis"], "auto");
+    }
+
+    #[test]
+    fn hover_and_focus_rules_follow_document_state() {
+        let css = "p{color:black} p:hover{color:red} \
+                   div:hover span{color:green} input:focus{color:blue}";
+        let html_src = "<div><p>x</p><span>s</span></div><input>";
+        // no hover/focus state: pseudo rules stay inert
+        let doc = styled(css, html_src);
+        assert_eq!(tag_style(&doc, "p")["color"], "black");
+        assert!(tag_style(&doc, "span").get("color")
+            .map(|c| c != "green").unwrap_or(true));
+        // hovering <p>: its ancestors join the chain, so both the
+        // subject rule and the ancestor-hover descendant rule fire
+        let mut doc = html::parse(html_src);
+        let p = (0..doc.nodes.len())
+            .find(|&i| doc.nodes[i].tag.as_deref() == Some("p"))
+            .unwrap();
+        let mut cur = Some(p);
+        while let Some(i) = cur {
+            doc.hover_chain.push(i);
+            cur = doc.nodes[i].parent;
+        }
+        let input = (0..doc.nodes.len())
+            .find(|&i| doc.nodes[i].tag.as_deref() == Some("input"))
+            .unwrap();
+        doc.focused = Some(input);
+        compute_styles(&mut doc, &["".to_string(), css.to_string()]);
+        assert_eq!(tag_style(&doc, "p")["color"], "red");
+        assert_eq!(tag_style(&doc, "span")["color"], "green");
+        assert_eq!(tag_style(&doc, "input")["color"], "blue");
+    }
+
+    #[test]
     fn where_root_defines_vars() {
         let doc = styled(
             ":where(:root,:host){--bg:#0f0} p{background-color:var(--bg)}",
@@ -839,6 +888,38 @@ fn apply(style: &mut HashMap<String, String>, prop: &str, value: &str) {
         }
         if let Some(c) = color {
             style.insert("border-color".into(), c.to_string());
+        }
+    } else if prop == "flex" {
+        // flex: none | <grow> <shrink>? <basis>?
+        if value.eq_ignore_ascii_case("none") {
+            style.insert("flex-grow".into(), "0".into());
+            style.insert("flex-shrink".into(), "0".into());
+            style.insert("flex-basis".into(), "auto".into());
+        } else {
+            let mut nums: Vec<f64> = Vec::new();
+            let mut basis: Option<&str> = None;
+            for part in value.split_whitespace() {
+                match part.parse::<f64>() {
+                    Ok(n) => nums.push(n),
+                    Err(_) => basis = Some(part),
+                }
+            }
+            if let Some(&g) = nums.first() {
+                style.insert("flex-grow".into(), g.to_string());
+            }
+            if let Some(&s) = nums.get(1) {
+                style.insert("flex-shrink".into(), s.to_string());
+            }
+            match basis {
+                Some(b) => {
+                    style.insert("flex-basis".into(), b.to_string());
+                }
+                None if !nums.is_empty() => {
+                    // "flex: 1" means basis 0 per spec
+                    style.insert("flex-basis".into(), "0".into());
+                }
+                None => {}
+            }
         }
     } else if prop == "font" {
         // too complex to fully parse; ignore rather than misrender

@@ -23,6 +23,10 @@ pub enum Simple {
     /// :first-child / :last-child
     FirstChild,
     LastChild,
+    /// :hover — the element is in the document's hover chain
+    Hover,
+    /// :focus — the element is the document's focused node
+    Focus,
 }
 
 #[derive(Clone, Debug)]
@@ -49,7 +53,9 @@ impl Selector {
                     Simple::Not(_)
                     | Simple::NthChild(_)
                     | Simple::FirstChild
-                    | Simple::LastChild => s.1 += 1,
+                    | Simple::LastChild
+                    | Simple::Hover
+                    | Simple::Focus => s.1 += 1,
                     Simple::Universal | Simple::Where(_) => {}
                 }
             }
@@ -92,6 +98,8 @@ pub fn compound_matches(doc: &Document, idx: usize, compound: &[Simple]) -> bool
         Simple::Id(i) => node.attr("id") == Some(i.as_str()),
         Simple::Universal => true,
         Simple::Root => node.tag.as_deref() == Some("html"),
+        Simple::Hover => doc.hover_chain.contains(&idx),
+        Simple::Focus => doc.focused == Some(idx),
         Simple::Where(options) => options
             .iter()
             .any(|opt| compound_matches(doc, idx, opt)),
@@ -385,6 +393,16 @@ impl<'a> CssParser<'a> {
                 {
                     self.i += 11;
                     parts.push(Simple::LastChild);
+                } else if self.peek_ci(":hover")
+                    && !self.name_char_at(6)
+                {
+                    self.i += 6;
+                    parts.push(Simple::Hover);
+                } else if self.peek_ci(":focus")
+                    && !self.name_char_at(6)
+                {
+                    self.i += 6;
+                    parts.push(Simple::Focus);
                 } else {
                     break;
                 }
@@ -542,6 +560,8 @@ impl<'a> CssParser<'a> {
                     && !self.peek_ci(":nth-child(")
                     && !self.peek_ci(":first-child")
                     && !self.peek_ci(":last-child")
+                    && !self.peek_ci(":hover")
+                    && !self.peek_ci(":focus")
                 {
                     return Err(());
                 }

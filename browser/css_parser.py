@@ -192,6 +192,37 @@ class NthChildSelector:
         return f":nth-child({self.kind})"
 
 
+class HoverSelector:
+    """:hover — matches while the pointer is over the element. The
+    shell marks the hover chain (element under the cursor and its
+    ancestors) with node.is_hovered before restyling."""
+
+    def __init__(self):
+        self.specificity = (0, 1, 0)
+
+    def matches(self, node):
+        return isinstance(node, Element) \
+            and getattr(node, "is_hovered", False)
+
+    def __repr__(self):
+        return ":hover"
+
+
+class FocusSelector:
+    """:focus — matches the focused element (node.is_focused, set by
+    the shell's click-to-focus)."""
+
+    def __init__(self):
+        self.specificity = (0, 1, 0)
+
+    def matches(self, node):
+        return isinstance(node, Element) \
+            and getattr(node, "is_focused", False)
+
+    def __repr__(self):
+        return ":focus"
+
+
 class StructuralSelector:
     """:first-child / :last-child."""
 
@@ -386,6 +417,12 @@ class CSSParser:
                         == ":last-child":
                     self.i += 11
                     parts.append(StructuralSelector(True))
+                elif self.s[self.i:self.i + 6].casefold() == ":hover":
+                    self.i += 6
+                    parts.append(HoverSelector())
+                elif self.s[self.i:self.i + 6].casefold() == ":focus":
+                    self.i += 6
+                    parts.append(FocusSelector())
                 else:
                     break
             else:
@@ -495,8 +532,8 @@ class CSSParser:
             if self.s[self.i] in ">+~":
                 self.i += 1
                 self.whitespace()
-            # Unsupported pseudo suffixes like :hover -> bail on rule
-            # (:root / :where( / [attr] are handled by simple_selector)
+            # Unsupported pseudo suffixes (:visited...) bail on the
+            # rule (:root / :where( / [attr] via simple_selector)
             if self.i < len(self.s) and self.s[self.i] == ":":
                 low = self.s[self.i:self.i + 12].casefold()
                 if not (low.startswith(":root")
@@ -504,7 +541,9 @@ class CSSParser:
                         or low.startswith(":not(")
                         or low.startswith(":nth-child(")
                         or low.startswith(":first-child")
-                        or low.startswith(":last-child")):
+                        or low.startswith(":last-child")
+                        or low.startswith(":hover")
+                        or low.startswith(":focus")):
                     raise Exception("unsupported selector feature")
             descendant = self.simple_selector()
             out = DescendantSelector(out, descendant)

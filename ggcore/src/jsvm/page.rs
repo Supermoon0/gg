@@ -13,9 +13,9 @@ use super::compiler;
 use super::parser;
 use super::value::Value;
 use super::vm::{
-    self, call_value, exec, has_pending_work, host, make_native,
-    new_plain_object, pump, raw_set_prop, reject_fetch, resolve_fetch, Ids,
-    LoadedModule, Native, St, DOC_NODE, IC_EMPTY,
+    self, call_value, call_value_this, exec, has_pending_work, host,
+    make_native, new_plain_object, pump, raw_set_prop, reject_fetch,
+    resolve_fetch, Ids, ModStore, Native, St, DOC_NODE,
 };
 
 /// Event-loop budget per settle turn (total microtasks + timers fired).
@@ -481,7 +481,7 @@ use crate::dom;
 
 pub struct PageVm {
     st: St,
-    mods: Vec<LoadedModule>,
+    mods: ModStore,
 }
 
 impl PageVm {
@@ -489,7 +489,7 @@ impl PageVm {
         let has_doc = doc.is_some();
         let mut vm = PageVm {
             st: St::new(doc),
-            mods: Vec::new(),
+            mods: ModStore::new(),
         };
         vm.st.ids = Ids {
             push: vm.name_id("push"),
@@ -628,8 +628,12 @@ impl PageVm {
                 ("assign", Native::HostFn(host::O_ASSIGN)),
                 ("freeze", Native::HostFn(host::O_FREEZE)),
                 ("defineProperty", Native::HostFn(host::O_DEFINE_PROP)),
+                ("defineProperties",
+                 Native::HostFn(host::O_DEFINE_PROPS)),
                 ("getOwnPropertyDescriptor",
                  Native::HostFn(host::O_GET_OWN_PD)),
+                ("getOwnPropertyNames",
+                 Native::HostFn(host::O_GET_OWN_NAMES)),
                 ("create", Native::HostFn(host::O_CREATE)),
                 ("getPrototypeOf", Native::HostFn(host::O_GET_PROTO)),
                 ("setPrototypeOf", Native::HostFn(host::O_SET_PROTO)),
@@ -930,40 +934,33 @@ impl PageVm {
     }
 
     /// Compile a script and bind it into the shared namespace.
-    fn load(&mut self, mut module: Module) -> u32 {
-        // string constants move into the VM-wide rope arena
-        let str_base = self.st.strs.len() as u32;
-        for s in &module.strings {
-            self.st.strs.push(vm::Str::Flat(s.clone()));
-        }
-        for proto in &mut module.protos {
-            for c in &mut proto.consts {
-                if c.is_string() {
-                    *c = Value::string(str_base + c.index());
-                }
-            }
-        }
-        let global_map =
-            module.atoms.iter().map(|n| self.name_id(n)).collect();
-        let ic_base = self.st.ics.len() as u32;
-        self.st
-            .ics
-            .extend(std::iter::repeat(IC_EMPTY).take(module.n_ics as usize));
-        self.mods.push(LoadedModule { module, global_map, ic_base });
-        (self.mods.len() - 1) as u32
+    fn load(&mut self, module: Module) -> u32 {
+        vm::load_module(&mut self.st, &self.mods, module)
     }
 
     /// Parse + compile + run one script; returns its last expression
     /// statement value.
+    /// Shell push after layout: real getBoundingClientRect geometry.
+    pub fn set_layout_rects(
+        &mut self,
+        rects: Vec<(u32, f64, f64, f64, f64)>,
+    ) {
+        self.st.layout_rects.clear();
+        for (idx, x, y, w, h) in rects {
+            self.st.layout_rects.insert(idx, (x, y, w, h));
+        }
+    }
+
     pub fn run_source(&mut self, src: &str) -> Result<Value, String> {
         let ast =
             parser::parse_program(src).map_err(|e| format!("{e:?}"))?;
         let module =
             compiler::compile(&ast).map_err(|e| format!("{e:?}"))?;
         let mi = self.load(module);
-        let main = self.mods[mi as usize].module.main;
-        let nregs = self.mods[mi as usize].module.protos[main as usize]
-            .nregs as usize;
+        let m = self.mods.rc(mi);
+        let main = m.module.main;
+        let nregs = m.module.protos[main as usize].nregs as usize;
+        drop(m);
         let base = self.st.regs.len();
         self.st.regs.resize(base + nregs, Value::UNDEFINED);
         self.st.fuel = vm::DEFAULT_FUEL; // fresh budget per top-level script
@@ -1065,9 +1062,15 @@ impl PageVm {
             for h in handlers {
                 handled = true;
                 self.st.fuel = vm::DEFAULT_FUEL; // fresh budget per handler
-                if let Err(e) =
-                    call_value(&mut self.st, &self.mods, h, &[ev])
-                {
+                // this = the node whose listener is running (the
+                // currentTarget), matching dispatchEvent's behavior
+                if let Err(e) = call_value_this(
+                    &mut self.st,
+                    &self.mods,
+                    h,
+                    Some(Value::dom_node(node)),
+                    &[ev],
+                ) {
                     self.st.logs.push(format!("[gg-js error] {}", e.msg));
                 }
             }
@@ -1107,10 +1110,23 @@ impl PageVm {
         let tk = self.name_id("type");
         let tv = vm::intern(&mut self.st, ty);
         raw_set_prop(&mut self.st, evt.index() as usize, tk, tv);
+        // this = the registration target. The window "node" is a
+        // sentinel index with no arena entry — hand those handlers the
+        // real JS window object instead (a fake dom node would panic
+        // on the first property access).
+        let this_v = if node == vm::WINDOW_NODE {
+            self.st.known.window
+        } else {
+            Value::dom_node(node)
+        };
         for cb in cbs {
-            if let Err(e) =
-                call_value(&mut self.st, &self.mods, cb, &[evt])
-            {
+            if let Err(e) = call_value_this(
+                &mut self.st,
+                &self.mods,
+                cb,
+                Some(this_v),
+                &[evt],
+            ) {
                 self.st
                     .logs
                     .push(format!("[gg-js error] {}", e.msg));
@@ -1289,6 +1305,25 @@ mod tests {
         assert_eq!(
             n("Object.getOwnPropertyDescriptor({}, 'nope') === \
                undefined ? 1 : 0"), 1.0);
+        // defineProperties: batch of data + accessor descriptors
+        assert_eq!(
+            n("var o = {}; Object.defineProperties(o, { \
+                 a: {value: 4}, \
+                 b: {get: function() { return this.a * 10; }} }); \
+               o.a + o.b"), 44.0);
+        // getOwnPropertyNames sees data props AND accessor-only keys
+        // (Object.keys skips the accessor side-table)
+        assert_eq!(
+            n("var o = {x: 1}; Object.defineProperty(o, 'y', \
+               {get: function() { return 2; }}); \
+               var names = Object.getOwnPropertyNames(o); \
+               (names.indexOf('x') >= 0 ? 1 : 0) + \
+               (names.indexOf('y') >= 0 ? 2 : 0) + \
+               (Object.keys(o).indexOf('y') < 0 ? 4 : 0)"), 7.0);
+        // array: index keys come first
+        assert_eq!(
+            n("Object.getOwnPropertyNames([7, 8]).join(',') === '0,1' \
+               ? 1 : 0"), 1.0);
     }
 
     #[test]
@@ -1970,6 +2005,118 @@ console.log('B typeof it: ' + typeof it);
             n("matchMedia('(min-width: 0px)').matches === false \
                ? 1 : 0"),
             1.0);
+    }
+
+    #[test]
+    #[ignore] // profiling harness, not a correctness test — run with:
+              // cargo test --release -- --ignored profile_phases --nocapture
+    fn profile_phases() {
+        use super::super::{compiler, lexer, parser, vm};
+        use super::super::value::Value;
+        use std::time::Instant;
+        // webpack-shaped synthetic bundle: many module functions, few
+        // ever called (naver: 4 bundles, 1.3MB, most modules cold)
+        let mut src = String::new();
+        src.push_str("var mods = {};\n");
+        for i in 0..1500 {
+            src.push_str(&format!(
+                "mods[{i}] = function (exports) {{\n\
+                   var state = {{n: {i}, list: []}};\n\
+                   function step(k) {{\n\
+                     var acc = 0;\n\
+                     for (var j = 0; j < k; j++) \
+                       {{ acc += j * state.n; }}\n\
+                     return acc;\n\
+                   }}\n\
+                   function push(v) {{ state.list.push(v); \
+                     return state.list.length; }}\n\
+                   var helper = function (a, b) \
+                     {{ return a < b ? a : b; }};\n\
+                   exports.run = function (k) {{\n\
+                     var s = step(k) + helper(k, {i});\n\
+                     push(s);\n\
+                     return s;\n\
+                   }};\n\
+                   exports.tag = 'm{i}';\n\
+                   return exports;\n\
+                 }};\n"));
+        }
+        src.push_str(
+            "var total = 0;\n\
+             for (var i = 0; i < 1500; i += 20) {\n\
+               var e = mods[i]({});\n\
+               total += e.run(50);\n\
+             }\n\
+             total");
+        println!("source:  {} KB", src.len() / 1024);
+        let t0 = Instant::now();
+        let toks = lexer::tokenize(&src).unwrap();
+        println!("lex:     {:>7.2} ms ({} tokens)",
+                 t0.elapsed().as_secs_f64() * 1e3, toks.len());
+        let t1 = Instant::now();
+        let ast = parser::parse_program(&src).unwrap();
+        println!("parse:   {:>7.2} ms (incl. its own lex)",
+                 t1.elapsed().as_secs_f64() * 1e3);
+        let t2 = Instant::now();
+        let module = compiler::compile(&ast).unwrap();
+        println!("compile: {:>7.2} ms ({} protos)",
+                 t2.elapsed().as_secs_f64() * 1e3,
+                 module.protos.len());
+        let mut pvm = PageVm::new(None);
+        let mi = pvm.load(module);
+        let m = pvm.mods.rc(mi);
+        let main = m.module.main;
+        let nregs = m.module.protos[main as usize].nregs as usize;
+        drop(m);
+        let base = pvm.st.regs.len();
+        pvm.st.regs.resize(base + nregs, Value::UNDEFINED);
+        pvm.st.fuel = vm::DEFAULT_FUEL;
+        let t3 = Instant::now();
+        let v = vm::exec(&mut pvm.st, &pvm.mods, mi, main, base,
+                         u32::MAX, Value::UNDEFINED, 0)
+            .unwrap();
+        println!("exec:    {:>7.2} ms (cold: includes lazy compiles)",
+                 t3.elapsed().as_secs_f64() * 1e3);
+        assert!(v.is_number());
+        // warm pass: same script, every called body already compiled —
+        // isolates pure interpreter time from lazy-compile time
+        pvm.st.fuel = vm::DEFAULT_FUEL;
+        let t4 = Instant::now();
+        let v2 = vm::exec(&mut pvm.st, &pvm.mods, mi, main, base,
+                          u32::MAX, Value::UNDEFINED, 0)
+            .unwrap();
+        println!("exec:    {:>7.2} ms (warm)",
+                 t4.elapsed().as_secs_f64() * 1e3);
+        assert!(v2.is_number());
+    }
+
+    #[test]
+    fn canvas_2d_stub_context() {
+        // drawing calls are swallowed, readbacks return zeros, and
+        // unsupported context kinds answer null (feature detection)
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<canvas id=c width=300></canvas>"),
+        ))));
+        let logs = vm.run_scripts(&["\
+            var el = document.getElementById('c');\n\
+            var ctx = el.getContext('2d');\n\
+            ctx.fillStyle = '#fff';\n\
+            ctx.fillRect(0, 0, 10, 10);\n\
+            ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(5, 5);\n\
+            ctx.stroke();\n\
+            var g = ctx.createLinearGradient(0, 0, 1, 1);\n\
+            g.addColorStop(0, 'red');\n\
+            console.log('w ' + ctx.measureText('hi').width);\n\
+            console.log('img ' + ctx.getImageData(0, 0, 1, 1).data.length);\n\
+            console.log('gl ' + (el.getContext('webgl') === null));\n\
+            console.log('cv ' + (ctx.canvas === el));\n\
+            console.log('url ' + el.toDataURL());\n"
+            .to_string()]);
+        assert!(logs.contains(&"w 0".to_string()), "{logs:?}");
+        assert!(logs.contains(&"img 0".to_string()), "{logs:?}");
+        assert!(logs.contains(&"gl true".to_string()), "{logs:?}");
+        assert!(logs.contains(&"cv true".to_string()), "{logs:?}");
+        assert!(logs.contains(&"url data:,".to_string()), "{logs:?}");
     }
 
     #[test]
@@ -2714,14 +2861,171 @@ console.log('B typeof it: ' + typeof it);
         assert!(eval("const c = 1; c++;").is_err());
         assert!(eval("{ const b = 1; b = 2; }").is_err());
         assert!(eval("for (const v of [1, 2]) v = 9;").is_err());
-        // rejected at compile time even if the function never runs
-        assert!(eval("function f() { const k = 5; k = 6; } 1").is_err());
+        // lazy compilation: a function body is checked at first call,
+        // so a never-called offender no longer fails the whole script
+        // (this matches real JS, where const-assignment is a call-time
+        // error, not an early error)
+        assert_eq!(n("function f() { const k = 5; k = 6; } 1"), 1.0);
+        assert!(
+            eval("function f() { const k = 5; k = 6; } f()").is_err());
         assert!(eval("const c;").is_err(), "const needs an initializer");
         // reading and shadowing a const is fine
         assert_eq!(n("const c = 40; c + 2"), 42.0);
         assert_eq!(n("const c = 1; { const c = 2; } c"), 1.0);
         // only the binding is frozen, not the object it names
         assert_eq!(n("const o = {n: 1}; o.n = 5; o.n"), 5.0);
+    }
+
+    #[test]
+    fn lazy_compilation_semantics() {
+        // a broken cold function must not kill the script...
+        assert_eq!(
+            n("function bad() { const k = 1; k = 2; } 40 + 2"), 42.0);
+        // ...and calling it throws a catchable error instead
+        assert_eq!(
+            n("function bad() { const k = 1; k = 2; } \
+               var r = 0; try { bad(); } catch (e) { r = 1; } r"), 1.0);
+        // captures resolved at deferral time behave identically:
+        // transitive capture through an intermediate function
+        assert_eq!(
+            n("function outer() { var x = 40; \
+               function mid() { function inner() { return x + 2; } \
+                 return inner(); } \
+               return mid(); } outer()"), 42.0);
+        // mutation through a captured cell round-trips
+        assert_eq!(
+            n("function box() { var v = 0; \
+               return { set: function (x) { v = x; }, \
+                        get: function () { return v; } }; } \
+               var b = box(); b.set(21); b.get() * 2"), 42.0);
+        // a lazy fn called twice compiles once and stays correct
+        assert_eq!(
+            n("function fib(n) { \
+               return n < 2 ? n : fib(n - 1) + fib(n - 2); } \
+               fib(10)"), 55.0);
+    }
+
+    #[test]
+    fn event_handler_this_binding() {
+        // lifecycle handlers: this = registration target; the window
+        // sentinel must map to the real window object (a fake dom
+        // node would panic on any property access)
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<div id=t>x</div>"),
+        ))));
+        let logs = vm.run_scripts(&["\
+            window.addEventListener('load', function () {\n\
+              console.log('w ' + (this === window));\n\
+            });\n\
+            document.addEventListener('DOMContentLoaded', \
+            function () {\n\
+              console.log('d ' + (this === document));\n\
+            });\n\
+            document.getElementById('t').addEventListener('click', \
+            function () {\n\
+              console.log('n ' + this.id);\n\
+            });\n"
+            .to_string()]);
+        assert!(logs.is_empty(), "{logs:?}");
+        let logs = vm.fire_lifecycle();
+        assert!(logs.contains(&"w true".to_string()), "{logs:?}");
+        assert!(logs.contains(&"d true".to_string()), "{logs:?}");
+        // click dispatch: this = the node whose listener runs
+        let t = {
+            let d = vm.st.doc.as_ref().unwrap().borrow();
+            (0..d.nodes.len())
+                .find(|&i| d.nodes[i].attr("id") == Some("t"))
+                .unwrap()
+        };
+        let (logs, handled, _) = vm.dispatch_click(t);
+        assert!(handled);
+        assert!(logs.contains(&"n t".to_string()), "{logs:?}");
+    }
+
+    #[test]
+    fn private_class_fields() {
+        // #x fields/methods work through the class desugar
+        assert_eq!(
+            n("class Counter { \
+                 #n = 0; \
+                 inc() { this.#n += 1; return this.#n; } \
+                 #twice() { return this.#n * 2; } \
+                 read() { return this.#twice(); } } \
+               var c = new Counter(); c.inc(); c.inc(); \
+               c.read() * 10 + c.inc()"), 43.0);
+        // two instances keep separate private state
+        assert_eq!(
+            n("class B { #v = 0; set(x) { this.#v = x; } \
+                 get() { return this.#v; } } \
+               var a = new B(), b = new B(); \
+               a.set(4); b.set(2); a.get() * 10 + b.get()"), 42.0);
+    }
+
+    #[test]
+    fn layout_rects_feed_gbcr() {
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<div id=t>x</div>"),
+        ))));
+        // before any push: zero-rect (crash prevention as before)
+        let logs = vm.run_scripts(&["\
+            var r = document.getElementById('t')\
+                .getBoundingClientRect();\n\
+            console.log('pre ' + r.width + ' ' + r.height);\n"
+            .to_string()]);
+        assert!(logs.contains(&"pre 0 0".to_string()), "{logs:?}");
+        // find the div's node index and push a rect for it
+        let div = {
+            let d = vm.st.doc.as_ref().unwrap().borrow();
+            (0..d.nodes.len())
+                .find(|&i| d.nodes[i].tag.as_deref() == Some("div"))
+                .unwrap() as u32
+        };
+        vm.set_layout_rects(vec![(div, 13.0, 26.0, 774.0, 20.0)]);
+        let logs = vm.run_scripts(&["\
+            var r = document.getElementById('t')\
+                .getBoundingClientRect();\n\
+            console.log('post ' + r.x + ' ' + r.top + ' ' + r.width \
+                + ' ' + r.bottom);\n"
+            .to_string()]);
+        assert!(logs.contains(&"post 13 26 774 46".to_string()),
+                "{logs:?}");
+    }
+
+    #[test]
+    fn lazy_parse_semantics() {
+        // bodies >= 24 tokens skip AST building at load; the token
+        // range parses at first call. Captures must still work.
+        assert_eq!(
+            n("var a = 30, b = 12; \
+               function big() { \
+                 var x = 0; var y = 0; var z = 0; \
+                 x = a; y = b; z = x + y; \
+                 return z + 0 + 0 + 0 + 0 + 0; } \
+               big()"), 42.0);
+        // template ${holes} in a skipped body still capture
+        assert_eq!(
+            n("var w = 'world'; \
+               function greet() { \
+                 var a = 1; var b = 2; var c = 3; var d = 4; \
+                 var s = `hi ${w}`; \
+                 return s.length + a + b + c + d; } \
+               greet()"), 18.0);
+        // a parse error inside a lazy body surfaces at call, catchable
+        assert_eq!(
+            n("function broken() { \
+                 var a = 1; var b = 2; var c = 3; var d = 4; \
+                 var e = 5; var f = 6; var g = 7; \
+                 return a + ; } \
+               var r = 0; try { broken(); } catch (e) { r = 1; } r"),
+            1.0);
+        // mutation of a captured var from a lazy-parsed body sticks
+        assert_eq!(
+            n("var n0 = 0; \
+               function bump() { \
+                 var a = 1; var b = 2; var c = 3; var d = 4; \
+                 var e = 5; var f = 6; \
+                 n0 = n0 + a + b + c + d + e + f; } \
+               bump(); bump(); n0"), 42.0);
     }
 
     #[test]

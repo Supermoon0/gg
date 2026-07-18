@@ -22,6 +22,12 @@ pub struct CachedGlyph {
 pub struct FontStore {
     fonts: Vec<fontdue::Font>,
     file_ids: HashMap<&'static str, usize>,
+    /// the font table that actually loaded (Windows or Linux) — all
+    /// family/variant lookups go through it
+    table: &'static [(&'static str, bool, bool, &'static str)],
+    /// runtime-registered web fonts (@font-face):
+    /// (family, bold, italic) -> font slot; wins over the table
+    dynamic: Vec<(String, bool, bool, usize)>,
     variants: Vec<Variant>,
     variant_ids: HashMap<(String, bool, bool), u32>,
     glyph_cache: HashMap<(usize, u32, char), CachedGlyph>,
@@ -29,6 +35,23 @@ pub struct FontStore {
 }
 
 const FONT_DIR: &str = r"C:\Windows\Fonts";
+const FONT_DIR_LINUX: &str = "/usr/share/fonts/truetype";
+
+/// Linux fallback table (headless builds, CI): DejaVu stands in for
+/// the Windows families under the same family keys, WenQuanYi covers
+/// CJK. Missing files are skipped — file_font() falls back to slot 0.
+const FONT_FILES_LINUX: &[(&str, bool, bool, &str)] = &[
+    ("segoe ui", false, false, "dejavu/DejaVuSans.ttf"),
+    ("segoe ui", true, false, "dejavu/DejaVuSans-Bold.ttf"),
+    ("segoe ui", false, true, "dejavu/DejaVuSans-Oblique.ttf"),
+    ("segoe ui", true, true, "dejavu/DejaVuSans-BoldOblique.ttf"),
+    ("consolas", false, false, "dejavu/DejaVuSansMono.ttf"),
+    ("consolas", true, false, "dejavu/DejaVuSansMono-Bold.ttf"),
+    ("georgia", false, false, "dejavu/DejaVuSerif.ttf"),
+    ("georgia", true, false, "dejavu/DejaVuSerif-Bold.ttf"),
+    ("malgun gothic", false, false, "wqy/wqy-zenhei.ttc"),
+    ("symbols", false, false, "dejavu/DejaVuSans.ttf"),
+];
 
 /// (family, bold, italic) -> file name
 const FONT_FILES: &[(&str, bool, bool, &str)] = &[
@@ -51,60 +74,117 @@ const FONT_FILES: &[(&str, bool, bool, &str)] = &[
 
 impl FontStore {
     pub fn new() -> Result<FontStore, String> {
-        let mut fonts = Vec::new();
-        let mut file_ids = HashMap::new();
-        for &(_, _, _, file) in FONT_FILES {
-            if file_ids.contains_key(file) {
-                continue;
+        // Windows fonts first (the primary target), then the Linux
+        // fallback table (headless/CI). Within a table, unreadable
+        // files are skipped; a table counts only if its default
+        // (first) font loaded.
+        for (dir, table, sep) in [
+            (FONT_DIR, FONT_FILES, '\\'),
+            (FONT_DIR_LINUX, FONT_FILES_LINUX, '/'),
+        ] {
+            let mut fonts = Vec::new();
+            let mut file_ids = HashMap::new();
+            for &(_, _, _, file) in table {
+                if file_ids.contains_key(file) {
+                    continue;
+                }
+                let path = format!("{}{}{}", dir, sep, file);
+                let Ok(data) = fs::read(&path) else { continue };
+                let Ok(font) = fontdue::Font::from_bytes(
+                    data,
+                    fontdue::FontSettings::default(),
+                ) else {
+                    continue;
+                };
+                file_ids.insert(file, fonts.len());
+                fonts.push(font);
             }
-            let path = format!("{}\\{}", FONT_DIR, file);
-            let data = fs::read(&path)
-                .map_err(|e| format!("cannot read {}: {}", path, e))?;
-            let font = fontdue::Font::from_bytes(
-                data,
-                fontdue::FontSettings::default(),
-            )
-            .map_err(|e| format!("cannot parse {}: {}", path, e))?;
-            file_ids.insert(file, fonts.len());
-            fonts.push(font);
+            if file_ids.contains_key(table[0].3) {
+                return Ok(FontStore {
+                    fonts,
+                    file_ids,
+                    table,
+                    dynamic: Vec::new(),
+                    variants: Vec::new(),
+                    variant_ids: HashMap::new(),
+                    glyph_cache: HashMap::new(),
+                    metrics_cache: HashMap::new(),
+                });
+            }
         }
-        Ok(FontStore {
-            fonts,
-            file_ids,
-            variants: Vec::new(),
-            variant_ids: HashMap::new(),
-            glyph_cache: HashMap::new(),
-            metrics_cache: HashMap::new(),
-        })
+        Err("no usable font table (Windows or Linux)".to_string())
+    }
+
+    /// Register a web font (@font-face). Existing variant ids keep
+    /// their old resolution; only the memo is cleared so future
+    /// lookups (post-load relayout) see the new font.
+    pub fn add_font(
+        &mut self,
+        family: &str,
+        bold: bool,
+        italic: bool,
+        data: Vec<u8>,
+    ) -> bool {
+        let Ok(font) = fontdue::Font::from_bytes(
+            data,
+            fontdue::FontSettings::default(),
+        ) else {
+            return false;
+        };
+        let slot = self.fonts.len();
+        self.fonts.push(font);
+        self.dynamic.push((
+            family.to_ascii_lowercase(),
+            bold,
+            italic,
+            slot,
+        ));
+        self.variant_ids.clear();
+        true
+    }
+
+    /// Is this family resolvable (table or web font)? The shell uses
+    /// it to decide whether an author font-family passes through or
+    /// collapses to the default family.
+    pub fn has_family(&self, family: &str) -> bool {
+        let f = family.to_ascii_lowercase();
+        self.dynamic.iter().any(|(fam, ..)| fam == &f)
+            || self.table.iter().any(|(fam, ..)| *fam == f)
     }
 
     fn file_font(&self, file: &str) -> usize {
         *self.file_ids.get(file).unwrap_or(&0)
     }
 
-    fn lookup_variant_file(family: &str, bold: bool, italic: bool) -> &'static str {
-        // exact variant, then same family without italic/bold, then default
-        for &(fam, b, i, file) in FONT_FILES {
+    fn lookup_variant_file(
+        &self,
+        family: &str,
+        bold: bool,
+        italic: bool,
+    ) -> &'static str {
+        // exact variant, then same family without italic/bold, then
+        // the default family's closest variant
+        for &(fam, b, i, file) in self.table {
             if fam == family && b == bold && i == italic {
                 return file;
             }
         }
-        for &(fam, b, _, file) in FONT_FILES {
+        for &(fam, b, _, file) in self.table {
             if fam == family && b == bold {
                 return file;
             }
         }
-        for &(fam, _, _, file) in FONT_FILES {
+        for &(fam, _, _, file) in self.table {
             if fam == family {
                 return file;
             }
         }
-        match (bold, italic) {
-            (false, false) => "segoeui.ttf",
-            (true, false) => "segoeuib.ttf",
-            (false, true) => "segoeuii.ttf",
-            (true, true) => "segoeuiz.ttf",
+        for &(fam, b, i, file) in self.table {
+            if fam == "segoe ui" && b == bold && i == italic {
+                return file;
+            }
         }
+        self.table[0].3
     }
 
     pub fn variant_id(&mut self, family: &str, bold: bool, italic: bool) -> u32 {
@@ -113,15 +193,35 @@ impl FontStore {
         if let Some(&id) = self.variant_ids.get(&key) {
             return id;
         }
-        let primary =
-            self.file_font(Self::lookup_variant_file(&family, bold, italic));
+        // web fonts win: exact variant, then same family
+        let dyn_hit = self
+            .dynamic
+            .iter()
+            .find(|(f, b, i, _)| f == &family && *b == bold && *i == italic)
+            .or_else(|| {
+                self.dynamic
+                    .iter()
+                    .find(|(f, b, _, _)| f == &family && *b == bold)
+            })
+            .or_else(|| {
+                self.dynamic.iter().find(|(f, _, _, _)| f == &family)
+            });
+        let primary = match dyn_hit {
+            Some(&(_, _, _, slot)) => slot,
+            None => self
+                .file_font(self.lookup_variant_file(&family, bold, italic)),
+        };
         // Hangul/symbol fallbacks; prefer bold Malgun for bold variants
         let mut fallbacks = Vec::new();
         if bold {
-            fallbacks.push(self.file_font("malgunbd.ttf"));
+            let f = self.lookup_variant_file("malgun gothic", true, false);
+            fallbacks.push(self.file_font(f));
         }
-        fallbacks.push(self.file_font("malgun.ttf"));
-        fallbacks.push(self.file_font("seguisym.ttf"));
+        let malgun =
+            self.lookup_variant_file("malgun gothic", false, false);
+        fallbacks.push(self.file_font(malgun));
+        let sym = self.lookup_variant_file("symbols", false, false);
+        fallbacks.push(self.file_font(sym));
         fallbacks.retain(|&f| f != primary);
 
         let id = self.variants.len() as u32;
@@ -242,5 +342,35 @@ impl FontStore {
         self.fonts[font_idx]
             .horizontal_kern(a, b, size)
             .unwrap_or(0.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn web_font_registration_dispatches() {
+        let Ok(mut store) = FontStore::new() else {
+            return; // no system fonts in this environment: skip
+        };
+        let serif = "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf";
+        let Ok(data) = fs::read(serif) else {
+            return; // Windows CI: table differs, skip
+        };
+        assert!(!store.has_family("myface"));
+        assert!(store.add_font("MyFace", false, false, data));
+        assert!(store.has_family("myface"));
+        assert!(store.has_family("MyFace")); // case-insensitive
+        // the web font actually renders: same text measures
+        // differently than the default (sans) family
+        let sans = store.variant_id("segoe ui", false, false);
+        let web = store.variant_id("myface", false, false);
+        let a = store.measure(sans, 16.0, "illustration");
+        let b = store.measure(web, 16.0, "illustration");
+        assert!((a - b).abs() > 0.5, "sans {a} vs web {b}");
+        // unparsable data is rejected, store stays sane
+        assert!(!store.add_font("bad", false, false, vec![1, 2, 3]));
+        assert!(store.has_family("myface"));
     }
 }

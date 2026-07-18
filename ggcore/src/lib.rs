@@ -27,6 +27,10 @@ struct TextEngine {
     store: fonts::FontStore,
     images: std::collections::HashMap<u32, (u32, u32, Vec<u8>)>,
     next_image: u32,
+    /// The page display list in document coordinates, stored once per
+    /// layout/paint change so scroll frames pass only offsets instead
+    /// of re-serializing and re-transferring every command (M6).
+    display_list: Vec<Cmd>,
 }
 
 #[pymethods]
@@ -38,6 +42,7 @@ impl TextEngine {
                 store,
                 images: std::collections::HashMap::new(),
                 next_image: 1,
+                display_list: Vec::new(),
             })
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
@@ -85,6 +90,22 @@ impl TextEngine {
         self.store.variant_id(family, bold, italic)
     }
 
+    /// Register a web font (@font-face) under a family name.
+    /// TTF/OTF only (fontdue); returns false on unparsable data.
+    fn load_font(
+        &mut self,
+        family: &str,
+        bold: bool,
+        italic: bool,
+        data: &[u8],
+    ) -> bool {
+        self.store.add_font(family, bold, italic, data.to_vec())
+    }
+
+    fn has_family(&self, family: &str) -> bool {
+        self.store.has_family(family)
+    }
+
     /// (ascent, descent, linespace) at a pixel size.
     fn metrics(&mut self, font_id: u32, size: f32) -> (f32, f32, f32) {
         self.store.metrics(font_id, size)
@@ -107,6 +128,47 @@ impl TextEngine {
         PyBytes::new(py, &r.to_ppm())
     }
 
+    /// Store the page display list (document coordinates; device px
+    /// if the shell pre-scales). Call on layout/paint changes only.
+    fn set_display_list(&mut self, cmds: Vec<Cmd>) {
+        self.display_list = cmds;
+    }
+
+    /// Rasterize the stored list at a scroll offset, then draw the
+    /// overlay (chrome — already in viewport coordinates) on top.
+    /// Off-viewport commands are culled here; clip brackets always
+    /// survive so push/pop stay balanced. Returns a binary PPM.
+    #[allow(clippy::too_many_arguments)]
+    fn render_frame<'py>(
+        &mut self,
+        py: Python<'py>,
+        width: u32,
+        height: u32,
+        bg: (u8, u8, u8),
+        dx: f64,
+        dy: f64,
+        overlay: Vec<Cmd>,
+    ) -> Bound<'py, PyBytes> {
+        let r = self.rasterize_at(width, height, bg, dx, dy, &overlay);
+        PyBytes::new(py, &r.to_ppm())
+    }
+
+    /// As render_frame, returning raw RGB bytes (native shell).
+    #[allow(clippy::too_many_arguments)]
+    fn render_frame_raw<'py>(
+        &mut self,
+        py: Python<'py>,
+        width: u32,
+        height: u32,
+        bg: (u8, u8, u8),
+        dx: f64,
+        dy: f64,
+        overlay: Vec<Cmd>,
+    ) -> Bound<'py, PyBytes> {
+        let r = self.rasterize_at(width, height, bg, dx, dy, &overlay);
+        PyBytes::new(py, &r.buf)
+    }
+
     /// Rasterize a display list; returns raw RGB bytes (no header).
     fn render_raw<'py>(
         &mut self,
@@ -122,6 +184,93 @@ impl TextEngine {
 }
 
 impl TextEngine {
+    /// Shift a command into viewport space and report whether any of
+    /// it can be visible. x2/y2 shift only when they are coordinates
+    /// (rect/line/oval/clip) — for images and background layers they
+    /// are width/height. Clip brackets are never culled.
+    fn shift_cull(
+        cmd: &Cmd,
+        dx: f64,
+        dy: f64,
+        width: f64,
+        height: f64,
+    ) -> Option<Cmd> {
+        let (kind, x1, y1, x2, y2, color, aux, font, text) = cmd;
+        let (kind, x1, y1, x2, y2) = (*kind, *x1, *y1, *x2, *y2);
+        match kind {
+            6 | 7 => Some((
+                kind,
+                x1 - dx,
+                y1 - dy,
+                x2 - dx,
+                y2 - dy,
+                *color,
+                *aux,
+                *font,
+                text.clone(),
+            )),
+            _ => {
+                let (top, bottom, left, right) = match kind {
+                    // text: y extent from the font size (linespace is
+                    // ~1.3x; 2x keeps the cull conservative)
+                    1 => (y1, y1 + aux * 2.0, x1, f64::INFINITY),
+                    // image / background layer: x2/y2 are w/h
+                    4 | 5 => (y1, y1 + y2, x1, x1 + x2),
+                    _ => (
+                        y1.min(y2),
+                        y1.max(y2),
+                        x1.min(x2),
+                        x1.max(x2),
+                    ),
+                };
+                if bottom < dy
+                    || top > dy + height
+                    || right < dx
+                    || left > dx + width
+                {
+                    return None;
+                }
+                let shifts_wh = !matches!(kind, 4 | 5);
+                Some((
+                    kind,
+                    x1 - dx,
+                    y1 - dy,
+                    if shifts_wh { x2 - dx } else { x2 },
+                    if shifts_wh { y2 - dy } else { y2 },
+                    *color,
+                    *aux,
+                    *font,
+                    text.clone(),
+                ))
+            }
+        }
+    }
+
+    fn rasterize_at(
+        &mut self,
+        width: u32,
+        height: u32,
+        bg: (u8, u8, u8),
+        dx: f64,
+        dy: f64,
+        overlay: &[Cmd],
+    ) -> raster::Raster {
+        let list = std::mem::take(&mut self.display_list);
+        let mut cmds: Vec<Cmd> =
+            Vec::with_capacity(list.len() / 4 + overlay.len());
+        for cmd in &list {
+            if let Some(c) = Self::shift_cull(
+                cmd, dx, dy, width as f64, height as f64,
+            ) {
+                cmds.push(c);
+            }
+        }
+        cmds.extend_from_slice(overlay);
+        let r = self.rasterize(width, height, bg, &cmds);
+        self.display_list = list;
+        r
+    }
+
     fn rasterize(
         &mut self,
         width: u32,
@@ -260,6 +409,43 @@ type SnapNode = (
 type QueryNode = (u64, String, Vec<(String, String)>, String);
 
 const RAW_TEXT_TAGS: [&str; 4] = ["script", "style", "template", "noscript"];
+
+/// Properties that can never move a box: a restyle touching only
+/// these skips relayout (conservative — unknown props count as
+/// geometry).
+fn is_paint_only_prop(k: &str) -> bool {
+    matches!(
+        k,
+        "color"
+            | "background"
+            | "background-color"
+            | "background-image"
+            | "background-position"
+            | "background-size"
+            | "background-repeat"
+            | "text-decoration"
+            | "border-color"
+            | "border-top-color"
+            | "border-right-color"
+            | "border-bottom-color"
+            | "border-left-color"
+            | "outline"
+            | "outline-color"
+            | "box-shadow"
+            | "opacity"
+            | "visibility"
+            | "cursor"
+            | "z-index"
+            | "border-radius"
+            | "transform"
+            | "transition"
+            | "animation"
+            | "text-overflow"
+            | "caret-color"
+            | "fill"
+            | "stroke"
+    )
+}
 
 fn is_interactive(tag: &str) -> bool {
     matches!(tag, "a" | "button" | "input" | "select" | "textarea" | "option")
@@ -425,6 +611,101 @@ impl Doc {
             }
         }
         out
+    }
+
+    /// Partial invalidation: recompute styles and report the damage
+    /// class instead of making Python rebuild everything.
+    /// 0 = nothing changed; 1 = paint-only (per-node style patches
+    /// returned); 2 = a geometry property changed (relayout);
+    /// 3 = structure changed (pseudo nodes appeared/vanished — the
+    /// caller must re-export the tree).
+    #[pyo3(signature = (css_sources, viewport_width=1280.0))]
+    fn restyle_diff(
+        &mut self,
+        css_sources: Vec<String>,
+        viewport_width: f64,
+    ) -> (u8, Vec<(usize, Vec<(String, String)>)>) {
+        let mut d = self.doc.borrow_mut();
+        let n_before = d.nodes.len();
+        let old: Vec<std::collections::HashMap<String, String>> =
+            d.nodes.iter().map(|nd| nd.style.clone()).collect();
+        style::compute_styles_vw(&mut d, &css_sources, viewport_width);
+        if d.nodes.len() != n_before {
+            return (3, Vec::new());
+        }
+        let mut patches = Vec::new();
+        let mut geometry = false;
+        for (i, nd) in d.nodes.iter().enumerate() {
+            if nd.style == old[i] {
+                continue;
+            }
+            for (k, v) in nd.style.iter() {
+                if old[i].get(k) != Some(v) && !is_paint_only_prop(k) {
+                    geometry = true;
+                }
+            }
+            for k in old[i].keys() {
+                if !nd.style.contains_key(k) && !is_paint_only_prop(k)
+                {
+                    geometry = true;
+                }
+            }
+            patches.push((
+                i,
+                nd.style
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ));
+        }
+        if patches.is_empty() {
+            return (0, Vec::new());
+        }
+        if geometry {
+            return (2, Vec::new());
+        }
+        (1, patches)
+    }
+
+    /// Push layout results so page JS reading getBoundingClientRect
+    /// gets real geometry (document coordinates). Call after layout.
+    fn set_layout_rects(
+        &mut self,
+        rects: Vec<(u32, f64, f64, f64, f64)>,
+    ) {
+        if self.use_ggjs {
+            self.ggvm().set_layout_rects(rects);
+        }
+    }
+
+    /// Shell-side hover update: mark the element under the pointer
+    /// and its ancestors so `:hover` rules match on the next
+    /// compute_styles. Pass None when the pointer leaves the page.
+    #[pyo3(signature = (node_idx=None))]
+    fn set_hover(&mut self, node_idx: Option<usize>) {
+        let mut d = self.doc.borrow_mut();
+        d.hover_chain.clear();
+        let mut cur = node_idx.filter(|&i| i < d.nodes.len());
+        while let Some(i) = cur {
+            d.hover_chain.push(i);
+            cur = d.nodes[i].parent;
+        }
+    }
+
+    /// Shell-side focus update for `:focus` rules.
+    #[pyo3(signature = (node_idx=None))]
+    fn set_focus(&mut self, node_idx: Option<usize>) {
+        let mut d = self.doc.borrow_mut();
+        d.focused = node_idx.filter(|&i| i < d.nodes.len());
+    }
+
+    /// Shell-side attribute write (typed input values): mirror the
+    /// change into the DOM so page JS reads what the user typed.
+    fn set_attr(&mut self, node_idx: usize, name: String, value: String) {
+        let mut d = self.doc.borrow_mut();
+        if node_idx < d.nodes.len() {
+            d.set_attr(node_idx, &name, &value);
+        }
     }
 
     /// Tell the JS engine the page URL so `location.*` is real.

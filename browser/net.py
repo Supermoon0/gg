@@ -265,6 +265,8 @@ def request_full(url, max_redirects=MAX_REDIRECTS, no_cache=False):
 
     if url.scheme == "file":
         path = url.path
+        # a query has no filesystem meaning (form GET submit to file:)
+        path = path.split("?", 1)[0].split("#", 1)[0]
         # file:///C:/foo -> C:/foo on Windows
         if len(path) >= 3 and path[0] == "/" and path[2] == ":":
             path = path[1:]
