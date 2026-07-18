@@ -645,11 +645,21 @@ class Browser:
             self.restyle()
 
     def restyle(self):
-        """Re-run style with the current hover/focus state, then
-        relayout. (Full-page for now — partial invalidation is the
-        M4 follow-up.)"""
+        """Re-run style with the current hover/focus state, doing
+        the least work the damage requires: paint-only changes patch
+        styles in place and skip relayout entirely (M4 partial
+        invalidation — the common case for hover/focus)."""
         if self._doc is not None:
-            self.nodes = native.refresh(self._doc, self._css_sources)
+            outcome = native.restyle_patch(
+                self._doc, self._css_sources, self.nodes)
+            if outcome == "none":
+                return
+            if outcome == "paint":
+                self.repaint()
+                return
+            # geometry or structure changed: re-export (styles are
+            # already fresh in Rust) and relayout
+            self.nodes = native.build_tree(self._doc.export())
             self._remap_marks()
             self.load_images(self.nodes, self.url, keep_cache=True)
         elif self._py_rule_index is not None:

@@ -261,6 +261,43 @@ type QueryNode = (u64, String, Vec<(String, String)>, String);
 
 const RAW_TEXT_TAGS: [&str; 4] = ["script", "style", "template", "noscript"];
 
+/// Properties that can never move a box: a restyle touching only
+/// these skips relayout (conservative — unknown props count as
+/// geometry).
+fn is_paint_only_prop(k: &str) -> bool {
+    matches!(
+        k,
+        "color"
+            | "background"
+            | "background-color"
+            | "background-image"
+            | "background-position"
+            | "background-size"
+            | "background-repeat"
+            | "text-decoration"
+            | "border-color"
+            | "border-top-color"
+            | "border-right-color"
+            | "border-bottom-color"
+            | "border-left-color"
+            | "outline"
+            | "outline-color"
+            | "box-shadow"
+            | "opacity"
+            | "visibility"
+            | "cursor"
+            | "z-index"
+            | "border-radius"
+            | "transform"
+            | "transition"
+            | "animation"
+            | "text-overflow"
+            | "caret-color"
+            | "fill"
+            | "stroke"
+    )
+}
+
 fn is_interactive(tag: &str) -> bool {
     matches!(tag, "a" | "button" | "input" | "select" | "textarea" | "option")
 }
@@ -425,6 +462,60 @@ impl Doc {
             }
         }
         out
+    }
+
+    /// Partial invalidation: recompute styles and report the damage
+    /// class instead of making Python rebuild everything.
+    /// 0 = nothing changed; 1 = paint-only (per-node style patches
+    /// returned); 2 = a geometry property changed (relayout);
+    /// 3 = structure changed (pseudo nodes appeared/vanished — the
+    /// caller must re-export the tree).
+    #[pyo3(signature = (css_sources, viewport_width=1280.0))]
+    fn restyle_diff(
+        &mut self,
+        css_sources: Vec<String>,
+        viewport_width: f64,
+    ) -> (u8, Vec<(usize, Vec<(String, String)>)>) {
+        let mut d = self.doc.borrow_mut();
+        let n_before = d.nodes.len();
+        let old: Vec<std::collections::HashMap<String, String>> =
+            d.nodes.iter().map(|nd| nd.style.clone()).collect();
+        style::compute_styles_vw(&mut d, &css_sources, viewport_width);
+        if d.nodes.len() != n_before {
+            return (3, Vec::new());
+        }
+        let mut patches = Vec::new();
+        let mut geometry = false;
+        for (i, nd) in d.nodes.iter().enumerate() {
+            if nd.style == old[i] {
+                continue;
+            }
+            for (k, v) in nd.style.iter() {
+                if old[i].get(k) != Some(v) && !is_paint_only_prop(k) {
+                    geometry = true;
+                }
+            }
+            for k in old[i].keys() {
+                if !nd.style.contains_key(k) && !is_paint_only_prop(k)
+                {
+                    geometry = true;
+                }
+            }
+            patches.push((
+                i,
+                nd.style
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ));
+        }
+        if patches.is_empty() {
+            return (0, Vec::new());
+        }
+        if geometry {
+            return (2, Vec::new());
+        }
+        (1, patches)
     }
 
     /// Shell-side hover update: mark the element under the pointer

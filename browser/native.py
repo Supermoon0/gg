@@ -16,7 +16,7 @@ else:
     if not hasattr(ggcore, "parse_html"):
         ggcore = None
 
-from .html_parser import Element, Text
+from .html_parser import Element, Text, tree_to_list
 from .style import DEFAULT_STYLE_SHEET
 
 
@@ -149,6 +149,37 @@ def refresh(doc, css_sources):
     """Re-style and re-export after JS mutated the DOM."""
     doc.compute_styles(css_sources)
     return build_tree(doc.export())
+
+
+def restyle_patch(doc, css_sources, root):
+    """Partial invalidation: recompute styles in Rust and, when only
+    paint-affecting properties changed, patch them into the existing
+    Python tree in place. Returns the least work the caller must
+    redo: 'none' | 'paint' | 'layout' | 'tree'. For 'layout'/'tree'
+    the Rust styles are already fresh — re-export with
+    build_tree(doc.export()), do not compute_styles again."""
+    if not hasattr(doc, "restyle_diff"):
+        doc.compute_styles(css_sources)
+        return "tree"
+    kind, patches = doc.restyle_diff(css_sources)
+    if kind == 0:
+        return "none"
+    if kind == 2:
+        return "layout"
+    if kind == 3:
+        return "tree"
+    by_ridx = {}
+    for n in tree_to_list(root, []):
+        r = getattr(n, "_ridx", None)
+        if r is not None:
+            by_ridx[r] = n
+    for ridx, style_pairs in patches:
+        n = by_ridx.get(ridx)
+        if n is None:
+            return "tree"  # tree out of sync: rebuild
+        n.style = dict(style_pairs)
+        n._font = None  # style changed: invalidate the font cache
+    return "paint"
 
 
 def async_available():
