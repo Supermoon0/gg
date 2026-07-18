@@ -13,8 +13,8 @@ pub enum Expr {
     Regex { pattern: String, flags: String },
     Array(Vec<Expr>),
     Object(Vec<Prop>),
-    Func(Box<FuncLit>),
-    Arrow(Box<FuncLit>),
+    Func(std::rc::Rc<FuncLit>),
+    Arrow(std::rc::Rc<FuncLit>),
     Unary(UnOp, Box<Expr>),
     /// `await E` — only valid inside an async function; the compiler
     /// lifts it into a `.then` continuation (see compiler desugar).
@@ -117,7 +117,7 @@ pub enum DeclKind {
 pub enum Stmt {
     Expr(Expr),
     VarDecl { kind: DeclKind, decls: Vec<(String, Option<Expr>)> },
-    FuncDecl(Box<FuncLit>),
+    FuncDecl(std::rc::Rc<FuncLit>),
     Return(Option<Expr>),
     If { test: Expr, cons: Box<Stmt>, alt: Option<Box<Stmt>> },
     While { test: Expr, body: Box<Stmt> },

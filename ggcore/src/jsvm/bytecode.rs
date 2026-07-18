@@ -152,6 +152,25 @@ pub struct FuncProto {
     /// The body references `arguments`: calls must keep extra args
     /// (beyond nparams) alive for the prologue's Arguments instruction.
     pub uses_arguments: bool,
+    /// Present = this is a lazy stub: the body has not been compiled
+    /// yet (code is empty). The VM compiles it on first call and
+    /// redirects to the compiled proto. `captures` above are real —
+    /// they were pre-resolved at deferral time so the Closure
+    /// instruction works unchanged.
+    pub lazy: Option<Box<LazySrc>>,
+}
+
+/// Everything needed to compile a deferred function body on first
+/// call (lazy compilation — most bundle functions never run).
+pub struct LazySrc {
+    pub lit: std::rc::Rc<super::ast::FuncLit>,
+    pub is_arrow: bool,
+    /// capture names in upval order (parallel to FuncProto.captures);
+    /// captured enclosing spill objects appear under their %spillN name
+    pub upval_names: Vec<String>,
+    /// free names that live in an enclosing function's spill object:
+    /// (variable name, that spill object's %spillN upval name)
+    pub spill_names: Vec<(String, String)>,
 }
 
 pub struct Module {

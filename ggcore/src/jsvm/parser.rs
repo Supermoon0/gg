@@ -5,6 +5,7 @@
 //! arrow-function lookahead, the `in`-operator / for-in ambiguity,
 //! optional chaining, and template holes (re-lexed recursively).
 
+use std::rc::Rc;
 use super::ast::*;
 use super::lexer::{tokenize, LexError, Token, Tok, TplElem, P};
 
@@ -113,7 +114,7 @@ impl Parser {
         let mut body: Vec<Stmt> = Vec::new();
         body.push(Stmt::VarDecl {
             kind: DeclKind::Var,
-            decls: vec![(cname.clone(), Some(Expr::Func(Box::new(ctor))))],
+            decls: vec![(cname.clone(), Some(Expr::Func(Rc::new(ctor))))],
         });
         if let Some(supn) = &sup {
             // C.prototype = Object.create(sup.prototype)
@@ -152,7 +153,7 @@ impl Parser {
                     prop: MemberProp::Static(mname),
                     optional: false,
                 }),
-                Box::new(Expr::Func(Box::new(f))),
+                Box::new(Expr::Func(Rc::new(f))),
             )));
         }
         for (aname, getter, setter) in accessors {
@@ -164,13 +165,13 @@ impl Parser {
             if let Some(g) = getter {
                 props.push(Prop {
                     key: PropKey::Ident("get".to_string()),
-                    value: Expr::Func(Box::new(g)),
+                    value: Expr::Func(Rc::new(g)),
                 });
             }
             if let Some(s) = setter {
                 props.push(Prop {
                     key: PropKey::Ident("set".to_string()),
-                    value: Expr::Func(Box::new(s)),
+                    value: Expr::Func(Rc::new(s)),
                 });
             }
             body.push(Stmt::Expr(Expr::Call {
@@ -200,7 +201,7 @@ impl Parser {
             _ => (Vec::new(), Vec::new()),
         };
         Ok(Expr::Call {
-            callee: Box::new(Expr::Func(Box::new(FuncLit {
+            callee: Box::new(Expr::Func(Rc::new(FuncLit {
                 name: None,
                 params,
                 body,
@@ -251,7 +252,7 @@ impl Parser {
                 let f =
                     self.func_lit_g(Some(mname.clone()), false, true)?;
                 if is_static {
-                    statics.push((mname, Expr::Func(Box::new(f))));
+                    statics.push((mname, Expr::Func(Rc::new(f))));
                 } else {
                     methods.push((mname, f));
                 }
@@ -324,7 +325,7 @@ impl Parser {
             if let Some(is_get) = acc {
                 if is_static {
                     // static accessor: approximate as a plain static
-                    statics.push((mname, Expr::Func(Box::new(f))));
+                    statics.push((mname, Expr::Func(Rc::new(f))));
                 } else if let Some(slot) =
                     accessors.iter_mut().find(|(n, _, _)| *n == mname)
                 {
@@ -339,7 +340,7 @@ impl Parser {
                     accessors.push((mname, None, Some(f)));
                 }
             } else if is_static {
-                statics.push((mname, Expr::Func(Box::new(f))));
+                statics.push((mname, Expr::Func(Rc::new(f))));
             } else if mname == "constructor" {
                 ctor = Some((f.params, f.body));
             } else {
@@ -520,14 +521,14 @@ impl Parser {
                     let name = self.expect_ident()?;
                     let f =
                         self.func_lit_g(Some(name), false, is_gen)?;
-                    Ok(Stmt::FuncDecl(Box::new(f)))
+                    Ok(Stmt::FuncDecl(Rc::new(f)))
                 }
                 "async" if matches!(self.kind_at(1), Some(Tok::Ident(k))
                     if k == "function") => {
                     self.pos += 2; // async function
                     let name = self.expect_ident()?;
                     let f = self.func_lit(Some(name), true)?;
-                    Ok(Stmt::FuncDecl(Box::new(f)))
+                    Ok(Stmt::FuncDecl(Rc::new(f)))
                 }
                 "class" => {
                     self.pos += 1;
@@ -1070,7 +1071,7 @@ impl Parser {
                             }
                             _ => None,
                         };
-                        return Ok(Expr::Func(Box::new(
+                        return Ok(Expr::Func(Rc::new(
                             self.func_lit(name, true)?,
                         )));
                     }
@@ -1150,7 +1151,7 @@ impl Parser {
                         tmp.clone(),
                     ))));
                     return Ok(Expr::Call {
-                        callee: Box::new(Expr::Arrow(Box::new(FuncLit {
+                        callee: Box::new(Expr::Arrow(Rc::new(FuncLit {
                             name: None,
                             params: vec![tmp],
                             body: stmts,
@@ -1372,7 +1373,7 @@ impl Parser {
             full.append(&mut body);
             body = full;
         }
-        Ok(Expr::Arrow(Box::new(FuncLit {
+        Ok(Expr::Arrow(Rc::new(FuncLit {
             name: None,
             params,
             body,
@@ -1734,7 +1735,7 @@ impl Parser {
                         }
                         _ => None,
                     };
-                    Ok(Expr::Func(Box::new(
+                    Ok(Expr::Func(Rc::new(
                         self.func_lit_g(name, false, is_gen)?,
                     )))
                 }
@@ -1988,7 +1989,7 @@ impl Parser {
                     self.func_lit_g(Some(key.clone()), false, true)?;
                 props.push(Prop {
                     key: PropKey::Ident(key),
-                    value: Expr::Func(Box::new(f)),
+                    value: Expr::Func(Rc::new(f)),
                 });
                 if !self.eat_punct(P::Comma) {
                     self.expect_punct(P::RBrace)?;
@@ -2050,7 +2051,7 @@ impl Parser {
                         let f = self.func_lit(Some(name.clone()), false)?;
                         Prop {
                             key: PropKey::Ident(name),
-                            value: Expr::Func(Box::new(f)),
+                            value: Expr::Func(Rc::new(f)),
                         }
                     } else if self.eat_punct(P::Colon) {
                         Prop {
@@ -2084,7 +2085,7 @@ impl Parser {
                         let f = self.func_lit(Some(s.clone()), false)?;
                         Prop {
                             key: PropKey::Str(s),
-                            value: Expr::Func(Box::new(f)),
+                            value: Expr::Func(Rc::new(f)),
                         }
                     } else {
                         self.expect_punct(P::Colon)?;
@@ -2100,7 +2101,7 @@ impl Parser {
                         let f = self.func_lit(None, false)?;
                         Prop {
                             key: PropKey::Num(n),
-                            value: Expr::Func(Box::new(f)),
+                            value: Expr::Func(Rc::new(f)),
                         }
                     } else {
                         self.expect_punct(P::Colon)?;
@@ -2118,7 +2119,7 @@ impl Parser {
                         let f = self.func_lit(None, false)?;
                         Prop {
                             key: PropKey::Computed(k),
-                            value: Expr::Func(Box::new(f)),
+                            value: Expr::Func(Rc::new(f)),
                         }
                     } else {
                         self.expect_punct(P::Colon)?;
@@ -2176,13 +2177,13 @@ impl Parser {
             if let Some(g) = getter {
                 dprops.push(Prop {
                     key: PropKey::Ident("get".to_string()),
-                    value: Expr::Func(Box::new(g)),
+                    value: Expr::Func(Rc::new(g)),
                 });
             }
             if let Some(s) = setter {
                 dprops.push(Prop {
                     key: PropKey::Ident("set".to_string()),
-                    value: Expr::Func(Box::new(s)),
+                    value: Expr::Func(Rc::new(s)),
                 });
             }
             body.push(Stmt::Expr(Expr::Call {
@@ -2201,7 +2202,7 @@ impl Parser {
         }
         body.push(Stmt::Return(Some(Expr::Ident(tmp))));
         Ok(Expr::Call {
-            callee: Box::new(Expr::Func(Box::new(FuncLit {
+            callee: Box::new(Expr::Func(Rc::new(FuncLit {
                 name: None,
                 params: Vec::new(),
                 body,
@@ -2549,7 +2550,7 @@ impl Parser {
                 (done.clone(), Some(Expr::Bool(false))),
             ],
         });
-        out.push(Stmt::FuncDecl(Box::new(FuncLit {
+        out.push(Stmt::FuncDecl(Rc::new(FuncLit {
             name: Some(step.clone()),
             params: Vec::new(),
             body: vec![Stmt::Switch {
@@ -2638,15 +2639,15 @@ impl Parser {
                 Some(Expr::Object(vec![
                     Prop {
                         key: PropKey::Ident("next".to_string()),
-                        value: Expr::Func(Box::new(next_fn)),
+                        value: Expr::Func(Rc::new(next_fn)),
                     },
                     Prop {
                         key: PropKey::Str("return".to_string()),
-                        value: Expr::Func(Box::new(ret_fn)),
+                        value: Expr::Func(Rc::new(ret_fn)),
                     },
                     Prop {
                         key: PropKey::Str("throw".to_string()),
-                        value: Expr::Func(Box::new(throw_fn)),
+                        value: Expr::Func(Rc::new(throw_fn)),
                     },
                 ])),
             )],
@@ -2659,7 +2660,7 @@ impl Parser {
                 prop: MemberProp::Static("@@iterator".to_string()),
                 optional: false,
             }),
-            Box::new(Expr::Func(Box::new(FuncLit {
+            Box::new(Expr::Func(Rc::new(FuncLit {
                 name: None,
                 params: Vec::new(),
                 body: vec![Stmt::Return(Some(Expr::Ident(it.clone())))],
@@ -2851,7 +2852,7 @@ mod tests {
     fn arrows() {
         assert_eq!(
             expr("x => x + 1"),
-            Expr::Arrow(Box::new(FuncLit {
+            Expr::Arrow(Rc::new(FuncLit {
                 name: None,
                 params: vec!["x".to_string()],
                 body: vec![Stmt::Return(Some(Expr::Binary(

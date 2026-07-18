@@ -15,7 +15,7 @@ use super::value::Value;
 use super::vm::{
     self, call_value, exec, has_pending_work, host, make_native,
     new_plain_object, pump, raw_set_prop, reject_fetch, resolve_fetch, Ids,
-    LoadedModule, Native, St, DOC_NODE, IC_EMPTY,
+    ModStore, Native, St, DOC_NODE,
 };
 
 /// Event-loop budget per settle turn (total microtasks + timers fired).
@@ -481,7 +481,7 @@ use crate::dom;
 
 pub struct PageVm {
     st: St,
-    mods: Vec<LoadedModule>,
+    mods: ModStore,
 }
 
 impl PageVm {
@@ -489,7 +489,7 @@ impl PageVm {
         let has_doc = doc.is_some();
         let mut vm = PageVm {
             st: St::new(doc),
-            mods: Vec::new(),
+            mods: ModStore::new(),
         };
         vm.st.ids = Ids {
             push: vm.name_id("push"),
@@ -934,27 +934,8 @@ impl PageVm {
     }
 
     /// Compile a script and bind it into the shared namespace.
-    fn load(&mut self, mut module: Module) -> u32 {
-        // string constants move into the VM-wide rope arena
-        let str_base = self.st.strs.len() as u32;
-        for s in &module.strings {
-            self.st.strs.push(vm::Str::Flat(s.clone()));
-        }
-        for proto in &mut module.protos {
-            for c in &mut proto.consts {
-                if c.is_string() {
-                    *c = Value::string(str_base + c.index());
-                }
-            }
-        }
-        let global_map =
-            module.atoms.iter().map(|n| self.name_id(n)).collect();
-        let ic_base = self.st.ics.len() as u32;
-        self.st
-            .ics
-            .extend(std::iter::repeat(IC_EMPTY).take(module.n_ics as usize));
-        self.mods.push(LoadedModule { module, global_map, ic_base });
-        (self.mods.len() - 1) as u32
+    fn load(&mut self, module: Module) -> u32 {
+        vm::load_module(&mut self.st, &self.mods, module)
     }
 
     /// Parse + compile + run one script; returns its last expression
@@ -965,9 +946,10 @@ impl PageVm {
         let module =
             compiler::compile(&ast).map_err(|e| format!("{e:?}"))?;
         let mi = self.load(module);
-        let main = self.mods[mi as usize].module.main;
-        let nregs = self.mods[mi as usize].module.protos[main as usize]
-            .nregs as usize;
+        let m = self.mods.rc(mi);
+        let main = m.module.main;
+        let nregs = m.module.protos[main as usize].nregs as usize;
+        drop(m);
         let base = self.st.regs.len();
         self.st.regs.resize(base + nregs, Value::UNDEFINED);
         self.st.fuel = vm::DEFAULT_FUEL; // fresh budget per top-level script
@@ -1996,6 +1978,89 @@ console.log('B typeof it: ' + typeof it);
     }
 
     #[test]
+    #[ignore] // profiling harness, not a correctness test — run with:
+              // cargo test --release -- --ignored profile_phases --nocapture
+    fn profile_phases() {
+        use super::super::{compiler, lexer, parser, vm};
+        use super::super::value::Value;
+        use std::time::Instant;
+        // webpack-shaped synthetic bundle: many module functions, few
+        // ever called (naver: 4 bundles, 1.3MB, most modules cold)
+        let mut src = String::new();
+        src.push_str("var mods = {};\n");
+        for i in 0..1500 {
+            src.push_str(&format!(
+                "mods[{i}] = function (exports) {{\n\
+                   var state = {{n: {i}, list: []}};\n\
+                   function step(k) {{\n\
+                     var acc = 0;\n\
+                     for (var j = 0; j < k; j++) \
+                       {{ acc += j * state.n; }}\n\
+                     return acc;\n\
+                   }}\n\
+                   function push(v) {{ state.list.push(v); \
+                     return state.list.length; }}\n\
+                   var helper = function (a, b) \
+                     {{ return a < b ? a : b; }};\n\
+                   exports.run = function (k) {{\n\
+                     var s = step(k) + helper(k, {i});\n\
+                     push(s);\n\
+                     return s;\n\
+                   }};\n\
+                   exports.tag = 'm{i}';\n\
+                   return exports;\n\
+                 }};\n"));
+        }
+        src.push_str(
+            "var total = 0;\n\
+             for (var i = 0; i < 1500; i += 20) {\n\
+               var e = mods[i]({});\n\
+               total += e.run(50);\n\
+             }\n\
+             total");
+        println!("source:  {} KB", src.len() / 1024);
+        let t0 = Instant::now();
+        let toks = lexer::tokenize(&src).unwrap();
+        println!("lex:     {:>7.2} ms ({} tokens)",
+                 t0.elapsed().as_secs_f64() * 1e3, toks.len());
+        let t1 = Instant::now();
+        let ast = parser::parse_program(&src).unwrap();
+        println!("parse:   {:>7.2} ms (incl. its own lex)",
+                 t1.elapsed().as_secs_f64() * 1e3);
+        let t2 = Instant::now();
+        let module = compiler::compile(&ast).unwrap();
+        println!("compile: {:>7.2} ms ({} protos)",
+                 t2.elapsed().as_secs_f64() * 1e3,
+                 module.protos.len());
+        let mut pvm = PageVm::new(None);
+        let mi = pvm.load(module);
+        let m = pvm.mods.rc(mi);
+        let main = m.module.main;
+        let nregs = m.module.protos[main as usize].nregs as usize;
+        drop(m);
+        let base = pvm.st.regs.len();
+        pvm.st.regs.resize(base + nregs, Value::UNDEFINED);
+        pvm.st.fuel = vm::DEFAULT_FUEL;
+        let t3 = Instant::now();
+        let v = vm::exec(&mut pvm.st, &pvm.mods, mi, main, base,
+                         u32::MAX, Value::UNDEFINED, 0)
+            .unwrap();
+        println!("exec:    {:>7.2} ms (cold: includes lazy compiles)",
+                 t3.elapsed().as_secs_f64() * 1e3);
+        assert!(v.is_number());
+        // warm pass: same script, every called body already compiled —
+        // isolates pure interpreter time from lazy-compile time
+        pvm.st.fuel = vm::DEFAULT_FUEL;
+        let t4 = Instant::now();
+        let v2 = vm::exec(&mut pvm.st, &pvm.mods, mi, main, base,
+                          u32::MAX, Value::UNDEFINED, 0)
+            .unwrap();
+        println!("exec:    {:>7.2} ms (warm)",
+                 t4.elapsed().as_secs_f64() * 1e3);
+        assert!(v2.is_number());
+    }
+
+    #[test]
     fn canvas_2d_stub_context() {
         // drawing calls are swallowed, readbacks return zeros, and
         // unsupported context kinds answer null (feature detection)
@@ -2766,14 +2831,48 @@ console.log('B typeof it: ' + typeof it);
         assert!(eval("const c = 1; c++;").is_err());
         assert!(eval("{ const b = 1; b = 2; }").is_err());
         assert!(eval("for (const v of [1, 2]) v = 9;").is_err());
-        // rejected at compile time even if the function never runs
-        assert!(eval("function f() { const k = 5; k = 6; } 1").is_err());
+        // lazy compilation: a function body is checked at first call,
+        // so a never-called offender no longer fails the whole script
+        // (this matches real JS, where const-assignment is a call-time
+        // error, not an early error)
+        assert_eq!(n("function f() { const k = 5; k = 6; } 1"), 1.0);
+        assert!(
+            eval("function f() { const k = 5; k = 6; } f()").is_err());
         assert!(eval("const c;").is_err(), "const needs an initializer");
         // reading and shadowing a const is fine
         assert_eq!(n("const c = 40; c + 2"), 42.0);
         assert_eq!(n("const c = 1; { const c = 2; } c"), 1.0);
         // only the binding is frozen, not the object it names
         assert_eq!(n("const o = {n: 1}; o.n = 5; o.n"), 5.0);
+    }
+
+    #[test]
+    fn lazy_compilation_semantics() {
+        // a broken cold function must not kill the script...
+        assert_eq!(
+            n("function bad() { const k = 1; k = 2; } 40 + 2"), 42.0);
+        // ...and calling it throws a catchable error instead
+        assert_eq!(
+            n("function bad() { const k = 1; k = 2; } \
+               var r = 0; try { bad(); } catch (e) { r = 1; } r"), 1.0);
+        // captures resolved at deferral time behave identically:
+        // transitive capture through an intermediate function
+        assert_eq!(
+            n("function outer() { var x = 40; \
+               function mid() { function inner() { return x + 2; } \
+                 return inner(); } \
+               return mid(); } outer()"), 42.0);
+        // mutation through a captured cell round-trips
+        assert_eq!(
+            n("function box() { var v = 0; \
+               return { set: function (x) { v = x; }, \
+                        get: function () { return v; } }; } \
+               var b = box(); b.set(21); b.get() * 2"), 42.0);
+        // a lazy fn called twice compiles once and stays correct
+        assert_eq!(
+            n("function fib(n) { \
+               return n < 2 ? n : fib(n - 1) + fib(n - 2); } \
+               fib(10)"), 55.0);
     }
 
     #[test]

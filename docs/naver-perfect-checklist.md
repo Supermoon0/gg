@@ -354,10 +354,20 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
 - [x] **디스크 캐시** — 07-11: `%LOCALAPPDATA%/gg-browser/cache`, 명시적
       max-age 응답만(HTML은 신선 유지). 실측: CSS 195→13ms, JS 7종 545→52ms,
       **전체 재방문 로드 1.19s → 0.18s**
-- [ ] **JS 게으른 컴파일(lazy parse)** — 함수 본문을 첫 호출 때 컴파일.
-      번들의 대부분 함수는 호출되지 않으므로 큰 폭 단축 예상.
-      07-16 실측으로 시급성 상승: JS 실행이 웜 로드의 **93%(1,003ms)**.
-      gg-js 구조 공사지만 V8도 쓰는 정공법.
+- [x] **JS 게으른 컴파일(lazy compile)** — 07-18: 함수 리터럴의 본문
+      코드젠을 첫 호출까지 미룸. 지연 시점에 free_vars로 자유변수를
+      선해석해(중간 함수 업밸류 스레딩·스필 객체 라우팅 포함) 캡처가
+      실물인 스텁 proto를 만들고, VM 호출 경로(ensure_compiled)가 첫
+      호출에 본문을 별도 모듈로 컴파일·로드한 뒤 클로저 레코드를
+      패치(재호출은 다이렉트). 중첩 함수는 재귀 지연 = 호출 안 되는
+      함수는 스텁조차 안 생김. ModStore(RefCell+Rc)로 실행 중 모듈
+      추가. 합성 웹팩형 605KB 실측(release): **컴파일 55→14ms(-74%),
+      protos 7,501→1,501개**, 웜 실행 저하 없음(0.5ms). 부수 효과:
+      콜드 함수의 본문 오류가 스크립트 전체를 못 죽이고 호출 시
+      catch 가능한 SyntaxError가 됨 — 실제 JS 시맨틱에 더 가까움.
+      잔여: lazy *parse*(본문 토큰 스킵)는 미착수 — 프런트엔드 잔여
+      병목은 이제 파싱(37ms/52ms). 네이버 웜 로드 1,003ms 재실측은
+      로컬에서 (이 세션은 egress 제한).
 - [ ] **스크롤 60fps** — 07-16 실측: 재직렬화 13ms + 래스터 26ms = 25fps.
       ① 스크롤은 재직렬화 없이 래스터 단에서 오프셋 처리(=13ms 제거),
       ② 더티 타일/디스플레이 리스트 캐시(M4와 합류)로 60fps 사정권
@@ -440,12 +450,13 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
 7. M5 입력/호버 — "쓸 수 있는 브라우저". 제너레이터·ES 모듈은 필요 사이트가
    나타날 때. M6 잔여(JIT·레이아웃 이식·GC)는 B단계 도달 후 측정해서 결정.
 
-*갱신: 2026-07-18 (canvas 2D 스텁·Object.defineProperties/
+*갱신: 2026-07-18 (오전: canvas 2D 스텁·Object.defineProperties/
 getOwnPropertyNames 추가, M3 스텁류 실태 반영 — Observer/matchMedia/
 postMessage/scrollTo/getComputedStyle/XHR은 코드에 이미 있었는데 문서만
-미갱신이었음. + tkinter 폴백 폰트에 .size 부재 버그 수정 — line-height가
-NativeFont에만 있던 속성을 읽어 폴백 경로에서 크래시).
-항목을 완료하면 [x]로 바꾸고 날짜를 적을 것. cargo 148/148, smoke 108종
+미갱신이었음. + tkinter 폴백 폰트에 .size 부재 버그 수정.
+오후: **M6 lazy 컴파일 가동** — 지연 배분 실측용 프로파일 하니스
+`cargo test --release -- --ignored profile_phases --nocapture` 상설화).
+항목을 완료하면 [x]로 바꾸고 날짜를 적을 것. cargo 149/149, smoke 108종
 (엔진 파트; 실네트워크 관문은 egress 제한 환경에서 측정 불가) 기준.
 검증 체인: cargo test → maturin build → pip 재설치 → smoke_test.py →
 basket_test.py (네이버 단건은 scratchpad diag 스크립트).*

@@ -78,6 +78,95 @@ pub(super) struct LoadedModule {
     pub(super) ic_base: u32,
 }
 
+/// The VM's module table. Interior-mutable because lazy compilation
+/// loads new modules mid-execution, while active frames hold Rc's to
+/// the modules they're running (a Vec re-allocation can't move them).
+pub(super) struct ModStore {
+    mods: RefCell<Vec<Rc<LoadedModule>>>,
+    /// lazy stub (module, proto) -> its compiled (module, main)
+    redirects: RefCell<HashMap<(u32, u32), (u32, u32)>>,
+}
+
+impl ModStore {
+    pub(super) fn new() -> ModStore {
+        ModStore {
+            mods: RefCell::new(Vec::new()),
+            redirects: RefCell::new(HashMap::new()),
+        }
+    }
+
+    pub(super) fn rc(&self, mi: u32) -> Rc<LoadedModule> {
+        self.mods.borrow()[mi as usize].clone()
+    }
+
+    pub(super) fn push(&self, m: LoadedModule) -> u32 {
+        let mut v = self.mods.borrow_mut();
+        v.push(Rc::new(m));
+        (v.len() - 1) as u32
+    }
+}
+
+/// Move a compiled module into the VM: string constants into the
+/// VM-wide rope arena, atoms mapped to name ids, IC slots allocated.
+pub(super) fn load_module(
+    st: &mut St,
+    mods: &ModStore,
+    mut module: Module,
+) -> u32 {
+    let str_base = st.strs.len() as u32;
+    for s in &module.strings {
+        st.strs.push(Str::Flat(s.clone()));
+    }
+    for proto in &mut module.protos {
+        for c in &mut proto.consts {
+            if c.is_string() {
+                *c = Value::string(str_base + c.index());
+            }
+        }
+    }
+    let global_map =
+        module.atoms.iter().map(|n| st.intern_name(n)).collect();
+    let ic_base = st.ics.len() as u32;
+    st.ics
+        .extend(std::iter::repeat(IC_EMPTY).take(module.n_ics as usize));
+    mods.push(LoadedModule { module, global_map, ic_base })
+}
+
+/// First call of a lazy stub: compile the deferred body, load it as a
+/// fresh module, and redirect (cm, cp) to it. The fast path — proto is
+/// not lazy — is one Rc clone and a field check. Compile errors
+/// surface as a catchable SyntaxError at the call, not at page load
+/// (so one broken cold function no longer kills the whole script).
+fn ensure_compiled(
+    st: &mut St,
+    mods: &ModStore,
+    cm: u32,
+    cp: u32,
+) -> Result<(u32, u32), VmError> {
+    {
+        let m = mods.rc(cm);
+        if m.module.protos[cp as usize].lazy.is_none() {
+            return Ok((cm, cp));
+        }
+    }
+    if let Some(&t) = mods.redirects.borrow().get(&(cm, cp)) {
+        return Ok(t);
+    }
+    let m = mods.rc(cm);
+    let lazy = m.module.protos[cp as usize].lazy.as_deref().unwrap();
+    let module = super::compiler::compile_lazy(lazy).map_err(|e| {
+        VmError {
+            msg: e.msg,
+            value: None,
+            kind: "SyntaxError",
+        }
+    })?;
+    let nmi = load_module(st, mods, module);
+    let main = mods.rc(nmi).module.main;
+    mods.redirects.borrow_mut().insert((cm, cp), (nmi, main));
+    Ok((nmi, main))
+}
+
 struct Frame {
     module: u32,
     proto: u32,
@@ -852,7 +941,7 @@ fn new_response(st: &mut St, status: u16, url: &str, body: String) -> Value {
 
 /// Drain the microtask queue to empty, running each reaction/callback.
 /// Callback errors reject the derived promise (never escape the pump).
-fn drain_microtasks(st: &mut St, mods: &[LoadedModule], budget: &mut usize) {
+fn drain_microtasks(st: &mut St, mods: &ModStore, budget: &mut usize) {
     while let Some(job) = st.microtasks.pop_front() {
         if *budget == 0 {
             return;
@@ -907,7 +996,7 @@ fn next_due_timer(st: &St) -> Option<usize> {
 /// service; they move to `awaiting` until resolve_fetch settles them.
 pub(super) fn pump(
     st: &mut St,
-    mods: &[LoadedModule],
+    mods: &ModStore,
     budget_max: usize,
 ) -> Vec<(u32, String)> {
     let mut budget = budget_max;
@@ -955,7 +1044,7 @@ pub(super) fn pump(
 /// pace, not spin to its budget.)
 pub(super) fn pump_bounded(
     st: &mut St,
-    mods: &[LoadedModule],
+    mods: &ModStore,
     budget_max: usize,
     dt_ms: f64,
 ) -> Vec<(u32, String)> {
@@ -1232,7 +1321,7 @@ fn has_own_property(
 /// itself in the error so the next gap is visible.
 fn method_ref_dispatch(
     st: &mut St,
-    mods: &[LoadedModule],
+    mods: &ModStore,
     recv: Value,
     key: u32,
     args: &[Value],
@@ -1888,7 +1977,7 @@ fn style_attr_set(style: &str, prop: &str, value: &str) -> String {
 /// instead of hanging).
 fn materialize_iterable(
     st: &mut St,
-    mods: &[LoadedModule],
+    mods: &ModStore,
     ov: Value,
 ) -> Result<Value, VmError> {
     if !ov.is_object() {
@@ -2185,7 +2274,7 @@ fn concat(st: &mut St, x: Value, y: Value) -> Value {
 
 fn do_native(
     st: &mut St,
-    mods: &[LoadedModule],
+    mods: &ModStore,
     n: Native,
     args_base: usize,
     argc: u8,
@@ -3689,7 +3778,7 @@ fn need_doc(st: &St) -> Result<Rc<RefCell<dom::Document>>, VmError> {
 /// DOM method dispatch (`document.x(...)` and element methods).
 fn dom_method(
     st: &mut St,
-    mods: &[LoadedModule],
+    mods: &ModStore,
     key: u32,
     node: u32,
     args_base: usize,
@@ -4350,7 +4439,7 @@ fn dom_set_prop(
 /// event handlers). Runs a nested `exec` to completion.
 pub(super) fn call_value(
     st: &mut St,
-    mods: &[LoadedModule],
+    mods: &ModStore,
     fv: Value,
     args: &[Value],
 ) -> Result<Value, VmError> {
@@ -4362,7 +4451,7 @@ pub(super) fn call_value(
 /// (they keep their captured lexical this).
 pub(super) fn call_value_this(
     st: &mut St,
-    mods: &[LoadedModule],
+    mods: &ModStore,
     fv: Value,
     this_explicit: Option<Value>,
     args: &[Value],
@@ -4541,7 +4630,14 @@ pub(super) fn call_value_this(
             let this0 = this_capture
                 .or(this_explicit)
                 .unwrap_or(Value::UNDEFINED);
-            let callee = &mods[m as usize].module.protos[p as usize];
+            let (m, p) = ensure_compiled(st, mods, m, p)?;
+            if let ClosureRec::User { module, proto, .. } =
+                &mut st.closures[idx as usize]
+            {
+                (*module, *proto) = (m, p);
+            }
+            let callee_rc = mods.rc(m);
+            let callee = &callee_rc.module.protos[p as usize];
             let top = st.regs.len();
             let new_base = top + 1;
             let keep = if callee.uses_arguments {
@@ -4570,13 +4666,13 @@ pub(super) fn call_value_this(
 /// Fallible merge sort (the comparator is JS and may throw).
 fn merge_sort(
     st: &mut St,
-    mods: &[LoadedModule],
+    mods: &ModStore,
     v: &mut Vec<Value>,
     cmp: Option<Value>,
 ) -> Result<(), VmError> {
     fn less(
         st: &mut St,
-        mods: &[LoadedModule],
+        mods: &ModStore,
         cmp: Option<Value>,
         a: Value,
         b: Value,
@@ -4623,7 +4719,7 @@ fn merge_sort(
 /// Run one activation (function invocation) to completion.
 pub(super) fn exec(
     st: &mut St,
-    mods: &[LoadedModule],
+    mods: &ModStore,
     mi0: u32,
     pi0: u32,
     base0: usize,
@@ -4723,7 +4819,7 @@ fn throw_msg(st: &mut St, v: Value) -> String {
 #[allow(clippy::too_many_arguments)]
 fn exec_loop(
     st: &mut St,
-    mods: &[LoadedModule],
+    mods: &ModStore,
     mi0: u32,
     pi0: u32,
     ip0: usize,
@@ -4740,8 +4836,7 @@ fn exec_loop(
     let mut cur_cl = cl0;
     let mut this_v = this0;
     let mut cur_argc = argc0;
-    let mut code: &[Instr] =
-        &mods[mi as usize].module.protos[pi as usize].code;
+    let mut cmod: Rc<LoadedModule> = mods.rc(mi);
 
     macro_rules! reg {
         ($i:expr) => {
@@ -4752,13 +4847,13 @@ fn exec_loop(
     /// module atom -> VM-wide name id
     macro_rules! name {
         ($atom:expr) => {
-            mods[mi as usize].global_map[$atom as usize]
+            cmod.global_map[$atom as usize]
         };
     }
 
     macro_rules! ic {
         ($ic:expr) => {
-            (mods[mi as usize].ic_base + $ic as u32) as usize
+            (cmod.ic_base + $ic as u32) as usize
         };
     }
 
@@ -4803,11 +4898,11 @@ fn exec_loop(
             return err("script exceeded its instruction budget");
         }
         st.fuel -= 1;
-        let instr = code[ip];
+        let instr = cmod.module.protos[pi as usize].code[ip];
         ip += 1;
         match instr {
             Instr::LoadConst { dst, idx } => {
-                reg!(dst) = mods[mi as usize].module.protos[pi as usize]
+                reg!(dst) = cmod.module.protos[pi as usize]
                     .consts[idx as usize];
             }
             Instr::LoadInt { dst, val } => reg!(dst) = Value::int(val),
@@ -5120,8 +5215,16 @@ fn exec_loop(
                         reg!(func) = r;
                     }
                     Ok((cm, cp, this_cap)) => {
-                        let callee = &mods[cm as usize].module.protos
-                            [cp as usize];
+                        let (cm, cp) =
+                            ensure_compiled(st, mods, cm, cp)?;
+                        if let ClosureRec::User { module, proto, .. } =
+                            &mut st.closures[cl_idx as usize]
+                        {
+                            (*module, *proto) = (cm, cp);
+                        }
+                        let callee_rc = mods.rc(cm);
+                        let callee =
+                            &callee_rc.module.protos[cp as usize];
                         let new_base = base + func as usize + 1;
                         let need = new_base + callee.nregs as usize;
                         if st.regs.len() < need {
@@ -5153,8 +5256,7 @@ fn exec_loop(
                         // arrows keep their lexical this; plain calls get
                         // undefined (no receiver)
                         this_v = this_cap.unwrap_or(Value::UNDEFINED);
-                        code = &mods[mi as usize].module.protos[pi as usize]
-                            .code;
+                        cmod = mods.rc(mi);
                     }
                 }
             }
@@ -5199,8 +5301,16 @@ fn exec_loop(
                         reg!(func) = r;
                     }
                     Ok((cm, cp, this_cap)) => {
-                        let callee = &mods[cm as usize].module.protos
-                            [cp as usize];
+                        let (cm, cp) =
+                            ensure_compiled(st, mods, cm, cp)?;
+                        if let ClosureRec::User { module, proto, .. } =
+                            &mut st.closures[cl_idx as usize]
+                        {
+                            (*module, *proto) = (cm, cp);
+                        }
+                        let callee_rc = mods.rc(cm);
+                        let callee =
+                            &callee_rc.module.protos[cp as usize];
                         let new_base = base + func as usize + 1;
                         let need = new_base + callee.nregs as usize;
                         if st.regs.len() < need {
@@ -5232,8 +5342,7 @@ fn exec_loop(
                         // arrows keep their lexical this; everything
                         // else gets the receiver the callee was read off
                         this_v = this_cap.unwrap_or(receiver);
-                        code = &mods[mi as usize].module.protos[pi as usize]
-                            .code;
+                        cmod = mods.rc(mi);
                     }
                 }
             }
@@ -5900,7 +6009,17 @@ fn exec_loop(
                                 reg!(obj) = r;
                             }
                             Ok((cm, cp, this_cap)) => {
-                                let callee = &mods[cm as usize]
+                                let (cm, cp) = ensure_compiled(
+                                    st, mods, cm, cp,
+                                )?;
+                                if let ClosureRec::User {
+                                    module, proto, ..
+                                } = &mut st.closures[cl_idx as usize]
+                                {
+                                    (*module, *proto) = (cm, cp);
+                                }
+                                let callee_rc = mods.rc(cm);
+                                let callee = &callee_rc
                                     .module
                                     .protos[cp as usize];
                                 let new_base = base + obj as usize + 1;
@@ -5938,9 +6057,7 @@ fn exec_loop(
                                 cur_argc = argc;
                                 // arrow method keeps its lexical this
                                 this_v = this_cap.unwrap_or(ov);
-                                code = &mods[mi as usize].module.protos
-                                    [pi as usize]
-                                    .code;
+                                cmod = mods.rc(mi);
                             }
                         }
                     }
@@ -6247,7 +6364,7 @@ fn exec_loop(
                 base = fr.base;
                 cur_cl = fr.closure;
                 this_v = fr.this_val;
-                code = &mods[mi as usize].module.protos[pi as usize].code;
+                cmod = mods.rc(mi);
             }
             Instr::ReturnUndef => {
                 if st.frames.len() == floor {
@@ -6267,11 +6384,11 @@ fn exec_loop(
                 base = fr.base;
                 cur_cl = fr.closure;
                 this_v = fr.this_val;
-                code = &mods[mi as usize].module.protos[pi as usize].code;
+                cmod = mods.rc(mi);
             }
             Instr::Closure { dst, proto: p } => {
                 let src_proto =
-                    &mods[mi as usize].module.protos[p as usize];
+                    &cmod.module.protos[p as usize];
                 let mut upvals =
                     Vec::with_capacity(src_proto.captures.len());
                 for cap in &src_proto.captures {
@@ -6354,7 +6471,7 @@ fn exec_loop(
                 reg!(executor) = pval;
             }
             Instr::NewRegex { dst, pat, flags } => {
-                let proto = &mods[mi as usize].module.protos[pi as usize];
+                let proto = &cmod.module.protos[pi as usize];
                 let pv = proto.consts[pat as usize];
                 let fv = proto.consts[flags as usize];
                 let pattern = str_ref(st, pv.index()).to_string();
