@@ -261,6 +261,13 @@ pub(super) enum Native {
     ArrayCtor,
     /// what FunctionCtor's product does when called: yield `window`
     ReturnGlobal,
+    /// document.implementation.createHTMLDocument: yields the document
+    /// (single-document model — created nodes stay detached anyway)
+    ReturnDoc,
+    /// an extracted DOM method (`document.addEventListener` read as a
+    /// property — jQuery 1.x feature-detects this way): calling it
+    /// routes back into dom_method with the captured node
+    DomMethod { node: u32, key: u32 },
     String,
     Number,
     Boolean,
@@ -496,6 +503,9 @@ pub(super) struct St {
     /// (closure index, name id) -> static properties on functions
     /// (Object.keys, Array.isArray, F.displayName = ...)
     pub(super) fn_props: HashMap<(u32, u32), Value>,
+    /// (dom node, name id) -> expando properties scripts hang on
+    /// nodes (jQuery's `elem[expando] = id` data-cache key)
+    pub(super) dom_expando: HashMap<(u32, u32), Value>,
     /// (object index, name id) -> (getter, setter) accessor pair
     /// (Object.defineProperty with get/set; UNDEFINED = absent side)
     pub(super) accessors: HashMap<(u32, u32), (Value, Value)>,
@@ -597,6 +607,7 @@ impl St {
             known: KnownCtors::default(),
             fn_protos: HashMap::new(),
             fn_props: HashMap::new(),
+            dom_expando: HashMap::new(),
             accessors: HashMap::new(),
             local_storage: HashMap::new(),
             session_storage: HashMap::new(),
@@ -765,7 +776,29 @@ fn new_regex(
         proto: Value::UNDEFINED,
         has_accessors: false,
     });
-    Ok(Value::object((st.objects.len() - 1) as u32))
+    let rv = Value::object((st.objects.len() - 1) as u32);
+    // real instance properties (jQuery reads .source to rebuild
+    // regexes: m.expr.match.bool.source.match(/\w+/g))
+    let oi = rv.index() as usize;
+    let sk = st.intern_name("source");
+    let sv = push_str(st, pattern.to_string());
+    raw_set_prop(st, oi, sk, sv);
+    let fk = st.intern_name("flags");
+    let fv = push_str(st, flags.to_string());
+    raw_set_prop(st, oi, fk, fv);
+    for (nm, on) in [
+        ("global", flags.contains('g')),
+        ("ignoreCase", flags.contains('i')),
+        ("multiline", flags.contains('m')),
+        ("sticky", flags.contains('y')),
+        ("unicode", flags.contains('u')),
+    ] {
+        let k = st.intern_name(nm);
+        raw_set_prop(st, oi, k, Value::boolean(on));
+    }
+    let lk = st.intern_name("lastIndex");
+    raw_set_prop(st, oi, lk, Value::int(0));
+    Ok(rv)
 }
 
 // ===================== async runtime (P3) =====================
@@ -1205,7 +1238,9 @@ fn num_of(v: Value) -> Result<f64, VmError> {
 /// ToNumber with string coercion (needs the string arena). Used by the
 /// unary `+`, arithmetic, relational compares, and sort — so "3" * 2,
 /// +"42", and "10" < "9" behave like real JS instead of throwing.
-fn to_number(st: &mut St, v: Value) -> Result<f64, VmError> {
+/// Objects go through ToPrimitive (valueOf/toString), which can call
+/// back into JS — hence the mods parameter.
+fn to_number(st: &mut St, mods: &ModStore, v: Value) -> Result<f64, VmError> {
     if v.is_string() {
         let s = str_ref(st, v.index()).trim().to_string();
         return Ok(if s.is_empty() {
@@ -1214,7 +1249,53 @@ fn to_number(st: &mut St, v: Value) -> Result<f64, VmError> {
             s.parse::<f64>().unwrap_or(f64::NAN)
         });
     }
+    if v.is_object() {
+        let p = to_primitive(st, mods, v, true)?;
+        return to_number(st, mods, p);
+    }
     num_of(v)
+}
+
+/// ToPrimitive for objects: valueOf/toString tried in hint order as real
+/// calls, so user classes (the prelude Date, wrapped values in bundles)
+/// convert with their own methods. A conversion attempt that fails or
+/// returns another object falls through to the next; when nothing
+/// produces a primitive we fall back to the display string instead of
+/// throwing (plain objects coerce like "[object Object]").
+pub(super) fn to_primitive(
+    st: &mut St,
+    mods: &ModStore,
+    v: Value,
+    number_hint: bool,
+) -> Result<Value, VmError> {
+    if !v.is_object() {
+        return Ok(v);
+    }
+    let order = if number_hint {
+        ["valueOf", "toString"]
+    } else {
+        ["toString", "valueOf"]
+    };
+    for name in order {
+        let key = st.intern_name(name);
+        let m = match lookup_prop(st, v.index() as usize, key) {
+            PropHit::Data(f) => f,
+            PropHit::Getter(g) => {
+                call_value_this(st, mods, g, Some(v), &[])?
+            }
+            PropHit::Missing => continue,
+        };
+        if !m.is_function() {
+            continue;
+        }
+        if let Ok(r) = call_value_this(st, mods, m, Some(v), &[]) {
+            if !r.is_object() {
+                return Ok(r);
+            }
+        }
+    }
+    let s = to_display(st, v);
+    Ok(push_str(st, s))
 }
 
 #[inline]
@@ -1259,16 +1340,35 @@ fn strict_eq(st: &mut St, x: Value, y: Value) -> bool {
     x == y
 }
 
-#[inline]
-fn loose_eq(st: &mut St, x: Value, y: Value) -> Result<bool, VmError> {
+fn loose_eq(
+    st: &mut St,
+    mods: &ModStore,
+    x: Value,
+    y: Value,
+) -> Result<bool, VmError> {
     if x.is_nullish() || y.is_nullish() {
         return Ok(x.is_nullish() && y.is_nullish());
     }
     if x.is_string() && y.is_string() {
         return Ok(strict_eq(st, x, y));
     }
+    // reference == reference is identity; object == primitive converts
+    // the object side (ToPrimitive) and compares again
+    let xr = x.is_object() || x.is_function() || x.is_dom_node();
+    let yr = y.is_object() || y.is_function() || y.is_dom_node();
+    if xr && yr {
+        return Ok(x == y);
+    }
+    if x.is_object() {
+        let xp = to_primitive(st, mods, x, true)?;
+        return loose_eq(st, mods, xp, y);
+    }
+    if y.is_object() {
+        let yp = to_primitive(st, mods, y, true)?;
+        return loose_eq(st, mods, x, yp);
+    }
     // mixed types compare by ToNumber (string -> number), like real ==
-    Ok(to_number(st, x)? == to_number(st, y)?)
+    Ok(to_number(st, mods, x)? == to_number(st, mods, y)?)
 }
 
 fn js_num_str(n: f64) -> String {
@@ -1285,9 +1385,17 @@ fn js_num_str(n: f64) -> String {
 /// chains); array element indices and `length` count as present.
 fn has_own_property(
     st: &mut St,
+    mods: &ModStore,
     obj: Value,
     key: Value,
 ) -> Result<bool, VmError> {
+    // ToPropertyKey: object keys (polyfilled Symbol wrappers) go
+    // through their toString, keeping tags distinct
+    let key = if key.is_object() {
+        to_primitive(st, mods, key, false)?
+    } else {
+        key
+    };
     if obj.is_function() {
         // `'name' in fn` — statics, prototype, and callables
         let name = to_display(st, key);
@@ -1298,6 +1406,23 @@ fn has_own_property(
         }
         let key_id = st.intern_name(&name);
         return Ok(fn_static_lookup(st, obj.index(), key_id).is_some());
+    }
+    if obj.is_dom_node() {
+        // feature detection ('ontouchstart' in document.documentElement)
+        let name = to_display(st, key);
+        let key_id = st.intern_name(&name);
+        let v = dom_get_prop(st, key_id, obj.index())?;
+        return Ok(!v.is_undefined());
+    }
+    if obj.is_object() && st.style_nodes.contains_key(&obj.index()) {
+        // jQuery probes CSS support with `prop in div.style`; the
+        // proxy accepts any property name, so membership is broad
+        let name = to_display(st, key);
+        return Ok(name
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic())
+            .unwrap_or(false));
     }
     if !obj.is_object() {
         return type_err("'in' right-hand side is not an object");
@@ -1412,6 +1537,107 @@ fn method_ref_dispatch(
                     .pop()
                     .unwrap_or(Value::UNDEFINED));
             }
+            "shift" => {
+                let oi = recv.index() as usize;
+                return Ok(if st.objects[oi].elems.is_empty() {
+                    Value::UNDEFINED
+                } else {
+                    st.objects[oi].elems.remove(0)
+                });
+            }
+            "unshift" => {
+                let oi = recv.index() as usize;
+                for &a in args.iter().rev() {
+                    st.objects[oi].elems.insert(0, a);
+                }
+                return Ok(Value::int(st.objects[oi].elems.len() as i32));
+            }
+            "reverse" => {
+                st.objects[recv.index() as usize].elems.reverse();
+                return Ok(recv);
+            }
+            "sort" => {
+                let cmp = args.first().copied().filter(|v| v.is_function());
+                let mut v = elems;
+                merge_sort(st, mods, &mut v, cmp)?;
+                st.objects[recv.index() as usize].elems = v;
+                return Ok(recv);
+            }
+            "splice" => {
+                let s = idx(0, 0.0);
+                let dc = if args.len() > 1 {
+                    match args.get(1).filter(|v| v.is_number()) {
+                        Some(v) => (v.to_number_raw().max(0.0) as usize)
+                            .min(elems.len() - s),
+                        None => 0,
+                    }
+                } else {
+                    elems.len() - s
+                };
+                let inserted: Vec<Value> =
+                    args.iter().skip(2).copied().collect();
+                let oi = recv.index() as usize;
+                let removed: Vec<Value> = st.objects[oi]
+                    .elems
+                    .splice(s..s + dc, inserted)
+                    .collect();
+                return Ok(new_array(st, removed));
+            }
+            "lastIndexOf" => {
+                let needle =
+                    args.first().copied().unwrap_or(Value::UNDEFINED);
+                let found = elems
+                    .iter()
+                    .rposition(|&e| strict_eq(st, e, needle))
+                    .map(|p| p as i32)
+                    .unwrap_or(-1);
+                return Ok(Value::int(found));
+            }
+            "some" | "every" => {
+                let want_all = name == "every";
+                let cb = args
+                    .first()
+                    .copied()
+                    .unwrap_or(Value::UNDEFINED);
+                for (i, &e) in elems.iter().enumerate() {
+                    let r = call_value(
+                        st, mods, cb,
+                        &[e, Value::int(i as i32), recv],
+                    )?;
+                    let t = truthy(st, r);
+                    if t != want_all {
+                        return Ok(Value::boolean(t));
+                    }
+                }
+                return Ok(Value::boolean(want_all));
+            }
+            "reduce" => {
+                let cb = args
+                    .first()
+                    .copied()
+                    .unwrap_or(Value::UNDEFINED);
+                let mut it = elems.iter().copied().enumerate();
+                let mut acc = if args.len() > 1 {
+                    args[1]
+                } else {
+                    match it.next() {
+                        Some((_, v)) => v,
+                        None => {
+                            return type_err(
+                                "Reduce of empty array with no \
+                                 initial value",
+                            )
+                        }
+                    }
+                };
+                for (i, e) in it {
+                    acc = call_value(
+                        st, mods, cb,
+                        &[acc, e, Value::int(i as i32), recv],
+                    )?;
+                }
+                return Ok(acc);
+            }
             "values" | "keys" | "entries" => {
                 let arr = match name.as_str() {
                     "keys" => {
@@ -1474,6 +1700,29 @@ fn method_ref_dispatch(
                     "extracted array builtin .{name}() not yet"
                 ))
             }
+        }
+    }
+    // array-like objects (jQuery instances: {0:.., 1:.., length:n}) —
+    // a numeric length property routes Array.prototype methods to the
+    // real array machinery before the display-string path below can
+    // swallow them. Map/Set instances keep their own dispatch.
+    if recv.is_object()
+        && !st.map_data.contains_key(&recv.index())
+        && !st.set_data.contains_key(&recv.index())
+        && matches!(
+            name.as_str(),
+            "push" | "pop" | "slice" | "indexOf" | "lastIndexOf"
+                | "join" | "concat" | "shift" | "unshift" | "splice"
+                | "sort" | "reverse" | "forEach" | "map" | "filter"
+                | "some" | "every" | "reduce"
+        )
+    {
+        let lenk = st.intern_name("length");
+        let has_len = raw_get_prop(st, recv.index() as usize, lenk)
+            .map(|v| v.is_number())
+            .unwrap_or(false);
+        if has_len {
+            return array_like_dispatch(st, mods, recv, &name, args);
         }
     }
     let s = to_display(st, recv);
@@ -1668,7 +1917,7 @@ fn method_ref_dispatch(
         "propertyIsEnumerable" => {
             let k = args.first().copied().unwrap_or(Value::UNDEFINED);
             Ok(Value::boolean(
-                recv.is_object() && has_own_property(st, recv, k)?,
+                recv.is_object() && has_own_property(st, mods, recv, k)?,
             ))
         }
         "isPrototypeOf" => {
@@ -1691,7 +1940,7 @@ fn method_ref_dispatch(
         "hasOwnProperty" => {
             let k = args.first().copied().unwrap_or(Value::UNDEFINED);
             Ok(Value::boolean(
-                recv.is_object() && has_own_property(st, recv, k)?,
+                recv.is_object() && has_own_property(st, mods, recv, k)?,
             ))
         }
         // array-iterator protocol (see make_array_iter)
@@ -1873,6 +2122,46 @@ fn method_ref_dispatch(
     }
 }
 
+/// Run an Array.prototype method against an array-like object: build a
+/// scratch array from (elems, length), delegate to the array dispatch,
+/// then write mutations and the new length back.
+fn array_like_dispatch(
+    st: &mut St,
+    mods: &ModStore,
+    recv: Value,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    let oi = recv.index() as usize;
+    let lenk = st.intern_name("length");
+    let stored = st.objects[oi].elems.clone();
+    let len = match raw_get_prop(st, oi, lenk) {
+        Some(v) if v.is_number() => {
+            (v.to_number_raw().max(0.0) as usize).min(1 << 20)
+        }
+        _ => stored.len(),
+    };
+    let view: Vec<Value> = (0..len)
+        .map(|i| stored.get(i).copied().unwrap_or(Value::UNDEFINED))
+        .collect();
+    let tmp = new_array(st, view);
+    let key = st.intern_name(name);
+    let r = method_ref_dispatch(st, mods, tmp, key, args)?;
+    if matches!(
+        name,
+        "push" | "pop" | "shift" | "unshift" | "splice" | "sort"
+            | "reverse"
+    ) {
+        let out = st.objects[tmp.index() as usize].elems.clone();
+        let n = out.len();
+        st.objects[oi].elems = out;
+        raw_set_prop(st, oi, lenk, Value::int(n as i32));
+    }
+    // methods that answer the receiver must answer the array-like,
+    // not the scratch array (jQuery chains off .sort()/.reverse())
+    Ok(if r == tmp { recv } else { r })
+}
+
 /// A property set on the window object (the global namespace's other
 /// half): `window.X = v` must be readable as bare `X`.
 fn window_prop(st: &St, key: u32) -> Option<Value> {
@@ -1928,6 +2217,69 @@ fn fn_static_lookup(st: &St, fidx: u32, key: u32) -> Option<Value> {
 }
 
 /// camelCase -> kebab-case (fontSize -> font-size)
+/// Resolve a possibly-relative URL against a base (page location).
+fn resolve_url(raw: &str, base: &str) -> String {
+    if raw.contains("://") || raw.is_empty() && base.is_empty() {
+        return raw.to_string();
+    }
+    let (bscheme, brest) =
+        base.split_once("://").unwrap_or(("https", "localhost/"));
+    let (bhost, bpath) = match brest.find('/') {
+        Some(i) => (&brest[..i], &brest[i..]),
+        None => (brest, "/"),
+    };
+    if let Some(r) = raw.strip_prefix("//") {
+        return format!("{bscheme}://{r}");
+    }
+    if raw.starts_with('/') {
+        return format!("{bscheme}://{bhost}{raw}");
+    }
+    if raw.starts_with('#') || raw.starts_with('?') || raw.is_empty() {
+        let bp = bpath.split(['#', '?']).next().unwrap_or("/");
+        return format!("{bscheme}://{bhost}{bp}{raw}");
+    }
+    let dir = &bpath[..bpath.rfind('/').map(|i| i + 1).unwrap_or(1)];
+    format!("{bscheme}://{bhost}{dir}{raw}")
+}
+
+/// One decomposed piece of an absolute URL (anchor-element getters).
+fn url_part(url: &str, part: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("https", url));
+    let (hostport, pathq) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (pathq, hash) = match pathq.find('#') {
+        Some(i) => (&pathq[..i], &pathq[i..]),
+        None => (pathq, ""),
+    };
+    let (path, search) = match pathq.find('?') {
+        Some(i) => (&pathq[..i], &pathq[i..]),
+        None => (pathq, ""),
+    };
+    let (hostname, port) = match hostport.rsplit_once(':') {
+        Some((h, p))
+            if !p.is_empty()
+                && p.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            (h, p)
+        }
+        _ => (hostport, ""),
+    };
+    match part {
+        "href" => url.to_string(),
+        "protocol" => format!("{scheme}:"),
+        "host" => hostport.to_string(),
+        "hostname" => hostname.to_string(),
+        "port" => port.to_string(),
+        "pathname" => path.to_string(),
+        "search" => search.to_string(),
+        "hash" => hash.to_string(),
+        "origin" => format!("{scheme}://{hostport}"),
+        _ => String::new(),
+    }
+}
+
 fn camel_to_kebab(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
     for c in s.chars() {
@@ -2118,12 +2470,12 @@ fn js_to_uint32(n: f64) -> u32 {
     m as u32
 }
 
-fn to_i32(st: &mut St, v: Value) -> Result<i32, VmError> {
-    Ok(js_to_uint32(to_number(st, v)?) as i32)
+fn to_i32(st: &mut St, mods: &ModStore, v: Value) -> Result<i32, VmError> {
+    Ok(js_to_uint32(to_number(st, mods, v)?) as i32)
 }
 
-fn to_u32(st: &mut St, v: Value) -> Result<u32, VmError> {
-    Ok(js_to_uint32(to_number(st, v)?))
+fn to_u32(st: &mut St, mods: &ModStore, v: Value) -> Result<u32, VmError> {
+    Ok(js_to_uint32(to_number(st, mods, v)?))
 }
 
 /// `delete obj[key]` — removes an own property by moving the object
@@ -2634,6 +2986,10 @@ fn do_native(
             }
         }
         Native::ReturnGlobal => Ok(st.known.window),
+        Native::ReturnDoc => Ok(Value::dom_node(DOC_NODE)),
+        Native::DomMethod { node, key } => {
+            dom_method(st, mods, key, node, args_base, argc)
+        }
         Native::Alert => {
             let msg = if argc > 0 {
                 to_display(st, st.regs[args_base])
@@ -2749,7 +3105,7 @@ fn do_native(
             }
             let cb = st.regs[args_base];
             let delay = if argc > 1 {
-                to_number(st, st.regs[args_base + 1])?.max(0.0)
+                to_number(st, mods, st.regs[args_base + 1])?.max(0.0)
             } else {
                 0.0
             };
@@ -2918,7 +3274,7 @@ fn do_native(
         }
         Native::ClearTimeout => {
             if argc > 0 {
-                let id = to_number(st, st.regs[args_base])? as u32;
+                let id = to_number(st, mods, st.regs[args_base])? as u32;
                 st.timers.retain(|t| t.id != id);
             }
             Ok(Value::UNDEFINED)
@@ -2958,7 +3314,7 @@ fn do_native(
             promise_settle(st, pid, v, true);
             Ok(pval)
         }
-        Native::HostFn(id) => host_fn(st, id, args_base, argc),
+        Native::HostFn(id) => host_fn(st, mods, id, args_base, argc),
         Native::Resolve { pid, reject } => {
             let v = if argc > 0 { st.regs[args_base] } else { Value::UNDEFINED };
             promise_settle(st, pid, v, reject);
@@ -3022,6 +3378,12 @@ fn define_one_prop(
         st.accessors.insert((oi as u32, key), (g, s));
         st.objects[oi].has_accessors = true;
     } else if let Some(v) = raw_get_prop(st, di, val_id) {
+        // defineProperty(window, ...) must reach bare-name reads too
+        // (core-js defineGlobalProperty installs polyfills this way)
+        if obj == st.known.window {
+            st.globals[key as usize] = v;
+            st.gdef[key as usize] = true;
+        }
         raw_set_prop(st, oi, key, v);
     }
     Ok(())
@@ -3029,6 +3391,7 @@ fn define_one_prop(
 
 fn host_fn(
     st: &mut St,
+    mods: &ModStore,
     id: u16,
     args_base: usize,
     argc: u8,
@@ -3046,7 +3409,7 @@ fn host_fn(
     macro_rules! m1 {
         ($f:expr) => {{
             let a = argv!(0);
-            let x = to_number(st, a)?;
+            let x = to_number(st, mods, a)?;
             Ok(Value::number($f(x)))
         }};
     }
@@ -3069,21 +3432,21 @@ fn host_fn(
         M_ATAN => m1!(f64::atan),
         M_POW => {
             let (a0, a1) = (argv!(0), argv!(1));
-            let a = to_number(st, a0)?;
-            let b = to_number(st, a1)?;
+            let a = to_number(st, mods, a0)?;
+            let b = to_number(st, mods, a1)?;
             Ok(Value::number(a.powf(b)))
         }
         M_ATAN2 => {
             let (a0, a1) = (argv!(0), argv!(1));
-            let a = to_number(st, a0)?;
-            let b = to_number(st, a1)?;
+            let a = to_number(st, mods, a0)?;
+            let b = to_number(st, mods, a1)?;
             Ok(Value::number(a.atan2(b)))
         }
         M_HYPOT => {
             let mut sum = 0.0;
             for k in 0..n {
                 let vk = argv!(k);
-                let v = to_number(st, vk)?;
+                let v = to_number(st, mods, vk)?;
                 sum += v * v;
             }
             Ok(Value::number(sum.sqrt()))
@@ -3092,7 +3455,7 @@ fn host_fn(
             let mut acc = if id == M_MIN { f64::INFINITY } else { f64::NEG_INFINITY };
             for k in 0..n {
                 let vk = argv!(k);
-                let v = to_number(st, vk)?;
+                let v = to_number(st, mods, vk)?;
                 if v.is_nan() {
                     acc = f64::NAN;
                     break;
@@ -3472,7 +3835,7 @@ fn host_fn(
             let mut s = String::new();
             for k in 0..n {
                 let ck = argv!(k);
-                let code = to_number(st, ck)? as u32;
+                let code = to_number(st, mods, ck)? as u32;
                 if let Some(c) = char::from_u32(code) {
                     s.push(c);
                 }
@@ -3807,6 +4170,89 @@ fn dom_method(
         }
         return Ok(Value::UNDEFINED);
     }
+    // IE-legacy pair: attachEvent("onload", fn) — the "on" prefix maps
+    // onto the modern listener table so old jQuery paths survive
+    {
+        let nm = st.names[key as usize].as_str();
+        if nm == "attachEvent" || nm == "detachEvent" {
+            let add = nm == "attachEvent";
+            let raw = arg_string(st, args_base, argc, 0)?.to_lowercase();
+            let ty = raw.strip_prefix("on").unwrap_or(&raw).to_string();
+            let handler = if argc >= 2 {
+                st.regs[args_base + 1]
+            } else {
+                Value::UNDEFINED
+            };
+            if add {
+                if handler.is_function() {
+                    st.listeners
+                        .entry((node, ty))
+                        .or_default()
+                        .push(handler);
+                }
+            } else if let Some(v) = st.listeners.get_mut(&(node, ty)) {
+                v.retain(|&h| h != handler);
+            }
+            return Ok(Value::UNDEFINED);
+        }
+    }
+    // primitive conversion (core-js ordinaryToPrimitive calls these)
+    {
+        let nm = st.names[key as usize].as_str();
+        if nm == "toString" {
+            let s = if node == DOC_NODE {
+                "[object HTMLDocument]".to_string()
+            } else if doc.borrow().nodes[node as usize].is_element() {
+                "[object HTMLElement]".to_string()
+            } else {
+                "[object Text]".to_string()
+            };
+            return Ok(push_str(st, s));
+        }
+        if nm == "valueOf" {
+            return Ok(Value::dom_node(node));
+        }
+    }
+    // shared by document and elements: descendant collection by tag
+    // or class (jQuery fast paths)
+    {
+        let by_tag = st.names[key as usize] == "getElementsByTagName";
+        if by_tag || st.names[key as usize] == "getElementsByClassName"
+        {
+            let needle = arg_string(st, args_base, argc, 0)?;
+            let tag = needle.to_ascii_lowercase();
+            let d = doc.borrow();
+            let start = if node == DOC_NODE {
+                d.root
+            } else {
+                node as usize
+            };
+            let mut out = Vec::new();
+            let mut stack: Vec<usize> =
+                d.nodes[start].children.iter().rev().copied().collect();
+            while let Some(i) = stack.pop() {
+                let hit = if by_tag {
+                    (tag == "*" && d.nodes[i].is_element())
+                        || d.nodes[i].tag.as_deref() == Some(tag.as_str())
+                } else {
+                    d.nodes[i]
+                        .attr("class")
+                        .map(|c| {
+                            c.split_whitespace().any(|w| w == needle)
+                        })
+                        .unwrap_or(false)
+                };
+                if hit {
+                    out.push(Value::dom_node(i as u32));
+                }
+                for &c in d.nodes[i].children.iter().rev() {
+                    stack.push(c);
+                }
+            }
+            drop(d);
+            return Ok(new_array(st, out));
+        }
+    }
     if node == DOC_NODE {
         if key == ids.get_element_by_id {
             let id = arg_string(st, args_base, argc, 0)?;
@@ -3863,25 +4309,40 @@ fn dom_method(
                 found.iter().map(|&i| Value::dom_node(i as u32)).collect();
             return Ok(new_array(st, elems));
         }
-        if key == ids.get_elements_by_tag_name {
-            let tag = arg_string(st, args_base, argc, 0)?
-                .to_ascii_lowercase();
-            let d = doc.borrow();
-            let mut out = Vec::new();
-            let mut stack = vec![d.root];
-            while let Some(i) = stack.pop() {
-                if d.nodes[i].tag.as_deref() == Some(tag.as_str()) {
-                    out.push(Value::dom_node(i as u32));
-                }
-                for &c in d.nodes[i].children.iter().rev() {
-                    stack.push(c);
-                }
-            }
-            drop(d);
-            return Ok(new_array(st, out));
-        }
     } else {
         let node_us = node as usize;
+        if key == ids.query_selector || key == ids.query_selector_all {
+            // element-scoped: document-wide query filtered to this
+            // subtree (jQuery's context.querySelectorAll path)
+            let sel = arg_string(st, args_base, argc, 0)?;
+            let first = key == ids.query_selector;
+            let d = doc.borrow();
+            let scoped: Vec<usize> = query(&d, &sel, false)
+                .into_iter()
+                .filter(|&i| {
+                    let mut n = i;
+                    loop {
+                        match d.nodes[n].parent {
+                            Some(p) if p == node_us => break true,
+                            Some(p) => n = p,
+                            None => break false,
+                        }
+                    }
+                })
+                .collect();
+            drop(d);
+            if first {
+                return Ok(match scoped.first() {
+                    Some(&i) => Value::dom_node(i as u32),
+                    None => Value::NULL,
+                });
+            }
+            let elems = scoped
+                .iter()
+                .map(|&i| Value::dom_node(i as u32))
+                .collect();
+            return Ok(new_array(st, elems));
+        }
         if key == ids.append_child {
             if argc == 0 {
                 return err("appendChild needs a DOM node");
@@ -4216,6 +4677,10 @@ fn dom_method(
 }
 
 fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
+    // expandos (own properties scripts stored) win over everything
+    if let Some(&v) = st.dom_expando.get(&(node, key)) {
+        return Ok(v);
+    }
     let ids = st.ids;
     let doc = need_doc(st)?;
     if node == DOC_NODE {
@@ -4246,6 +4711,35 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
         if st.names[key as usize] == "readyState" {
             let rs = st.ready_state;
             return Ok(push_str(st, rs.to_string()));
+        }
+        match st.names[key as usize].as_str() {
+            "documentElement" | "head" => {
+                let tag = if st.names[key as usize] == "head" {
+                    "head"
+                } else {
+                    "html"
+                };
+                return Ok(match find_tag(&doc.borrow(), tag) {
+                    Some(i) => Value::dom_node(i as u32),
+                    None => Value::NULL,
+                });
+            }
+            "implementation" => {
+                // jQuery's parseHTML support probe; created nodes are
+                // detached until appended, so the real document serves
+                let obj = new_plain_object(st);
+                let k = st.intern_name("createHTMLDocument");
+                let f = make_native(st, Native::ReturnDoc);
+                raw_set_prop(st, obj.index() as usize, k, f);
+                return Ok(obj);
+            }
+            "ownerDocument" => return Ok(Value::NULL),
+            "defaultView" | "parentWindow" => return Ok(st.known.window),
+            "nodeType" => return Ok(Value::int(9)),
+            _ => {}
+        }
+        if is_dom_method_name(st.names[key as usize].as_str()) {
+            return Ok(make_native(st, Native::DomMethod { node, key }));
         }
         return Ok(Value::UNDEFINED);
     }
@@ -4296,6 +4790,9 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
                 None => Value::NULL,
             });
         }
+        "ownerDocument" => {
+            return Ok(Value::dom_node(DOC_NODE));
+        }
         "tagName" | "nodeName" => {
             let tag = doc.borrow().nodes[node_us]
                 .tag
@@ -4304,16 +4801,128 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
                 .to_uppercase();
             return Ok(push_str(st, tag));
         }
-        "firstChild" => {
-            return Ok(match doc
-                .borrow()
-                .nodes[node_us]
-                .children
-                .first()
-            {
+        "firstChild" | "lastChild" => {
+            let first = st.names[key as usize] == "firstChild";
+            let d = doc.borrow();
+            let kids = &d.nodes[node_us].children;
+            let pick = if first { kids.first() } else { kids.last() };
+            return Ok(match pick {
                 Some(&c) => Value::dom_node(c as u32),
                 None => Value::NULL,
             });
+        }
+        "nextSibling" | "previousSibling"
+        | "nextElementSibling" | "previousElementSibling" => {
+            let nm = st.names[key as usize].clone();
+            let fwd = nm.starts_with("next");
+            let el_only = nm.ends_with("ElementSibling");
+            let d = doc.borrow();
+            let sib = d.nodes[node_us].parent.and_then(|p| {
+                let kids = &d.nodes[p].children;
+                let at = kids.iter().position(|&c| c == node_us)?;
+                let mut i = at;
+                loop {
+                    i = if fwd {
+                        if i + 1 >= kids.len() {
+                            return None;
+                        }
+                        i + 1
+                    } else {
+                        if i == 0 {
+                            return None;
+                        }
+                        i - 1
+                    };
+                    let c = kids[i];
+                    if !el_only || d.nodes[c].is_element() {
+                        return Some(c);
+                    }
+                }
+            });
+            return Ok(match sib {
+                Some(c) => Value::dom_node(c as u32),
+                None => Value::NULL,
+            });
+        }
+        "defaultValue" => {
+            // the initial value attribute (jQuery's clone support test)
+            let out = doc.borrow().nodes[node_us]
+                .attr("value")
+                .unwrap_or("")
+                .to_string();
+            return Ok(push_str(st, out));
+        }
+        "href" | "protocol" | "host" | "hostname" | "port"
+        | "pathname" | "search" | "hash" | "origin"
+            if doc.borrow().nodes[node_us].attr("href").is_some()
+                || matches!(
+                    doc.borrow().nodes[node_us].tag.as_deref(),
+                    Some("a") | Some("area")
+                ) =>
+        {
+            // anchor URL decomposition (jQuery parses URLs by
+            // reading a.pathname off a created <a>)
+            let raw = doc.borrow().nodes[node_us]
+                .attr("href")
+                .unwrap_or("")
+                .to_string();
+            let base = {
+                let lockey = st.intern_name("location");
+                let loc = st.globals[lockey as usize];
+                if loc.is_object() {
+                    let hk = st.intern_name("href");
+                    raw_get_prop(st, loc.index() as usize, hk)
+                        .filter(|v| v.is_string())
+                        .map(|v| str_ref(st, v.index()).to_string())
+                } else {
+                    None
+                }
+            }
+            .unwrap_or_default();
+            let abs = resolve_url(&raw, &base);
+            let part =
+                url_part(&abs, st.names[key as usize].as_str());
+            return Ok(push_str(st, part));
+        }
+        "src" | "value" | "type" | "title" | "alt" | "name" | "rel"
+        | "target" | "placeholder" | "content" | "lang" | "dir"
+        | "role" | "href" => {
+            // attribute-mirror getters (the setter side already
+            // routes these to attributes)
+            let nm = st.names[key as usize].clone();
+            let out = doc.borrow().nodes[node_us]
+                .attr(&nm)
+                .unwrap_or("")
+                .to_string();
+            return Ok(push_str(st, out));
+        }
+        "attributes" => {
+            // NamedNodeMap snapshot: named + indexed access, each
+            // entry an Attr-ish record (jQuery probes .expando)
+            let attrs = doc.borrow().nodes[node_us].attrs.clone();
+            let obj = new_plain_object(st);
+            let oi = obj.index() as usize;
+            let lenk = st.intern_name("length");
+            raw_set_prop(st, oi, lenk,
+                         Value::int(attrs.len() as i32));
+            for (an, av) in &attrs {
+                let item = new_plain_object(st);
+                let ii = item.index() as usize;
+                let nk = st.intern_name("name");
+                let nv = push_str(st, an.clone());
+                raw_set_prop(st, ii, nk, nv);
+                let vk = st.intern_name("value");
+                let vv = push_str(st, av.clone());
+                raw_set_prop(st, ii, vk, vv);
+                let ek = st.intern_name("expando");
+                raw_set_prop(st, ii, ek, Value::boolean(false));
+                let sk = st.intern_name("specified");
+                raw_set_prop(st, ii, sk, Value::boolean(true));
+                let kk = st.intern_name(an);
+                raw_set_prop(st, oi, kk, item);
+                st.objects[oi].elems.push(item);
+            }
+            return Ok(obj);
         }
         "children" => {
             let kids: Vec<Value> = {
@@ -4341,7 +4950,70 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
         }
         _ => {}
     }
+    if is_dom_method_name(st.names[key as usize].as_str())
+        && !is_doc_only_method(st.names[key as usize].as_str())
+    {
+        return Ok(make_native(st, Native::DomMethod { node, key }));
+    }
     Ok(Value::UNDEFINED)
+}
+
+/// Factory methods only the document owns. Elements must NOT advertise
+/// these: jQuery 1.x sniffs `fragment.createElement` truthiness to
+/// detect IE8 and takes shim paths when it sees a function.
+fn is_doc_only_method(name: &str) -> bool {
+    matches!(
+        name,
+        "createElement"
+            | "createTextNode"
+            | "createComment"
+            | "createDocumentFragment"
+            | "getElementById"
+    )
+}
+
+/// Names dom_method can dispatch. dom_get_prop resolves these to
+/// extractable natives, so feature detection (`if (document
+/// .addEventListener)`) and uncurrying see real functions instead of
+/// undefined. attachEvent/detachEvent stay out: old jQuery must pick
+/// the modern branch of its either/or probe.
+fn is_dom_method_name(name: &str) -> bool {
+    matches!(
+        name,
+        "addEventListener"
+            | "removeEventListener"
+            | "dispatchEvent"
+            | "getElementById"
+            | "createElement"
+            | "createTextNode"
+            | "createComment"
+            | "createDocumentFragment"
+            | "querySelector"
+            | "querySelectorAll"
+            | "getElementsByTagName"
+            | "getElementsByClassName"
+            | "getAttribute"
+            | "setAttribute"
+            | "setAttributeNS"
+            | "removeAttribute"
+            | "appendChild"
+            | "insertBefore"
+            | "removeChild"
+            | "replaceChild"
+            | "cloneNode"
+            | "contains"
+            | "closest"
+            | "focus"
+            | "blur"
+            | "scrollIntoView"
+            | "scrollTo"
+            | "scrollBy"
+            | "getBoundingClientRect"
+            | "getClientRects"
+            | "getContext"
+            | "toString"
+            | "valueOf"
+    )
 }
 
 fn dom_set_prop(
@@ -4390,7 +5062,8 @@ fn dom_set_prop(
             }
             return Ok(());
         }
-        return err("cannot set that property on document (yet)");
+        st.dom_expando.insert((node, key), v);
+        return Ok(());
     }
     let node_us = node as usize;
     if key == ids.text_content {
@@ -4452,7 +5125,12 @@ fn dom_set_prop(
         | "contentEditable" | "async" | "defer" | "crossOrigin"
         | "charset" | "referrerPolicy" | "integrity"
         | "loading" | "decoding" => Ok(()),
-        _ => err(format!("cannot set DOM property .{name} (yet)")),
+        _ => {
+            // real DOM nodes accept arbitrary expandos (jQuery's
+            // data cache hangs its id key on the element)
+            st.dom_expando.insert((node, key), v);
+            Ok(())
+        }
     }
 }
 
@@ -4889,7 +5567,7 @@ fn exec_loop(
                     ),
                 }
             } else {
-                Value::number(to_number(st, x)? $op to_number(st, y)?)
+                Value::number(to_number(st, mods, x)? $op to_number(st, mods, y)?)
             };
         }};
     }
@@ -4905,7 +5583,7 @@ fn exec_loop(
                 let b = str_ref(st, y.index());
                 a.as_str() $op b
             } else {
-                to_number(st, x)? $op to_number(st, y)?
+                to_number(st, mods, x)? $op to_number(st, mods, y)?
             };
             reg!($dst) = Value::boolean(r);
         }};
@@ -4994,7 +5672,15 @@ fn exec_loop(
                 st.gdef[key] = true;
             }
             Instr::Add { dst, a, b } => {
-                let (x, y) = (reg!(a), reg!(b));
+                let (mut x, mut y) = (reg!(a), reg!(b));
+                // `+` sees primitives: objects convert first (valueOf/
+                // toString), then the string-vs-number split below
+                if x.is_object() {
+                    x = to_primitive(st, mods, x, true)?;
+                }
+                if y.is_object() {
+                    y = to_primitive(st, mods, y, true)?;
+                }
                 reg!(dst) = if x.is_int() && y.is_int() {
                     match x.as_i32().checked_add(y.as_i32()) {
                         Some(v) => Value::int(v),
@@ -5005,14 +5691,14 @@ fn exec_loop(
                 } else if x.is_string() || y.is_string() {
                     concat(st, x, y)
                 } else {
-                    Value::number(to_number(st, x)? + to_number(st, y)?)
+                    Value::number(to_number(st, mods, x)? + to_number(st, mods, y)?)
                 };
             }
             Instr::Sub { dst, a, b } => arith!(dst, a, b, checked_sub, -),
             Instr::Mul { dst, a, b } => arith!(dst, a, b, checked_mul, *),
             Instr::Div { dst, a, b } => {
                 let (x, y) = (reg!(a), reg!(b));
-                reg!(dst) = Value::number(to_number(st, x)? / to_number(st, y)?);
+                reg!(dst) = Value::number(to_number(st, mods, x)? / to_number(st, mods, y)?);
             }
             Instr::Mod { dst, a, b } => {
                 let (x, y) = (reg!(a), reg!(b));
@@ -5022,13 +5708,13 @@ fn exec_loop(
                         None => Value::number(f64::NAN),
                     }
                 } else {
-                    Value::number(to_number(st, x)? % to_number(st, y)?)
+                    Value::number(to_number(st, mods, x)? % to_number(st, mods, y)?)
                 };
             }
             Instr::Pow { dst, a, b } => {
                 let (x, y) = (reg!(a), reg!(b));
                 reg!(dst) =
-                    Value::number(to_number(st, x)?.powf(to_number(st, y)?));
+                    Value::number(to_number(st, mods, x)?.powf(to_number(st, mods, y)?));
             }
             Instr::Neg { dst, src } => {
                 let v = reg!(src);
@@ -5038,12 +5724,12 @@ fn exec_loop(
                         _ => Value::number(-(v.as_i32() as f64)),
                     }
                 } else {
-                    Value::number(-to_number(st, v)?)
+                    Value::number(-to_number(st, mods, v)?)
                 };
             }
             Instr::ToNum { dst, src } => {
                 let v = reg!(src);
-                reg!(dst) = Value::number(to_number(st, v)?);
+                reg!(dst) = Value::number(to_number(st, mods, v)?);
             }
             Instr::Not { dst, src } => {
                 reg!(dst) = Value::boolean(!truthy(st, reg!(src)));
@@ -5064,47 +5750,47 @@ fn exec_loop(
             }
             Instr::LooseEq { dst, a, b } => {
                 let (x, y) = (reg!(a), reg!(b));
-                let r = loose_eq(st, x, y)?;
+                let r = loose_eq(st, mods, x, y)?;
                 reg!(dst) = Value::boolean(r);
             }
             Instr::LooseNotEq { dst, a, b } => {
                 let (x, y) = (reg!(a), reg!(b));
-                let r = loose_eq(st, x, y)?;
+                let r = loose_eq(st, mods, x, y)?;
                 reg!(dst) = Value::boolean(!r);
             }
             Instr::Shl { dst, a, b } => {
                 let (x, y) = (reg!(a), reg!(b));
-                let (xi, s) = (to_i32(st, x)?, to_u32(st, y)? & 31);
+                let (xi, s) = (to_i32(st, mods, x)?, to_u32(st, mods, y)? & 31);
                 reg!(dst) = Value::int(xi.wrapping_shl(s));
             }
             Instr::Shr { dst, a, b } => {
                 let (x, y) = (reg!(a), reg!(b));
-                let (xi, s) = (to_i32(st, x)?, to_u32(st, y)? & 31);
+                let (xi, s) = (to_i32(st, mods, x)?, to_u32(st, mods, y)? & 31);
                 reg!(dst) = Value::int(xi.wrapping_shr(s));
             }
             Instr::UShr { dst, a, b } => {
                 let (x, y) = (reg!(a), reg!(b));
-                let (xu, s) = (to_u32(st, x)?, to_u32(st, y)? & 31);
+                let (xu, s) = (to_u32(st, mods, x)?, to_u32(st, mods, y)? & 31);
                 reg!(dst) = Value::number((xu >> s) as f64);
             }
             Instr::BitAnd { dst, a, b } => {
                 let (x, y) = (reg!(a), reg!(b));
-                let r = to_i32(st, x)? & to_i32(st, y)?;
+                let r = to_i32(st, mods, x)? & to_i32(st, mods, y)?;
                 reg!(dst) = Value::int(r);
             }
             Instr::BitOr { dst, a, b } => {
                 let (x, y) = (reg!(a), reg!(b));
-                let r = to_i32(st, x)? | to_i32(st, y)?;
+                let r = to_i32(st, mods, x)? | to_i32(st, mods, y)?;
                 reg!(dst) = Value::int(r);
             }
             Instr::BitXor { dst, a, b } => {
                 let (x, y) = (reg!(a), reg!(b));
-                let r = to_i32(st, x)? ^ to_i32(st, y)?;
+                let r = to_i32(st, mods, x)? ^ to_i32(st, mods, y)?;
                 reg!(dst) = Value::int(r);
             }
             Instr::BitNot { dst, src } => {
                 let v = reg!(src);
-                reg!(dst) = Value::int(!to_i32(st, v)?);
+                reg!(dst) = Value::int(!to_i32(st, mods, v)?);
             }
             Instr::Arguments { dst } => {
                 let vals: Vec<Value> = (0..cur_argc as usize)
@@ -5143,7 +5829,7 @@ fn exec_loop(
             }
             Instr::In { dst, a, b } => {
                 let (key, obj) = (reg!(a), reg!(b));
-                let r = has_own_property(st, obj, key)?;
+                let r = has_own_property(st, mods, obj, key)?;
                 reg!(dst) = Value::boolean(r);
             }
             Instr::InstanceOf { dst, a, b } => {
@@ -5966,6 +6652,8 @@ fn exec_loop(
                                 "hasOwnProperty"
                                     | "propertyIsEnumerable"
                                     | "isPrototypeOf"
+                                    | "valueOf"
+                                    | "toString"
                             ) {
                                 let args: Vec<Value> = (0..argc as usize)
                                     .map(|k| {
@@ -6623,6 +7311,37 @@ fn exec_loop(
                         {
                             st.globals[key_id as usize]
                         }
+                        // Object.prototype staples — core-js getMethod
+                        // reads V["valueOf"] as a computed access, so
+                        // GetIndex must mirror GetProp's fallback or
+                        // ordinaryToPrimitive finds nothing callable
+                        None if matches!(
+                            text.as_str(),
+                            "hasOwnProperty" | "toString" | "valueOf"
+                                | "propertyIsEnumerable"
+                                | "isPrototypeOf"
+                        ) =>
+                        {
+                            make_native(st, Native::MethodRef(key_id))
+                        }
+                        None if st.objects[oi].regex != REGEX_NONE
+                            && matches!(text.as_str(), "exec" | "test") =>
+                        {
+                            make_native(st, Native::MethodRef(key_id))
+                        }
+                        None if st.objects[oi].is_array
+                            && matches!(
+                                text.as_str(),
+                                "slice" | "concat" | "join" | "indexOf"
+                                    | "push" | "pop" | "map" | "filter"
+                                    | "forEach" | "sort" | "splice"
+                                    | "shift" | "unshift" | "reverse"
+                                    | "some" | "every" | "reduce"
+                                    | "lastIndexOf"
+                            ) =>
+                        {
+                            make_native(st, Native::MethodRef(key_id))
+                        }
                         None => Value::UNDEFINED,
                     };
                 } else if ov.is_function() {
@@ -6637,7 +7356,7 @@ fn exec_loop(
                         v
                     } else if matches!(
                         text.as_str(),
-                        "call" | "apply" | "bind"
+                        "call" | "apply" | "bind" | "toString" | "valueOf"
                     ) {
                         make_native(st, Native::MethodRef(key_id))
                     } else {
@@ -6645,8 +7364,12 @@ fn exec_loop(
                     };
                 } else if ov.is_object() {
                     // odd key type (null/undefined/bool/object): JS
-                    // stringifies the key
-                    let text = to_display(st, kv);
+                    // ToPropertyKey = ToPrimitive(string) then
+                    // stringify — object keys with custom toString
+                    // (polyfilled Symbol wrappers) must keep their
+                    // distinct tags, not collapse to [object Object]
+                    let kvp = to_primitive(st, mods, kv, false)?;
+                    let text = to_display(st, kvp);
                     let oi = ov.index() as usize;
                     let key_id = st.intern_name(&text);
                     reg!(dst) = raw_get_prop(st, oi, key_id)
@@ -6727,6 +7450,10 @@ fn exec_loop(
                         }
                     }
                     let key_id = st.intern_name(&text);
+                    if ov == st.known.window {
+                        st.globals[key_id as usize] = v;
+                        st.gdef[key_id as usize] = true;
+                    }
                     raw_set_prop(st, oi, key_id, v);
                 } else if ov.is_function() {
                     let text = to_display(st, kv);
@@ -6736,9 +7463,15 @@ fn exec_loop(
                     } else {
                         st.fn_props.insert((ov.index(), key_id), v);
                     }
-                } else if ov.is_object() {
-                    // odd key type: JS stringifies it
+                } else if ov.is_dom_node() {
+                    // el[expando] = v — same surface as SetProp
                     let text = to_display(st, kv);
+                    let key_id = st.intern_name(&text);
+                    dom_set_prop(st, key_id, ov.index(), v)?;
+                } else if ov.is_object() {
+                    // odd key type: ToPropertyKey (see GetIndex twin)
+                    let kvp = to_primitive(st, mods, kv, false)?;
+                    let text = to_display(st, kvp);
                     let key_id = st.intern_name(&text);
                     raw_set_prop(st, ov.index() as usize, key_id, v);
                 } else if ov.is_nullish() {
@@ -6747,11 +7480,9 @@ fn exec_loop(
                         "cannot set [{text}] of {}",
                         if ov.is_null() { "null" } else { "undefined" },
                     ));
-                } else {
-                    return err(format!(
-                        "unsupported indexing {ov:?}[{kv:?}] (yet)"
-                    ));
                 }
+                // sloppy mode: computed writes to other primitives
+                // are silently dropped
             }
             Instr::GetProp { dst, obj, atom, ic } => {
                 let ov = reg!(obj);
@@ -6840,6 +7571,21 @@ fn exec_loop(
                                     "slice" | "concat" | "join"
                                         | "indexOf" | "push" | "pop"
                                         | "map" | "filter" | "forEach"
+                                        | "sort" | "splice" | "shift"
+                                        | "unshift" | "reverse" | "some"
+                                        | "every" | "reduce"
+                                        | "lastIndexOf"
+                                ) =>
+                        {
+                            make_native(st, Native::MethodRef(key))
+                        }
+                        // regex literals expose extractable exec/test
+                        // (core-js: uncurryThis(/^0x/i.exec))
+                        PropHit::Missing
+                            if st.objects[oi].regex != REGEX_NONE
+                                && matches!(
+                                    st.names[key as usize].as_str(),
+                                    "exec" | "test"
                                 ) =>
                         {
                             make_native(st, Native::MethodRef(key))
@@ -6879,7 +7625,8 @@ fn exec_loop(
                         v
                     } else if matches!(
                         st.names[key as usize].as_str(),
-                        "call" | "apply" | "bind"
+                        "call" | "apply" | "bind" | "toString"
+                            | "valueOf"
                     ) {
                         make_native(st, Native::MethodRef(key))
                     } else {
@@ -6973,13 +7720,22 @@ fn exec_loop(
                     continue;
                 }
                 if !ov.is_object() {
-                    return err(format!(
-                        "cannot set .{} on {ov:?} (yet)",
-                        st.names[key as usize]
-                    ));
+                    // sloppy mode: writes to primitive receivers are
+                    // silently dropped ("str".x = 1 — jQuery trigger
+                    // stamps .isTrigger on whatever it was passed)
+                    continue;
                 }
                 let oi = ov.index() as usize;
                 let v = reg!(src);
+                // window doubles as the global namespace — a write
+                // must be visible to bare-name reads too, or polyfills
+                // that replace `window.Symbol` leave the old global
+                // behind (split-brain Symbol broke core-js isSymbol)
+                if ov == st.known.window {
+                    let k = key as usize;
+                    st.globals[k] = v;
+                    st.gdef[k] = true;
+                }
                 let slot_ic = ic!(ic);
                 let e = st.ics[slot_ic];
                 if e.shape == st.objects[oi].shape {

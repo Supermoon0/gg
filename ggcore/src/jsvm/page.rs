@@ -554,6 +554,17 @@ impl PageVm {
                 _ => {}
             }
         }
+        // String statics ride the fn_props table like Object.keys does
+        // (the ctor itself stays a callable coercion function)
+        for (m, id) in [
+            ("fromCharCode", host::S_FROMCHARCODE),
+            ("fromCodePoint", host::S_FROMCHARCODE),
+        ] {
+            let key = vm.name_id(m);
+            let mv = make_native(&mut vm.st, Native::HostFn(id));
+            let sidx = vm.st.known.string.index();
+            vm.st.fn_props.insert((sidx, key), mv);
+        }
         // async runtime (P3): timers, microtasks, fetch, Promise
         for (name, n) in [
             ("setTimeout", Native::SetTimeout),
@@ -663,7 +674,9 @@ impl PageVm {
         let aproto = vm::fn_prototype(&mut vm.st, array_ctor);
         for m in ["values", "keys", "entries", "slice", "concat",
                   "join", "indexOf", "push", "pop", "forEach", "map",
-                  "filter", "@@iterator"] {
+                  "filter", "@@iterator", "sort", "splice", "shift",
+                  "unshift", "reverse", "some", "every", "reduce",
+                  "lastIndexOf", "toString"] {
             let k = vm.name_id(m);
             let f = make_native(&mut vm.st, Native::MethodRef(k));
             raw_set_prop(&mut vm.st, aproto.index() as usize, k, f);
@@ -1271,6 +1284,171 @@ mod tests {
         assert_eq!(
             n("var s = 0; loop: for (var i = 0; i < 5; i++) { \
                if (i === 3) break; s += i; } s"), 3.0);
+    }
+
+    #[test]
+    fn to_primitive_object_coercion() {
+        // valueOf drives arithmetic
+        assert_eq!(
+            n("var o = { valueOf: function() { return 7; } }; o * 3"),
+            21.0);
+        assert_eq!(
+            n("var o = { valueOf: function() { return 5; } }; o + 1"),
+            6.0);
+        // toString drives concat when valueOf yields no primitive
+        assert_eq!(
+            n("var o = { toString: function() { return '4'; } }; \
+               +(o + '2')"),
+            42.0);
+        // == converts the object side; object == object is identity
+        assert_eq!(
+            n("var o = { valueOf: function() { return 3; } }; \
+               (o == 3 ? 1 : 0) + ({} == {} ? 10 : 0) + \
+               (function(a) { return a == a ? 100 : 0; })({})"),
+            101.0);
+        // prototype methods convert instances too
+        assert_eq!(
+            n("function C() {} C.prototype.valueOf = \
+               function() { return 9; }; new C() - 4"),
+            5.0);
+        // plain objects and arrays fall back to display strings
+        assert_eq!(n("+[] + [3] * 2"), 6.0);
+        assert_eq!(n("('' + {}).length"), 15.0);
+        // computed access finds the staples too (core-js getMethod
+        // does V["valueOf"] — GetIndex, not GetProp)
+        assert_eq!(
+            n("var o = { a: 1 }; var f = o['valueOf']; \
+               (typeof f === 'function' ? 1 : 0) + \
+               (o['toString']().length > 0 ? 10 : 0) + \
+               ([]['sort'] ? 100 : 0)"),
+            111.0);
+    }
+
+    #[test]
+    fn function_to_string_and_dom_siblings() {
+        // String(fn) — bundle feature-sniffing must not throw
+        assert_eq!(
+            n("function f() {} (('' + f).length > 0 ? 1 : 0) + \
+               (typeof f.toString === 'function' ? 10 : 0) + \
+               (typeof f['valueOf'] === 'function' ? 100 : 0)"),
+            111.0);
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse(
+                "<html><body><div id=a>t1<p id=b>x</p>t2\
+                 <p id=c>y</p></div></body></html>",
+            ),
+        ))));
+        let logs = vm.run_scripts(&["\
+            var a = document.getElementById('a');\n\
+            var b = document.getElementById('b');\n\
+            console.log('last ' + (a.lastChild === a.firstChild ? 0 : 1));\n\
+            console.log('nes ' + b.nextElementSibling.id);\n\
+            console.log('pes ' + \
+                (b.previousElementSibling === null ? 'null' : 'el'));\n\
+            console.log('ns ' + b.nextSibling.nodeType);\n"
+            .to_string()]);
+        assert!(logs.contains(&"last 1".to_string()), "{logs:?}");
+        assert!(logs.contains(&"nes c".to_string()), "{logs:?}");
+        assert!(logs.contains(&"pes null".to_string()), "{logs:?}");
+        assert!(logs.contains(&"ns 3".to_string()), "{logs:?}");
+    }
+
+    #[test]
+    fn anchor_url_decomposition() {
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<html><body></body></html>"),
+        ))));
+        vm.set_page_url("https://www.naver.com/dir/page?q=1#top");
+        let logs = vm.run_scripts(&["\
+            var a = document.createElement('a');\n\
+            a.setAttribute('href', '/search?x=2#frag');\n\
+            console.log('pn ' + a.pathname);\n\
+            console.log('hn ' + a.hostname);\n\
+            console.log('pr ' + a.protocol);\n\
+            console.log('se ' + a.search);\n\
+            console.log('ha ' + a.hash);\n\
+            var b = document.createElement('a');\n\
+            b.setAttribute('href', 'rel.html');\n\
+            console.log('rel ' + b.pathname);\n\
+            var s = document.createElement('div').style;\n\
+            console.log('in ' + ('position' in s) + ('9' in s));\n"
+            .to_string()]);
+        assert!(logs.contains(&"pn /search".to_string()), "{logs:?}");
+        assert!(
+            logs.contains(&"hn www.naver.com".to_string()),
+            "{logs:?}"
+        );
+        assert!(logs.contains(&"pr https:".to_string()), "{logs:?}");
+        assert!(logs.contains(&"se ?x=2".to_string()), "{logs:?}");
+        assert!(logs.contains(&"ha #frag".to_string()), "{logs:?}");
+        assert!(logs.contains(&"rel /dir/rel.html".to_string()),
+                "{logs:?}");
+        assert!(logs.contains(&"in truefalse".to_string()), "{logs:?}");
+    }
+
+    #[test]
+    fn object_keys_use_to_property_key() {
+        // polyfilled Symbol wrappers carry unique toString tags; as
+        // computed keys they must stay distinct (not all collapse to
+        // "[object Object]")
+        assert_eq!(
+            n("var k1 = { toString: function(){ return '@@a'; } }; \
+               var k2 = { toString: function(){ return '@@b'; } }; \
+               var o = {}; o[k1] = 1; o[k2] = 2; \
+               (o[k1] === 1 ? 1 : 0) + (o[k2] === 2 ? 10 : 0) + \
+               (k1 in o ? 100 : 0) + ('@@a' in o ? 1000 : 0)"),
+            1111.0);
+    }
+
+    #[test]
+    fn window_writes_reach_bare_globals() {
+        // polyfills replace prelude globals via the window face; the
+        // bare name must see the replacement (split-brain Symbol bug)
+        assert_eq!(
+            n("window.Symbol = function(){ return { poly: 1 }; }; \
+               (Symbol === window.Symbol ? 1 : 0) + \
+               (typeof Symbol() === 'object' ? 10 : 0)"),
+            11.0);
+        assert_eq!(
+            n("window['parseInt'] = function(){ return 777; }; \
+               parseInt('42') === 777 ? 1 : 0"),
+            1.0);
+        assert_eq!(
+            n("Object.defineProperty(window, 'isNaN', \
+               { value: function(){ return 'patched'; } }); \
+               isNaN(5) === 'patched' ? 1 : 0"),
+            1.0);
+    }
+
+    #[test]
+    fn regex_instance_properties() {
+        assert_eq!(
+            n("var r = /ab+c/gi; \
+               (r.source === 'ab+c' ? 1 : 0) + \
+               (r.global ? 10 : 0) + \
+               (r.ignoreCase ? 100 : 0) + \
+               (r.multiline ? 1000 : 0) + \
+               (r.flags === 'gi' ? 10000 : 0) + \
+               (r.source.match(/\\w+/) ? 100000 : 0)"),
+            110111.0);
+        // extracted exec/test survive uncurrying (core-js parseInt)
+        assert_eq!(
+            n("var h = /^[+-]?0x/i; var p = h.exec; \
+               (typeof p === 'function' ? 1 : 0) + \
+               (p.call(h, '0x1F') ? 10 : 0) + \
+               (p.call(h, 'zzz') === null ? 100 : 0) + \
+               (h['test'].call(h, '0xAB') ? 1000 : 0)"),
+            1111.0);
+    }
+
+    #[test]
+    fn string_static_from_char_code() {
+        assert_eq!(n("String.fromCharCode(72, 105).length"), 2.0);
+        assert_eq!(n("String.fromCharCode(65) === 'A' ? 1 : 0"), 1.0);
+        // extraction survives (bundles do var f = String.fromCharCode)
+        assert_eq!(
+            n("var f = String.fromCharCode; f(66) === 'B' ? 1 : 0"),
+            1.0);
     }
 
     #[test]
@@ -2117,6 +2295,210 @@ console.log('B typeof it: ' + typeof it);
         assert!(logs.contains(&"gl true".to_string()), "{logs:?}");
         assert!(logs.contains(&"cv true".to_string()), "{logs:?}");
         assert!(logs.contains(&"url data:,".to_string()), "{logs:?}");
+    }
+
+    #[test]
+    fn document_surface_for_jquery() {
+        // implementation/documentElement/ownerDocument: the probes
+        // jQuery+Sizzle run before touching the selector engine
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<html><body><p id=t>x</p></body></html>"),
+        ))));
+        let logs = vm.run_scripts(&["\
+            var d = document.implementation.createHTMLDocument('');\n\
+            var el = d.createElement('div');\n\
+            console.log('ce ' + el.tagName);\n\
+            console.log('de ' + document.documentElement.nodeType);\n\
+            var p = document.getElementById('t');\n\
+            console.log('od ' + (p.ownerDocument === document));\n\
+            console.log('odn ' + (document.ownerDocument === null));\n\
+            console.log('nt ' + document.nodeType);\n\
+            console.log('dv ' + (document.defaultView === window));\n"
+            .to_string()]);
+        assert!(logs.contains(&"ce DIV".to_string()), "{logs:?}");
+        assert!(logs.contains(&"de 1".to_string()), "{logs:?}");
+        assert!(logs.contains(&"od true".to_string()), "{logs:?}");
+        assert!(logs.contains(&"odn true".to_string()), "{logs:?}");
+        assert!(logs.contains(&"nt 9".to_string()), "{logs:?}");
+        assert!(logs.contains(&"dv true".to_string()), "{logs:?}");
+    }
+
+    #[test]
+    fn dom_method_extraction_and_legacy_events() {
+        // jQuery 1.x probes `if (document.addEventListener)` as a
+        // property read, and falls back to attachEvent("onX") on IE
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<html><body><p id=t>x</p></body></html>"),
+        ))));
+        let logs = vm.run_scripts(&["\
+            console.log('ael ' + (document.addEventListener ? 1 : 0));\n\
+            var probe = document.addEventListener ? 'modern' : 'legacy';\n\
+            console.log('branch ' + probe);\n\
+            var hits = 0;\n\
+            document.attachEvent('onclick', function() { hits++; });\n\
+            var ce = document.createElement;\n\
+            var el = ce.call(document, 'div');\n\
+            console.log('ext ' + el.tagName);\n\
+            var p = document.getElementById('t');\n\
+            var ga = p.getAttribute;\n\
+            console.log('ga ' + ga.call(p, 'id'));\n"
+            .to_string()]);
+        assert!(logs.contains(&"ael 1".to_string()), "{logs:?}");
+        assert!(logs.contains(&"branch modern".to_string()), "{logs:?}");
+        assert!(logs.contains(&"ext DIV".to_string()), "{logs:?}");
+        assert!(logs.contains(&"ga t".to_string()), "{logs:?}");
+        assert!(
+            !logs.iter().any(|l| l.contains("error")),
+            "{logs:?}"
+        );
+    }
+
+    #[test]
+    fn array_like_uncurried_methods() {
+        // jQuery merge: push.call(arrayLike, el) grows elems + length
+        assert_eq!(
+            n("var push = [].push; var jq = { length: 0 }; \
+               push.call(jq, 'a'); push.call(jq, 'b'); \
+               jq.length * 10 + ([].indexOf.call(jq, 'b'))"),
+            21.0);
+        // slice materializes a real array; sort answers the receiver
+        assert_eq!(
+            n("var jq = { 0: 3, 1: 1, 2: 2, length: 3 }; \
+               var arr = [].slice.call(jq); \
+               var back = [].sort.call(jq); \
+               arr.length * 100 + jq[0] * 10 + (back === jq ? 1 : 0)"),
+            311.0);
+    }
+
+    #[test]
+    fn scoped_element_collections() {
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse(
+                "<html><body><div id=a><p class='x y'>1</p><p>2</p>\
+                 <span class=x>3</span></div><p class=x>out</p>\
+                 </body></html>",
+            ),
+        ))));
+        let logs = vm.run_scripts(&["\
+            var a = document.getElementById('a');\n\
+            console.log('tag ' + a.getElementsByTagName('p').length);\n\
+            console.log('all ' + a.getElementsByTagName('*').length);\n\
+            console.log('cls ' + a.getElementsByClassName('x').length);\n\
+            console.log('doc ' + \
+                document.getElementsByClassName('x').length);\n\
+            console.log('qsa ' + a.querySelectorAll('.x').length);\n\
+            var q = a.querySelector('span');\n\
+            console.log('qs ' + (q ? q.textContent : 'none'));\n"
+            .to_string()]);
+        assert!(logs.contains(&"tag 2".to_string()), "{logs:?}");
+        assert!(logs.contains(&"all 3".to_string()), "{logs:?}");
+        assert!(logs.contains(&"cls 2".to_string()), "{logs:?}");
+        assert!(logs.contains(&"doc 3".to_string()), "{logs:?}");
+        assert!(logs.contains(&"qsa 2".to_string()), "{logs:?}");
+        assert!(logs.contains(&"qs 3".to_string()), "{logs:?}");
+    }
+
+    #[test]
+    fn dom_expando_properties() {
+        // jQuery's data cache: elem[expando] = id, read back later
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<html><body><p id=t>x</p></body></html>"),
+        ))));
+        let logs = vm.run_scripts(&["\
+            var el = document.getElementById('t');\n\
+            var key = 'jQuery360' + Math.floor(Math.random() * 10);\n\
+            el[key] = 42;\n\
+            console.log('rt ' + el[key]);\n\
+            el._cache = { n: 7 };\n\
+            console.log('obj ' + el._cache.n);\n\
+            document.customFlag = 'y';\n\
+            console.log('doc ' + document.customFlag);\n\
+            console.log('tc ' + el.textContent);\n"
+            .to_string()]);
+        assert!(logs.contains(&"rt 42".to_string()), "{logs:?}");
+        assert!(logs.contains(&"obj 7".to_string()), "{logs:?}");
+        assert!(logs.contains(&"doc y".to_string()), "{logs:?}");
+        assert!(logs.contains(&"tc x".to_string()), "{logs:?}");
+    }
+
+    #[test]
+    fn attributes_named_node_map() {
+        // jQuery's event support probe: setAttribute then
+        // n.attributes[name].expando === false
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<html><body></body></html>"),
+        ))));
+        let logs = vm.run_scripts(&["\
+            var n = document.createElement('div');\n\
+            n.setAttribute('onsubmit', 't');\n\
+            var a = n.attributes['onsubmit'];\n\
+            console.log('exp ' + (false === a.expando));\n\
+            console.log('val ' + a.value);\n\
+            console.log('len ' + n.attributes.length);\n\
+            console.log('idx ' + n.attributes[0].name);\n\
+            console.log('ts ' + n.toString());\n\
+            console.log('vo ' + (n.valueOf() === n));\n\
+            console.log('frag ' + (document.createDocumentFragment()\
+.createElement ? 'ie' : 'modern'));\n\
+            's'.isTrigger = 1; console.log('sloppy ok');\n"
+            .to_string()]);
+        assert!(logs.contains(&"exp true".to_string()), "{logs:?}");
+        assert!(logs.contains(&"val t".to_string()), "{logs:?}");
+        assert!(logs.contains(&"len 1".to_string()), "{logs:?}");
+        assert!(logs.contains(&"idx onsubmit".to_string()), "{logs:?}");
+        assert!(
+            logs.contains(&"ts [object HTMLElement]".to_string()),
+            "{logs:?}"
+        );
+        assert!(logs.contains(&"vo true".to_string()), "{logs:?}");
+        assert!(logs.contains(&"frag modern".to_string()), "{logs:?}");
+        assert!(logs.contains(&"sloppy ok".to_string()), "{logs:?}");
+    }
+
+    #[test]
+    fn in_operator_on_dom_nodes() {
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<html><body><p id=t>x</p></body></html>"),
+        ))));
+        let logs = vm.run_scripts(&["\
+            var de = document.documentElement;\n\
+            console.log('touch ' + ('ontouchstart' in de ? 1 : 0));\n\
+            console.log('tag ' + ('tagName' in de ? 1 : 0));\n\
+            console.log('ael ' + ('addEventListener' in document ? 1 : 0));\n"
+            .to_string()]);
+        assert!(logs.contains(&"touch 0".to_string()), "{logs:?}");
+        assert!(logs.contains(&"tag 1".to_string()), "{logs:?}");
+        assert!(logs.contains(&"ael 1".to_string()), "{logs:?}");
+    }
+
+    #[test]
+    fn array_method_extraction() {
+        // uncurried prototype methods (core-js habit) keep working
+        assert_eq!(
+            n("var s = [].sort; var a = [3, 1, 2]; \
+               s.call(a); a[0] * 100 + a[1] * 10 + a[2]"),
+            123.0);
+        assert_eq!(
+            n("var sp = Array.prototype.splice; var a = [1, 2, 3, 4]; \
+               var r = sp.call(a, 1, 2, 9); \
+               a.length * 100 + a[1] * 10 + r[0]"),
+            392.0);
+        assert_eq!(
+            n("var sh = [].shift, un = [].unshift; var a = [5, 6]; \
+               un.call(a, 4); sh.call(a) * 10 + a.length"),
+            42.0);
+        assert_eq!(
+            n("var r = [].reduce; \
+               r.call([1, 2, 3], function(x, y) { return x + y; }, 10)"),
+            16.0);
+        assert_eq!(
+            n("var ev = [].every, so = [].some; \
+               (ev.call([1, 2], function(x) { return x > 0; }) ? 10 : 0) \
+               + (so.call([0, 3], function(x) { return x > 2; }) ? 1 : 0)"),
+            11.0);
+        assert_eq!(
+            n("var rv = [].reverse; var a = [1, 2, 3]; rv.call(a); a[0]"),
+            3.0);
     }
 
     #[test]
