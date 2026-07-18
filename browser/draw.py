@@ -79,6 +79,20 @@ def scale_cmds(cmds, scale):
     return out
 
 
+def translate_cmds(cmds, dx, dy):
+    """Shift painted commands in place (CSS transform: translate is
+    paint-only — sibling layout is unaffected). Every command class
+    keeps its geometry in left/top/right/bottom, so one shift covers
+    text, rects, images, background tiles, and clip brackets alike."""
+    for c in cmds:
+        c.left += dx
+        c.top += dy
+        if hasattr(c, "right"):
+            c.right += dx
+        c.bottom += dy
+    return cmds
+
+
 class DrawText:
     def __init__(self, x, y, text, font, color):
         self.left = x

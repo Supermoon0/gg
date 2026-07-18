@@ -300,6 +300,52 @@ _scmds = paint_tree(_sdoc, [])
 check("box-shadow paints an offset rect behind the box",
       any(getattr(c, "color", "") == "#888888" for c in _scmds))
 
+# transform: translate shifts the painted subtree, layout unaffected
+tf_dom = _styled(
+    "", '<div style="width:50px; height:20px; background-color:#c0ffee;'
+    ' transform: translate(30px, 10px)">t</div>'
+    '<div style="height:20px; background-color:#123123">after</div>')
+_tdoc = DocumentLayout(tf_dom)
+_tdoc.layout(400)
+_tcmds = paint_tree(_tdoc, [])
+_tbox = next(c for c in _tcmds if getattr(c, "color", "") == "#c0ffee")
+_abox = next(c for c in _tcmds if getattr(c, "color", "") == "#123123")
+# the untransformed sibling anchors the expected geometry: without
+# the transform the first div would sit directly above it
+check("transform:translate shifts the painted box",
+      _tbox.left == _abox.left + 30 and _tbox.top == _abox.top - 10,
+      f"box=({_tbox.left}, {_tbox.top}) anchor=({_abox.left}, "
+      f"{_abox.top})")
+
+# percentage translate resolves against the element's own border box
+tp_dom = _styled(
+    "", '<div style="width:60px; height:40px; background-color:#facade;'
+    ' transform: translate(-50%, -50%)">p</div>'
+    '<div style="height:20px; background-color:#123123">anchor</div>')
+_tpdoc = DocumentLayout(tp_dom)
+_tpdoc.layout(400)
+_tpcmds = paint_tree(_tpdoc, [])
+_tpbox = next(c for c in _tpcmds
+              if getattr(c, "color", "") == "#facade")
+_tpanchor = next(c for c in _tpcmds
+                 if getattr(c, "color", "") == "#123123")
+check("transform % translate uses own border box",
+      _tpbox.left == _tpanchor.left - 30
+      and _tpbox.top == _tpanchor.top - 40 - 20,
+      f"box=({_tpbox.left}, {_tpbox.top}) anchor=({_tpanchor.left}, "
+      f"{_tpanchor.top})")
+
+# scale(0) hides the subtree
+ts_dom = _styled(
+    "", '<div style="height:20px; background-color:#dead00;'
+    ' transform: scale(0)">gone</div>')
+_tsdoc = DocumentLayout(ts_dom)
+_tsdoc.layout(400)
+_tscmds = paint_tree(_tsdoc, [])
+check("transform scale(0) hides the subtree",
+      not any(getattr(c, "color", "") == "#dead00" for c in _tscmds)
+      and not any(getattr(c, "text", "") == "gone" for c in _tscmds))
+
 # z-index reorders positioned siblings (lower z paints first = below)
 z_dom = _styled(
     "", '<div>'

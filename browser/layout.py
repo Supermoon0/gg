@@ -10,7 +10,8 @@ import tkinter.font
 from . import textengine
 from .colors import NAMED
 from .draw import (DrawBgImage, DrawClipPop, DrawClipPush, DrawImage,
-                   DrawLine, DrawOval, DrawRect, DrawText)
+                   DrawLine, DrawOval, DrawRect, DrawText,
+                   translate_cmds)
 from .html_parser import Element, Text
 from .style import parse_px, parse_size
 
@@ -1099,7 +1100,72 @@ def _z_index(obj):
         return 0
 
 
+def parse_transform(value, w, h):
+    """CSS transform -> (dx, dy, hidden). The translate components of
+    translate/translateX/translateY/translate3d/matrix are honored
+    (percentages resolve against the element's own border box, the
+    spec's reference box for translate); a zero scale hides the
+    subtree. Rotation, skew, and non-zero scales are ignored —
+    sprite sheets position with translate, which is what ×646 of
+    naver's usage is."""
+    dx = dy = 0.0
+    hidden = False
+
+    def px(v, base):
+        v = v.strip()
+        try:
+            if v.endswith("%"):
+                return float(v[:-1]) / 100.0 * base
+            if v.endswith("px"):
+                return float(v[:-2])
+            return float(v)
+        except ValueError:
+            return 0.0
+
+    for m in re.finditer(r"([a-zA-Z0-9]+)\s*\(([^)]*)\)", value):
+        fn = m.group(1).lower()
+        args = [a for a in m.group(2).split(",") if a.strip()]
+        if not args:
+            continue
+        if fn in ("translate", "translate3d"):
+            dx += px(args[0], w)
+            if len(args) > 1:
+                dy += px(args[1], h)
+        elif fn == "translatex":
+            dx += px(args[0], w)
+        elif fn == "translatey":
+            dy += px(args[0], h)
+        elif fn == "matrix" and len(args) == 6:
+            dx += px(args[4], w)
+            dy += px(args[5], h)
+            if px(args[0], 1) == 0 and px(args[3], 1) == 0:
+                hidden = True
+        elif fn in ("scale", "scale3d", "scalex", "scaley"):
+            if all(px(a, 1) == 0 for a in args[:2]):
+                hidden = True
+    return dx, dy, hidden
+
+
 def paint_tree(layout_object, display_list):
+    # transform applies to an element's principal box (blocks only —
+    # line/text boxes share their block's node and must not re-apply)
+    if isinstance(layout_object, BlockLayout):
+        style = getattr(layout_object.node, "style", None)
+        tf = style.get("transform") if style else None
+        if tf and tf != "none":
+            dx, dy, hidden = parse_transform(
+                tf, layout_object.width, layout_object.height)
+            if hidden:
+                return display_list
+            if dx or dy:
+                sub = _paint_tree_inner(layout_object, [])
+                translate_cmds(sub, dx, dy)
+                display_list.extend(sub)
+                return display_list
+    return _paint_tree_inner(layout_object, display_list)
+
+
+def _paint_tree_inner(layout_object, display_list):
     display_list.extend(layout_object.paint())
     # Paint each child subtree into its own group so positioned boxes
     # with a z-index can be reordered. Sorting per container (not

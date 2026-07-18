@@ -331,7 +331,14 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
 - [ ] **부분** 재스타일/재레이아웃/재페인트 (지금은 변이 시 전체 재계산 —
       껍데기급에선 충분, 피드 규모에서 필요해지면)
 - [ ] winit 셸(shell.py --native)에도 라이브 루프 배선 (현재 tkinter만)
-- [ ] `transform` (×646 — 스프라이트 배치·이동에 광범위)
+- [x] **`transform`** (×646) — 07-18: translate/translateX/translateY/
+      translate3d/matrix(e,f)의 이동 성분을 페인트 오프셋으로 적용
+      (px·% — %는 스펙대로 자기 border box 기준, 다중 함수 합성,
+      중첩 조상과도 합성). scale(0)/matrix(0,..,0,..)은 서브트리 숨김.
+      명령 클래스가 전부 left/top/right/bottom 좌표라 translate_cmds
+      일괄 이동 — tkinter·native 양 렌더 경로 공통. 레이아웃 비영향
+      (paint-only, 스펙 일치). 미지원: 회전·비영 스케일 렌더,
+      인라인 요소 transform, 히트테스트 반영(클릭 좌표는 원위치)
 - [ ] `transition`(×98) / `@keyframes` 애니메이션(×163) — 시각 완성도
 - [ ] 스크롤 리페인트 성능 (디스플레이 리스트 캐시/타일)
 
@@ -461,7 +468,8 @@ getOwnPropertyNames 추가, M3 스텁류 실태 반영 — Observer/matchMedia/
 postMessage/scrollTo/getComputedStyle/XHR은 코드에 이미 있었는데 문서만
 미갱신이었음. + tkinter 폴백 폰트에 .size 부재 버그 수정.
 오후: **M6 lazy 컴파일 가동** — 지연 배분 실측용 프로파일 하니스
-`cargo test --release -- --ignored profile_phases --nocapture` 상설화).
+`cargo test --release -- --ignored profile_phases --nocapture` 상설화.
+저녁: lazy parse + M4 transform — smoke 111종).
 항목을 완료하면 [x]로 바꾸고 날짜를 적을 것. cargo 150/150, smoke 108종
 (엔진 파트; 실네트워크 관문은 egress 제한 환경에서 측정 불가) 기준.
 검증 체인: cargo test → maturin build → pip 재설치 → smoke_test.py →
