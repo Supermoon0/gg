@@ -251,8 +251,8 @@ class Browser:
                 print(f"[js live] {line}")
             for fetch_id, furl in fetches:
                 try:
-                    _h, body, _f = _net.request_text(
-                        self.url.resolve(furl))
+                    _h, body, _f = _net.fetch_for_page(
+                        self.url, self.url.resolve(furl))
                     self._doc.resolve_fetch(fetch_id, 200, body)
                 except Exception as e:
                     self._doc.reject_fetch(
@@ -820,9 +820,25 @@ class Browser:
         form = forms.find_form(node)
         if form is None:
             return
+        post = forms.submit_post(form)
+        if post is not None:
+            action, body = post
+            target = self.url.resolve(action) if action else self.url
+            self.set_status(f"POST 제출 중... {target}")
+            try:
+                _h, text, final = net.request_post_text(
+                    target, body, initiator=self.url.host)
+                self.render_page(final, text)
+                self.history = self.history[:self.history_index + 1]
+                self.history.append(final)
+                self.history_index = len(self.history) - 1
+                self._update_nav_buttons()
+            except Exception as e:
+                self.set_status(f"POST 실패: {e}")
+            return
         href = forms.submit_href(form)
         if href is None:
-            self.set_status("POST 폼은 아직 지원하지 않습니다")
+            self.set_status("지원하지 않는 폼 제출 방식입니다")
             return
         try:
             self.load(self.url.resolve(href))

@@ -33,15 +33,34 @@ _CACHE_MAX_ENTRIES = 300
 _CACHE_MAX_BODY = 4 * 1024 * 1024
 _CACHE_DEFAULT_TTL = 300.0
 
-# --- cookie jar (session-scoped, exact-host, in-memory) ---
-_COOKIES = {}  # host -> {name: value}
+# --- cookie jar v2 (T3: attribute-complete, in-memory) ---
+# (domain, path, name) -> record. Spec-shaped semantics: Domain
+# suffix matching, Path boundaries, Expires/Max-Age, Secure,
+# HttpOnly (hidden from document.cookie), SameSite (Strict enforced
+# against a cross-site initiator; Lax approximated as send — our
+# subresource fetches act on the page's behalf). No public-suffix
+# list yet: same-site compares the last two labels.
+_COOKIES = {}
 _COOKIE_LOCK = threading.Lock()
 
 
+def _site_of(host):
+    parts = host.lower().rstrip(".").split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host.lower()
+
+
+def same_site(a, b):
+    return _site_of(a) == _site_of(b)
+
+
+def _cookie_expired(rec, now=None):
+    exp = rec.get("expires")
+    return exp is not None and exp <= (now or time.time())
+
+
 def store_cookie(host, line, scheme="https"):
-    """Record one Set-Cookie line. v1: name=value only — attributes
-    are ignored except Secure (which drops the cookie on plain http)
-    and Max-Age=0/expired deletions."""
+    """Record one Set-Cookie line with its attributes."""
+    host = host.lower()
     parts = [p.strip() for p in line.split(";")]
     if not parts or "=" not in parts[0]:
         return
@@ -49,39 +68,103 @@ def store_cookie(host, line, scheme="https"):
     name = name.strip()
     if not name:
         return
-    attrs = {a.split("=", 1)[0].strip().lower():
-             (a.split("=", 1)[1].strip() if "=" in a else "")
-             for a in parts[1:]}
+    attrs = {}
+    for a in parts[1:]:
+        k, _, v = a.partition("=")
+        attrs[k.strip().lower()] = v.strip()
     if "secure" in attrs and scheme != "https":
         return
+    domain = attrs.get("domain", "").lstrip(".").lower()
+    host_only = not domain
+    if domain and host != domain \
+            and not host.endswith("." + domain):
+        return  # a host may not set cookies for unrelated domains
+    if host_only:
+        domain = host
+    path = attrs.get("path", "")
+    if not path.startswith("/"):
+        path = "/"
+    expires = None
+    if "max-age" in attrs:
+        try:
+            expires = time.time() + float(attrs["max-age"])
+        except ValueError:
+            pass
+    elif "expires" in attrs:
+        try:
+            from email.utils import parsedate_to_datetime
+            expires = parsedate_to_datetime(
+                attrs["expires"]).timestamp()
+        except (ValueError, TypeError):
+            pass
+    key = (domain, path, name)
     with _COOKIE_LOCK:
-        jar = _COOKIES.setdefault(host, {})
-        if attrs.get("max-age", "").lstrip("-").isdigit() \
-                and int(attrs["max-age"]) <= 0:
-            jar.pop(name, None)
-        else:
-            jar[name] = value.strip()
+        if expires is not None and expires <= time.time():
+            _COOKIES.pop(key, None)
+            return
+        _COOKIES[key] = {
+            "value": value.strip(),
+            "secure": "secure" in attrs,
+            "httponly": "httponly" in attrs,
+            "samesite": attrs.get("samesite", "lax").lower() or "lax",
+            "expires": expires,
+            "host_only": host_only,
+        }
 
 
-def cookie_header(host):
-    """The Cookie: header value for this exact host ('' if none)."""
+def _cookie_matches(key, rec, host, scheme, path, initiator):
+    domain, cpath, _name = key
+    if rec["host_only"]:
+        if host != domain:
+            return False
+    elif host != domain and not host.endswith("." + domain):
+        return False
+    if not (path == cpath or cpath == "/"
+            or path.startswith(cpath.rstrip("/") + "/")):
+        return False
+    if rec["secure"] and scheme != "https":
+        return False
+    if rec["samesite"] == "strict" and initiator \
+            and not same_site(initiator, host):
+        return False
+    return not _cookie_expired(rec)
+
+
+def cookie_header(host, scheme="https", path="/", initiator=None):
+    """The Cookie: header value for this request ('' if none).
+    Longer paths first, per spec."""
+    host = host.lower()
+    path = path.split("?", 1)[0] or "/"
+    out = []
     with _COOKIE_LOCK:
-        jar = _COOKIES.get(host)
-        if not jar:
-            return ""
-        return "; ".join(f"{k}={v}" for k, v in jar.items())
+        dead = [k for k, r in _COOKIES.items() if _cookie_expired(r)]
+        for k in dead:
+            del _COOKIES[k]
+        for key, rec in _COOKIES.items():
+            if _cookie_matches(key, rec, host, scheme, path, initiator):
+                out.append((key[1], key[2], rec["value"]))
+    out.sort(key=lambda t: -len(t[0]))
+    return "; ".join(f"{n}={v}" for (_p, n, v) in out)
 
 
 def cookies_for(host):
+    """name->value for document.cookie (HttpOnly excluded)."""
+    host = host.lower()
     with _COOKIE_LOCK:
-        return dict(_COOKIES.get(host, {}))
+        return {k[2]: r["value"] for k, r in _COOKIES.items()
+                if not r["httponly"] and not _cookie_expired(r)
+                and _cookie_matches(k, r, host, "https", "/", None)}
 
 
 def seed_cookies(host, pairs):
-    """Merge (name, value) pairs into the jar (JS document.cookie
-    writes flowing back to the network layer)."""
+    """JS document.cookie writes flowing back: host-only, path=/."""
+    host = host.lower()
     with _COOKIE_LOCK:
-        _COOKIES.setdefault(host, {}).update(dict(pairs))
+        for name, value in dict(pairs).items():
+            _COOKIES[(host, "/", name)] = {
+                "value": value, "secure": False, "httponly": False,
+                "samesite": "lax", "expires": None, "host_only": True,
+            }
 
 
 # --- disk cache (survives restarts; only explicit max-age responses,
@@ -303,10 +386,13 @@ class URL:
         return URL(joined)
 
 
-def request_full(url, max_redirects=MAX_REDIRECTS, no_cache=False):
+def request_full(url, max_redirects=MAX_REDIRECTS, no_cache=False,
+                 method="GET", body=None, content_type=None,
+                 initiator=None):
     """Fetch a URL. Returns (headers: dict, body: bytes, final_url) —
     final_url differs from url after redirects; callers must use it as
-    the base for relative links."""
+    the base for relative links. initiator (a host) is the requesting
+    page's host for SameSite cookie decisions."""
     if url.scheme == "about":
         from .pages import about_page
         return {}, about_page(url.path).encode("utf-8"), url
@@ -325,7 +411,8 @@ def request_full(url, max_redirects=MAX_REDIRECTS, no_cache=False):
         with open(path, "rb") as f:
             return {}, f.read(), url
 
-    return _http_request(url, max_redirects, no_cache)
+    return _http_request(url, max_redirects, no_cache, method,
+                         body, content_type, initiator)
 
 
 def request_raw(url, max_redirects=MAX_REDIRECTS):
@@ -351,14 +438,77 @@ def sniff_charset(body, ctype=""):
     return "utf-8"
 
 
-def request_text(url, max_redirects=MAX_REDIRECTS, no_cache=False):
+def request_text(url, max_redirects=MAX_REDIRECTS, no_cache=False,
+                 method="GET", body=None, content_type=None,
+                 initiator=None):
     """Fetch and decode as text. Returns (headers, str, final_url)."""
-    headers, body, final_url = request_full(url, max_redirects, no_cache)
+    headers, body, final_url = request_full(
+        url, max_redirects, no_cache, method, body, content_type,
+        initiator)
     charset = sniff_charset(body, headers.get("content-type", ""))
     try:
         return headers, body.decode(charset, errors="replace"), final_url
     except LookupError:
         return headers, body.decode("utf-8", errors="replace"), final_url
+
+
+class CorsError(Exception):
+    """A cross-origin fetch()/XHR response did not opt in via CORS."""
+
+
+def origin_of(url):
+    """The serialized origin of a URL ('null' for opaque schemes)."""
+    if url.scheme not in ("http", "https"):
+        return "null"
+    default = 80 if url.scheme == "http" else 443
+    port = "" if url.port == default else f":{url.port}"
+    return f"{url.scheme}://{url.host}{port}"
+
+
+def same_origin(a, b):
+    return (a.scheme, a.host, a.port) == (b.scheme, b.host, b.port)
+
+
+def cors_allows(page_url, target_url, resp_headers):
+    """The CORS response check for a simple cross-origin request:
+    Access-Control-Allow-Origin must be * or the page's origin.
+    Same-origin (and non-HTTP schemes, e.g. file: pages reading
+    file: fixtures) always pass."""
+    if same_origin(page_url, target_url):
+        return True
+    if target_url.scheme not in ("http", "https"):
+        return page_url.scheme == target_url.scheme
+    acao = resp_headers.get(
+        "access-control-allow-origin", "").strip()
+    return acao == "*" or (acao != "" and acao == origin_of(page_url))
+
+
+def fetch_for_page(page_url, target_url):
+    """A fetch()/XHR load on behalf of page_url: carries the page's
+    host as the SameSite initiator and enforces the CORS response
+    check (the fetch channel only issues simple GETs, so there is no
+    preflight). Embedded resources (script/img/link) are no-cors and
+    do NOT go through here. Returns (headers, text, final_url)."""
+    headers, text, final = request_text(
+        target_url, no_cache=True,
+        initiator=page_url.host or None)
+    if not cors_allows(page_url, final, headers):
+        raise CorsError(
+            f"CORS: {origin_of(final)} did not allow "
+            f"{origin_of(page_url)}")
+    return headers, text, final
+
+
+def request_post_text(url, data, initiator=None):
+    """POST an urlencoded form. Returns (headers, str, final_url)."""
+    if isinstance(data, dict):
+        data = urllib.parse.urlencode(data)
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    return request_text(
+        url, no_cache=True, method="POST", body=data,
+        content_type="application/x-www-form-urlencoded",
+        initiator=initiator)
 
 
 def request(url, max_redirects=MAX_REDIRECTS):
@@ -383,9 +533,12 @@ def _data_url(path):
     return {"content-type": meta or "text/plain"}, body
 
 
-def _http_request(url, redirects_left, no_cache=False):
+def _http_request(url, redirects_left, no_cache=False, method="GET",
+                  body=None, content_type=None, initiator=None):
     # fragments never reach the wire: exclude them from the cache key
     cache_key = f"{url.scheme}://{url.host}:{url.port}{url.path}"
+    if method != "GET":
+        no_cache = True
     if not no_cache:
         cached = _cache_get(cache_key)
         if cached is not None:
@@ -405,7 +558,8 @@ def _http_request(url, redirects_left, no_cache=False):
         if s is None:
             s = _connect(url)
         try:
-            result = _one_request(url, s, pool_key)
+            result = _one_request(url, s, pool_key, method,
+                                  body, content_type, initiator)
             break
         except (OSError, ssl.SSLError, ConnectionError) as e:
             try:
@@ -424,7 +578,12 @@ def _http_request(url, redirects_left, no_cache=False):
         if redirects_left <= 0:
             raise RuntimeError("too many redirects")
         target = url.resolve(headers["location"])
-        return _http_request(target, redirects_left - 1, no_cache)
+        # browsers turn a redirected POST into a GET (303 always;
+        # 301/302 in practice)
+        if method != "GET" and status in (301, 302, 303):
+            method, body, content_type = "GET", None, None
+        return _http_request(target, redirects_left - 1, no_cache,
+                             method, body, content_type, initiator)
 
     if headers.get("content-encoding", "").lower() == "gzip":
         body = gzip.decompress(body) if body else b""
@@ -442,26 +601,37 @@ def _safe_path(path):
     return urllib.parse.quote(path, safe="/?#[]@!$&'()*+,;=:%~._-")
 
 
-def _one_request(url, s, pool_key):
-    """Send one GET on an open socket; returns (status, headers, body).
-    Returns the socket to the pool when the response allows reuse."""
+def _one_request(url, s, pool_key, method="GET", body=None,
+                 content_type=None, initiator=None):
+    """Send one request on an open socket; returns (status, headers,
+    body). Returns the socket to the pool when the response allows
+    reuse."""
     host = f"[{url.host}]" if ":" in url.host else url.host
     default = 80 if url.scheme == "http" else 443
     if url.port != default:
         host += f":{url.port}"  # RFC 7230: Host carries non-default port
-    cookies = cookie_header(url.host)
+    cookies = cookie_header(url.host, url.scheme, url.path, initiator)
     cookie_line = f"Cookie: {cookies}\r\n" if cookies else ""
+    extra = ""
+    payload = b""
+    if body is not None:
+        payload = body if isinstance(body, bytes) \
+            else str(body).encode("utf-8")
+        ct = content_type or "application/x-www-form-urlencoded"
+        extra = (f"Content-Type: {ct}\r\n"
+                 f"Content-Length: {len(payload)}\r\n")
     req = (
-        f"GET {_safe_path(url.path)} HTTP/1.1\r\n"
+        f"{method} {_safe_path(url.path)} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
         f"Connection: keep-alive\r\n"
         f"User-Agent: {USER_AGENT}\r\n"
         f"Accept: text/html,*/*\r\n"
         f"Accept-Encoding: gzip\r\n"
         f"{cookie_line}"
+        f"{extra}"
         f"\r\n"
     )
-    s.sendall(req.encode("utf-8"))
+    s.sendall(req.encode("utf-8") + payload)
 
     f = s.makefile("rb")
     statusline = f.readline().decode("latin-1")

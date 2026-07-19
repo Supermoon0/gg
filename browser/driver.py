@@ -186,7 +186,8 @@ class Page:
 
     def _service_fetch(self, fetch_id, url):
         try:
-            _h, body, _final = net.request_text(self.url.resolve(url))
+            _h, body, _final = net.fetch_for_page(
+                self.url, self.url.resolve(url))
             self._doc.resolve_fetch(fetch_id, 200, body)
         except Exception as e:
             self._doc.reject_fetch(fetch_id, f"{type(e).__name__}: {e}")

@@ -1181,6 +1181,77 @@ check("cookie jar: Secure over http is dropped",
 check("cookie jar: unknown host sends nothing",
       net.cookie_header("nowhere.example") == "")
 
+# --- T3: attribute-complete cookies ---
+net.store_cookie("example.com", "dom=1; Domain=example.com")
+net.store_cookie("example.com", "hostonly=1")
+check("cookie T3: Domain cookie reaches subdomains, host-only doesn't",
+      "dom=1" in net.cookie_header("www.example.com")
+      and "hostonly" not in net.cookie_header("www.example.com")
+      and "hostonly=1" in net.cookie_header("example.com"),
+      net.cookie_header("www.example.com"))
+net.store_cookie("example.com", "scoped=1; Path=/app")
+check("cookie T3: Path bounds where a cookie is sent",
+      "scoped=1" in net.cookie_header("example.com", path="/app/x")
+      and "scoped" not in net.cookie_header("example.com",
+                                            path="/other"),
+      net.cookie_header("example.com", path="/app/x"))
+net.store_cookie("example.com", "sec=1; Secure")
+check("cookie T3: Secure cookie stays off plain http",
+      "sec=1" in net.cookie_header("example.com", scheme="https")
+      and "sec" not in net.cookie_header("example.com", scheme="http"))
+net.store_cookie("example.com",
+                 "old=1; Expires=Wed, 01 Jan 2020 00:00:00 GMT")
+check("cookie T3: expired cookie is purged",
+      "old" not in net.cookie_header("example.com"))
+net.store_cookie("example.com", "secret=1; HttpOnly")
+check("cookie T3: HttpOnly sent on the wire but hidden from JS",
+      "secret=1" in net.cookie_header("example.com")
+      and "secret" not in net.cookies_for("example.com"))
+net.store_cookie("example.com", "ss=1; SameSite=Strict")
+check("cookie T3: SameSite=Strict blocks a cross-site initiator",
+      "ss=1" in net.cookie_header("example.com",
+                                  initiator="sub.example.com")
+      and "ss" not in net.cookie_header("example.com",
+                                        initiator="evil.org"),
+      net.cookie_header("example.com", initiator="evil.org"))
+check("cookie T3: a host cannot set cookies for another domain",
+      (net.store_cookie("evil.org", "steal=1; Domain=example.com")
+       or "steal" not in net.cookie_header("example.com")))
+
+# --- T3: CORS response check (fetch/XHR channel) ---
+_pg = net.URL("https://app.example/index.html")
+check("CORS: same-origin always allowed",
+      net.cors_allows(_pg, net.URL("https://app.example/api"), {}))
+check("CORS: cross-origin without ACAO is blocked",
+      not net.cors_allows(_pg, net.URL("https://api.other/v1"), {}))
+check("CORS: ACAO * allows",
+      net.cors_allows(_pg, net.URL("https://api.other/v1"),
+                      {"access-control-allow-origin": "*"}))
+check("CORS: ACAO exact origin allows, mismatch blocks",
+      net.cors_allows(_pg, net.URL("https://api.other/v1"),
+                      {"access-control-allow-origin":
+                       "https://app.example"})
+      and not net.cors_allows(_pg, net.URL("https://api.other/v1"),
+                              {"access-control-allow-origin":
+                               "https://elsewhere.example"}))
+check("CORS: file: pages read file: fixtures (same scheme)",
+      net.cors_allows(net.URL("file:///a/index.html"),
+                      net.URL("file:///a/dep.js"), {}))
+
+# --- T3: POST form serialization ---
+from browser import forms as _f3
+_post_dom = _styled("", '<form method=post action="/login">'
+                    '<input name=user value="kim">'
+                    '<input name=pw type=password value="s3cret">'
+                    '<input type=submit value=go></form>')
+_pform = _find(_post_dom, "form")
+_ppost = _f3.submit_post(_pform)
+check("POST: urlencoded body from named fields (submit excluded)",
+      _ppost == ("/login", "user=kim&pw=s3cret"), str(_ppost))
+_get_dom = _styled("", '<form action="/s"><input name=q value=x></form>')
+check("POST: GET forms return None from submit_post",
+      _f3.submit_post(_find(_get_dom, "form")) is None)
+
 # --- charset sniffing (legacy Korean sites: EUC-KR via <meta>) ---
 check("charset: Content-Type header wins",
       net.sniff_charset(b"<html>", "text/html; charset=euc-kr")

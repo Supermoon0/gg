@@ -353,7 +353,8 @@ def settle_async(doc, css_sources, base_url, timeout=8.0, max_rounds=2000):
             mutated = True
             for fetch_id, url in fetches:
                 try:
-                    _h, body, _f = net.request_text(base_url.resolve(url))
+                    _h, body, _f = net.fetch_for_page(
+                        base_url, base_url.resolve(url))
                     doc.resolve_fetch(fetch_id, 200, body)
                 except Exception as e:
                     doc.reject_fetch(fetch_id, f"{type(e).__name__}: {e}")
