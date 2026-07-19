@@ -26,7 +26,7 @@ cd ggcore && cargo test --lib         # 엔진 단위 테스트 (174종)
 레지스터 바이트코드 VM + NaN 박싱 + 인라인 캐시. 함수 본문은 **첫 호출까지
 파싱·컴파일을 지연**한다(lazy parse/compile). async 지원 빌드에서는 브라우저가
 자동으로 gg-js 경로를 사용한다(`GGJS=1`, Boa는 폴백).
-[연구 노트](docs/jsvm-research.md) · [네이버 완벽 구동 체크리스트](docs/naver-perfect-checklist.md)
+[연구 노트](docs/jsvm-research.md) · [네이버 완벽 구동 체크리스트](docs/naver-perfect-checklist.md) · [완벽 구동 설계](docs/naver-perfect-design.md)
 
 **언어**: 프로토타입 체인 실물화(`new`·`instanceof`·상속), 클래스(extends/super/
 static/필드/접근자/`#private`), 제너레이터·이터레이터 프로토콜, async/await(전 위치),
