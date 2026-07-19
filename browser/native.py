@@ -86,13 +86,21 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
     logs = []
     if fetch_js is not None:
         entries = doc.script_entries()
-        srcs = [value for kind, value in entries if kind == "src"]
+        srcs = [value for kind, value in entries
+                if kind in ("src", "msrc")]
         fetched = fetch_js(srcs) if srcs else {}
         sources = []
         for kind, value in entries:
-            code = value if kind == "inline" else fetched.get(value, "")
-            if code:
-                sources.append(code)
+            code = (value if kind in ("inline", "minline")
+                    else fetched.get(value, ""))
+            if not code:
+                continue
+            if kind in ("minline", "msrc"):
+                # <script type=module>: run the static import linker
+                # so import/export never reach the classic parser
+                code = _link_module(
+                    code, kind, value, page_url, fetch_js, logs)
+            sources.append(code)
         # gg-js has execution fuel (a runaway script is killed at its
         # instruction budget), so it may run scripts of any size. Boa
         # has no interrupt — keep the size guard there.
@@ -145,6 +153,38 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
 
     doc.compute_styles(css_sources)
     return build_tree(doc.export()), doc, css_sources, logs
+
+
+def _link_module(code, kind, value, page_url, fetch_js, logs):
+    """Link a <script type=module> with the static linker; on any
+    failure the original source runs (and errors) unmodified."""
+    from . import esmodules, net
+
+    if page_url is not None and kind == "msrc":
+        try:
+            base = page_url.resolve(value)
+        except Exception:
+            base = page_url
+    else:
+        base = page_url
+
+    def loader(spec, base_url):
+        try:
+            resolved = (base_url.resolve(spec) if base_url is not None
+                        else net.URL(spec))
+            _h, text, _f = net.request_text(resolved)
+            return text, str(resolved)
+        except Exception as e:
+            logs.append(f"[gg] module fetch failed: {spec} "
+                        f"({type(e).__name__})")
+            return None, spec
+
+    try:
+        return esmodules.link(code, base, loader)
+    except Exception as e:
+        logs.append(f"[gg] module link failed ({type(e).__name__}: {e})"
+                    " - running unlinked")
+        return code
 
 
 def _seed_page_cookies(doc, page_url):

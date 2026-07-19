@@ -1109,6 +1109,61 @@ check("cookie jar: Secure over http is dropped",
 check("cookie jar: unknown host sends nothing",
       net.cookie_header("nowhere.example") == "")
 
+# --- charset sniffing (legacy Korean sites: EUC-KR via <meta>) ---
+check("charset: Content-Type header wins",
+      net.sniff_charset(b"<html>", "text/html; charset=euc-kr")
+      == "euc-kr")
+check("charset: <meta charset> sniffed from the head",
+      net.sniff_charset(
+          b'<html><head><meta charset="EUC-KR"></head>', "text/html")
+      == "EUC-KR")
+check("charset: http-equiv content sniffed",
+      net.sniff_charset(
+          b'<meta http-equiv="Content-Type" '
+          b'content="text/html; charset=euc-kr">', "")
+      == "euc-kr")
+check("charset: euc-kr bytes decode",
+      "한글 텍스트".encode("euc-kr").decode(
+          net.sniff_charset(b"<meta charset=euc-kr>", ""))
+      == "한글 텍스트")
+check("charset: default stays utf-8", net.sniff_charset(b"<html>", "")
+      == "utf-8")
+
+# --- ES module linker v1 (static import/export -> classic script) ---
+from browser import esmodules
+
+_MODS = {
+    "https://x.example/util.js":
+        "export const answer = 42;\n"
+        "export function double(n) { return n * 2; }\n"
+        "export default function () { return 'dflt'; }\n",
+    "https://x.example/side.js":
+        "window.__side = (window.__side || 0) + 1;\n",
+}
+
+
+def _mod_loader(spec, base):
+    url = "https://x.example/" + spec.lstrip("./")
+    return _MODS.get(url), url
+
+
+_ENTRY = (
+    "import dflt, { answer, double as twice } from './util.js';\n"
+    "import './side.js';\n"
+    "import './side.js';\n"
+    "export const local = 1;\n"
+    "var out = answer + twice(4) + dflt().length;\n")
+_linked = esmodules.link(_ENTRY, None, _mod_loader)
+check("module linker: no import/export statements survive",
+      "import " not in _linked and "\nexport " not in _linked
+      and "export const" not in _linked, _linked[:120])
+check("module linker: dedup - side-effect dep inlined once",
+      _linked.count("side.js'] =") == 1,
+      f"registrations={_linked.count(chr(39) + '] =')}")
+check("module linker: named/renamed/default reads wired",
+      "var twice = " in _linked and ".double;" in _linked
+      and ".default;" in _linked)
+
 # --- Real network fetch (GG_SKIP_NET=1 for egress-limited CI) ---
 if os.environ.get("GG_SKIP_NET") == "1":
     print("[SKIP] real-network checks - GG_SKIP_NET=1")
@@ -1154,6 +1209,12 @@ if native.available():
     dp.click("#b")
     check("driver: click runs the handler", dp.text("#o") == "hit",
           repr(dp.text("#o")))
+    # linked module output actually runs in gg-js
+    check("driver: linked ES module executes",
+          dp.evaluate("(function () { " + _linked
+                      + "; return out; })()") == 54,
+          repr(dp.evaluate("(function () { " + _linked
+                           + "; return out; })()")))
 else:
     print("[SKIP] driver checks - native ggcore not built")
 

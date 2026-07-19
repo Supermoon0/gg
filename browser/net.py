@@ -9,6 +9,7 @@ import base64
 import gzip
 import hashlib
 import json
+import re
 import os
 import socket
 import ssl
@@ -333,13 +334,27 @@ def request_raw(url, max_redirects=MAX_REDIRECTS):
     return headers, body
 
 
+_META_CHARSET_RE = re.compile(
+    rb"""<meta[^>]+charset\s*=\s*["']?([a-zA-Z0-9_\-]+)""", re.I)
+
+
+def sniff_charset(body, ctype=""):
+    """The document's charset: Content-Type header first, then a
+    <meta charset=...> / http-equiv sniff of the head (legacy Korean
+    sites are EUC-KR-with-silent-headers), utf-8 otherwise."""
+    if "charset=" in ctype:
+        return (ctype.split("charset=", 1)[1].split(";")[0]
+                .strip().strip('"'))
+    m = _META_CHARSET_RE.search(body[:2048])
+    if m:
+        return m.group(1).decode("ascii", errors="replace")
+    return "utf-8"
+
+
 def request_text(url, max_redirects=MAX_REDIRECTS, no_cache=False):
     """Fetch and decode as text. Returns (headers, str, final_url)."""
     headers, body, final_url = request_full(url, max_redirects, no_cache)
-    charset = "utf-8"
-    ctype = headers.get("content-type", "")
-    if "charset=" in ctype:
-        charset = ctype.split("charset=", 1)[1].split(";")[0].strip().strip('"')
+    charset = sniff_charset(body, headers.get("content-type", ""))
     try:
         return headers, body.decode(charset, errors="replace"), final_url
     except LookupError:

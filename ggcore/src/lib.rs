@@ -592,8 +592,12 @@ impl Doc {
                     || stype.contains("javascript")
                     || stype == "module"
                 {
+                    // module scripts are marked so the Python side can
+                    // run its static import linker on them
+                    let m = stype == "module";
                     if let Some(src) = node.attr("src") {
-                        out.push(("src".to_string(), src.to_string()));
+                        let kind = if m { "msrc" } else { "src" };
+                        out.push((kind.to_string(), src.to_string()));
                     } else {
                         let code: String = node
                             .children
@@ -601,7 +605,9 @@ impl Doc {
                             .map(|&c| doc.nodes[c].text.as_str())
                             .collect();
                         if !code.trim().is_empty() {
-                            out.push(("inline".to_string(), code));
+                            let kind =
+                                if m { "minline" } else { "inline" };
+                            out.push((kind.to_string(), code));
                         }
                     }
                 }
