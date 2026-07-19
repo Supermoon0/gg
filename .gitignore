@@ -4,3 +4,5 @@ ggcore/target/
 ggcore/target-gnu/
 ggcore/dist/
 .claude/
+validation/out/
+validation/file_scheme_probe.txt

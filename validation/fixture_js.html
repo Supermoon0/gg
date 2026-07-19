@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>before-js</title>
+<style>
+  body { font-family: sans-serif; margin: 16px; }
+  .hdr { color: #7c2d12; }
+  .card { background-color: #fde68a; padding: 8px; margin: 6px 0; width: 420px; border: 2px solid #b45309; }
+  .item { background-color: #dbeafe; margin: 3px 0; padding: 4px 8px; width: 300px; }
+  .stat { color: #065f46; font-weight: bold; }
+</style>
+</head>
+<body>
+  <div id="app"></div>
+  <script>
+  (function () {
+    var app = document.getElementById("app");
+
+    // 1. createElement / appendChild / textContent / setAttribute
+    var h1 = document.createElement("h1");
+    h1.setAttribute("class", "hdr");
+    h1.textContent = "JS가 전부 만든 페이지 (JS-built page)";
+    app.appendChild(h1);
+
+    // 2. class component with extends/super/#private
+    class Base {
+      constructor(label) { this.label = label; }
+      tag() { return "div"; }
+    }
+    class Card extends Base {
+      #count = 0;
+      constructor(label, n) {
+        super(label);
+        this.#count = n;
+      }
+      render() {
+        var el = document.createElement(this.tag());
+        el.setAttribute("class", "card");
+        el.textContent = this.label + " — private count = " + this.#count;
+        return el;
+      }
+    }
+    app.appendChild(new Card("클래스 컴포넌트 Card", 42).render());
+
+    // 3. generator + for-of building list items
+    // (gg-js supports statement-level yields only, so the fib sequence is
+    //  unrolled: yield / destructuring-swap / yield ...)
+    function* fib() {
+      let a = 1, b = 1;
+      yield a;
+      [a, b] = [b, a + b];
+      yield a;
+      [a, b] = [b, a + b];
+      yield a;
+      [a, b] = [b, a + b];
+      yield a;
+      [a, b] = [b, a + b];
+      yield a;
+      [a, b] = [b, a + b];
+      yield a;
+    }
+    var ul = document.createElement("ul");
+    for (const v of fib()) {
+      var li = document.createElement("li");
+      li.setAttribute("class", "item");
+      li.textContent = "피보나치 항목 fib = " + v;
+      ul.appendChild(li);
+    }
+    app.appendChild(ul);
+
+    // 4. destructuring + spread + optional chaining + Map/Set
+    const { x, y = 9, ...rest } = { x: 3, z: 5, w: 7 };
+    const arr = [...[10, 20], ...[30]];
+    const maybe = { deep: { val: 111 } };
+    const opt = maybe?.deep?.val;
+    const missing = maybe?.nope?.val;
+    const m = new Map([["a", 1], ["b", 2]]);
+    m.set("c", 3);
+    const s = new Set([1, 2, 2, 3, 3, 3]);
+    var p = document.createElement("p");
+    p.setAttribute("class", "stat");
+    p.textContent = "x=" + x + " y=" + y +
+      " restKeys=" + Object.keys(rest).join(",") +
+      " spreadSum=" + arr.reduce(function (acc, v) { return acc + v; }, 0) +
+      " opt=" + opt + " missing=" + missing +
+      " mapSize=" + m.size + " setSize=" + s.size;
+    app.appendChild(p);
+
+    // 5. document.title set by JS
+    document.title = "JS DOM OK: " + m.size + "/" + s.size;
+    var t = document.createElement("p");
+    t.textContent = "title은 이제 → " + document.title;
+    app.appendChild(t);
+
+    console.log("fixture_js done: items=" + ul.children.length +
+      " title=" + document.title);
+  })();
+  </script>
+</body>
+</html>

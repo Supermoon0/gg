@@ -134,7 +134,11 @@ class 2회) 문법 갭이 좁고, `display:grid`·`position:sticky`도 **0회**�
 
 ### 레이아웃
 - [x] **`line-height`** (×380) — 07-16: normal(1.25 유지)·unitless·px·
-      em/rem·% → 줄 박스 높이 배율. LineLayout 베이스라인/높이에 반영
+      em/rem·% → 줄 박스 높이 배율. LineLayout 베이스라인/높이에 반영.
+      **07-19 실증 결함 발견**: 블록 요소(p/div) 직속 텍스트에 무시됨 —
+      Rust export의 Text 상속 화이트리스트에 line-height가 빠져 있고
+      LineLayout이 Text 노드에서 읽는 구조. 인라인(span) 직접 지정만
+      동작(46.56 vs 23.28px 실측, validation/css_gauntlet.py). 수정 필요
 - [x] **`white-space: nowrap`** (×83) — 07-16: word()에서 줄바꿈 억제 +
       **`text-overflow: ellipsis`** (×84) — 단일 라인 오버플로를 잘라 "…"
       (비상속 속성이라 요소 조상에서 읽음; measure 이분탐색 절단)
@@ -557,4 +561,13 @@ postMessage/scrollTo/getComputedStyle/XHR은 코드에 이미 있었는데 문�
 항목을 완료하면 [x]로 바꾸고 날짜를 적을 것. cargo 156/156, smoke 141종
 (엔진 파트; 실네트워크 관문은 egress 제한 환경에서 측정 불가) 기준.
 검증 체인: cargo test → maturin build → pip 재설치 → smoke_test.py →
-basket_test.py (네이버 단건은 scratchpad diag 스크립트).*
+basket_test.py (네이버 단건은 scratchpad diag 스크립트).
+
+07-19 전면 실증(docs/validation-2026-07-19.md): cargo 171/171, smoke
+149종 전수(실네트워크 2건 env-skip), lazy 컴파일 protos 7501→1501 정확
+재현, 신규 상설 건틀릿 validation/ 4종 — HTTP/1.1 스택 로컬 서버 실증
+14/14(keep-alive 접속 1개·디스크 캐시 계층·리다이렉트 캡), gg-js 언어
+30종 node v22 대조(CLAIM 20/20, 조용한 오답 0), CSS 실좌표 22/23
+(line-height 결함 ↑), 네이티브 래스터 PNG 4장. egress 게이트의 실체는
+소켓 차단이 아니라 허용목록 인터셉터의 text/plain 안내문(그래서 basket
+예외 0건·전원 "빈약")으로 규명.*

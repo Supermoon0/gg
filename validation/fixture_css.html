@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>CSS 렌더링 증거 페이지</title>
+<style>
+  :root {
+    --brand: #6b21a8;
+    --brand-2: var(--brand);
+    --chip-pad: 6px;
+  }
+  body { font-family: sans-serif; margin: 16px; background-color: #fafafa; }
+  h1 { color: var(--brand-2); }
+  h2 { color: #0f766e; margin-top: 18px; }
+
+  /* 1. border-radius 알약(pill) */
+  .pill {
+    display: inline-block;
+    background-color: #2563eb;
+    color: white;
+    padding: 8px 24px;
+    border-radius: 999px;
+  }
+
+  /* 2. box-shadow */
+  .shadowbox {
+    width: 220px;
+    background-color: #ffffff;
+    box-shadow: 6px 6px 12px rgba(0,0,0,0.45);
+    padding: 12px;
+    border: 1px solid #ddd;
+  }
+
+  /* 3. ::before / ::after content */
+  .deco::before { content: "【앞】 "; color: #dc2626; }
+  .deco::after { content: " 【뒤】"; color: #16a34a; }
+
+  /* 4. z-index 겹침 3박스 (이 엔진은 absolute를 뷰포트 기준으로 배치하므로
+     제목을 가리지 않게 오른쪽 상단에 둔다) */
+  .stack { position: relative; height: 40px; }
+  .stack .b { position: absolute; width: 90px; height: 90px; }
+  .b1 { background-color: crimson; left: 1000px; top: 8px; z-index: 1; }
+  .b2 { background-color: gold; left: 1045px; top: 28px; z-index: 3; }
+  .b3 { background-color: teal; left: 1090px; top: 48px; z-index: 2; }
+
+  /* 5. flexbox */
+  .flexrow {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background-color: #e0e7ff;
+    height: 70px;
+    padding: 0 10px;
+  }
+  .flexrow .cell { background-color: #4338ca; color: white; padding: 6px 10px; }
+  .flexrow .tall { padding: 16px 10px; }
+
+  /* 6. float + clear */
+  .floatbox {
+    float: left;
+    width: 140px;
+    background-color: #f59e0b;
+    padding: 8px;
+    margin-right: 10px;
+  }
+  .cleared { clear: both; background-color: #d1fae5; padding: 6px; }
+
+  /* 7. text-overflow: ellipsis */
+  .ellip {
+    width: 150px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    border: 1px solid #999;
+    background-color: #fff;
+    padding: 4px;
+  }
+
+  /* 8. linear-gradient (첫 색상 폴백 허용) */
+  .grad {
+    background: linear-gradient(90deg, #db2777, #7c3aed);
+    color: white;
+    padding: 14px;
+    width: 320px;
+  }
+
+  /* 9. 색상 칩: named / hex / rgb */
+  .chip {
+    display: inline-block;
+    width: 60px;
+    height: 34px;
+    padding: var(--chip-pad);
+    margin-right: 6px;
+    color: white;
+    font-size: 11px;
+  }
+  .c-named { background-color: rebeccapurple; }
+  .c-hex { background-color: #ff6600; }
+  .c-rgb { background-color: rgb(20, 130, 60); }
+
+  /* 10. var() 체인 */
+  .varbox { border: 3px solid var(--brand-2); color: var(--brand-2); padding: 8px; width: 260px; }
+
+  /* 12. opacity:0 — 절대 보이면 안 됨 */
+  .ghost { opacity: 0; background-color: #000; color: red; font-size: 40px; }
+</style>
+</head>
+<body>
+  <h1>한글 CSS 쇼케이스 — 렌더링 증거</h1>
+
+  <h2>1. 둥근 알약 버튼</h2>
+  <span class="pill">알약 모양 버튼</span>
+
+  <h2>2. 그림자 상자</h2>
+  <div class="shadowbox">그림자가 있는 흰 상자</div>
+
+  <h2>3. 가상요소 ::before / ::after</h2>
+  <p class="deco">가운데 본문 텍스트</p>
+
+  <h2>4. z-index 겹침 (빨강 → 노랑 위 → 청록 중간)</h2>
+  <div class="stack">
+    <div class="b b1"></div>
+    <div class="b b2"></div>
+    <div class="b b3"></div>
+  </div>
+
+  <h2>5. 플렉스 가로 정렬</h2>
+  <div class="flexrow">
+    <span class="cell">왼쪽</span>
+    <span class="cell tall">가운데(높음)</span>
+    <span class="cell">오른쪽</span>
+  </div>
+
+  <h2>6. 플로트와 클리어</h2>
+  <div class="floatbox">왼쪽 플로트 상자</div>
+  <p>플로트 옆으로 흐르는 본문 문장입니다. 두 줄 이상 이어질 수 있게 조금 길게 씁니다.</p>
+  <div class="cleared">클리어된 초록 배경 줄</div>
+
+  <h2>7. 말줄임표</h2>
+  <div class="ellip">이 문장은 아주 길어서 반드시 말줄임표로 잘려야 합니다 결코 다 보이면 안 됩니다</div>
+
+  <h2>8. 그라디언트 배경</h2>
+  <div class="grad">분홍에서 보라로 가는 그라디언트</div>
+
+  <h2>9. 색상 칩</h2>
+  <span class="chip c-named">named</span>
+  <span class="chip c-hex">hex</span>
+  <span class="chip c-rgb">rgb</span>
+
+  <h2>10. 사용자 정의 변수 체인</h2>
+  <div class="varbox">--brand → --brand-2 → 이 테두리와 글자색</div>
+
+  <h2>11. 인라인 SVG 아이콘</h2>
+  <svg width="60" height="60" viewBox="0 0 60 60">
+    <circle cx="30" cy="30" r="24" fill="#0ea5e9"/>
+    <rect x="22" y="22" width="16" height="16" fill="#facc15"/>
+  </svg>
+  <span>← 원과 사각형 아이콘</span>
+
+  <h2>12. 투명 유령 (보이면 실패)</h2>
+  <div class="ghost">이 글자가 보이면 opacity 실패</div>
+  <p>유령 요소 아래의 정상 문장.</p>
+</body>
+</html>
