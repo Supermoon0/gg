@@ -28,6 +28,10 @@ pub enum Expr {
     Call { callee: Box<Expr>, args: Vec<Expr>, optional: bool },
     New { callee: Box<Expr>, args: Vec<Expr> },
     Seq(Vec<Expr>),
+    /// Iterator-protocol materialization of a spread operand: arrays
+    /// pass through, Set/Map/strings/@@iterator objects become fresh
+    /// arrays (compiles to the IterMaterialize instruction).
+    IterMat(Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

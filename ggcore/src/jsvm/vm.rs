@@ -2338,8 +2338,19 @@ fn materialize_iterable(
     mods: &ModStore,
     ov: Value,
 ) -> Result<Value, VmError> {
+    if ov.is_string() {
+        // spread/for-of over a string yields its characters — a real
+        // array so [].concat (the spread desugar) flattens it
+        let chars: Vec<String> = str_ref(st, ov.index())
+            .chars()
+            .map(|c| c.to_string())
+            .collect();
+        let vals: Vec<Value> =
+            chars.into_iter().map(|c| push_str(st, c)).collect();
+        return Ok(new_array(st, vals));
+    }
     if !ov.is_object() {
-        return Ok(ov); // strings keep the existing indexed walk
+        return Ok(ov);
     }
     let oi = ov.index();
     if st.objects[oi as usize].is_array {

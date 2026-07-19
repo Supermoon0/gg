@@ -1671,6 +1671,48 @@ mod tests {
     }
 
     #[test]
+    fn spread_uses_iterator_protocol() {
+        // Set spread: dedup preserved by materialization
+        assert_eq!(
+            n("var s = new Set([1, 2, 2, 3]); [...s].length"), 3.0);
+        // string spread splits into characters
+        assert_eq!(n("[...'abc'].length * 10 + \
+                      ([...'ab'][1] === 'b' ? 1 : 0)"), 31.0);
+        // Map spread yields entries
+        assert_eq!(
+            n("var m = new Map([['a', 1], ['b', 2]]); \
+               var e = [...m]; e.length * 10 + e[1][1]"), 22.0);
+        // call spread over a Set
+        assert_eq!(
+            n("function f(a, b, c) { return a + b * 10 + c * 100; } \
+               f(...new Set([1, 2, 3]))"), 321.0);
+        // custom @@iterator object spreads through the protocol
+        assert_eq!(
+            n("var it = {}; it[Symbol.iterator] = function() { \
+                 var i = 0; return { next: function() { i++; \
+                   return i <= 2 ? {value: i * 5, done: false} \
+                                 : {value: undefined, done: true}; } }; }; \
+               var a = [...it]; a[0] + a[1]"), 15.0);
+        // arrays still pass through (and copy via concat)
+        assert_eq!(
+            n("var a = [1, 2]; var b = [...a, 3]; \
+               b.length * 100 + b[2] * 10 + (b === a ? 1 : 0)"), 330.0);
+    }
+
+    #[test]
+    fn private_brand_check() {
+        assert_eq!(
+            n("class A { #x = 1; static has(o) { return #x in o; } } \
+               A.has(new A()) * 10 + (A.has({}) ? 1 : 0)"), 10.0);
+        // brand check distinguishes unrelated classes
+        assert_eq!(
+            n("class A { #x = 1; static has(o) { return #x in o; } } \
+               class B { #y = 2; } \
+               (A.has(new B()) ? 1 : 0) + (A.has(new A()) ? 10 : 0)"),
+            10.0);
+    }
+
+    #[test]
     fn no_in_stops_at_boundaries() {
         // `in` inside a function literal in a for-head is fine
         assert_eq!(

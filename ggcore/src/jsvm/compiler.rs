@@ -575,7 +575,9 @@ fn scan_expr<'a>(
             }
         }
         Expr::Func(f) | Expr::Arrow(f) => lits.push(f),
-        Expr::Unary(_, e) | Expr::Await(e) => scan_expr(e, ids, lits),
+        Expr::Unary(_, e) | Expr::Await(e) | Expr::IterMat(e) => {
+            scan_expr(e, ids, lits)
+        }
         Expr::Update { target, .. } => scan_expr(target, ids, lits),
         Expr::Binary(_, a, b) | Expr::Logical(_, a, b) => {
             scan_expr(a, ids, lits);
@@ -709,6 +711,7 @@ fn has_side_effects(e: &Expr) -> bool {
             items.iter().any(has_side_effects)
         }
         Expr::Object(props) => props.iter().any(|p| has_side_effects(&p.value)),
+        Expr::IterMat(e) => has_side_effects(e),
         Expr::Template(parts) => parts.iter().any(|p| matches!(
             p, TplPart::Expr(e) if has_side_effects(e))),
     }
@@ -751,7 +754,7 @@ fn lower_new_expr(e: &mut Expr, n: &mut usize) {
                 lower_new_stmt(s, n);
             }
         }
-        Expr::Unary(_, a) | Expr::Await(a)
+        Expr::Unary(_, a) | Expr::Await(a) | Expr::IterMat(a)
         | Expr::Update { target: a, .. } => lower_new_expr(a, n),
         Expr::Binary(_, a, b) | Expr::Logical(_, a, b)
         | Expr::Assign(_, a, b) => {
@@ -3178,6 +3181,12 @@ impl Compiler {
                 let fk = self.fx().const_idx(fv);
                 let r = self.fx().alloc()?;
                 self.fx().emit(Instr::NewRegex { dst: r, pat: pk, flags: fk });
+                Ok(r)
+            }
+            Expr::IterMat(inner) => {
+                let src = self.expr(inner)?;
+                let r = self.fx().alloc()?;
+                self.fx().emit(Instr::IterMaterialize { dst: r, obj: src });
                 Ok(r)
             }
             Expr::Ident(name) => match name.as_str() {
