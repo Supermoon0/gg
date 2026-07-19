@@ -1182,6 +1182,60 @@ headers, body = net.request(net.URL("about:home"))
 check("about:home renders", "GG Browser" in body)
 
 # --- Headless automation driver (needs the native wheel + JS) ---
+# --- N3: partial refresh splices mutated subtrees only ---
+if native.available():
+    import os as _os
+    _prev_ggjs = _os.environ.get("GGJS")
+    _os.environ["GGJS"] = "1"
+    try:
+        n3_root, n3_doc, n3_css, _lg = native.load_document(
+            "<html><body><div id=a><p id=p1>one</p></div>"
+            "<div id=b><p id=p2>two</p></div></body></html>",
+            lambda h: {}, lambda s: {})
+    finally:
+        if _prev_ggjs is None:
+            _os.environ.pop("GGJS", None)
+        else:
+            _os.environ["GGJS"] = _prev_ggjs
+    if hasattr(n3_doc, "take_mutated"):
+        def _n3_find(root, nid):
+            return next(n for n in tree_to_list(root, [])
+                        if isinstance(n, Element)
+                        and n.attributes.get("id") == nid)
+
+        def _n3_dump(root):
+            out = []
+            for n in tree_to_list(root, []):
+                if isinstance(n, Element):
+                    out.append((n.tag, tuple(sorted(
+                        n.attributes.items()))))
+                else:
+                    out.append(("#text", n.text))
+            return out
+
+        b_before = _n3_find(n3_root, "b")
+        n3_doc.run_scripts([
+            "document.getElementById('p1').textContent = 'changed';"
+            "var s = document.createElement('span');"
+            "s.id = 'newnode'; s.textContent = 'fresh';"
+            "document.getElementById('a').appendChild(s);"])
+        n3_root2 = native.refresh_partial(n3_doc, n3_css, n3_root)
+        check("partial refresh: root object survives",
+              n3_root2 is n3_root)
+        check("partial refresh: untouched sibling is NOT re-marshaled",
+              _n3_find(n3_root2, "b") is b_before)
+        check("partial refresh: mutated text and new node arrive",
+              "changed" in "".join(
+                  t.text for t in tree_to_list(
+                      _n3_find(n3_root2, "p1"), [])
+                  if isinstance(t, Text))
+              and _n3_find(n3_root2, "newnode").tag == "span")
+        check("partial refresh: tree equals a full rebuild (golden)",
+              _n3_dump(n3_root2) == _n3_dump(
+                  native.build_tree(n3_doc.export())))
+    else:
+        print("[SKIP] partial refresh - wheel predates take_mutated")
+
 if native.available():
     from browser.driver import Page
 

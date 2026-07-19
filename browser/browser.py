@@ -266,7 +266,8 @@ class Browser:
             if version != self._dom_version:
                 self._dom_version = version
                 self._live_idle = 0
-                self.nodes = native.refresh(self._doc, self._css_sources)
+                self.nodes = native.refresh_partial(
+                    self._doc, self._css_sources, self.nodes)
                 self._remap_marks()
                 self.load_images(self.nodes, self.url, keep_cache=True)
                 self.relayout()

@@ -4432,6 +4432,7 @@ fn dom_method(
             d.detach(c);
             d.nodes[c].parent = Some(node_us);
             d.nodes[node_us].children.push(c);
+            d.mutated.push(node_us);
             queue_script_node(st, &d, c);
             return Ok(child);
         }
@@ -4601,6 +4602,7 @@ fn dom_method(
                 None => d.nodes[pu].children.push(ni),
             }
             d.nodes[ni].parent = Some(pu);
+            d.mutated.push(pu);
             queue_script_node(st, &d, ni);
             return Ok(newn);
         }
@@ -4632,6 +4634,7 @@ fn dom_method(
                 d.nodes[pu].children[i] = ni;
                 d.nodes[ni].parent = Some(pu);
                 d.nodes[oi_].parent = None;
+                d.mutated.push(pu);
                 queue_script_node(st, &d, ni);
             }
             return Ok(oldn);
@@ -5192,6 +5195,7 @@ fn dom_set_prop(
             if d.nodes[node_us].tag.is_none() {
                 d.nodes[node_us].text = value;
                 d.version += 1;
+                d.mutated.push(node_us);
             }
             Ok(())
         }

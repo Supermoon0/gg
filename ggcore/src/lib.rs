@@ -926,6 +926,63 @@ impl Doc {
         out
     }
 
+    /// N3: node indices touched since the last drain — structural
+    /// ops report the parent whose child list changed. Empty result
+    /// means no structural/attr/text mutations happened.
+    fn take_mutated(&mut self) -> Vec<u64> {
+        let mut d = self.doc.borrow_mut();
+        let mut v: Vec<u64> =
+            d.mutated.drain(..).map(|i| i as u64).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// N3: flat pre-order dump of ONE subtree (same row shape as
+    /// export; the subtree root's parent is -1). Lets the shell
+    /// splice small mutations into its tree without a full-DOM
+    /// marshal.
+    fn export_subtree(&self, root: u64) -> Vec<ExportedNode> {
+        let doc = self.doc.borrow();
+        let n = doc.nodes.len();
+        let root = root as usize;
+        if root >= n {
+            return Vec::new();
+        }
+        let mut out: Vec<ExportedNode> = Vec::new();
+        let mut map = vec![usize::MAX; n];
+        let mut stack = vec![root];
+        while let Some(idx) = stack.pop() {
+            let node = &doc.nodes[idx];
+            map[idx] = out.len();
+            let parent = match node.parent {
+                Some(p) if map[p] != usize::MAX => map[p] as i64,
+                _ => -1,
+            };
+            let (tag, text) = match &node.tag {
+                Some(t) => (Some(t.clone()), None),
+                None => (None, Some(node.text.clone())),
+            };
+            let style_pairs = node
+                .style
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            out.push((
+                parent,
+                idx as u64,
+                tag,
+                text,
+                node.attrs.clone(),
+                style_pairs,
+            ));
+            for &c in node.children.iter().rev() {
+                stack.push(c);
+            }
+        }
+        out
+    }
+
     /// Compact semantic snapshot for an AI agent: one entry per node
     /// that has a role, with a pre-computed accessible name, in document
     /// order. This is the AI-native primitive — it lets the agent read

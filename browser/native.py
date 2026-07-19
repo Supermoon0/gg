@@ -152,6 +152,8 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
             css_sources.append(css)
 
     doc.compute_styles(css_sources)
+    if hasattr(doc, "take_mutated"):
+        doc.take_mutated()  # the full export below covers everything
     return build_tree(doc.export()), doc, css_sources, logs
 
 
@@ -219,7 +221,76 @@ def _pull_page_cookies(doc, page_url):
 def refresh(doc, css_sources):
     """Re-style and re-export after JS mutated the DOM."""
     doc.compute_styles(css_sources)
+    if hasattr(doc, "take_mutated"):
+        doc.take_mutated()  # full rebuild covers everything: drain
     return build_tree(doc.export())
+
+
+# more mutated subtrees than this per tick -> a full rebuild is
+# cheaper than many splices (and React's initial mount IS a full tree)
+_PARTIAL_MAX_SUBTREES = 32
+
+
+def refresh_partial(doc, css_sources, root):
+    """N3 v1: refresh the Python tree after JS mutations with the
+    least marshaling. Styles recompute in Rust (fast); then, when few
+    subtrees changed, only those are re-exported and spliced in place
+    — the full-DOM marshal (build_tree(export()), the dominant cost
+    on big pages) is skipped. Any doubt falls back to the full
+    rebuild (never silently wrong). Returns the tree root.
+
+    v1 gap: unmutated nodes keep their previous style copies; a
+    mutation that restyles distant nodes (sibling combinators) shows
+    stale style until the next full refresh. hover/focus restyles
+    take the accurate restyle_patch path instead."""
+    if root is None or not hasattr(doc, "take_mutated") \
+            or not hasattr(doc, "export_subtree"):
+        return refresh(doc, css_sources)
+    doc.compute_styles(css_sources)
+    mutated = doc.take_mutated()
+    if not mutated or len(mutated) > _PARTIAL_MAX_SUBTREES:
+        return build_tree(doc.export())
+    by_ridx = {}
+    for n in tree_to_list(root, []):
+        r = getattr(n, "_ridx", None)
+        if r is not None:
+            by_ridx[r] = n
+    mset = set(mutated)
+    tops = []
+    for ridx in mutated:
+        node = by_ridx.get(ridx)
+        if node is None:
+            # a node created this tick under a mutated parent: its
+            # parent is in the set too, so it's covered — but a
+            # mutated node we can't locate at all means the trees
+            # diverged: rebuild
+            continue
+        anc = node.parent
+        covered = False
+        while anc is not None:
+            if getattr(anc, "_ridx", None) in mset:
+                covered = True
+                break
+            anc = anc.parent
+        if not covered:
+            tops.append(node)
+    if not tops:
+        return build_tree(doc.export())
+    for old in tops:
+        flat = doc.export_subtree(old._ridx)
+        if not flat:
+            return build_tree(doc.export())
+        sub = build_tree(flat)
+        parent = old.parent
+        sub.parent = parent
+        if parent is None:
+            return sub  # the root itself mutated
+        try:
+            i = parent.children.index(old)
+        except ValueError:
+            return build_tree(doc.export())
+        parent.children[i] = sub
+    return root
 
 
 def restyle_patch(doc, css_sources, root):
