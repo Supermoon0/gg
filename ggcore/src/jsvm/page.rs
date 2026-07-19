@@ -362,13 +362,24 @@ function DOMException(m, n) {
   this.message = '' + (m || '');
   this.name = '' + (n || 'Error');
 }
+// Real message delivery: portN.postMessage fires the peer's onmessage
+// as a macrotask. React 18's scheduler flushes work through this — a
+// swallowing stub would hang every createRoot render.
 function MessageChannel() {
-  this.port1 = { onmessage: null,
-    postMessage: function () {},
-    addEventListener: function () {} };
-  this.port2 = { onmessage: null,
-    postMessage: function () {},
-    addEventListener: function () {} };
+  var p1 = { onmessage: null, addEventListener: function () {} };
+  var p2 = { onmessage: null, addEventListener: function () {} };
+  p1.postMessage = function (data) {
+    setTimeout(function () {
+      if (p2.onmessage) p2.onmessage({ data: data });
+    }, 0);
+  };
+  p2.postMessage = function (data) {
+    setTimeout(function () {
+      if (p1.onmessage) p1.onmessage({ data: data });
+    }, 0);
+  };
+  this.port1 = p1;
+  this.port2 = p2;
 }
 function Blob() {}
 function File() {}
@@ -1557,6 +1568,105 @@ mod tests {
         match eval(&src) {
             Ok(_) => println!("polyfill: OK"),
             Err(e) => println!("polyfill: {e}"),
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic: run with -- --ignored --nocapture (needs bench/js/react)
+    fn react_boot_diag() {
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../bench/js/react/");
+        let Ok(react) =
+            std::fs::read_to_string(format!("{base}react.production.min.js"))
+        else {
+            println!("react bundle missing, skip");
+            return;
+        };
+        let dom =
+            std::fs::read_to_string(format!("{base}react-dom.production.min.js"))
+                .unwrap();
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse(
+                "<html><body><div id=root></div></body></html>",
+            ),
+        ))));
+        let boot = "\
+            try {\n\
+              var e = React.createElement;\n\
+              var app = e('div', {id: 'app'},\n\
+                e('h1', null, 'hello from react'),\n\
+                e('p', {className: 'msg'}, 'count: ', String(1 + 1)));\n\
+              ReactDOM.render(app, document.getElementById('root'));\n\
+              console.log('BOOT-OK ' + \
+                document.getElementById('root').innerHTML);\n\
+            } catch (err) {\n\
+              console.log('BOOT-ERR ' + err + ' :: ' + (err && err.stack));\n\
+            }\n"
+            .to_string();
+        // Round 2: hooks + state + synthetic events under createRoot
+        let hooks = "\
+            try {\n\
+              var e = React.createElement;\n\
+              var renders = 0;\n\
+              function Counter() {\n\
+                var s = React.useState(0);\n\
+                renders++;\n\
+                React.useEffect(function() {\n\
+                  console.log('EFFECT ran, count=' + s[0]);\n\
+                }, [s[0]]);\n\
+                return e('button', {id: 'btn', onClick: function() {\n\
+                  s[1](s[0] + 1);\n\
+                }}, 'clicked ' + s[0]);\n\
+              }\n\
+              var host = document.createElement('div');\n\
+              host.id = 'hookroot';\n\
+              document.body.appendChild(host);\n\
+              var root = ReactDOM.createRoot ?\n\
+                ReactDOM.createRoot(host) : null;\n\
+              if (root) { root.render(e(Counter)); }\n\
+              else { ReactDOM.render(e(Counter), host); }\n\
+              window.__hookHost = host;\n\
+              window.__renders = function() { return renders; };\n\
+              console.log('HOOKS-MOUNT-QUEUED');\n\
+            } catch (err) {\n\
+              console.log('HOOKS-ERR ' + err + ' :: ' + (err && err.stack));\n\
+            }\n"
+            .to_string();
+        let logs = vm.run_scripts(&[react, dom, boot, hooks]);
+        for l in &logs {
+            println!("LOG {l}");
+        }
+        // createRoot renders async (scheduler) — pump the loop, then
+        // inspect the mounted output and fire a click.
+        for _ in 0..3 {
+            let (plogs, _) = vm.pump();
+            for l in &plogs {
+                println!("PUMP {l}");
+            }
+        }
+        let probe = "\
+            try {\n\
+              console.log('HOOKS-DOM ' + window.__hookHost.innerHTML);\n\
+              var btn = document.getElementById('btn');\n\
+              console.log('BTN ' + (btn ? btn.tagName : 'missing'));\n\
+              btn.dispatchEvent(new Event('click', {bubbles: true}));\n\
+            } catch (err) { console.log('PROBE-ERR ' + err); }\n"
+            .to_string();
+        let logs2 = vm.run_scripts(&[probe]);
+        for l in &logs2 {
+            println!("LOG {l}");
+        }
+        for _ in 0..3 {
+            let (plogs, _) = vm.pump();
+            for l in &plogs {
+                println!("PUMP {l}");
+            }
+        }
+        let after = "\
+            console.log('AFTER-CLICK ' + window.__hookHost.innerHTML + \
+              ' renders=' + window.__renders());\n"
+            .to_string();
+        for l in &vm.run_scripts(&[after]) {
+            println!("LOG {l}");
         }
     }
 

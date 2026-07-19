@@ -142,7 +142,7 @@ enum BindKind {
 /// One declared variable of the function being compiled.
 #[derive(Clone, Copy)]
 struct Binding {
-    reg: u8,
+    reg: u16,
     /// the register holds a heap-cell reference (captured by a closure)
     is_cell: bool,
     kind: BindKind,
@@ -158,7 +158,7 @@ struct Binding {
 struct Scope {
     bindings: HashMap<String, Binding>,
     /// locals_end to restore when the scope closes
-    prev_locals_end: u8,
+    prev_locals_end: u16,
 }
 
 struct FnCtx {
@@ -186,9 +186,9 @@ struct FnCtx {
     upvals: Vec<CapSrc>,
     upval_map: HashMap<String, u16>,
     /// registers below this are locals; temps start here
-    locals_end: u8,
-    tmp_top: u8,
-    nregs: u8,
+    locals_end: u16,
+    tmp_top: u16,
+    nregs: u16,
     /// one per enclosing `break`-able construct (loop or switch)
     loops: Vec<LoopCtx>,
     /// a `label:` seen just before the next loop pushes its LoopCtx
@@ -242,7 +242,7 @@ impl LoopCtx {
 /// disarm them) and its `finally` body (inlined at each early exit).
 #[derive(Clone)]
 struct TryCtx {
-    handlers: u8,
+    handlers: u16,
     finally: Option<Rc<Vec<Stmt>>>,
 }
 
@@ -256,7 +256,7 @@ impl FnCtx {
             consts: Vec::new(),
             scopes: vec![Scope {
                 bindings: HashMap::new(),
-                prev_locals_end: nparams,
+                prev_locals_end: nparams as u16,
             }],
             captured: HashSet::new(),
             uses_arguments: false,
@@ -265,9 +265,9 @@ impl FnCtx {
             lazy_spills: HashMap::new(),
             upvals: Vec::new(),
             upval_map: HashMap::new(),
-            locals_end: nparams,
-            tmp_top: nparams,
-            nregs: nparams,
+            locals_end: nparams as u16,
+            tmp_top: nparams as u16,
+            nregs: nparams as u16,
             loops: Vec::new(),
             pending_label: None,
             trys: Vec::new(),
@@ -312,7 +312,7 @@ impl FnCtx {
         name: &str,
         kind: BindKind,
         initialized: bool,
-    ) -> Result<u8, CompileError> {
+    ) -> Result<u16, CompileError> {
         if self.locals_end >= 250 {
             return Err(CompileError {
                 msg: format!("too many locals in {}", self.name),
@@ -338,8 +338,11 @@ impl FnCtx {
         self.code.len() - 1
     }
 
-    fn alloc(&mut self) -> Result<u8, CompileError> {
-        if self.tmp_top >= 250 {
+    fn alloc(&mut self) -> Result<u16, CompileError> {
+        // u16 register file: the old u8 ceiling (250) killed minified
+        // mega-expressions (react-dom); 16000 is a runaway-recursion
+        // guard, not a real budget.
+        if self.tmp_top >= 16000 {
             return Err(CompileError {
                 msg: format!(
                     "expression too deep in {} (locals={}, tmp={}, \
@@ -389,14 +392,14 @@ impl FnCtx {
 /// Where a name lives, from the perspective of the current function.
 #[derive(Clone, Copy)]
 enum Place {
-    Reg(u8),
-    Cell(u8),
+    Reg(u16),
+    Cell(u16),
     Up(u16),
     Global(u16),
     /// Overflow local spilled into a hidden %spillN object (always
     /// cell-wrapped so closures can capture the whole spill area):
     /// (cell register, property atom) in the current function.
-    SpillCell(u8, u16),
+    SpillCell(u16, u16),
     /// Same, but the spill object lives in an enclosing function:
     /// (upvalue index, property atom).
     SpillUp(u16, u16),
@@ -1825,7 +1828,7 @@ impl Compiler {
         })
     }
 
-    fn emit_tdz_check(&mut self, name: &str, src: u8) {
+    fn emit_tdz_check(&mut self, name: &str, src: u16) {
         let atom = self.atom(name);
         self.fx().emit(Instr::TdzCheck { src, atom });
     }
@@ -1895,7 +1898,7 @@ impl Compiler {
         Ok(())
     }
 
-    fn load_place(&mut self, p: Place, dst: u8) {
+    fn load_place(&mut self, p: Place, dst: u16) {
         match p {
             Place::Reg(r) => {
                 if r != dst {
@@ -1930,7 +1933,7 @@ impl Compiler {
         }
     }
 
-    fn store_place(&mut self, p: Place, src: u8) {
+    fn store_place(&mut self, p: Place, src: u16) {
         match p {
             Place::Reg(r) => {
                 if r != src {
@@ -1965,7 +1968,7 @@ impl Compiler {
         }
     }
 
-    fn store_name(&mut self, name: &str, src: u8) {
+    fn store_name(&mut self, name: &str, src: u16) {
         let p = self.resolve(name);
         self.store_place(p, src);
     }
@@ -2092,7 +2095,7 @@ impl Compiler {
             f.scopes[0].bindings.insert(
                 p.clone(),
                 Binding {
-                    reg: i as u8,
+                    reg: i as u16,
                     is_cell: false,
                     kind: BindKind::Var,
                     initialized: true,
@@ -2157,7 +2160,7 @@ impl Compiler {
         // them on entry
         f.captured = captured_names(&lit.body);
         let captured = std::mem::take(&mut f.captured);
-        let mut cell_regs: Vec<u8> = Vec::new();
+        let mut cell_regs: Vec<u16> = Vec::new();
         for (n, b) in f.scopes[0].bindings.iter_mut() {
             if captured.contains(n) {
                 b.is_cell = true;
@@ -2208,7 +2211,7 @@ impl Compiler {
         &mut self,
         lit: &Rc<FuncLit>,
         is_arrow: bool,
-    ) -> Result<u8, CompileError> {
+    ) -> Result<u16, CompileError> {
         let idx = self.compile_func(lit, is_arrow)?;
         if idx > u16::MAX as u32 {
             return self.err("too many functions");
@@ -2457,9 +2460,9 @@ impl Compiler {
                 // captured for-let variables get a fresh cell each
                 // iteration (at the continue target, below) so each
                 // iteration's closures see that iteration's value
-                let refresh: Vec<u8> = if lexical_init {
+                let refresh: Vec<u16> = if lexical_init {
                     let f = self.fns.last().unwrap();
-                    let mut regs: Vec<u8> = f
+                    let mut regs: Vec<u16> = f
                         .scopes
                         .last()
                         .unwrap()
@@ -2837,7 +2840,7 @@ impl Compiler {
                     None => None,
                 };
                 let n_armed =
-                    (fin_arm.is_some() as u8) + (cat_arm.is_some() as u8);
+                    (fin_arm.is_some() as u16) + (cat_arm.is_some() as u16);
                 self.fx().trys.push(TryCtx {
                     handlers: n_armed,
                     finally: fin.clone(),
@@ -2851,7 +2854,7 @@ impl Compiler {
                     // inside the catch body only the finally handler
                     // (if any) is still armed
                     self.fx().trys.last_mut().unwrap().handlers =
-                        fin_arm.is_some() as u8;
+                        fin_arm.is_some() as u16;
                     j_join =
                         Some(self.fx().emit(Instr::Jump { target: 0 }));
 
@@ -2977,7 +2980,7 @@ impl Compiler {
     /// Compile an optional chain (`a?.b`, `a?.b.c`, `a?.b?.c`, `a?.[k]`,
     /// `a?.b()`, `fn?.()`): every `?.` link that sees null/undefined
     /// short-circuits the whole rest of the chain to `undefined`.
-    fn optional_chain(&mut self, e: &Expr) -> Result<u8, CompileError> {
+    fn optional_chain(&mut self, e: &Expr) -> Result<u16, CompileError> {
         let mut bails: Vec<usize> = Vec::new();
         let dst = self.chain_into(e, &mut bails)?;
         if bails.is_empty() {
@@ -2999,7 +3002,7 @@ impl Compiler {
         &mut self,
         e: &Expr,
         bails: &mut Vec<usize>,
-    ) -> Result<u8, CompileError> {
+    ) -> Result<u16, CompileError> {
         match e {
             Expr::Member { obj, prop, optional } => {
                 let base = self.chain_into(obj, bails)?;
@@ -3129,7 +3132,7 @@ impl Compiler {
     }
 
     /// Compile into `dst`, using only registers >= dst as scratch.
-    fn expr_to(&mut self, e: &Expr, dst: u8) -> Result<(), CompileError> {
+    fn expr_to(&mut self, e: &Expr, dst: u16) -> Result<(), CompileError> {
         let saved = self.fx().tmp_top;
         {
             let f = self.fx();
@@ -3143,7 +3146,7 @@ impl Compiler {
         Ok(())
     }
 
-    fn expr(&mut self, e: &Expr) -> Result<u8, CompileError> {
+    fn expr(&mut self, e: &Expr) -> Result<u16, CompileError> {
         match e {
             Expr::Num(n) => {
                 let r = self.fx().alloc()?;
@@ -3521,7 +3524,7 @@ impl Compiler {
         }
     }
 
-    fn load_num(&mut self, dst: u8, n: f64) {
+    fn load_num(&mut self, dst: u16, n: f64) {
         if n.fract() == 0.0
             && n >= i32::MIN as f64
             && n <= i32::MAX as f64
@@ -3538,7 +3541,7 @@ impl Compiler {
         &mut self,
         op: UnOp,
         operand: &Expr,
-    ) -> Result<u8, CompileError> {
+    ) -> Result<u16, CompileError> {
         if op == UnOp::Typeof {
             // typeof must not throw on undeclared globals
             let rs = match operand {
@@ -3615,7 +3618,7 @@ impl Compiler {
         op: UpdateOp,
         prefix: bool,
         target: &Expr,
-    ) -> Result<u8, CompileError> {
+    ) -> Result<u16, CompileError> {
         if let Expr::Member { obj, prop, .. } = target {
             // o.x++ / o[k]-- : read, ToNumber, add/sub 1, write back;
             // postfix yields the old (numeric) value, prefix the new
@@ -3708,7 +3711,7 @@ impl Compiler {
         }
     }
 
-    fn emit_update(&mut self, op: UpdateOp, dst: u8, a: u8, b: u8) {
+    fn emit_update(&mut self, op: UpdateOp, dst: u16, a: u16, b: u16) {
         match op {
             UpdateOp::Inc => self.fx().emit(Instr::Add { dst, a, b }),
             UpdateOp::Dec => self.fx().emit(Instr::Sub { dst, a, b }),
@@ -3720,7 +3723,7 @@ impl Compiler {
         op: AssignOp,
         target: &Expr,
         value: &Expr,
-    ) -> Result<u8, CompileError> {
+    ) -> Result<u16, CompileError> {
         match target {
             Expr::Ident(name) => match op {
                 AssignOp::Plain => {
@@ -3851,7 +3854,7 @@ impl Compiler {
 
 /// Register-to-register instruction for a binary operator, if the VM
 /// has one.
-fn bin_instr(op: BinOp, dst: u8, a: u8, b: u8) -> Option<Instr> {
+fn bin_instr(op: BinOp, dst: u16, a: u16, b: u16) -> Option<Instr> {
     Some(match op {
         BinOp::In => Instr::In { dst, a, b },
         BinOp::InstanceOf => Instr::InstanceOf { dst, a, b },

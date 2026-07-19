@@ -189,7 +189,7 @@ struct Handler {
     closure: u32,
     this_val: Value,
     catch_ip: u32,
-    exc_reg: u8,
+    exc_reg: u16,
     argc: u8,
 }
 
