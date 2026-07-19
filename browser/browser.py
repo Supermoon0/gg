@@ -316,6 +316,7 @@ class Browser:
         for node in img_nodes:
             node._img = self._img_by_src.get(node.attributes["src"])
         textengine.load_svgs(nodes)
+        textengine.load_canvases(nodes, getattr(self, '_doc', None))
 
         def fetch_raw(urls):
             with ThreadPoolExecutor(max_workers=6) as pool:

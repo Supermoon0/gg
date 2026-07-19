@@ -1209,6 +1209,10 @@ class BlockLayout:
                 # image handle — never lay out path/defs children
                 self.image(node)
                 return
+            elif node.tag == "canvas":
+                # T4: the baked canvas bitmap is a replaced element
+                self.image(node)
+                return
             elif node.tag in ("::before", "::after"):
                 # synthesized icon: a fixed-size inline box painted by
                 # its background layer; text content flows normally

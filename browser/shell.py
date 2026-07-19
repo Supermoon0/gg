@@ -178,6 +178,7 @@ class Shell:
         for node in img_nodes:
             node._img = self._img_by_src.get(node.attributes["src"])
         textengine.load_svgs(self.nodes)
+        textengine.load_canvases(self.nodes, self._doc)
         textengine.load_background_images(
             self.nodes,
             lambda urls: _fetch_many(urls, self.url, binary=True))

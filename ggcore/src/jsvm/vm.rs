@@ -232,6 +232,11 @@ pub(super) enum Native {
     PerfNow,
     /// element.classList.<op>; op: 0=add 1=remove 2=contains 3=toggle
     ClassList { node: u32, op: u8 },
+    /// canvas 2D recording (T4): drawing calls append to the node's
+    /// command list; the shell rasterizes them into the canvas image.
+    /// op: 1 fillRect 2 strokeRect 3 clearRect 4 fillText 5 beginPath
+    /// 6 moveTo 7 lineTo 8 arc 9 rect 10 closePath 11 fill 12 stroke
+    CanvasOp { node: u32, ctx: u32, op: u8 },
     /// window.addEventListener / removeEventListener (listeners keyed
     /// on WINDOW_NODE so lifecycle events can find them)
     WinEvent { add: bool },
@@ -513,6 +518,10 @@ pub(super) struct St {
     pub(super) pending_inline_scripts: Vec<(u32, String)>,
     /// script nodes already queued/run — a node never runs twice
     pub(super) scripts_seen: std::collections::HashSet<u32>,
+    /// recorded canvas-2d commands per canvas node (T4):
+    /// (op, a, b, c, d, e, text, style)
+    pub(super) canvas_cmds: HashMap<
+        u32, Vec<(u8, f64, f64, f64, f64, f64, String, String)>>,
     /// (object index, name id) -> (getter, setter) accessor pair
     /// (Object.defineProperty with get/set; UNDEFINED = absent side)
     pub(super) accessors: HashMap<(u32, u32), (Value, Value)>,
@@ -622,6 +631,7 @@ impl St {
             pending_ext_scripts: Vec::new(),
             pending_inline_scripts: Vec::new(),
             scripts_seen: std::collections::HashSet::new(),
+            canvas_cmds: HashMap::new(),
             accessors: HashMap::new(),
             local_storage: HashMap::new(),
             session_storage: HashMap::new(),
@@ -3251,6 +3261,69 @@ fn do_native(
             Ok(Value::int(id as i32))
         }
         Native::PerfNow => Ok(Value::number(st.now_ms)),
+        Native::CanvasOp { node, ctx, op } => {
+            let mut nums = [0.0f64; 5];
+            for (k, slot) in nums.iter_mut().enumerate() {
+                if k < argc as usize {
+                    let v = st.regs[args_base + k];
+                    if v.is_number() {
+                        *slot = v.to_number_raw();
+                    }
+                }
+            }
+            let ctx_prop = |st: &mut St, name: &str| -> String {
+                let k = st.intern_name(name);
+                match raw_get_prop(st, ctx as usize, k) {
+                    Some(v) => to_display(st, v),
+                    None => String::new(),
+                }
+            };
+            let mut text = String::new();
+            let (a, b, c, d, e);
+            match op {
+                4 => {
+                    // fillText(text, x, y) — e carries the font px
+                    text = if argc > 0 {
+                        to_display(st, st.regs[args_base])
+                    } else {
+                        String::new()
+                    };
+                    a = nums[1];
+                    b = nums[2];
+                    c = 0.0;
+                    d = 0.0;
+                    let font = ctx_prop(st, "font");
+                    e = font
+                        .split_whitespace()
+                        .find_map(|t| {
+                            t.strip_suffix("px")
+                                .and_then(|n| n.parse::<f64>().ok())
+                        })
+                        .unwrap_or(10.0);
+                }
+                _ => {
+                    a = nums[0];
+                    b = nums[1];
+                    c = nums[2];
+                    d = nums[3];
+                    e = nums[4];
+                }
+            }
+            let style = match op {
+                1 | 4 | 11 => ctx_prop(st, "fillStyle"),
+                2 | 12 => ctx_prop(st, "strokeStyle"),
+                _ => String::new(),
+            };
+            let list = st.canvas_cmds.entry(node).or_default();
+            if op == 3 && a == 0.0 && b == 0.0 {
+                // clearRect from the origin: treat as a fresh frame
+                // (the overwhelmingly common repaint pattern)
+                list.clear();
+            } else {
+                list.push((op, a, b, c, d, e, text, style));
+            }
+            return Ok(Value::UNDEFINED);
+        }
         Native::ClassList { node, op } => {
             let doc = need_doc(st)?;
             let current = doc
@@ -4521,13 +4594,26 @@ fn dom_method(
             }
             let ctx = new_plain_object(st);
             let ci = ctx.index() as usize;
-            for m in ["fillRect", "clearRect", "strokeRect",
-                      "beginPath", "closePath", "moveTo", "lineTo",
-                      "bezierCurveTo", "quadraticCurveTo", "arc",
-                      "arcTo", "ellipse", "rect", "fill", "stroke",
+            // recorded subset (T4 real rendering)
+            for (m, op) in [
+                ("fillRect", 1u8), ("strokeRect", 2), ("clearRect", 3),
+                ("fillText", 4), ("beginPath", 5), ("moveTo", 6),
+                ("lineTo", 7), ("arc", 8), ("rect", 9),
+                ("closePath", 10), ("fill", 11), ("stroke", 12),
+            ] {
+                let k = st.intern_name(m);
+                let f = make_native(
+                    st,
+                    Native::CanvasOp { node, ctx: ci as u32, op },
+                );
+                raw_set_prop(st, ci, k, f);
+            }
+            // still-noop tail (transforms, images, dashes...)
+            for m in ["bezierCurveTo", "quadraticCurveTo",
+                      "arcTo", "ellipse",
                       "clip", "save", "restore", "translate", "scale",
                       "rotate", "transform", "setTransform",
-                      "resetTransform", "drawImage", "fillText",
+                      "resetTransform", "drawImage",
                       "strokeText", "putImageData", "setLineDash"] {
                 let k = st.intern_name(m);
                 let f = make_native(st, Native::Noop);

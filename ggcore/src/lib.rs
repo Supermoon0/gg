@@ -86,6 +86,29 @@ impl TextEngine {
         (id, w, h)
     }
 
+    /// Rasterize a display list into the image store (canvas 2D —
+    /// T4). Returns (image_id, w, h) like load_image.
+    fn load_canvas(
+        &mut self,
+        width: u32,
+        height: u32,
+        cmds: Vec<Cmd>,
+    ) -> (u32, u32, u32) {
+        let w = width.clamp(1, 4096);
+        let h = height.clamp(1, 4096);
+        let r = self.rasterize(w, h, (255, 255, 255), &cmds);
+        // RGB -> RGBA
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for px in r.buf.chunks_exact(3) {
+            rgba.extend_from_slice(px);
+            rgba.push(255);
+        }
+        let id = self.next_image;
+        self.next_image += 1;
+        self.images.insert(id, (w, h, rgba));
+        (id, w, h)
+    }
+
     fn font_id(&mut self, family: &str, bold: bool, italic: bool) -> u32 {
         self.store.variant_id(family, bold, italic)
     }
@@ -701,6 +724,27 @@ impl Doc {
     fn fire_node_event(&mut self, node: u32, ty: &str) -> Vec<String> {
         if self.use_ggjs {
             self.ggvm().fire_node_event(node, ty)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// T4: recorded canvas-2d commands for a canvas node.
+    fn canvas_cmds(
+        &mut self,
+        node: u32,
+    ) -> Vec<(u8, f64, f64, f64, f64, f64, String, String)> {
+        if self.use_ggjs {
+            self.ggvm().canvas_cmds(node)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// T4: canvas nodes with recorded drawing.
+    fn canvas_nodes(&mut self) -> Vec<u32> {
+        if self.use_ggjs {
+            self.ggvm().canvas_nodes()
         } else {
             Vec::new()
         }

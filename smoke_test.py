@@ -1325,6 +1325,47 @@ headers, body = net.request(net.URL("about:home"))
 check("about:home renders", "GG Browser" in body)
 
 # --- Headless automation driver (needs the native wheel + JS) ---
+# --- T4: canvas 2D real rendering ---
+from browser import textengine as _te
+if native.available() and _te.available():
+    import os as _os4
+    _prev4 = _os4.environ.get("GGJS")
+    _os4.environ["GGJS"] = "1"
+    try:
+        cv_root, cv_doc, cv_css, _lg4 = native.load_document(
+            "<html><body><canvas id=cv width=60 height=40></canvas>"
+            "<script>var c=document.getElementById('cv');"
+            "var x=c.getContext('2d');"
+            "x.fillStyle='#ff0000'; x.fillRect(5,5,20,10);"
+            "x.strokeStyle='#0000ff'; x.beginPath(); x.moveTo(0,0);"
+            "x.lineTo(50,30); x.stroke();"
+            "x.font='10px sans'; x.fillStyle='#000000';"
+            "x.fillText('hi',2,38);</script></body></html>",
+            lambda h: {}, lambda s: {})
+    finally:
+        if _prev4 is None:
+            _os4.environ.pop("GGJS", None)
+        else:
+            _os4.environ["GGJS"] = _prev4
+    if hasattr(cv_doc, "canvas_nodes"):
+        _cvn = cv_doc.canvas_nodes()
+        _cvc = cv_doc.canvas_cmds(_cvn[0]) if _cvn else []
+        check("canvas T4: drawing calls are recorded in the VM",
+              len(_cvn) == 1 and len(_cvc) >= 5,
+              f"nodes={_cvn} cmds={len(_cvc)}")
+        check("canvas T4: styles captured per call",
+              any(st == "#ff0000" for (*_, st) in _cvc)
+              and any(st == "#0000ff" for (*_, st) in _cvc),
+              str([(op, st) for (op, *_r, st) in _cvc]))
+        _te.load_canvases(cv_root, cv_doc)
+        _cv_el = _find(cv_root, "canvas")
+        check("canvas T4: baked into a real image handle (60x40)",
+              getattr(_cv_el, "_img", None) is not None
+              and _cv_el._img[1] == 60 and _cv_el._img[2] == 40,
+              str(getattr(_cv_el, "_img", None)))
+    else:
+        print("[SKIP] canvas T4 - wheel predates canvas_nodes")
+
 # --- N3: partial refresh splices mutated subtrees only ---
 if native.available():
     import os as _os

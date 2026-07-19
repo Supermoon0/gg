@@ -1028,6 +1028,27 @@ impl PageVm {
         std::mem::take(&mut self.st.logs)
     }
 
+    /// T4: recorded canvas-2d commands for one canvas node
+    /// (op, a, b, c, d, e, text, style) — see Native::CanvasOp.
+    pub fn canvas_cmds(
+        &self,
+        node: u32,
+    ) -> Vec<(u8, f64, f64, f64, f64, f64, String, String)> {
+        self.st
+            .canvas_cmds
+            .get(&node)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// T4: canvas nodes that have any recorded drawing.
+    pub fn canvas_nodes(&self) -> Vec<u32> {
+        let mut v: Vec<u32> =
+            self.st.canvas_cmds.keys().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
     /// Shell pull: the page's document.cookie pairs (network-layer
     /// cookie jar sync).
     pub fn get_cookies(&self) -> Vec<(String, String)> {
