@@ -50,6 +50,46 @@
 메서드 추출 → Error 계층 → 숫자 메서드 → callable Object/Array →
 arguments → 라벨 블록/elision/no-in 경계.
 
+**07-19 부팅 관문 정밀 진단** (실네트워크, 웹팩 모듈 트레일 계측 —
+polyfill·preload 완주(705모듈), search는 regenerator 팩토리에서,
+main(react-dom 18.3.1)은 8번째 모듈 초기화에서 사망. 5개 관문 특정):
+
+1. **[S] `Object.getPrototypeOf(함수)`가 undefined** (vm.rs O_GET_PROTO
+   함수 분기) → core-js-pure toObject가 폭발, **search 번들 사망 지점**.
+   Function.prototype 실물 반환으로 해제. 관련: fn instanceof Object,
+   fn.constructor, fn.__proto__
+2. **[M] `new Set(배열)` 전역 파손 → react-dom 사망** (nonDelegatedEvents
+   초기화). 엔진 이음새 3개가 각각 core-js 이터레이터 룩업을 끊음:
+   (a) 배열 인스턴스가 Array.prototype expando를 못 봄, (b) defineProperty/
+   인덱싱이 객체(가짜 심볼) 키를 ToPropertyKey 안 함, (c) 추출된
+   `Object.prototype.toString.call([])`이 ''(브랜드 미지원 — '[object
+   Array]'가 최대 지렛대)
+3. **[M] 원시값 프로퍼티 읽기가 아무 키에나 truthy MethodRef 스텁 반환**
+   → jQuery ready 경로 사망(`"ready"[jQuery.expando]` truthy →
+   isPropagationStopped 호출) → **$(document).ready 전멸**. 지원 이름일
+   때만 스텁, 나머지 undefined로
+4. **[S] 최상위 `var X = X || {}` 호이스팅 버그** — pc.veta.core가
+   NBP_CORP를 **자체 정의**하는데 읽기가 먼저 죽음 (기존 "외부 전역
+   의존" 진단은 오진 — 스킵 범주 아님)
+5. **[S] 이름 있는 함수 표현식의 자기 이름 바인딩 부재** — babel
+   _classCallCheck에서 "Cannot call a class as a function" (gfp-core,
+   광고 SDK라 부팅 비차단). + instanceof 비호출가능 RHS는 TypeError로
+
+후속: 동적 주입 `<script src>` 미실행(ndp-core/ntm — pump 프로토콜에
+script 종 추가 [M]), 정규식 lookaround/backref 31건 never-matching 강등
+(fancy-regex 2차 엔진 [M], 서로게이트 클래스 강등은 무해 판명).
+
+**시각 격차의 정체(07-19)**: 네이버 서빙 HTML은 `<img>` 0개의 앱 셸 —
+로고·아이콘·썸네일은 전부 JS 부팅 후 생성. @font-face 4종 모두 ttf
+폴백 보유(woff2 갭 안 물림)·사용 요소 0. 그라디언트/그림자 근사도 서빙
+셸에선 매칭 0. **즉 "완벽 렌더" ≈ 위 관문 격파가 거의 전부**. 부팅 후
+과제: 모서리별 radius(196 box-shadow 중 blur 156)·실그라디언트·부분
+opacity 합성. 별건 발견: line-height가 크롬보다 ×1.164 헐거움(factor를
+font_px 기준으로 만들고 ascent+descent에 곱함 — layout.py [S]),
+gradient+url 다중 레이어에서 url 레이어 소실(draw.py parse_background
+[S/M]), 오프셋 없는 absolute 박스 레이아웃 탈락(layout.py [S/M]),
+basket 이미지 열은 하니스가 이미지를 아예 안 싣는 아티팩트([S]).
+
 근거: 2026-07-11 실측 — 네이버 홈 HTML 215KB, main.css 754KB,
 JS 번들 4개(polyfill 254KB + preload 192KB + search 283KB + main 763KB)를
 전수 스캔한 기능 사용 횟수. `(×n)`이 그 횟수다.
