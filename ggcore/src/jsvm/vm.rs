@@ -344,6 +344,11 @@ pub(super) mod host {
     pub const CV_MEASURE_TEXT: u16 = 120;
     pub const CV_IMAGE_DATA: u16 = 121;
     pub const CV_GRADIENT: u16 = 122;
+    // WebSocket (T5): connect/send/close delegate to the Python
+    // shell like fetch does; messages come back via deliver_ws
+    pub const WS_CONNECT: u16 = 130;
+    pub const WS_SEND: u16 = 131;
+    pub const WS_CLOSE: u16 = 132;
 }
 
 /// Hidden class: property layout shared by every object that acquired
@@ -522,6 +527,12 @@ pub(super) struct St {
     /// (op, a, b, c, d, e, text, style)
     pub(super) canvas_cmds: HashMap<
         u32, Vec<(u8, f64, f64, f64, f64, f64, String, String)>>,
+    /// WebSocket shell delegation (T5)
+    pub(super) ws_connects: Vec<(u32, String)>,
+    pub(super) ws_outbox: Vec<(u32, String)>,
+    pub(super) ws_closes: Vec<u32>,
+    pub(super) ws_objects: HashMap<u32, Value>,
+    pub(super) ws_next_id: u32,
     /// (object index, name id) -> (getter, setter) accessor pair
     /// (Object.defineProperty with get/set; UNDEFINED = absent side)
     pub(super) accessors: HashMap<(u32, u32), (Value, Value)>,
@@ -632,6 +643,11 @@ impl St {
             pending_inline_scripts: Vec::new(),
             scripts_seen: std::collections::HashSet::new(),
             canvas_cmds: HashMap::new(),
+            ws_connects: Vec::new(),
+            ws_outbox: Vec::new(),
+            ws_closes: Vec::new(),
+            ws_objects: HashMap::new(),
+            ws_next_id: 1,
             accessors: HashMap::new(),
             local_storage: HashMap::new(),
             session_storage: HashMap::new(),
@@ -1210,7 +1226,7 @@ fn str_ref(st: &mut St, i: u32) -> &str {
     }
 }
 
-fn raw_get_prop(st: &St, oi: usize, key: u32) -> Option<Value> {
+pub(super) fn raw_get_prop(st: &St, oi: usize, key: u32) -> Option<Value> {
     let mut oi = oi;
     for _ in 0..16 {
         let o = &st.objects[oi];
@@ -3713,6 +3729,46 @@ fn host_fn(
                 }
             }
             Ok(new_array(st, out))
+        }
+        WS_CONNECT => {
+            let url = if argc > 0 {
+                to_display(st, st.regs[args_base])
+            } else {
+                String::new()
+            };
+            let obj = if argc > 1 {
+                st.regs[args_base + 1]
+            } else {
+                Value::UNDEFINED
+            };
+            let id = st.ws_next_id;
+            st.ws_next_id += 1;
+            st.ws_objects.insert(id, obj);
+            st.ws_connects.push((id, url));
+            Ok(Value::number(id as f64))
+        }
+        WS_SEND => {
+            let id = if argc > 0 {
+                st.regs[args_base].to_number_raw() as u32
+            } else {
+                0
+            };
+            let data = if argc > 1 {
+                to_display(st, st.regs[args_base + 1])
+            } else {
+                String::new()
+            };
+            st.ws_outbox.push((id, data));
+            Ok(Value::UNDEFINED)
+        }
+        WS_CLOSE => {
+            let id = if argc > 0 {
+                st.regs[args_base].to_number_raw() as u32
+            } else {
+                0
+            };
+            st.ws_closes.push(id);
+            Ok(Value::UNDEFINED)
         }
         CV_MEASURE_TEXT => {
             // canvas-2d stub: zero metrics (layout runs after JS)

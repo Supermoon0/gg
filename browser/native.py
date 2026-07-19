@@ -189,6 +189,63 @@ def _link_module(code, kind, value, page_url, fetch_js, logs):
         return code
 
 
+# open WebSocket clients per (doc identity, ws id) — T5
+_WS_CLIENTS = {}
+
+
+def _service_websockets(doc, base_url):
+    """T5: open queued WebSocket connects, flush sends, poll for
+    inbound frames, and deliver open/message/close/error into page
+    JS. Returns True when anything was delivered."""
+    if not hasattr(doc, "take_ws_work"):
+        return False
+    from . import net
+    did = id(doc)
+    connects, outbox, closes = doc.take_ws_work()
+    ran = False
+
+    def deliver(wid, kind, data=""):
+        for line in doc.deliver_ws(wid, kind, data):
+            print(f"[js console] {line}")
+
+    for wid, url in connects:
+        ran = True
+        try:
+            resolved = (base_url.resolve(url)
+                        if base_url is not None else net.URL(url))
+            _WS_CLIENTS[(did, wid)] = net.WsClient(resolved)
+            deliver(wid, "open")
+        except Exception as e:
+            print(f"[gg] websocket connect failed: {url} "
+                  f"({type(e).__name__}: {e})")
+            deliver(wid, "error", str(e))
+    for wid, data in outbox:
+        cli = _WS_CLIENTS.get((did, wid))
+        if cli is None:
+            continue
+        ran = True
+        try:
+            cli.send_text(data)
+        except Exception as e:
+            deliver(wid, "error", str(e))
+    for wid in closes:
+        cli = _WS_CLIENTS.pop((did, wid), None)
+        if cli is not None:
+            cli.close()
+        deliver(wid, "close")
+        ran = True
+    mine = [(k, c) for k, c in list(_WS_CLIENTS.items())
+            if k[0] == did]
+    for (k, cli) in mine:
+        # a short blocking window so request/response chats settle
+        for kind, data in cli.poll(wait=0.1 if mine else 0.0):
+            ran = True
+            if kind == "close":
+                _WS_CLIENTS.pop(k, None)
+            deliver(k[1], kind, data)
+    return ran
+
+
 def _seed_page_cookies(doc, page_url):
     """document.cookie starts with this host's network-jar cookies."""
     if page_url is None or not hasattr(doc, "set_cookies"):
@@ -364,6 +421,9 @@ def settle_async(doc, css_sources, base_url, timeout=8.0, max_rounds=2000):
         if ran:
             mutated = True
             continue  # injected code may queue more work
+        if _service_websockets(doc, base_url):
+            mutated = True
+            continue  # ws handlers may queue more work
         if not doc.has_pending_work():
             break
         if time.monotonic() > deadline:

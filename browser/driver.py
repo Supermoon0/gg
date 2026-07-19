@@ -172,6 +172,9 @@ class Page:
             if ran:
                 mutated = True
                 continue  # injected code may queue more work
+            if native._service_websockets(self._doc, self.url):
+                mutated = True
+                continue
             if not self._doc.has_pending_work():
                 break
             if time.monotonic() > deadline:

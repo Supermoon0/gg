@@ -306,7 +306,8 @@ class URL:
 
         self.scheme, rest = url.split("://", 1)
         self.scheme = self.scheme.lower()
-        assert self.scheme in ("http", "https", "file"), \
+        assert self.scheme in ("http", "https", "file",
+                               "ws", "wss"), \
             f"unsupported scheme: {self.scheme}"
 
         if self.scheme == "file":
@@ -329,7 +330,7 @@ class URL:
         if "@" in authority:
             authority = authority.rsplit("@", 1)[1]
 
-        self.port = 80 if self.scheme == "http" else 443
+        self.port = 80 if self.scheme in ("http", "ws") else 443
         if authority.startswith("["):  # IPv6 literal: [::1] or [::1]:8080
             end = authority.find("]")
             if end < 0:
@@ -706,3 +707,157 @@ def _read_chunked(f):
         out.append(_read_exact(f, size))
         f.readline()  # trailing CRLF after each chunk
     return b"".join(out)
+
+
+# --- WebSocket client (T5, RFC 6455) ---
+class WsClient:
+    """A real WebSocket client: HTTP Upgrade handshake, masked client
+    frames, text messages, ping/pong, close. Fragmented messages are
+    not reassembled yet (fin-only, documented)."""
+
+    _GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def __init__(self, url, timeout=10):
+        import hashlib
+        self.url = url
+        self.open = False
+        s = socket.create_connection((url.host, url.port),
+                                     timeout=timeout)
+        if url.scheme == "wss":
+            ctx = ssl.create_default_context()
+            s = ctx.wrap_socket(s, server_hostname=url.host)
+        key = base64.b64encode(os.urandom(16))
+        host = f"[{url.host}]" if ":" in url.host else url.host
+        default = 80 if url.scheme == "ws" else 443
+        if url.port != default:
+            host += f":{url.port}"
+        path = url.path or "/"
+        req = (
+            f"GET {_safe_path(path)} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key.decode()}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"\r\n"
+        )
+        s.sendall(req.encode("utf-8"))
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = s.recv(4096)
+            if not chunk:
+                raise ConnectionError("websocket handshake EOF")
+            resp = resp + chunk
+        head, _, extra = resp.partition(b"\r\n\r\n")
+        if b" 101 " not in head.split(b"\r\n", 1)[0]:
+            raise ConnectionError("websocket upgrade refused")
+        want = base64.b64encode(
+            hashlib.sha1(key + self._GUID).digest())
+        accept = b""
+        for line in head.split(b"\r\n"):
+            if line.lower().startswith(b"sec-websocket-accept"):
+                accept = line.split(b":", 1)[1].strip()
+        if accept != want:
+            raise ConnectionError("bad Sec-WebSocket-Accept")
+        s.setblocking(False)
+        self._s = s
+        self._buf = bytearray(extra)
+        self.open = True
+
+    def send_text(self, text):
+        payload = text.encode("utf-8")
+        mask = os.urandom(4)
+        n = len(payload)
+        if n < 126:
+            head = bytes([0x81, 0x80 | n])
+        elif n < 65536:
+            head = bytes([0x81, 0x80 | 126]) + n.to_bytes(2, "big")
+        else:
+            head = bytes([0x81, 0x80 | 127]) + n.to_bytes(8, "big")
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self._s.sendall(head + mask + masked)
+
+    def _send_raw(self, op, payload=b""):
+        mask = os.urandom(4)
+        head = bytes([0x80 | op, 0x80 | len(payload)])
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        try:
+            self._s.sendall(head + mask + masked)
+        except OSError:
+            pass
+
+    def poll(self, wait=0.0):
+        """Drain readable frames; returns [(kind, text)] where kind is
+        'message' or 'close'."""
+        import select
+        out = []
+        if not self.open:
+            return out
+        try:
+            r, _, _ = select.select([self._s], [], [], wait)
+            if r:
+                chunk = self._s.recv(65536)
+                if not chunk:
+                    self.open = False
+                    return [("close", "")]
+                self._buf += chunk
+        except (BlockingIOError, InterruptedError):
+            pass
+        except OSError:
+            self.open = False
+            return [("close", "")]
+        while True:
+            frame = self._parse_frame()
+            if frame is None:
+                break
+            op, payload = frame
+            if op == 1:
+                out.append(("message",
+                            payload.decode("utf-8", "replace")))
+            elif op == 8:
+                self._send_raw(8)
+                self.open = False
+                out.append(("close", ""))
+                break
+            elif op == 9:
+                self._send_raw(10, bytes(payload))
+        return out
+
+    def _parse_frame(self):
+        buf = self._buf
+        if len(buf) < 2:
+            return None
+        ln = buf[1] & 0x7F
+        off = 2
+        if ln == 126:
+            if len(buf) < 4:
+                return None
+            ln = int.from_bytes(buf[2:4], "big")
+            off = 4
+        elif ln == 127:
+            if len(buf) < 10:
+                return None
+            ln = int.from_bytes(buf[2:10], "big")
+            off = 10
+        masked = buf[1] & 0x80
+        if masked:
+            off += 4  # servers must not mask; tolerate anyway
+        if len(buf) < off + ln:
+            return None
+        op = buf[0] & 0x0F
+        payload = bytes(buf[off:off + ln])
+        if masked:
+            mask = bytes(buf[off - 4:off])
+            payload = bytes(b ^ mask[i % 4]
+                            for i, b in enumerate(payload))
+        del buf[:off + ln]
+        return op, payload
+
+    def close(self):
+        if self.open:
+            self._send_raw(8)
+            self.open = False
+        try:
+            self._s.close()
+        except OSError:
+            pass

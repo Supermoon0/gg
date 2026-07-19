@@ -1447,6 +1447,60 @@ if native.available():
     dp.click("#b")
     check("driver: click runs the handler", dp.text("#o") == "hit",
           repr(dp.text("#o")))
+    # --- T5: WebSocket end-to-end against a local RFC6455 echo ---
+    def _ws_echo_port():
+        import base64 as _b64
+        import hashlib as _hl
+        import socket as _sk
+        import threading as _th
+        srv = _sk.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+
+        def run():
+            conn, _ = srv.accept()
+            conn.settimeout(10)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += conn.recv(4096)
+            key = next(ln.split(b":", 1)[1].strip()
+                       for ln in data.split(b"\r\n")
+                       if ln.lower().startswith(b"sec-websocket-key"))
+            acc = _b64.b64encode(_hl.sha1(
+                key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+            ).digest())
+            conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\n"
+                         b"Upgrade: websocket\r\n"
+                         b"Connection: Upgrade\r\n"
+                         b"Sec-WebSocket-Accept: " + acc + b"\r\n\r\n")
+            hdr = b""
+            while len(hdr) < 2:
+                hdr += conn.recv(2 - len(hdr))
+            ln = hdr[1] & 0x7F
+            mask = conn.recv(4)
+            payload = bytearray()
+            while len(payload) < ln:
+                payload += conn.recv(ln - len(payload))
+            for i in range(ln):
+                payload[i] ^= mask[i % 4]
+            conn.sendall(bytes([0x81, ln]) + bytes(payload))
+
+        _th.Thread(target=run, daemon=True).start()
+        return port
+
+    _wsport = _ws_echo_port()
+    wsp = Page(engine="ggjs")
+    wsp.goto("data:text/html,<html><body><p>ws</p><script>"
+             "var ws = new WebSocket('ws://127.0.0.1:%d/echo');"
+             "ws.onopen = function () { ws.send('안녕 ws'); };"
+             "ws.onmessage = function (e) {"
+             "  window.__ws = e.data; ws.close(); };"
+             "</script></body></html>" % _wsport)
+    check("T5 websocket: handshake, send, echo delivered to JS",
+          wsp.evaluate("window.__ws") == "안녕 ws",
+          repr(wsp.evaluate("window.__ws")))
+
     # linked module output actually runs in gg-js
     check("driver: linked ES module executes",
           dp.evaluate("(function () { " + _linked

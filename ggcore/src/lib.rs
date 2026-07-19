@@ -729,6 +729,31 @@ impl Doc {
         }
     }
 
+    /// T5: WebSocket work queued by page JS.
+    fn take_ws_work(
+        &mut self,
+    ) -> (Vec<(u32, String)>, Vec<(u32, String)>, Vec<u32>) {
+        if self.use_ggjs {
+            self.ggvm().take_ws_work()
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        }
+    }
+
+    /// T5: deliver a WebSocket event into page JS.
+    fn deliver_ws(
+        &mut self,
+        id: u32,
+        kind: &str,
+        data: &str,
+    ) -> Vec<String> {
+        if self.use_ggjs {
+            self.ggvm().deliver_ws(id, kind, data)
+        } else {
+            Vec::new()
+        }
+    }
+
     /// T4: recorded canvas-2d commands for a canvas node.
     fn canvas_cmds(
         &mut self,

@@ -14,7 +14,8 @@ use super::parser;
 use super::value::Value;
 use super::vm::{
     self, call_value, call_value_this, exec, has_pending_work, host,
-    make_native, new_plain_object, pump, raw_set_prop, reject_fetch,
+    make_native, new_plain_object, pump, raw_get_prop,
+    raw_set_prop, reject_fetch,
     resolve_fetch, Ids, ModStore, Native, St, DOC_NODE,
 };
 
@@ -22,6 +23,40 @@ use super::vm::{
 const PUMP_BUDGET: usize = 200_000;
 
 /// Promise.all / Promise.race, built on the native new Promise + then.
+// T5: WebSocket over the shell delegation channel (real RFC6455 in
+// Python; open/message/close/error delivered via deliver_ws).
+const WS_PRELUDE: &str = r#"
+function WebSocket(url) {
+  this.url = '' + url;
+  this.readyState = 0;
+  this.bufferedAmount = 0;
+  this.protocol = '';
+  this.onopen = null; this.onmessage = null;
+  this.onclose = null; this.onerror = null;
+  this._id = __gg_ws_connect('' + url, this);
+}
+WebSocket.CONNECTING = 0; WebSocket.OPEN = 1;
+WebSocket.CLOSING = 2; WebSocket.CLOSED = 3;
+WebSocket.prototype.send = function (d) {
+  if (this.readyState !== 1) {
+    throw new Error('WebSocket is not open');
+  }
+  __gg_ws_send(this._id, '' + d);
+};
+WebSocket.prototype.close = function () {
+  if (this.readyState < 2) {
+    this.readyState = 2;
+    __gg_ws_close(this._id);
+  }
+};
+WebSocket.prototype.addEventListener = function (t, f) {
+  this['on' + t] = f;
+};
+WebSocket.prototype.removeEventListener = function (t, f) {
+  if (this['on' + t] === f) { this['on' + t] = null; }
+};
+"#;
+
 const PROMISE_PRELUDE: &str = r#"
 Promise.all = function (arr) {
   return new Promise(function (resolve, reject) {
@@ -596,6 +631,9 @@ impl PageVm {
              Native::UriCoder { encode: true, component: false }),
             ("decodeURI",
              Native::UriCoder { encode: false, component: false }),
+            ("__gg_ws_connect", Native::HostFn(vm::host::WS_CONNECT)),
+            ("__gg_ws_send", Native::HostFn(vm::host::WS_SEND)),
+            ("__gg_ws_close", Native::HostFn(vm::host::WS_CLOSE)),
         ] {
             let fv = make_native(&mut vm.st, n);
             vm.set_global(name, fv);
@@ -883,6 +921,7 @@ impl PageVm {
         }
         // Promise.all/race defined in JS on top of new Promise + then
         vm.run_source(PROMISE_PRELUDE).ok();
+        vm.run_source(WS_PRELUDE).ok();
         vm
     }
 
@@ -1024,6 +1063,76 @@ impl PageVm {
                     .logs
                     .push(format!("[gg-js error] on{ty}: {msg}"));
             }
+        }
+        std::mem::take(&mut self.st.logs)
+    }
+
+    /// T5: WebSocket work queued by page JS since the last drain —
+    /// (connects (id, url), outbox (id, text), closes).
+    pub fn take_ws_work(
+        &mut self,
+    ) -> (Vec<(u32, String)>, Vec<(u32, String)>, Vec<u32>) {
+        (
+            std::mem::take(&mut self.st.ws_connects),
+            std::mem::take(&mut self.st.ws_outbox),
+            std::mem::take(&mut self.st.ws_closes),
+        )
+    }
+
+    /// T5: deliver a socket event (open/message/close/error) to the
+    /// JS WebSocket object. Returns console output.
+    pub fn deliver_ws(
+        &mut self,
+        id: u32,
+        kind: &str,
+        data: &str,
+    ) -> Vec<String> {
+        let Some(&obj) = self.st.ws_objects.get(&id) else {
+            return Vec::new();
+        };
+        if !obj.is_object() {
+            return Vec::new();
+        }
+        let oi = obj.index() as usize;
+        let state = match kind {
+            "open" => 1,
+            "close" | "error" => 3,
+            _ => -1,
+        };
+        if state >= 0 {
+            let k = self.name_id("readyState");
+            raw_set_prop(&mut self.st, oi, k, Value::int(state));
+        }
+        let evt = vm::new_plain_object(&mut self.st);
+        let ei = evt.index() as usize;
+        let tk = self.name_id("type");
+        let tv = vm::push_str(&mut self.st, kind.to_string());
+        raw_set_prop(&mut self.st, ei, tk, tv);
+        if kind == "message" {
+            let dk = self.name_id("data");
+            let dv = vm::push_str(&mut self.st, data.to_string());
+            raw_set_prop(&mut self.st, ei, dk, dv);
+        }
+        let hk = self.name_id(&format!("on{kind}"));
+        let handler = raw_get_prop(&self.st, oi, hk);
+        if let Some(h) = handler {
+            if h.is_function() {
+                if let Err(e) = vm::call_value_this(
+                    &mut self.st,
+                    &self.mods,
+                    h,
+                    Some(obj),
+                    &[evt],
+                ) {
+                    let msg = e.msg.clone();
+                    self.st.logs.push(format!(
+                        "[gg-js error] ws on{kind}: {msg}"
+                    ));
+                }
+            }
+        }
+        if kind == "close" || kind == "error" {
+            self.st.ws_objects.remove(&id);
         }
         std::mem::take(&mut self.st.logs)
     }
