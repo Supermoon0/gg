@@ -318,6 +318,9 @@ def gradient_color(value, default=""):
     return default
 
 
+_REPEAT_RE = re.compile(r"repeat\(\s*(\d+)\s*,([^)]*)\)")
+
+
 def layout_mode(node):
     if isinstance(node, Text):
         return "inline"
@@ -557,8 +560,17 @@ class BlockLayout:
             self.x = self.parent.x + self.ml + self.bw + self.pl
             if self.previous:
                 p = self.previous
-                self.y = (p.y + p.height + p.pb + p.bw + p.margin_bottom
-                          + self.margin_top + self.bw + self.pt)
+                # adjoining sibling margins collapse: both positive ->
+                # max, both negative -> min, mixed -> sum (CSS 2.1)
+                m1, m2 = p.margin_bottom, self.margin_top
+                if m1 >= 0 and m2 >= 0:
+                    coll = max(m1, m2)
+                elif m1 < 0 and m2 < 0:
+                    coll = min(m1, m2)
+                else:
+                    coll = m1 + m2
+                self.y = (p.y + p.height + p.pb + p.bw
+                          + coll + self.bw + self.pt)
             else:
                 self.y = (self.parent.y + self.margin_top
                           + self.bw + self.pt)
@@ -599,7 +611,12 @@ class BlockLayout:
                 spec_h - self.pt - self.pb - 2 * self.bw, 0)
 
         mode = layout_mode(node)
-        if mode == "flex":
+        if isinstance(node, Element) and self._table_rows(node):
+            self._layout_table(node, em)
+        elif isinstance(node, Element) and node.children \
+                and st.get("display", "").strip() == "grid":
+            self._layout_grid(node, em)
+        elif mode == "flex":
             self._layout_flex(node, em)
         elif mode == "block":
             # incremental placement: floats registered by earlier
@@ -898,6 +915,179 @@ class BlockLayout:
                     translate(b, 0, dy)
         apply_relative_offsets(self.children)
 
+    # ----- table layout (v1) -----
+
+    def _table_rows(self, node):
+        """The <tr> rows of a table box, walking through row groups.
+        A box is a table when it's <table> or display:table AND has at
+        least one row — otherwise it stays in normal block flow."""
+        st = node.style
+        if node.tag != "table" and st.get("display", "").strip() != "table":
+            return []
+        rows = []
+
+        def collect(n):
+            for c in n.children:
+                if not isinstance(c, Element) or not is_visible(c):
+                    continue
+                if c.tag == "tr" \
+                        or c.style.get("display", "") == "table-row":
+                    rows.append(c)
+                elif c.tag in ("thead", "tbody", "tfoot"):
+                    collect(c)
+
+        collect(node)
+        return rows
+
+    def _layout_table(self, node, em):
+        """Fixed-grid table v1: every column gets an equal share of the
+        content width (colspan spans that many shares); the row advances
+        by its tallest cell. No auto column sizing, border-spacing, or
+        rowspan yet."""
+        rows = self._table_rows(node)
+
+        def cells_of(tr):
+            return [c for c in tr.children if isinstance(c, Element)
+                    and is_visible(c)
+                    and (c.tag in ("td", "th") or c.style.get(
+                        "display", "") == "table-cell")]
+
+        def span_of(cell):
+            try:
+                return max(int(cell.attributes.get("colspan", 1)), 1)
+            except (ValueError, TypeError):
+                return 1
+
+        ncols = max((sum(span_of(c) for c in cells_of(tr))
+                     for tr in rows), default=0)
+        if not ncols:
+            self.height = 0
+            return
+        col_w = self.width / ncols
+        y = self.y
+        for tr in rows:
+            x = self.x
+            row_boxes = []
+            for cell in cells_of(tr):
+                w = col_w * min(span_of(cell), ncols)
+                box = BlockLayout(cell, self, None)
+                box.forced_width = w
+                box.flex_origin = (x, y)
+                self.children.append(box)
+                box.layout()
+                row_boxes.append(box)
+                x += w
+            y += max((b.outer_height() for b in row_boxes), default=0)
+        self.height = y - self.y
+        apply_relative_offsets(self.children)
+
+    # ----- grid layout (v1) -----
+
+    def _grid_tracks(self, spec, em, gap):
+        """grid-template-columns -> list of track widths in px.
+        Supports px/%/em, fr, auto (=1fr), and repeat(n, ...). Anything
+        unparseable yields a single full-width track."""
+        # expand repeat(n, X ...) — the parenthesized body has no
+        # nesting we support, so a simple scan suffices
+        expanded = []
+        i = 0
+        text = spec.strip()
+        while i < len(text):
+            m = _REPEAT_RE.match(text, i)
+            if m:
+                count = int(m.group(1))
+                body = m.group(2).strip()
+                expanded.extend(body.split() * max(count, 0))
+                i = m.end()
+            else:
+                j = text.find(" ", i)
+                if j == -1:
+                    expanded.append(text[i:])
+                    break
+                if text[i:j]:
+                    expanded.append(text[i:j])
+                i = j + 1
+        fixed = []
+        total_fr = 0.0
+        for tok in expanded:
+            tok = tok.strip()
+            if not tok:
+                continue
+            if tok.endswith("fr"):
+                try:
+                    total_fr += max(float(tok[:-2]), 0.0)
+                    fixed.append(("fr", max(float(tok[:-2]), 0.0)))
+                    continue
+                except ValueError:
+                    pass
+            if tok == "auto":
+                total_fr += 1.0
+                fixed.append(("fr", 1.0))
+                continue
+            px = parse_size(tok, self.width, em)
+            if px is None:
+                return []
+            fixed.append(("px", px))
+        if not fixed:
+            return []
+        gaps = gap * (len(fixed) - 1)
+        free = max(self.width - gaps
+                   - sum(v for (k, v) in fixed if k == "px"), 0.0)
+        return [v if k == "px" else
+                (free * v / total_fr if total_fr else 0.0)
+                for (k, v) in fixed]
+
+    def _layout_grid(self, node, em):
+        """display:grid v1: children fill the template's columns in
+        row-major order; each row advances by its tallest item. No
+        grid-area/span placement, dense packing, or implicit-track
+        sizing beyond auto=1fr."""
+        st = node.style
+        gap_raw = st.get("gap", st.get("grid-gap", "")).split()
+        row_gap = parse_size(
+            st.get("row-gap", gap_raw[0] if gap_raw else ""),
+            self.width, em) or 0
+        col_gap = parse_size(
+            st.get("column-gap",
+                   gap_raw[1] if len(gap_raw) > 1
+                   else (gap_raw[0] if gap_raw else "")),
+            self.width, em) or 0
+        tracks = self._grid_tracks(
+            st.get("grid-template-columns", ""), em, col_gap)
+        if not tracks:
+            tracks = [self.width]
+        items = [c for c in node.children
+                 if isinstance(c, Element) and is_visible(c)
+                 and not is_out_of_flow(c)]
+        for c in node.children:
+            if is_out_of_flow(c):
+                self._document().abs_queue.append(c)
+        y = self.y
+        col = 0
+        row_boxes = []
+        x_starts = []
+        run = self.x
+        for w in tracks:
+            x_starts.append(run)
+            run += w + col_gap
+        for item in items:
+            if col >= len(tracks):
+                y += max((b.outer_height() for b in row_boxes),
+                         default=0) + row_gap
+                row_boxes = []
+                col = 0
+            box = BlockLayout(item, self, None)
+            box.forced_width = tracks[col]
+            box.flex_origin = (x_starts[col], y)
+            self.children.append(box)
+            box.layout()
+            row_boxes.append(box)
+            col += 1
+        if row_boxes:
+            y += max(b.outer_height() for b in row_boxes)
+        self.height = y - self.y
+        apply_relative_offsets(self.children)
+
     # ----- inline layout -----
 
     def new_line(self):
@@ -920,6 +1110,12 @@ class BlockLayout:
                 return
             if node.tag == "br":
                 self.new_line()
+            elif (isinstance(node, Element)
+                  and node is not self.node
+                  and node.style.get("display", "").strip()
+                  == "inline-block"
+                  and self.inline_block(node)):
+                return
             elif node.tag == "img":
                 self.image(node)
             elif node.tag == "svg":
@@ -957,6 +1153,28 @@ class BlockLayout:
         text = TextLayout(node, word, line, prev)
         line.children.append(text)
         self.cursor_x += w + measure(font, " ")
+
+    def inline_block(self, node):
+        """display:inline-block with a specified width rides the line
+        as an atomic box (auto-width shrink-to-fit is not measured yet
+        — those fall back to plain inline flow, the pre-v1 behavior).
+        Returns True when the box was placed."""
+        em = parse_px(node.style.get("font-size", "16px"), 16.0)
+        w = parse_size(node.style.get("width"), self.width, em)
+        if w is None:
+            return False
+        inner = BlockLayout(node, self, None)
+        inner.forced_width = w
+        inner.flex_origin = (0, 0)  # laid out at origin, moved later
+        inner.layout()
+        if self.cursor_x + inner.outer_width() > self.width \
+                and self.cursor_x > 0:
+            self.new_line()
+        line = self.children[-1]
+        prev = line.children[-1] if line.children else None
+        line.children.append(InlineBlockLayout(inner, line, prev))
+        self.cursor_x += inner.outer_width()
+        return True
 
     def image(self, node):
         img = getattr(node, "_img", None)  # (image_id, w, h) or None
@@ -1105,7 +1323,10 @@ class BlockLayout:
         if not isinstance(self.node, Element):
             return False
         for axis in ("overflow", "overflow-x", "overflow-y"):
-            if self.node.style.get(axis) in ("hidden", "clip", "scroll"):
+            # auto/scroll areas clip like hidden (v1: no inner
+            # scrolling yet — content just can't bleed out)
+            if self.node.style.get(axis) in ("hidden", "clip", "scroll",
+                                             "auto"):
                 return True
         return False
 
@@ -1170,6 +1391,12 @@ class LineLayout:
                 shift = free / 2 if align == "center" else free
                 for word in self.children:
                     word.x += shift
+
+        # inline-block items: x/y are settled now — move the inner
+        # block tree into place
+        for word in self.children:
+            if hasattr(word, "finalize"):
+                word.finalize()
 
     def paint(self):
         return []
@@ -1240,6 +1467,45 @@ class TextLayout:
             y = self.y + self.height / 2
             cmds.append(DrawLine(self.x, y, self.x + self.width, y, color))
         return cmds
+
+
+class InlineBlockLayout:
+    """A line item wrapping a fully laid-out BlockLayout (at origin
+    coords). The line assigns x via layout() and y via the baseline
+    pass; finalize() then translates the inner tree into place. The
+    inner box is our only child, so ancestor translate()/paint walks
+    reach it naturally."""
+
+    def __init__(self, inner, parent, previous):
+        self.node = inner.node
+        self.inner = inner
+        self.parent = parent
+        self.previous = previous
+        self.children = [inner]
+        self.font = None  # baseline sits at the bottom, image-style
+        self.x = 0
+        self.y = 0
+        self.width = inner.outer_width()
+        self.height = inner.outer_height()
+        self.margin_top = 0
+        self.margin_bottom = 0
+        self._ox = 0.0  # inner tree's applied offset so far
+        self._oy = 0.0
+
+    def layout(self):
+        if self.previous:
+            self.x = self.previous.x + self.previous.width
+        else:
+            self.x = self.parent.x
+
+    def finalize(self):
+        dx, dy = self.x - self._ox, self.y - self._oy
+        if dx or dy:
+            translate(self.inner, dx, dy)
+            self._ox, self._oy = self.x, self.y
+
+    def paint(self):
+        return []
 
 
 class ImageLayout:

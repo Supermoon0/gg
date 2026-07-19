@@ -1,5 +1,6 @@
 """Headless smoke test for the GG engine pipeline."""
 
+import os
 import tkinter
 
 from browser import net
@@ -711,6 +712,72 @@ check("clear:both drops below the tallest float",
 check("container height contains its floats",
       _w.height >= 80 + 10 - 1, f"h={_w.height:.0f}")
 
+# --- P2 sweep: margin collapse / table / grid / inline-block /
+#     overflow:auto ---
+P2_PAGE = """<html><body style="margin: 0">
+<div id=mcw>
+  <div id=mc1 style="margin:0; margin-bottom:30px; height:20px">a</div>
+  <div id=mc2 style="margin:0; margin-top:10px; height:20px">b</div>
+</div>
+<table id=tb style="width:300px">
+  <tr><td id=c11>a</td><td id=c12>b</td><td id=c13>c</td></tr>
+  <tr><td id=c21 colspan=2>wide</td><td id=c22>d</td></tr>
+</table>
+<div id=gr style="display:grid; width:400px; gap:10px;
+     grid-template-columns: 100px 1fr 1fr">
+  <div id=g1 style="height:30px">1</div>
+  <div id=g2 style="height:40px">2</div>
+  <div id=g3 style="height:10px">3</div>
+  <div id=g4 style="height:20px">4</div>
+</div>
+<div id=para style="width:400px"><span id=ib
+  style="display:inline-block; width:120px; height:40px">box</span> tail</div>
+<div id=ovf style="overflow:auto; height:30px">
+  <div id=ovin style="height:200px">tall</div>
+</div>
+</body></html>"""
+p2_dom = HTMLParser(P2_PAGE).parse()
+style(p2_dom, sorted(ua, key=cascade_priority))
+p2_doc = DocumentLayout(p2_dom)
+p2_doc.layout(800)
+p2 = {}
+for b in layout_tree_to_list(p2_doc, []):
+    if isinstance(b, BlockLayout) and isinstance(b.node, Element):
+        node_id = b.node.attributes.get("id")
+        if node_id:
+            p2[node_id] = b
+check("sibling margins collapse to the larger one",
+      abs(p2["mc2"].y - (p2["mc1"].y + 20 + 30)) < 1,
+      f"mc2.y={p2['mc2'].y:.0f} expected {p2['mc1'].y + 50:.0f}")
+check("table: three equal columns of the table width",
+      abs(p2["c12"].x - p2["c11"].x - 100) < 1
+      and abs(p2["c13"].x - p2["c11"].x - 200) < 1,
+      f"dx12={p2['c12'].x - p2['c11'].x:.0f}")
+check("table: second row sits below the first",
+      p2["c21"].y > p2["c11"].y,
+      f"r1={p2['c11'].y:.0f} r2={p2['c21'].y:.0f}")
+check("table: colspan=2 cell spans two column slots",
+      abs(p2["c22"].x - p2["c21"].x - 200) < 1,
+      f"dx={p2['c22'].x - p2['c21'].x:.0f}")
+check("grid: px track then fr tracks share the rest minus gaps",
+      abs(p2["g2"].x - p2["g1"].x - 110) < 1
+      and abs(p2["g3"].x - p2["g1"].x - 260) < 1,
+      f"g2dx={p2['g2'].x - p2['g1'].x:.0f} "
+      f"g3dx={p2['g3'].x - p2['g1'].x:.0f}")
+check("grid: second row drops by tallest item + row gap",
+      abs(p2["g4"].y - (p2["g1"].y + 40 + 10)) < 1
+      and abs(p2["g4"].x - p2["g1"].x) < 1,
+      f"g4.y={p2['g4'].y:.0f} expected {p2['g1'].y + 50:.0f}")
+check("inline-block: atomic box keeps its specified size",
+      abs(p2["ib"].outer_width() - 120) < 1
+      and abs(p2["ib"].height - 40) < 1,
+      f"w={p2['ib'].outer_width():.0f} h={p2['ib'].height:.0f}")
+check("inline-block: the line grows to the box height",
+      p2["para"].height >= 40 - 1, f"h={p2['para'].height:.0f}")
+check("overflow:auto clips like hidden (v1)",
+      p2["ovf"]._clips() and abs(p2["ovf"].height - 30) < 8,
+      f"clips={p2['ovf']._clips()} h={p2['ovf'].height:.0f}")
+
 # --- flex deep-dive: justify/align/shrink/basis/flex shorthand ---
 FLEX2_PAGE = """<html><body style="margin: 0">
 <div id=jc style="display:flex; justify-content:center; width:300px">
@@ -1019,15 +1086,19 @@ check("request path sanitized",
       "\r" not in net._safe_path("/a\r\nX: 1")
       and " " not in net._safe_path("/a b"))
 
-# --- Real network fetch ---
-headers, body = net.request(net.URL("https://example.com"))
-check("HTTPS fetch example.com", "<html" in body.lower()
-      and "example" in body.lower(), f"{len(body)} bytes")
+# --- Real network fetch (GG_SKIP_NET=1 for egress-limited CI) ---
+if os.environ.get("GG_SKIP_NET") == "1":
+    print("[SKIP] real-network checks - GG_SKIP_NET=1")
+else:
+    headers, body = net.request(net.URL("https://example.com"))
+    check("HTTPS fetch example.com", "<html" in body.lower()
+          and "example" in body.lower(), f"{len(body)} bytes")
 
-# redirect propagates the final URL (http://google.com -> www.google.com)
-_h, _b, final = net.request_text(net.URL("http://google.com/"))
-check("redirect returns final URL", final.host != "google.com"
-      and "google" in final.host, str(final))
+    # redirect propagates the final URL
+    # (http://google.com -> www.google.com)
+    _h, _b, final = net.request_text(net.URL("http://google.com/"))
+    check("redirect returns final URL", final.host != "google.com"
+          and "google" in final.host, str(final))
 
 headers, body = net.request(net.URL("about:home"))
 check("about:home renders", "GG Browser" in body)
