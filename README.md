@@ -4,7 +4,7 @@
 
 - **Rust (`ggcore`)**: HTML 파싱, CSS 파싱, 스타일 계산, **자체 JavaScript 엔진(gg-js)**,
   이미지 디코딩(PNG/JPEG/GIF/WebP), SVG 래스터라이즈, **텍스트 셰이핑·글꼴 래스터화·
-  프레임 렌더링**(윈도우 TTF 직접 로드, 글리프 단위 한글 폴백, @font-face 웹폰트),
+  프레임 렌더링**(윈도우 TTF 직접 로드, 글리프 단위 한글 폴백, @font-face 웹폰트 — woff2 포함),
   네이티브 창 백엔드(winit + softbuffer), Rust 상주 디스플레이 리스트 스크롤
 - **Python**: 네트워크, 레이아웃, 브라우저 로직, 라이브 틱 루프
 - 러스트 모듈이 없으면 순수 파이썬 + tkinter 캔버스 경로로 자동 폴백
@@ -15,10 +15,10 @@
 python main.py                        # tkinter 셸, 홈 화면(about:home)
 python main.py https://naver.com      # tkinter 셸
 python main.py --native               # 러스트(winit) 창 셸
-python smoke_test.py                  # 헤드리스 파이프라인 테스트 (170종)
+python smoke_test.py                  # 헤드리스 파이프라인 테스트 (178종)
 GG_SKIP_NET=1 xvfb-run python smoke_test.py   # egress 제한/헤드리스 CI
 python basket_test.py                 # 대표 사이트 렌더 측정 (9곳)
-cd ggcore && cargo test --lib         # 엔진 단위 테스트 (174종)
+cd ggcore && cargo test --lib         # 엔진 단위 테스트 (176종)
 ```
 
 ## JavaScript — 자체 엔진 gg-js
@@ -50,7 +50,9 @@ polyfill(core-js)·preload(jQuery) 번들이 끝까지 실행되고 앱이 리�
 ("expression too deep")을 제거 — ReactDOM.render/createRoot 마운트,
 useState/useEffect, 클릭→setState→리렌더까지 E2E 검증. **ES 모듈 v1**:
 `<script type=module>`을 정적 링커가 실행 전에 클래식 스크립트로 링크.
-네이버 원본 main 번들 재검증은 로컬 네트워크 필요.
+**동적 주입 스크립트 채널**(주입 → 페치 → 실행 → onload 체이닝)과
+**합성 네이버 픽스처**(EAGER-DATA + 3단 주입 + React 피드)가 부팅 체인을
+헤드리스로 상시 검증한다. 네이버 원본 번들 재검증은 로컬 네트워크 필요.
 
 ## 네트워크
 

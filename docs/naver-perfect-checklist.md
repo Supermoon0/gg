@@ -117,8 +117,8 @@ class 2회) 문법 갭이 좁고, `display:grid`·`position:sticky`도 **0회**�
       memo만 무효화해 기존 variant id 유지) → 폰트 캐시 클리어 후
       첫 레이아웃. 미지 패밀리도 등록돼 있으면 통과(has_family).
       E2E: file:// 웹폰트가 p에 실적용·실측 폭 차이 확인.
-      갭: **woff/woff2 미지원**(fontdue에 인플레이터 없음 — 실사이트
-      대부분이 woff2라 로컬 검증 필요, 스킵은 무해), CSS 파일 기준
+      갭 해소(07-19): **woff2 디코드 지원**(woff2-patched → ttf 변환).
+      잔여는 woff(1), CSS 파일 기준
       상대경로(지금은 페이지 기준), unicode-range
 - [x] input `placeholder` 표시 — 07-11 ("검색어를 입력해 주세요." 회색 렌더,
       `input[type=hidden]` UA 룰 포함)
@@ -386,8 +386,9 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
       radius·transform 등 — 모르는 속성은 보수적으로 지오메트리).
       3,506노드 실측: hover당 114→53ms(2.2×; diff+패치 14 + 리페인트
       34). 잔여: 리페인트 자체의 부분화(디스플레이 리스트 캐시 —
-      M6 스크롤 60fps와 합류), 라이브 틱의 구조 변이 경로는 여전히
-      전체 재구축
+      M6 스크롤 60fps와 합류), 라이브 틱의 구조 변이 경로도
+      07-19부터 서브트리 스플라이스 v1(refresh_partial — ≤32 서브트리
+      제자리 교체, 의심 시 전체 폴백); 부분 레이아웃은 잔여
 - [ ] winit 셸(shell.py --native)에도 라이브 루프 배선 (현재 tkinter만)
 - [x] **`transform`** (×646) — 07-18: translate/translateX/translateY/
       translate3d/matrix(e,f)의 이동 성분을 페인트 오프셋으로 적용

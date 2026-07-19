@@ -125,6 +125,19 @@ impl FontStore {
         italic: bool,
         data: Vec<u8>,
     ) -> bool {
+        // woff2 (what real sites actually serve) decompresses to ttf
+        // in front of fontdue; failure falls through to the normal
+        // ttf/otf attempt so a bad container never kills the load
+        let data = if woff2_patched::decode::is_woff2(&data) {
+            match woff2_patched::decode::convert_woff2_to_ttf(
+                &mut &data[..],
+            ) {
+                Ok(ttf) => ttf,
+                Err(_) => data,
+            }
+        } else {
+            data
+        };
         let Ok(font) = fontdue::Font::from_bytes(
             data,
             fontdue::FontSettings::default(),
@@ -372,5 +385,31 @@ mod tests {
         // unparsable data is rejected, store stays sane
         assert!(!store.add_font("bad", false, false, vec![1, 2, 3]));
         assert!(store.has_family("myface"));
+    }
+
+    #[test]
+    fn woff2_web_fonts_decompress_and_register() {
+        let Ok(mut store) = FontStore::new() else {
+            return; // no system fonts in this environment: skip
+        };
+        // Lato regular (SIL OFL 1.1) — the sample the woff2 crate
+        // itself validates against
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../bench/fonts/lato-v22-latin-regular.woff2"
+        );
+        let Ok(data) = fs::read(path) else {
+            return; // fixture not checked out: skip
+        };
+        assert!(woff2_patched::decode::is_woff2(&data));
+        assert!(store.add_font("LatoWeb", false, false, data));
+        assert!(store.has_family("latoweb"));
+        // it actually shapes text
+        let id = store.variant_id("latoweb", false, false);
+        assert!(store.measure(id, 16.0, "hamburgefonstiv") > 10.0);
+        // truncated woff2 falls through and is rejected sanely
+        let Ok(data2) = fs::read(path) else { return };
+        assert!(!store.add_font(
+            "broken", false, false, data2[..200].to_vec()));
     }
 }
