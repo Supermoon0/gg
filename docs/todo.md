@@ -1,6 +1,7 @@
 # GG 통합 TODO 체크리스트
 
-프로젝트 전체의 남은 작업을 한 곳에 모은 목록. 세부 이력·완료 항목은
+프로젝트 전체의 남은 작업을 한 곳에 모은 목록. 최상위 목표와 티어
+구조는 [전체 웹 로드맵](roadmap.md)이 정의한다. 세부 이력·완료 항목은
 [네이버 완벽 구동 체크리스트](naver-perfect-checklist.md),
 [jsvm 연구 노트](jsvm-research.md),
 [AI 네이티브 전략](ai-native-strategy.md) 참조.
@@ -168,10 +169,11 @@
 - [ ] 디스크 캐시 범위 확대 검토 (현재 명시적 max-age만)
 - [ ] HTTP/2
 
-## P5 — 장기 / 별도 프로젝트급
+## P5 — 로드맵 T3~T5 (구 "비범위" — 전체 웹 목표로 범위 편입)
 
 - [ ] 로그인 — 쿠키 보안 속성 전체(HttpOnly/SameSite/Domain/Path), HTTPS 세션
-      (세션 쿠키 자 v1은 07-19 가동 — P1 항목)
+      (세션 쿠키 자 v1은 07-19 가동 — P1 항목). **로드맵 T3: 보안
+      모델(오리진·CORS·CSP)과 한 묶음 — "대충 v1" 금지 원칙**
 - [ ] iframe 문서 격리, CORS (광고·로그인·임베드)
 - [ ] Web Worker / Service Worker / WebAssembly
 - [ ] `<video>` / `<audio>` / WebGL (유튜브·지도류)

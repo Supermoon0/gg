@@ -1,6 +1,8 @@
 # GG Browser
 
 밑바닥부터 만든 하이브리드(Python + Rust) 웹 브라우저 엔진.
+목표는 **전체 웹** — 티어별 판정 기준은 [로드맵](docs/roadmap.md) 참조
+(T1 문서 웹 ✅ · T2 앱 웹 진행 중 · T3 세션 · T4 미디어 · T5 플랫폼).
 
 - **Rust (`ggcore`)**: HTML 파싱, CSS 파싱, 스타일 계산, **자체 JavaScript 엔진(gg-js)**,
   이미지 디코딩(PNG/JPEG/GIF/WebP), SVG 래스터라이즈, **텍스트 셰이핑·글꼴 래스터화·
