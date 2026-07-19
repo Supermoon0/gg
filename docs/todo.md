@@ -8,17 +8,23 @@
 
 **검증 체인**: `cargo test --lib` → maturin 휠 빌드·재설치 →
 `python smoke_test.py` → `python basket_test.py`
+(egress 제한 CI에서는 `GG_SKIP_NET=1` + xvfb, 휠은 tkinter 있는
+파이썬 버전으로 `maturin build -i` 지정)
 
 ---
 
 ## P0 — 현재 프런티어: 네이버 main(React) 번들 부팅
 
-polyfill·preload(jQuery)는 완주(07-19). 앱 부팅의 마지막 관문.
-
-- [ ] search 번들 잔여 관문 1개 격파
-- [ ] main(React) 번들 실행 완주 — React DOM 초기화 도달
+- [x] **React 18 UMD 실번들 부팅 (합성 검증)** — 07-19: u16 레지스터
+      확장으로 react-dom 131KB 컴파일 관문("expression too deep")
+      소멸 + MessageChannel 실물화(스케줄러 플러시). production.min
+      기준 ReactDOM.render 동기 마운트, createRoot+useState+useEffect
+      스케줄러 경유 마운트, dispatchEvent(click)→setState→리렌더까지
+      전 루프 검증(`react_boot_diag`, 번들은 bench/js/react).
+      **네이버 원본 번들 재검증은 로컬(네이버 egress 필요)에서**
+- [ ] 네이버 원본 search/main 번들 완주 — 로컬 실측 (환경 egress 차단)
 - [ ] 부팅 후 첫 화면(뉴스·쇼핑·피드) 실렌더 확인 — B단계 판정
-- [ ] 동적 주입 스크립트의 후속 로드·실행 경로 점검 (preload가 주입까지는 확인됨)
+- [ ] 동적 주입 스크립트의 후속 로드·실행 경로 점검
 
 ## P1 — 부팅 직후 체감 (성능·상호작용)
 
@@ -29,19 +35,38 @@ polyfill·preload(jQuery)는 완주(07-19). 앱 부팅의 마지막 관문.
 - [ ] native 셸 텍스트 입력 배선 (포커스·타이핑·캐럿 — 현재 tkinter만)
 - [ ] IME 한글 조합 (tkinter 캔버스 IME — 로컬 윈도우 실기 검증 필요)
 - [ ] 캐럿 이동·선택 (현재 캐럿은 값 끝 고정)
-- [ ] `document.cookie` ↔ 네트워크 계층 연동 (요청에 실어 보내기, 세션 유지)
-- [ ] getBoundingClientRect 스크롤 반영 (현재 문서좌표 근사)
+- [x] **`document.cookie` ↔ 네트워크 계층 연동** — 07-19: net.py에
+      세션 쿠키 자(호스트 단위, name=value v1 — Secure는 http에서
+      드롭, Max-Age≤0 삭제), 응답 Set-Cookie 수집 + 동일 호스트
+      요청에 Cookie 헤더 자동 첨부. Doc.get/set_cookies로 document.
+      cookie와 양방향 동기화(스크립트 실행 전 시드, lifecycle/settle
+      후 회수). 잔여: Path/Domain/만료 정밀 시맨틱, 디스크 영속화
+- [x] **getBoundingClientRect 스크롤 반영** — 07-19: 양 셸이
+      clamp_scroll에서 Doc.set_scroll 푸시, gBCR이 스크롤을 빼고
+      뷰포트 상대 좌표 반환(스펙 일치)
 - [ ] 시작 시간 단축 — 파이썬 기동+창+폰트 수백 ms (프로파일 후 캐시)
 - [ ] 윈도우 실기 재실측 — 스크롤 fps·네이버 웜 로드 (컨테이너 수치와 대조)
 
 ## P2 — 레이아웃·CSS 일반화 ("모든 웹사이트" 방향)
 
-- [ ] 테이블 레이아웃 (옛 사이트·정부 사이트 뼈대)
-- [ ] `display: grid` (GitHub·뉴스 사이트 도배 수준)
-- [ ] `position: sticky`
-- [ ] margin collapsing
-- [ ] inline-block 정식 배치 (지금은 근사)
-- [ ] `overflow: auto` 내부 스크롤 영역 (채팅창·사이드바)
+- [x] **테이블 레이아웃 v1** — 07-19: table/display:table + tr/td·th
+      (행 그룹 통과, display:table-row/cell 수용). 균등 컬럼 분할,
+      colspan은 그 배수 폭, 행 높이는 최고 셀. 잔여: 자동 컬럼 폭,
+      border-spacing, rowspan
+- [x] **`display: grid` v1** — 07-19: grid-template-columns
+      (px/%/em·fr·auto=1fr·repeat(n,…)), gap/row-gap/column-gap.
+      자식을 행 우선 배치, 행 높이는 최고 아이템. 잔여: grid-area/
+      span 배치, 암시적 트랙 사이징
+- [ ] `position: sticky` — 현재 일반 흐름 렌더(초기 화면은 정상),
+      스크롤 시 고정(pinning)은 디스플레이 리스트 캐시와 함께
+- [x] **margin collapsing** — 07-19: 인접 형제 마진 붕괴(CSS 2.1 —
+      양수 max, 음수 min, 혼합 합). 잔여: 부모-자식 붕괴, 빈 블록
+- [x] **inline-block 정식 배치** — 07-19: 폭 명시 박스가 라인의
+      원자 박스로 배치(InlineBlockLayout — 미리 레이아웃한 블록을
+      베이스라인 패스가 배치, finalize()가 내부 트리 이동). auto 폭은
+      기존 인라인 흐름 폴백(float v1과 같은 게이트)
+- [x] **`overflow: auto` 클리핑** — 07-19: hidden과 동일하게 클립
+      (v1: 내부 스크롤은 아직 — 콘텐츠가 새어나오지만 않음)
 - [ ] float 잔여: 인라인 흐름 안의 float, float 아래 텍스트 재확장, margin 스택 근사
 - [ ] 폼 컨트롤 렌더링 (`<select>`·체크박스·라디오)
 - [ ] `transition` / `@keyframes` 애니메이션 (시각 완성도)
@@ -51,14 +76,26 @@ polyfill·preload(jQuery)는 완주(07-19). 앱 부팅의 마지막 관문.
 
 ## P3 — gg-js 엔진 심화
 
-- [ ] ES 모듈 (import/export)
+- [x] **ES 모듈 v1 (정적 링커)** — 07-19: `<script type=module>`을
+      실행 전에 클래식 스크립트로 링크(browser/esmodules.py) —
+      정적 import를 깊이우선 인라인(URL 중복 제거), 모듈별 IIFE가
+      __ggmod에 export 등록, import 문은 var 읽기로 재작성(default/
+      named/renamed/namespace/bare). 게이트: dynamic import()·
+      re-export·라이브 바인딩·import.meta 미지원, 링크 실패 시 원본
+      실행. E2E: 링크 결과가 gg-js에서 실행 검증
 - [ ] `Proxy` / `Reflect` — 의도적 보류 중 (반쪽 스텁은 폴리필 오판 유발, 실물로 갈 것)
+- [x] **u16 레지스터 파일** — 07-19: "expression too deep" 영구
+      소멸(u8 250 한도가 최소화 번들의 마지막 컴파일 관문이었음).
+      argc/nparams는 u8 유지, 16000은 폭주 가드
+- [x] **spread 이터레이터 프로토콜** — 07-19: [...set]/f(...str)/
+      new C(...x)가 IterMat 노드로 실물화(Set/Map/문자열/@@iterator).
+      문자열은 문자 배열로 분해(for-of도 승격)
+- [x] **`#x in obj` 브랜드 체크** — 07-19: 표현식 위치의 프라이빗
+      이름이 '#x' 키 문자열로 낮춰져 own-property 검사 = 브랜드 체크
 - [ ] baseline JIT — 부팅 후 실행 시간이 병목으로 판명되면 (3~10배 목표)
 - [ ] mark-sweep GC — arena는 자라기만 함, 무한 스크롤·긴 세션 누수
 - [ ] 인스턴스별 메모리 상한 + 협조적 cancel 핸들
-- [ ] `#x in obj` 프라이빗 브랜드 체크
 - [ ] 루프/조건 안 `yield` (현재 명시 에러)
-- [ ] spread에 이터레이터 프로토콜 적용 (`[...set]` — 현재 concat 디슈가라 미적용)
 - [ ] Symbol 실물화 (현재 문자열 페이크 — typeof가 'string')
 
 ## P4 — 아키텍처·인프라
@@ -67,16 +104,21 @@ polyfill·preload(jQuery)는 완주(07-19). 앱 부팅의 마지막 관문.
       (파싱/스타일 242→11ms 같은 승리가 한 번 더 남은 곳; 부팅 후 측정하고 결정)
 - [ ] 탈 tkinter — tk PhotoImage 스왑 25ms가 잔여 병목 (native 셸 완성도와 연동)
 - [ ] P5: C ABI + headless Linux 빌드 + Boa 폴백 제거
+      (smoke는 이미 GG_SKIP_NET=1 + xvfb로 리눅스 완주 — 07-19)
 - [ ] 디스크 캐시 범위 확대 검토 (현재 명시적 max-age만)
 - [ ] HTTP/2
 
 ## P5 — 장기 / 별도 프로젝트급
 
-- [ ] 로그인 — 쿠키 보안 속성 전체(Secure/HttpOnly/SameSite), HTTPS 세션
+- [ ] 로그인 — 쿠키 보안 속성 전체(HttpOnly/SameSite/Domain/Path), HTTPS 세션
+      (세션 쿠키 자 v1은 07-19 가동 — P1 항목)
 - [ ] iframe 문서 격리, CORS (광고·로그인·임베드)
 - [ ] Web Worker / Service Worker / WebAssembly
 - [ ] `<video>` / `<audio>` / WebGL (유튜브·지도류)
-- [ ] HTML5 오류 복구 완전판, quirks 모드, EUC-KR 등 레거시 인코딩, RTL/양방향
+- [x] **EUC-KR 등 레거시 인코딩** — 07-19: Content-Type 헤더 우선 +
+      헤더 침묵 시 첫 2KB에서 `<meta charset>`/http-equiv 스니핑
+      (파이썬 코덱이 euc-kr 계열 전부 처리). 잔여: quirks 모드,
+      HTML5 오류 복구 완전판, RTL/양방향
 - [ ] AI 통합 (엔진 수준 — 전략 문서의 주차장 항목):
   - [ ] 요약/질문 사이드 패널 (레이아웃 트리 텍스트 추출 기반, 2~3일 규모)
   - [ ] 그레이스풀 디그러데이션 AI — 렌더 실패 감지 → 리더 모드 재구성
@@ -84,5 +126,7 @@ polyfill·preload(jQuery)는 완주(07-19). 앱 부팅의 마지막 관문.
 
 ---
 
-*작성: 2026-07-19 — 기준 상태: cargo 171종 · smoke 149종 · basket 8/9 읽을만함 ·
-polyfill/preload 번들 완주, main(React) 부팅이 프런티어.*
+*작성: 2026-07-19 · P0~P5 1차 스프린트 반영: 2026-07-19 —
+기준 상태: cargo 174종 · smoke 170종(GG_SKIP_NET=1, xvfb, cp312 휠) ·
+React 18 UMD 부팅·리렌더 E2E. basket_test와 네이버 원본 번들은
+egress 차단으로 이 환경에서 미측정(로컬 검증 항목).*
