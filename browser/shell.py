@@ -178,6 +178,7 @@ class Shell:
         for node in img_nodes:
             node._img = self._img_by_src.get(node.attributes["src"])
         textengine.load_svgs(self.nodes)
+        textengine.load_canvases(self.nodes, self._doc)
         textengine.load_background_images(
             self.nodes,
             lambda urls: _fetch_many(urls, self.url, binary=True))
@@ -399,6 +400,9 @@ class Shell:
         self.scroll = min(max(0, self.scroll), max_scroll)
         max_hscroll = max(self.content_width + HSTEP - w, 0)
         self.hscroll = min(max(0, self.hscroll), max_hscroll)
+        if self._doc is not None and hasattr(self._doc, "set_scroll"):
+            self._doc.set_scroll(float(self.hscroll),
+                                 float(self.scroll))
 
     def chrome_cmds(self, w, h):
         """Toolbar, status bar, and scrollbars — viewport-coordinate

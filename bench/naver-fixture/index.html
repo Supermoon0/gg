@@ -1,0 +1,57 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>합성 네이버 픽스처</title>
+<style>
+  body { margin: 0; font-size: 14px; }
+  #shell { width: 1190px; margin-left: auto; margin-right: auto; }
+  #header { height: 60px; background-color: #ffffff; }
+  #sbox {
+    width: 500px; height: 40px; border-width: 2px;
+    border-radius: 20px; display: block;
+  }
+  #root { min-width: 300px; }
+  .headline { color: #0068c3; }
+  #feed h2 { font-size: 18px; }
+</style>
+</head>
+<body>
+<div id="shell">
+  <div id="header">
+    <form id="sform" action="search.html">
+      <input id="query" name="query"
+             placeholder="검색어를 입력해 주세요.">
+    </form>
+  </div>
+  <div id="root"></div>
+</div>
+
+<!-- polyfill-mini: the shape of a core-js pass (feature checks that
+     must not throw) -->
+<script>
+(function () {
+  var ok = typeof Object.assign === 'function'
+    && typeof Promise !== 'undefined'
+    && typeof Symbol !== 'undefined'
+    && [].map && ''.trim;
+  window.__polyfillOk = !!ok;
+})();
+</script>
+
+<!-- EAGER-DATA: naver ships its first-screen content as inline JSON;
+     the app reads it after boot (reader mode also mines this shape) -->
+<script>
+window['EAGER-DATA'] = {};
+window["EAGER-DATA"]["NEWS"] = {"items": [
+  {"title": "헤드라인 첫째 기사", "url": "a1.html"},
+  {"title": "헤드라인 둘째 기사", "url": "a2.html"},
+  {"title": "헤드라인 셋째 기사", "url": "a3.html"}
+]};
+</script>
+
+<!-- entry: the webpack-runtime stand-in — injects vendor bundles
+     dynamically with onload chaining (the N1 channel under test) -->
+<script src="entry.js"></script>
+</body>
+</html>

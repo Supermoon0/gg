@@ -123,7 +123,8 @@ class Page:
         os.environ["GGJS"] = "1" if self.engine == "ggjs" else "0"
         try:
             _root, doc, css_sources, logs = native.load_document(
-                body, self._fetch_stylesheets, fetch_js)
+                body, self._fetch_stylesheets, fetch_js,
+                page_url=final_url)
         finally:
             if prev is None:
                 os.environ.pop("GGJS", None)
@@ -132,6 +133,7 @@ class Page:
 
         self._doc = doc
         self._css_sources = css_sources
+        self._injected = 0  # per-page injected-script budget (N1)
         self._console = list(logs)
         self._ver += 1
         self._export_cache = None
@@ -154,6 +156,7 @@ class Page:
         import time
         deadline = time.monotonic() + self.timeout
         mutated = False
+        injected = getattr(self, "_injected", 0)
         for _ in range(_SETTLE_MAX_ROUNDS):
             logs, fetches = self._doc.pump()
             if logs:
@@ -164,11 +167,23 @@ class Page:
                 for fetch_id, url in fetches:
                     self._service_fetch(fetch_id, url)
                 continue  # resolves queued more microtasks; keep draining
+            ran, injected = native._drain_injected_scripts(
+                self._doc, self.url, injected)
+            if ran:
+                mutated = True
+                continue  # injected code may queue more work
+            if native._service_websockets(self._doc, self.url):
+                mutated = True
+                continue
+            if native._service_workers(self._doc, self.url):
+                mutated = True
+                continue
             if not self._doc.has_pending_work():
                 break
             if time.monotonic() > deadline:
                 self._console.append("[driver] settle timed out")
                 break
+        self._injected = injected
         if mutated:
             # a handler/timer may have changed the DOM; restyle + refresh
             self._doc.compute_styles(self._css_sources)
@@ -177,7 +192,8 @@ class Page:
 
     def _service_fetch(self, fetch_id, url):
         try:
-            _h, body, _final = net.request_text(self.url.resolve(url))
+            _h, body, _final = net.fetch_for_page(
+                self.url, self.url.resolve(url))
             self._doc.resolve_fetch(fetch_id, 200, body)
         except Exception as e:
             self._doc.reject_fetch(fetch_id, f"{type(e).__name__}: {e}")

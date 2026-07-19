@@ -1,5 +1,6 @@
 """Headless smoke test for the GG engine pipeline."""
 
+import os
 import tkinter
 
 from browser import net
@@ -338,12 +339,13 @@ check("box-shadow paints an offset rect behind the box",
 # @font-face descriptor extraction (loadable sources only)
 from browser.webfonts import parse_font_faces
 _faces = parse_font_faces(["""@font-face { font-family: 'My Face'; src: url('fonts/a.woff2') format('woff2'), url(fonts/a.ttf) format('truetype'); }@font-face { font-family: IconFont; font-weight: 700; src: url(icons.otf); }@font-face { font-family: WoffOnly; src: url(x.woff2); }@font-face { font-family: DataFont; src: url(data:font/ttf;base64,AAAA); }"""])
-check("@font-face picks the loadable source",
-      ("my face", False, False, "fonts/a.ttf") in _faces, str(_faces))
+check("@font-face picks the first loadable source (woff2 now decodes)",
+      ("my face", False, False, "fonts/a.woff2") in _faces, str(_faces))
 check("@font-face numeric weight maps to bold",
       ("iconfont", True, False, "icons.otf") in _faces, str(_faces))
-check("woff2-only faces are skipped",
-      not any(f[0] == "woffonly" for f in _faces), str(_faces))
+check("woff2-only faces load since the Rust decoder landed",
+      any(f[0] == "woffonly" and f[3] == "x.woff2" for f in _faces),
+      str(_faces))
 check("data: font sources are accepted",
       any(f[0] == "datafont" and f[3].startswith("data:")
           for f in _faces), str(_faces))
@@ -711,6 +713,143 @@ check("clear:both drops below the tallest float",
 check("container height contains its floats",
       _w.height >= 80 + 10 - 1, f"h={_w.height:.0f}")
 
+# --- P2 sweep: margin collapse / table / grid / inline-block /
+#     overflow:auto ---
+P2_PAGE = """<html><body style="margin: 0">
+<div id=mcw>
+  <div id=mc1 style="margin:0; margin-bottom:30px; height:20px">a</div>
+  <div id=mc2 style="margin:0; margin-top:10px; height:20px">b</div>
+</div>
+<table id=tb style="width:300px">
+  <tr><td id=c11>a</td><td id=c12>b</td><td id=c13>c</td></tr>
+  <tr><td id=c21 colspan=2>wide</td><td id=c22>d</td></tr>
+</table>
+<div id=gr style="display:grid; width:400px; gap:10px;
+     grid-template-columns: 100px 1fr 1fr">
+  <div id=g1 style="height:30px">1</div>
+  <div id=g2 style="height:40px">2</div>
+  <div id=g3 style="height:10px">3</div>
+  <div id=g4 style="height:20px">4</div>
+</div>
+<div id=para style="width:400px"><span id=ib
+  style="display:inline-block; width:120px; height:40px">box</span> tail</div>
+<div id=ovf style="overflow:auto; height:30px">
+  <div id=ovin style="height:200px">tall</div>
+</div>
+</body></html>"""
+p2_dom = HTMLParser(P2_PAGE).parse()
+style(p2_dom, sorted(ua, key=cascade_priority))
+p2_doc = DocumentLayout(p2_dom)
+p2_doc.layout(800)
+p2 = {}
+for b in layout_tree_to_list(p2_doc, []):
+    if isinstance(b, BlockLayout) and isinstance(b.node, Element):
+        node_id = b.node.attributes.get("id")
+        if node_id:
+            p2[node_id] = b
+check("sibling margins collapse to the larger one",
+      abs(p2["mc2"].y - (p2["mc1"].y + 20 + 30)) < 1,
+      f"mc2.y={p2['mc2'].y:.0f} expected {p2['mc1'].y + 50:.0f}")
+check("table: similar content gives near-equal columns summing to "
+      "the table width",
+      abs(p2["c12"].x - p2["c11"].x - 100) < 15
+      and abs(p2["c13"].x - p2["c11"].x - 200) < 15
+      and abs((p2["c13"].x + p2["c13"].outer_width())
+              - (p2["c11"].x + 300)) < 2,
+      f"dx12={p2['c12'].x - p2['c11'].x:.0f} "
+      f"dx13={p2['c13'].x - p2['c11'].x:.0f}")
+check("table: second row sits below the first",
+      p2["c21"].y > p2["c11"].y,
+      f"r1={p2['c11'].y:.0f} r2={p2['c21'].y:.0f}")
+check("table: colspan=2 cell spans the first two columns exactly",
+      abs((p2["c22"].x - p2["c21"].x)
+          - (p2["c13"].x - p2["c11"].x)) < 1,
+      f"span2={p2['c22'].x - p2['c21'].x:.0f} "
+      f"col01={p2['c13'].x - p2['c11'].x:.0f}")
+check("grid: px track then fr tracks share the rest minus gaps",
+      abs(p2["g2"].x - p2["g1"].x - 110) < 1
+      and abs(p2["g3"].x - p2["g1"].x - 260) < 1,
+      f"g2dx={p2['g2'].x - p2['g1'].x:.0f} "
+      f"g3dx={p2['g3'].x - p2['g1'].x:.0f}")
+check("grid: second row drops by tallest item + row gap",
+      abs(p2["g4"].y - (p2["g1"].y + 40 + 10)) < 1
+      and abs(p2["g4"].x - p2["g1"].x) < 1,
+      f"g4.y={p2['g4'].y:.0f} expected {p2['g1'].y + 50:.0f}")
+check("inline-block: atomic box keeps its specified size",
+      abs(p2["ib"].outer_width() - 120) < 1
+      and abs(p2["ib"].height - 40) < 1,
+      f"w={p2['ib'].outer_width():.0f} h={p2['ib'].height:.0f}")
+check("inline-block: the line grows to the box height",
+      p2["para"].height >= 40 - 1, f"h={p2['para'].height:.0f}")
+check("overflow:auto clips like hidden (v1)",
+      p2["ovf"]._clips() and abs(p2["ovf"].height - 30) < 8,
+      f"clips={p2['ovf']._clips()} h={p2['ovf'].height:.0f}")
+
+# --- layout v2: auto table columns / grid span / form controls ---
+V2_PAGE = """<html><body style="margin: 0">
+<table id=at style="width:400px">
+  <tr><td id=wide>a much much longer cell with plenty of text</td>
+      <td id=slim>x</td></tr>
+  <tr><td>second row long-ish content here</td><td>y</td></tr>
+</table>
+<div id=g2 style="display:grid; width:330px; gap:10px;
+     grid-template-columns: 100px 100px 100px">
+  <div id=sp2 style="grid-column: span 2; height:10px">wide</div>
+  <div id=sp1 style="height:10px">one</div>
+  <div id=nx style="height:10px">next row</div>
+</div>
+<form>
+  <input id=cb type=checkbox checked>
+  <input id=rd type=radio name=g checked>
+  <select id=sel><option>첫째</option>
+    <option selected>둘째 옵션</option></select>
+</form>
+</body></html>"""
+v2_dom = HTMLParser(V2_PAGE).parse()
+style(v2_dom, sorted(ua, key=cascade_priority))
+v2_doc = DocumentLayout(v2_dom)
+v2_doc.layout(800)
+v2 = {}
+for b in layout_tree_to_list(v2_doc, []):
+    if isinstance(b, BlockLayout) and isinstance(b.node, Element):
+        node_id = b.node.attributes.get("id")
+        if node_id:
+            v2[node_id] = b
+check("table v2: columns share width by content, not equally",
+      v2["wide"].outer_width() > v2["slim"].outer_width() * 2
+      and abs((v2["wide"].outer_width() + v2["slim"].outer_width())
+              - 400) < 2,
+      f"wide={v2['wide'].outer_width():.0f} "
+      f"slim={v2['slim'].outer_width():.0f}")
+check("grid v2: span 2 item covers two tracks plus the gap",
+      abs(v2["sp2"].outer_width() - 210) < 1
+      and abs(v2["sp1"].x - v2["sp2"].x - 220) < 1,
+      f"w={v2['sp2'].outer_width():.0f} dx={v2['sp1'].x - v2['sp2'].x:.0f}")
+check("grid v2: full row wraps the next item",
+      v2["nx"].y > v2["sp2"].y and abs(v2["nx"].x - v2["sp2"].x) < 1,
+      f"nx=({v2['nx'].x:.0f},{v2['nx'].y:.0f})")
+check("form controls: checkbox/radio get their 14px UA box",
+      abs(v2["cb"].width - 14) < 1 and abs(v2["rd"].width - 14) < 1,
+      f"cb={v2['cb'].width:.0f}")
+_cbc = v2["cb"].paint()
+check("form controls: checked checkbox paints mark strokes",
+      sum(1 for c in _cbc if type(c).__name__ == "DrawLine") >= 2
+      and any(getattr(c, "color", "") == "#1a73e8" for c in _cbc),
+      str([type(c).__name__ for c in _cbc]))
+_rdc = v2["rd"].paint()
+check("form controls: checked radio paints the inner dot",
+      sum(1 for c in _rdc if type(c).__name__ == "DrawOval") >= 3,
+      str([type(c).__name__ for c in _rdc]))
+_selc = v2["sel"].paint()
+_seltexts = [c.text for c in _selc if hasattr(c, "text")]
+check("form controls: select shows the selected option + arrow",
+      any("둘째" in t for t in _seltexts)
+      and any("▾" in t for t in _seltexts), str(_seltexts))
+check("form controls: option lists are display:none",
+      all(n.style.get("display") == "none"
+          for n in tree_to_list(v2_dom, [])
+          if isinstance(n, Element) and n.tag == "option"))
+
 # --- flex deep-dive: justify/align/shrink/basis/flex shorthand ---
 FLEX2_PAGE = """<html><body style="margin: 0">
 <div id=jc style="display:flex; justify-content:center; width:300px">
@@ -1019,20 +1158,268 @@ check("request path sanitized",
       "\r" not in net._safe_path("/a\r\nX: 1")
       and " " not in net._safe_path("/a b"))
 
-# --- Real network fetch ---
-headers, body = net.request(net.URL("https://example.com"))
-check("HTTPS fetch example.com", "<html" in body.lower()
-      and "example" in body.lower(), f"{len(body)} bytes")
+# --- cookie jar (network layer, exact host) ---
+net.store_cookie("a.example", "sid=abc; Path=/; HttpOnly")
+net.store_cookie("a.example", "theme=dark")
+net.store_cookie("b.example", "other=1")
+check("cookie jar: attributes stripped, host-scoped",
+      net.cookie_header("a.example") == "sid=abc; theme=dark"
+      and net.cookie_header("b.example") == "other=1",
+      net.cookie_header("a.example"))
+net.store_cookie("a.example", "sid=xyz")
+check("cookie jar: same name upserts",
+      net.cookie_header("a.example") == "sid=xyz; theme=dark",
+      net.cookie_header("a.example"))
+net.store_cookie("a.example", "theme=; Max-Age=0")
+check("cookie jar: Max-Age=0 deletes",
+      net.cookie_header("a.example") == "sid=xyz",
+      net.cookie_header("a.example"))
+net.store_cookie("a.example", "sec=1; Secure", scheme="http")
+check("cookie jar: Secure over http is dropped",
+      "sec" not in net.cookie_header("a.example"),
+      net.cookie_header("a.example"))
+check("cookie jar: unknown host sends nothing",
+      net.cookie_header("nowhere.example") == "")
 
-# redirect propagates the final URL (http://google.com -> www.google.com)
-_h, _b, final = net.request_text(net.URL("http://google.com/"))
-check("redirect returns final URL", final.host != "google.com"
-      and "google" in final.host, str(final))
+# --- T3: attribute-complete cookies ---
+net.store_cookie("example.com", "dom=1; Domain=example.com")
+net.store_cookie("example.com", "hostonly=1")
+check("cookie T3: Domain cookie reaches subdomains, host-only doesn't",
+      "dom=1" in net.cookie_header("www.example.com")
+      and "hostonly" not in net.cookie_header("www.example.com")
+      and "hostonly=1" in net.cookie_header("example.com"),
+      net.cookie_header("www.example.com"))
+net.store_cookie("example.com", "scoped=1; Path=/app")
+check("cookie T3: Path bounds where a cookie is sent",
+      "scoped=1" in net.cookie_header("example.com", path="/app/x")
+      and "scoped" not in net.cookie_header("example.com",
+                                            path="/other"),
+      net.cookie_header("example.com", path="/app/x"))
+net.store_cookie("example.com", "sec=1; Secure")
+check("cookie T3: Secure cookie stays off plain http",
+      "sec=1" in net.cookie_header("example.com", scheme="https")
+      and "sec" not in net.cookie_header("example.com", scheme="http"))
+net.store_cookie("example.com",
+                 "old=1; Expires=Wed, 01 Jan 2020 00:00:00 GMT")
+check("cookie T3: expired cookie is purged",
+      "old" not in net.cookie_header("example.com"))
+net.store_cookie("example.com", "secret=1; HttpOnly")
+check("cookie T3: HttpOnly sent on the wire but hidden from JS",
+      "secret=1" in net.cookie_header("example.com")
+      and "secret" not in net.cookies_for("example.com"))
+net.store_cookie("example.com", "ss=1; SameSite=Strict")
+check("cookie T3: SameSite=Strict blocks a cross-site initiator",
+      "ss=1" in net.cookie_header("example.com",
+                                  initiator="sub.example.com")
+      and "ss" not in net.cookie_header("example.com",
+                                        initiator="evil.org"),
+      net.cookie_header("example.com", initiator="evil.org"))
+check("cookie T3: a host cannot set cookies for another domain",
+      (net.store_cookie("evil.org", "steal=1; Domain=example.com")
+       or "steal" not in net.cookie_header("example.com")))
+
+# --- T3: CORS response check (fetch/XHR channel) ---
+_pg = net.URL("https://app.example/index.html")
+check("CORS: same-origin always allowed",
+      net.cors_allows(_pg, net.URL("https://app.example/api"), {}))
+check("CORS: cross-origin without ACAO is blocked",
+      not net.cors_allows(_pg, net.URL("https://api.other/v1"), {}))
+check("CORS: ACAO * allows",
+      net.cors_allows(_pg, net.URL("https://api.other/v1"),
+                      {"access-control-allow-origin": "*"}))
+check("CORS: ACAO exact origin allows, mismatch blocks",
+      net.cors_allows(_pg, net.URL("https://api.other/v1"),
+                      {"access-control-allow-origin":
+                       "https://app.example"})
+      and not net.cors_allows(_pg, net.URL("https://api.other/v1"),
+                              {"access-control-allow-origin":
+                               "https://elsewhere.example"}))
+check("CORS: file: pages read file: fixtures (same scheme)",
+      net.cors_allows(net.URL("file:///a/index.html"),
+                      net.URL("file:///a/dep.js"), {}))
+
+# --- T3: POST form serialization ---
+from browser import forms as _f3
+_post_dom = _styled("", '<form method=post action="/login">'
+                    '<input name=user value="kim">'
+                    '<input name=pw type=password value="s3cret">'
+                    '<input type=submit value=go></form>')
+_pform = _find(_post_dom, "form")
+_ppost = _f3.submit_post(_pform)
+check("POST: urlencoded body from named fields (submit excluded)",
+      _ppost == ("/login", "user=kim&pw=s3cret"), str(_ppost))
+_get_dom = _styled("", '<form action="/s"><input name=q value=x></form>')
+check("POST: GET forms return None from submit_post",
+      _f3.submit_post(_find(_get_dom, "form")) is None)
+
+# --- charset sniffing (legacy Korean sites: EUC-KR via <meta>) ---
+check("charset: Content-Type header wins",
+      net.sniff_charset(b"<html>", "text/html; charset=euc-kr")
+      == "euc-kr")
+check("charset: <meta charset> sniffed from the head",
+      net.sniff_charset(
+          b'<html><head><meta charset="EUC-KR"></head>', "text/html")
+      == "EUC-KR")
+check("charset: http-equiv content sniffed",
+      net.sniff_charset(
+          b'<meta http-equiv="Content-Type" '
+          b'content="text/html; charset=euc-kr">', "")
+      == "euc-kr")
+check("charset: euc-kr bytes decode",
+      "한글 텍스트".encode("euc-kr").decode(
+          net.sniff_charset(b"<meta charset=euc-kr>", ""))
+      == "한글 텍스트")
+check("charset: default stays utf-8", net.sniff_charset(b"<html>", "")
+      == "utf-8")
+
+# --- ES module linker v1 (static import/export -> classic script) ---
+from browser import esmodules
+
+_MODS = {
+    "https://x.example/util.js":
+        "export const answer = 42;\n"
+        "export function double(n) { return n * 2; }\n"
+        "export default function () { return 'dflt'; }\n",
+    "https://x.example/side.js":
+        "window.__side = (window.__side || 0) + 1;\n",
+}
+
+
+def _mod_loader(spec, base):
+    url = "https://x.example/" + spec.lstrip("./")
+    return _MODS.get(url), url
+
+
+_ENTRY = (
+    "import dflt, { answer, double as twice } from './util.js';\n"
+    "import './side.js';\n"
+    "import './side.js';\n"
+    "export const local = 1;\n"
+    "var out = answer + twice(4) + dflt().length;\n")
+_linked = esmodules.link(_ENTRY, None, _mod_loader)
+check("module linker: no import/export statements survive",
+      "import " not in _linked and "\nexport " not in _linked
+      and "export const" not in _linked, _linked[:120])
+check("module linker: dedup - side-effect dep inlined once",
+      _linked.count("side.js'] =") == 1,
+      f"registrations={_linked.count(chr(39) + '] =')}")
+check("module linker: named/renamed/default reads wired",
+      "var twice = " in _linked and ".double;" in _linked
+      and ".default;" in _linked)
+
+# --- Real network fetch (GG_SKIP_NET=1 for egress-limited CI) ---
+if os.environ.get("GG_SKIP_NET") == "1":
+    print("[SKIP] real-network checks - GG_SKIP_NET=1")
+else:
+    headers, body = net.request(net.URL("https://example.com"))
+    check("HTTPS fetch example.com", "<html" in body.lower()
+          and "example" in body.lower(), f"{len(body)} bytes")
+
+    # redirect propagates the final URL
+    # (http://google.com -> www.google.com)
+    _h, _b, final = net.request_text(net.URL("http://google.com/"))
+    check("redirect returns final URL", final.host != "google.com"
+          and "google" in final.host, str(final))
 
 headers, body = net.request(net.URL("about:home"))
 check("about:home renders", "GG Browser" in body)
 
 # --- Headless automation driver (needs the native wheel + JS) ---
+# --- T4: canvas 2D real rendering ---
+from browser import textengine as _te
+if native.available() and _te.available():
+    import os as _os4
+    _prev4 = _os4.environ.get("GGJS")
+    _os4.environ["GGJS"] = "1"
+    try:
+        cv_root, cv_doc, cv_css, _lg4 = native.load_document(
+            "<html><body><canvas id=cv width=60 height=40></canvas>"
+            "<script>var c=document.getElementById('cv');"
+            "var x=c.getContext('2d');"
+            "x.fillStyle='#ff0000'; x.fillRect(5,5,20,10);"
+            "x.strokeStyle='#0000ff'; x.beginPath(); x.moveTo(0,0);"
+            "x.lineTo(50,30); x.stroke();"
+            "x.font='10px sans'; x.fillStyle='#000000';"
+            "x.fillText('hi',2,38);</script></body></html>",
+            lambda h: {}, lambda s: {})
+    finally:
+        if _prev4 is None:
+            _os4.environ.pop("GGJS", None)
+        else:
+            _os4.environ["GGJS"] = _prev4
+    if hasattr(cv_doc, "canvas_nodes"):
+        _cvn = cv_doc.canvas_nodes()
+        _cvc = cv_doc.canvas_cmds(_cvn[0]) if _cvn else []
+        check("canvas T4: drawing calls are recorded in the VM",
+              len(_cvn) == 1 and len(_cvc) >= 5,
+              f"nodes={_cvn} cmds={len(_cvc)}")
+        check("canvas T4: styles captured per call",
+              any(st == "#ff0000" for (*_, st) in _cvc)
+              and any(st == "#0000ff" for (*_, st) in _cvc),
+              str([(op, st) for (op, *_r, st) in _cvc]))
+        _te.load_canvases(cv_root, cv_doc)
+        _cv_el = _find(cv_root, "canvas")
+        check("canvas T4: baked into a real image handle (60x40)",
+              getattr(_cv_el, "_img", None) is not None
+              and _cv_el._img[1] == 60 and _cv_el._img[2] == 40,
+              str(getattr(_cv_el, "_img", None)))
+    else:
+        print("[SKIP] canvas T4 - wheel predates canvas_nodes")
+
+# --- N3: partial refresh splices mutated subtrees only ---
+if native.available():
+    import os as _os
+    _prev_ggjs = _os.environ.get("GGJS")
+    _os.environ["GGJS"] = "1"
+    try:
+        n3_root, n3_doc, n3_css, _lg = native.load_document(
+            "<html><body><div id=a><p id=p1>one</p></div>"
+            "<div id=b><p id=p2>two</p></div></body></html>",
+            lambda h: {}, lambda s: {})
+    finally:
+        if _prev_ggjs is None:
+            _os.environ.pop("GGJS", None)
+        else:
+            _os.environ["GGJS"] = _prev_ggjs
+    if hasattr(n3_doc, "take_mutated"):
+        def _n3_find(root, nid):
+            return next(n for n in tree_to_list(root, [])
+                        if isinstance(n, Element)
+                        and n.attributes.get("id") == nid)
+
+        def _n3_dump(root):
+            out = []
+            for n in tree_to_list(root, []):
+                if isinstance(n, Element):
+                    out.append((n.tag, tuple(sorted(
+                        n.attributes.items()))))
+                else:
+                    out.append(("#text", n.text))
+            return out
+
+        b_before = _n3_find(n3_root, "b")
+        n3_doc.run_scripts([
+            "document.getElementById('p1').textContent = 'changed';"
+            "var s = document.createElement('span');"
+            "s.id = 'newnode'; s.textContent = 'fresh';"
+            "document.getElementById('a').appendChild(s);"])
+        n3_root2 = native.refresh_partial(n3_doc, n3_css, n3_root)
+        check("partial refresh: root object survives",
+              n3_root2 is n3_root)
+        check("partial refresh: untouched sibling is NOT re-marshaled",
+              _n3_find(n3_root2, "b") is b_before)
+        check("partial refresh: mutated text and new node arrive",
+              "changed" in "".join(
+                  t.text for t in tree_to_list(
+                      _n3_find(n3_root2, "p1"), [])
+                  if isinstance(t, Text))
+              and _n3_find(n3_root2, "newnode").tag == "span")
+        check("partial refresh: tree equals a full rebuild (golden)",
+              _n3_dump(n3_root2) == _n3_dump(
+                  native.build_tree(n3_doc.export())))
+    else:
+        print("[SKIP] partial refresh - wheel predates take_mutated")
+
 if native.available():
     from browser.driver import Page
 
@@ -1060,6 +1447,110 @@ if native.available():
     dp.click("#b")
     check("driver: click runs the handler", dp.text("#o") == "hit",
           repr(dp.text("#o")))
+    # --- T5: WebSocket end-to-end against a local RFC6455 echo ---
+    def _ws_echo_port():
+        import base64 as _b64
+        import hashlib as _hl
+        import socket as _sk
+        import threading as _th
+        srv = _sk.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+
+        def run():
+            conn, _ = srv.accept()
+            conn.settimeout(10)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += conn.recv(4096)
+            key = next(ln.split(b":", 1)[1].strip()
+                       for ln in data.split(b"\r\n")
+                       if ln.lower().startswith(b"sec-websocket-key"))
+            acc = _b64.b64encode(_hl.sha1(
+                key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+            ).digest())
+            conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\n"
+                         b"Upgrade: websocket\r\n"
+                         b"Connection: Upgrade\r\n"
+                         b"Sec-WebSocket-Accept: " + acc + b"\r\n\r\n")
+            hdr = b""
+            while len(hdr) < 2:
+                hdr += conn.recv(2 - len(hdr))
+            ln = hdr[1] & 0x7F
+            mask = conn.recv(4)
+            payload = bytearray()
+            while len(payload) < ln:
+                payload += conn.recv(ln - len(payload))
+            for i in range(ln):
+                payload[i] ^= mask[i % 4]
+            conn.sendall(bytes([0x81, ln]) + bytes(payload))
+
+        _th.Thread(target=run, daemon=True).start()
+        return port
+
+    _wsport = _ws_echo_port()
+    wsp = Page(engine="ggjs")
+    wsp.goto("data:text/html,<html><body><p>ws</p><script>"
+             "var ws = new WebSocket('ws://127.0.0.1:%d/echo');"
+             "ws.onopen = function () { ws.send('안녕 ws'); };"
+             "ws.onmessage = function (e) {"
+             "  window.__ws = e.data; ws.close(); };"
+             "</script></body></html>" % _wsport)
+    check("T5 websocket: handshake, send, echo delivered to JS",
+          wsp.evaluate("window.__ws") == "안녕 ws",
+          repr(wsp.evaluate("window.__ws")))
+
+    # --- T5: Web Worker — real isolation in a separate VM ---
+    wkp = Page(engine="ggjs")
+    wkp.goto(
+        "data:text/html,<html><body><p>wk</p><script>"
+        "window.__iso = 'main';"
+        "var w = new Worker('data:text/javascript,"
+        "var seen = typeof __iso; "
+        'onmessage = function (e) {'
+        ' postMessage(e.data + "/" + seen); }\');'
+        "w.onmessage = function (e) { window.__wk = e.data; };"
+        "w.postMessage('철수');"
+        "</script></body></html>")
+    check("T5 worker: separate VM round-trip, globals NOT shared",
+          wkp.evaluate("window.__wk") == "철수/undefined",
+          repr(wkp.evaluate("window.__wk")))
+
+    # linked module output actually runs in gg-js
+    check("driver: linked ES module executes",
+          dp.evaluate("(function () { " + _linked
+                      + "; return out; })()") == 54,
+          repr(dp.evaluate("(function () { " + _linked
+                           + "; return out; })()")))
+
+    # --- synthetic naver fixture: the full boot chain under one roof
+    #     (N1 injection chain -> React mount -> EAGER-DATA feed ->
+    #     stateful click). Skipped if the React bundles are absent.
+    _FX = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "bench", "naver-fixture", "index.html")
+    _REACT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "bench", "js", "react",
+                          "react.production.min.js")
+    if os.path.exists(_FX) and os.path.exists(_REACT):
+        fp = Page(engine="ggjs")
+        fp.goto("file://" + _FX)
+        check("fixture: 3-deep injected chain boots React",
+              fp.evaluate("typeof React") == "object"
+              and fp.evaluate("typeof ReactDOM") == "object",
+              repr(fp.evaluate("typeof React")))
+        feed = fp.text("#feed") or ""
+        check("fixture: React renders the EAGER-DATA feed",
+              "헤드라인 첫째 기사" in feed and "뉴스 헤드라인" in feed,
+              feed[:60])
+        check("fixture: headline count matches the JSON",
+              len(fp.query_all(".headline")) == 3)
+        fp.click(".headline")
+        check("fixture: click -> setState -> re-render",
+              "선택: 1" in (fp.text("#picked") or ""),
+              repr(fp.text("#picked")))
+    else:
+        print("[SKIP] naver fixture - react bundles not present")
 else:
     print("[SKIP] driver checks - native ggcore not built")
 

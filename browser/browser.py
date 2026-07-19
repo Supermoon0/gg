@@ -228,6 +228,7 @@ class Browser:
             return
         self._dom_version = self._doc.dom_version()
         self._live_idle = 0
+        self._live_injected = 0
         import time
         self._live_last = time.monotonic()
         gen = self._live_gen
@@ -250,17 +251,25 @@ class Browser:
                 print(f"[js live] {line}")
             for fetch_id, furl in fetches:
                 try:
-                    _h, body, _f = _net.request_text(
-                        self.url.resolve(furl))
+                    _h, body, _f = _net.fetch_for_page(
+                        self.url, self.url.resolve(furl))
                     self._doc.resolve_fetch(fetch_id, 200, body)
                 except Exception as e:
                     self._doc.reject_fetch(
                         fetch_id, f"{type(e).__name__}: {e}")
+            # N1: scripts the page injected during this tick (the
+            # injected-count cap is per page generation)
+            _ran, self._live_injected = native._drain_injected_scripts(
+                self._doc, self.url,
+                getattr(self, "_live_injected", 0))
+            native._service_websockets(self._doc, self.url)
+            native._service_workers(self._doc, self.url)
             version = self._doc.dom_version()
             if version != self._dom_version:
                 self._dom_version = version
                 self._live_idle = 0
-                self.nodes = native.refresh(self._doc, self._css_sources)
+                self.nodes = native.refresh_partial(
+                    self._doc, self._css_sources, self.nodes)
                 self._remap_marks()
                 self.load_images(self.nodes, self.url, keep_cache=True)
                 self.relayout()
@@ -309,6 +318,7 @@ class Browser:
         for node in img_nodes:
             node._img = self._img_by_src.get(node.attributes["src"])
         textengine.load_svgs(nodes)
+        textengine.load_canvases(nodes, getattr(self, '_doc', None))
 
         def fetch_raw(urls):
             with ThreadPoolExecutor(max_workers=6) as pool:
@@ -523,6 +533,14 @@ class Browser:
         height = self.canvas.winfo_height()
         max_scroll = max(self.document.height + 2 * VSTEP - height, 0)
         self.scroll = min(max(0, self.scroll), max_scroll)
+        self._push_scroll()
+
+    def _push_scroll(self):
+        # gBCR answers viewport-relative coords: keep the JS engine's
+        # scroll offset current (cheap - two floats)
+        doc = getattr(self, "_doc", None)
+        if doc is not None and hasattr(doc, "set_scroll"):
+            doc.set_scroll(0.0, float(self.scroll))
 
     def scroll_by(self, delta):
         if self.window.focus_get() == self.url_entry:
@@ -618,7 +636,44 @@ class Browser:
             except Exception as e:
                 self.set_status(f"이동 실패: {e}")
             return
-        self.set_focus(forms.find_input(obj.node))
+        target = forms.find_input(obj.node)
+        if target is not None and self.toggle_control(target):
+            return
+        self.set_focus(target)
+
+    def toggle_control(self, node):
+        """Checkbox/radio click semantics: toggle (checkbox) or select
+        exclusively within the same-name group (radio). Mirrored into
+        the Rust DOM so form serialization and page JS see it.
+        Returns True when the click was consumed."""
+        itype = node.attributes.get("type", "").strip().casefold()
+        if itype == "checkbox":
+            if "checked" in node.attributes:
+                del node.attributes["checked"]
+                self.sync_attr(node, "checked", None)
+            else:
+                node.attributes["checked"] = "checked"
+                self.sync_attr(node, "checked", "checked")
+            self.repaint()
+            return True
+        if itype == "radio":
+            name = node.attributes.get("name", "")
+            form = forms.find_form(node) or self.nodes
+            if name:
+                for peer in tree_to_list(form, []):
+                    if (isinstance(peer, Element)
+                            and peer.tag == "input"
+                            and peer.attributes.get(
+                                "type", "").casefold() == "radio"
+                            and peer.attributes.get("name", "") == name
+                            and "checked" in peer.attributes):
+                        del peer.attributes["checked"]
+                        self.sync_attr(peer, "checked", None)
+            node.attributes["checked"] = "checked"
+            self.sync_attr(node, "checked", "checked")
+            self.repaint()
+            return True
+        return False
 
     # ---------- text input focus / typing ----------
 
@@ -768,9 +823,25 @@ class Browser:
         form = forms.find_form(node)
         if form is None:
             return
+        post = forms.submit_post(form)
+        if post is not None:
+            action, body = post
+            target = self.url.resolve(action) if action else self.url
+            self.set_status(f"POST 제출 중... {target}")
+            try:
+                _h, text, final = net.request_post_text(
+                    target, body, initiator=self.url.host)
+                self.render_page(final, text)
+                self.history = self.history[:self.history_index + 1]
+                self.history.append(final)
+                self.history_index = len(self.history) - 1
+                self._update_nav_buttons()
+            except Exception as e:
+                self.set_status(f"POST 실패: {e}")
+            return
         href = forms.submit_href(form)
         if href is None:
-            self.set_status("POST 폼은 아직 지원하지 않습니다")
+            self.set_status("지원하지 않는 폼 제출 방식입니다")
             return
         try:
             self.load(self.url.resolve(href))
@@ -782,8 +853,14 @@ class Browser:
         page JS reading the input sees the typed value."""
         doc = getattr(self, "_doc", None)
         ridx = getattr(node, "_ridx", None)
-        if doc is not None and ridx is not None \
-                and hasattr(doc, "set_attr"):
+        if doc is None or ridx is None:
+            return
+        if value is None:
+            if hasattr(doc, "remove_attr"):
+                doc.remove_attr(ridx, name)
+            elif hasattr(doc, "set_attr"):
+                doc.set_attr(ridx, name, "")
+        elif hasattr(doc, "set_attr"):
             doc.set_attr(ridx, name, value)
 
     def on_motion(self, event):

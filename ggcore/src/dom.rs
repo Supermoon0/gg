@@ -41,6 +41,10 @@ pub struct Document {
     pub hover_chain: Vec<usize>,
     /// :focus state — the focused element, if any
     pub focused: Option<usize>,
+    /// nodes touched since the last drain (N3 partial re-render):
+    /// structural ops record the PARENT whose subtree changed,
+    /// attribute/text ops the node itself. Drained by take_mutated.
+    pub mutated: Vec<usize>,
 }
 
 impl Document {
@@ -52,6 +56,7 @@ impl Document {
             version: 0,
             hover_chain: Vec::new(),
             focused: None,
+            mutated: Vec::new(),
         }
     }
 
@@ -81,6 +86,9 @@ impl Document {
         parent: Option<usize>,
     ) -> usize {
         self.version += 1;
+        if let Some(p) = parent {
+            self.mutated.push(p);
+        }
         let classes = attrs
             .iter()
             .find(|(k, _)| k == "class")
@@ -108,6 +116,7 @@ impl Document {
 
     pub fn set_attr(&mut self, idx: usize, name: &str, value: &str) {
         self.version += 1;
+        self.mutated.push(idx);
         if name == "id" {
             if let Some(old) = self.nodes[idx].attr("id") {
                 let old = old.to_string();
@@ -131,6 +140,7 @@ impl Document {
 
     pub fn remove_attr(&mut self, idx: usize, name: &str) {
         self.version += 1;
+        self.mutated.push(idx);
         if name == "id" {
             if let Some(old) = self.nodes[idx].attr("id") {
                 let old = old.to_string();
@@ -166,6 +176,7 @@ impl Document {
     pub fn detach(&mut self, idx: usize) {
         self.version += 1;
         if let Some(p) = self.nodes[idx].parent {
+            self.mutated.push(p);
             self.nodes[p].children.retain(|&c| c != idx);
             self.nodes[idx].parent = None;
         }
@@ -174,6 +185,7 @@ impl Document {
     /// Deep-copy a node (and subtree) from another document into self.
     pub fn graft(&mut self, other: &Document, src: usize, parent: usize) {
         self.version += 1;
+        self.mutated.push(parent);
         let node = &other.nodes[src];
         let new_idx = if node.is_element() {
             self.new_element(
@@ -191,6 +203,7 @@ impl Document {
 
     pub fn new_text(&mut self, text: String, parent: usize) -> usize {
         self.version += 1;
+        self.mutated.push(parent);
         let idx = self.nodes.len();
         self.nodes.push(Node {
             parent: Some(parent),

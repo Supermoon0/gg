@@ -79,6 +79,83 @@ def load_svgs(nodes):
             (vx, vy, vw, vh), out_w, out_h, paths)
 
 
+def load_canvases(nodes, doc):
+    """T4: bake each canvas's recorded 2D commands into an image
+    handle (node._img) via the Rust rasterizer. Path fills beyond
+    rect/full-circle draw as outlines (v1 gap)."""
+    if _engine is None or doc is None \
+            or not hasattr(doc, "canvas_nodes"):
+        return
+    from math import pi
+    from .colors import to_rgb
+    from .html_parser import Element, tree_to_list
+    active = set(doc.canvas_nodes())
+    if not active:
+        return
+    default_font = _engine.font_id("default", False, False)
+    for node in tree_to_list(nodes, []):
+        if not (isinstance(node, Element) and node.tag == "canvas"):
+            continue
+        ridx = getattr(node, "_ridx", None)
+        if ridx is None or ridx not in active:
+            continue
+        try:
+            w = int(float(node.attributes.get("width", 300) or 300))
+            h = int(float(node.attributes.get("height", 150) or 150))
+        except ValueError:
+            w, h = 300, 150
+        cmds = []
+        path = []          # [(x, y)] current subpath
+        arcs = []          # [(x, y, r, full)] arcs in current path
+        for (op, a, b, c, d, e, text, style) in doc.canvas_cmds(ridx):
+            rgb = to_rgb(style or "black")
+            if op == 1:      # fillRect
+                cmds.append((0, a, b, a + c, b + d, rgb, 0.0, 0, ""))
+            elif op == 2:    # strokeRect
+                for (x1, y1, x2, y2) in ((a, b, a + c, b),
+                                         (a, b + d, a + c, b + d),
+                                         (a, b, a, b + d),
+                                         (a + c, b, a + c, b + d)):
+                    cmds.append((2, x1, y1, x2, y2, rgb, 1.0, 0, ""))
+            elif op == 3:    # clearRect (partial — full clears reset
+                cmds.append((0, a, b, a + c, b + d,   # in the VM)
+                             (255, 255, 255), 0.0, 0, ""))
+            elif op == 4:    # fillText(text, x, y-baseline)
+                px = e or 10.0
+                cmds.append((1, a, b - px, 0.0, 0.0, rgb, px,
+                             default_font, text))
+            elif op == 5:    # beginPath
+                path, arcs = [], []
+            elif op == 6:    # moveTo
+                path.append(("m", a, b))
+            elif op == 7:    # lineTo
+                path.append(("l", a, b))
+            elif op == 8:    # arc(x, y, r, a0, a1)
+                arcs.append((a, b, c, abs(e - d) >= 2 * pi - 1e-3))
+            elif op == 9:    # rect(x, y, w, h): closed subpath
+                path.extend((("m", a, b), ("l", a + c, b),
+                             ("l", a + c, b + d), ("l", a, b + d),
+                             ("l", a, b), ("m", a, b)))
+            elif op == 10:   # closePath
+                first = next(((x, y) for (k, x, y) in path
+                              if k == "m"), None)
+                if first:
+                    path.append(("l", first[0], first[1]))
+            elif op in (11, 12):  # fill / stroke
+                for (cx, cy, r, full) in arcs:
+                    if full:
+                        cmds.append((3, cx - r, cy - r, cx + r,
+                                     cy + r, rgb, 0.0, 0, ""))
+                prev = None
+                for (k, x, y) in path:
+                    if k == "l" and prev is not None:
+                        cmds.append((2, prev[0], prev[1], x, y,
+                                     rgb, 1.0, 0, ""))
+                    prev = (x, y)
+        if cmds:
+            node._img = _engine.load_canvas(w, h, cmds)
+
+
 def load_background_images(nodes, fetch_raw):
     """Decode every element's first CSS background-image layer.
     fetch_raw(urls) -> {url: bytes} does the (parallel) networking.

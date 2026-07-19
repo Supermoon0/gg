@@ -189,7 +189,7 @@ struct Handler {
     closure: u32,
     this_val: Value,
     catch_ip: u32,
-    exc_reg: u8,
+    exc_reg: u16,
     argc: u8,
 }
 
@@ -232,6 +232,11 @@ pub(super) enum Native {
     PerfNow,
     /// element.classList.<op>; op: 0=add 1=remove 2=contains 3=toggle
     ClassList { node: u32, op: u8 },
+    /// canvas 2D recording (T4): drawing calls append to the node's
+    /// command list; the shell rasterizes them into the canvas image.
+    /// op: 1 fillRect 2 strokeRect 3 clearRect 4 fillText 5 beginPath
+    /// 6 moveTo 7 lineTo 8 arc 9 rect 10 closePath 11 fill 12 stroke
+    CanvasOp { node: u32, ctx: u32, op: u8 },
     /// window.addEventListener / removeEventListener (listeners keyed
     /// on WINDOW_NODE so lifecycle events can find them)
     WinEvent { add: bool },
@@ -339,6 +344,18 @@ pub(super) mod host {
     pub const CV_MEASURE_TEXT: u16 = 120;
     pub const CV_IMAGE_DATA: u16 = 121;
     pub const CV_GRADIENT: u16 = 122;
+    // WebSocket (T5): connect/send/close delegate to the Python
+    // shell like fetch does; messages come back via deliver_ws
+    pub const WS_CONNECT: u16 = 130;
+    pub const WS_SEND: u16 = 131;
+    pub const WS_CLOSE: u16 = 132;
+    // Web Worker (T5): real isolation — the shell runs the worker in
+    // its own VM; these queue spawn/post/terminate for it
+    pub const WK_SPAWN: u16 = 140;
+    pub const WK_POST: u16 = 141;
+    pub const WK_TERM: u16 = 142;
+    /// postMessage *inside* a worker VM: queues to self_posts
+    pub const WK_SELF_POST: u16 = 143;
 }
 
 /// Hidden class: property layout shared by every object that acquired
@@ -506,6 +523,31 @@ pub(super) struct St {
     /// (dom node, name id) -> expando properties scripts hang on
     /// nodes (jQuery's `elem[expando] = id` data-cache key)
     pub(super) dom_expando: HashMap<(u32, u32), Value>,
+    /// dynamically injected <script> work the shell must run:
+    /// (node, src) for external, (node, code) for inline. Queued at
+    /// DOM insertion; drained by Doc.take_pending_scripts (N1).
+    pub(super) pending_ext_scripts: Vec<(u32, String)>,
+    pub(super) pending_inline_scripts: Vec<(u32, String)>,
+    /// script nodes already queued/run — a node never runs twice
+    pub(super) scripts_seen: std::collections::HashSet<u32>,
+    /// recorded canvas-2d commands per canvas node (T4):
+    /// (op, a, b, c, d, e, text, style)
+    pub(super) canvas_cmds: HashMap<
+        u32, Vec<(u8, f64, f64, f64, f64, f64, String, String)>>,
+    /// Web Worker shell delegation (T5)
+    pub(super) worker_spawns: Vec<(u32, String)>,
+    pub(super) worker_posts: Vec<(u32, String)>,
+    pub(super) worker_terms: Vec<u32>,
+    pub(super) worker_objects: HashMap<u32, Value>,
+    pub(super) worker_next_id: u32,
+    /// outbox when THIS VM is a worker (postMessage global)
+    pub(super) self_posts: Vec<String>,
+    /// WebSocket shell delegation (T5)
+    pub(super) ws_connects: Vec<(u32, String)>,
+    pub(super) ws_outbox: Vec<(u32, String)>,
+    pub(super) ws_closes: Vec<u32>,
+    pub(super) ws_objects: HashMap<u32, Value>,
+    pub(super) ws_next_id: u32,
     /// (object index, name id) -> (getter, setter) accessor pair
     /// (Object.defineProperty with get/set; UNDEFINED = absent side)
     pub(super) accessors: HashMap<(u32, u32), (Value, Value)>,
@@ -520,6 +562,10 @@ pub(super) struct St {
     /// real geometry (document-origin approximation: scroll offset is
     /// not subtracted)
     pub(super) layout_rects: HashMap<u32, (f64, f64, f64, f64)>,
+    /// current viewport scroll offset (shell-pushed): rects above are
+    /// document coords; gBCR answers viewport-relative per spec
+    pub(super) scroll_x: f64,
+    pub(super) scroll_y: f64,
     /// Map/Set backing stores, keyed by the owning object's index
     /// (entries in insertion order; lookups are linear strict-eq)
     pub(super) map_data: HashMap<u32, Vec<(Value, Value)>>,
@@ -608,11 +654,28 @@ impl St {
             fn_protos: HashMap::new(),
             fn_props: HashMap::new(),
             dom_expando: HashMap::new(),
+            pending_ext_scripts: Vec::new(),
+            pending_inline_scripts: Vec::new(),
+            scripts_seen: std::collections::HashSet::new(),
+            canvas_cmds: HashMap::new(),
+            worker_spawns: Vec::new(),
+            worker_posts: Vec::new(),
+            worker_terms: Vec::new(),
+            worker_objects: HashMap::new(),
+            worker_next_id: 1,
+            self_posts: Vec::new(),
+            ws_connects: Vec::new(),
+            ws_outbox: Vec::new(),
+            ws_closes: Vec::new(),
+            ws_objects: HashMap::new(),
+            ws_next_id: 1,
             accessors: HashMap::new(),
             local_storage: HashMap::new(),
             session_storage: HashMap::new(),
             cookies: Vec::new(),
             layout_rects: HashMap::new(),
+            scroll_x: 0.0,
+            scroll_y: 0.0,
             map_data: HashMap::new(),
             set_data: HashMap::new(),
             style_nodes: HashMap::new(),
@@ -1184,7 +1247,7 @@ fn str_ref(st: &mut St, i: u32) -> &str {
     }
 }
 
-fn raw_get_prop(st: &St, oi: usize, key: u32) -> Option<Value> {
+pub(super) fn raw_get_prop(st: &St, oi: usize, key: u32) -> Option<Value> {
     let mut oi = oi;
     for _ in 0..16 {
         let o = &st.objects[oi];
@@ -2338,8 +2401,19 @@ fn materialize_iterable(
     mods: &ModStore,
     ov: Value,
 ) -> Result<Value, VmError> {
+    if ov.is_string() {
+        // spread/for-of over a string yields its characters — a real
+        // array so [].concat (the spread desugar) flattens it
+        let chars: Vec<String> = str_ref(st, ov.index())
+            .chars()
+            .map(|c| c.to_string())
+            .collect();
+        let vals: Vec<Value> =
+            chars.into_iter().map(|c| push_str(st, c)).collect();
+        return Ok(new_array(st, vals));
+    }
     if !ov.is_object() {
-        return Ok(ov); // strings keep the existing indexed walk
+        return Ok(ov);
     }
     let oi = ov.index();
     if st.objects[oi as usize].is_array {
@@ -3224,6 +3298,69 @@ fn do_native(
             Ok(Value::int(id as i32))
         }
         Native::PerfNow => Ok(Value::number(st.now_ms)),
+        Native::CanvasOp { node, ctx, op } => {
+            let mut nums = [0.0f64; 5];
+            for (k, slot) in nums.iter_mut().enumerate() {
+                if k < argc as usize {
+                    let v = st.regs[args_base + k];
+                    if v.is_number() {
+                        *slot = v.to_number_raw();
+                    }
+                }
+            }
+            let ctx_prop = |st: &mut St, name: &str| -> String {
+                let k = st.intern_name(name);
+                match raw_get_prop(st, ctx as usize, k) {
+                    Some(v) => to_display(st, v),
+                    None => String::new(),
+                }
+            };
+            let mut text = String::new();
+            let (a, b, c, d, e);
+            match op {
+                4 => {
+                    // fillText(text, x, y) — e carries the font px
+                    text = if argc > 0 {
+                        to_display(st, st.regs[args_base])
+                    } else {
+                        String::new()
+                    };
+                    a = nums[1];
+                    b = nums[2];
+                    c = 0.0;
+                    d = 0.0;
+                    let font = ctx_prop(st, "font");
+                    e = font
+                        .split_whitespace()
+                        .find_map(|t| {
+                            t.strip_suffix("px")
+                                .and_then(|n| n.parse::<f64>().ok())
+                        })
+                        .unwrap_or(10.0);
+                }
+                _ => {
+                    a = nums[0];
+                    b = nums[1];
+                    c = nums[2];
+                    d = nums[3];
+                    e = nums[4];
+                }
+            }
+            let style = match op {
+                1 | 4 | 11 => ctx_prop(st, "fillStyle"),
+                2 | 12 => ctx_prop(st, "strokeStyle"),
+                _ => String::new(),
+            };
+            let list = st.canvas_cmds.entry(node).or_default();
+            if op == 3 && a == 0.0 && b == 0.0 {
+                // clearRect from the origin: treat as a fresh frame
+                // (the overwhelmingly common repaint pattern)
+                list.clear();
+            } else {
+                list.push((op, a, b, c, d, e, text, style));
+            }
+            return Ok(Value::UNDEFINED);
+        }
         Native::ClassList { node, op } => {
             let doc = need_doc(st)?;
             let current = doc
@@ -3613,6 +3750,96 @@ fn host_fn(
                 }
             }
             Ok(new_array(st, out))
+        }
+        WK_SPAWN => {
+            let url = if argc > 0 {
+                to_display(st, st.regs[args_base])
+            } else {
+                String::new()
+            };
+            let obj = if argc > 1 {
+                st.regs[args_base + 1]
+            } else {
+                Value::UNDEFINED
+            };
+            let id = st.worker_next_id;
+            st.worker_next_id += 1;
+            st.worker_objects.insert(id, obj);
+            st.worker_spawns.push((id, url));
+            Ok(Value::number(id as f64))
+        }
+        WK_POST => {
+            let id = if argc > 0 {
+                st.regs[args_base].to_number_raw() as u32
+            } else {
+                0
+            };
+            let data = if argc > 1 {
+                to_display(st, st.regs[args_base + 1])
+            } else {
+                String::new()
+            };
+            st.worker_posts.push((id, data));
+            Ok(Value::UNDEFINED)
+        }
+        WK_TERM => {
+            let id = if argc > 0 {
+                st.regs[args_base].to_number_raw() as u32
+            } else {
+                0
+            };
+            st.worker_terms.push(id);
+            st.worker_objects.remove(&id);
+            Ok(Value::UNDEFINED)
+        }
+        WK_SELF_POST => {
+            let data = if argc > 0 {
+                to_display(st, st.regs[args_base])
+            } else {
+                String::new()
+            };
+            st.self_posts.push(data);
+            Ok(Value::UNDEFINED)
+        }
+        WS_CONNECT => {
+            let url = if argc > 0 {
+                to_display(st, st.regs[args_base])
+            } else {
+                String::new()
+            };
+            let obj = if argc > 1 {
+                st.regs[args_base + 1]
+            } else {
+                Value::UNDEFINED
+            };
+            let id = st.ws_next_id;
+            st.ws_next_id += 1;
+            st.ws_objects.insert(id, obj);
+            st.ws_connects.push((id, url));
+            Ok(Value::number(id as f64))
+        }
+        WS_SEND => {
+            let id = if argc > 0 {
+                st.regs[args_base].to_number_raw() as u32
+            } else {
+                0
+            };
+            let data = if argc > 1 {
+                to_display(st, st.regs[args_base + 1])
+            } else {
+                String::new()
+            };
+            st.ws_outbox.push((id, data));
+            Ok(Value::UNDEFINED)
+        }
+        WS_CLOSE => {
+            let id = if argc > 0 {
+                st.regs[args_base].to_number_raw() as u32
+            } else {
+                0
+            };
+            st.ws_closes.push(id);
+            Ok(Value::UNDEFINED)
         }
         CV_MEASURE_TEXT => {
             // canvas-2d stub: zero metrics (layout runs after JS)
@@ -4137,6 +4364,44 @@ fn arg_string(st: &mut St, args_base: usize, argc: u8, k: usize)
     Ok(to_display(st, v))
 }
 
+/// N1: a <script> that lands in the tree is queued for the shell —
+/// external srcs are fetched in Python, inline bodies run at the next
+/// pump drain. A node is queued at most once.
+fn queue_script_node(st: &mut St, d: &dom::Document, c: usize) {
+    if d.nodes[c].tag.as_deref() != Some("script") {
+        return;
+    }
+    let cu = c as u32;
+    if st.scripts_seen.contains(&cu) {
+        return;
+    }
+    let stype = d.nodes[c]
+        .attr("type")
+        .unwrap_or("")
+        .to_lowercase();
+    if !(stype.is_empty()
+        || stype.contains("javascript")
+        || stype == "module")
+    {
+        return; // JSON data blocks etc.
+    }
+    st.scripts_seen.insert(cu);
+    if let Some(src) = d.nodes[c].attr("src") {
+        if !src.is_empty() {
+            st.pending_ext_scripts.push((cu, src.to_string()));
+            return;
+        }
+    }
+    let code: String = d.nodes[c]
+        .children
+        .iter()
+        .map(|&ch| d.nodes[ch].text.as_str())
+        .collect();
+    if !code.trim().is_empty() {
+        st.pending_inline_scripts.push((cu, code));
+    }
+}
+
 fn need_doc(st: &St) -> Result<Rc<RefCell<dom::Document>>, VmError> {
     match &st.doc {
         Some(d) => Ok(d.clone()),
@@ -4367,6 +4632,8 @@ fn dom_method(
             d.detach(c);
             d.nodes[c].parent = Some(node_us);
             d.nodes[node_us].children.push(c);
+            d.mutated.push(node_us);
+            queue_script_node(st, &d, c);
             return Ok(child);
         }
         if key == ids.remove {
@@ -4420,6 +4687,7 @@ fn dom_method(
                 .get(&node)
                 .copied()
                 .unwrap_or((0.0, 0.0, 0.0, 0.0));
+            let (x, y) = (x - st.scroll_x, y - st.scroll_y);
             let rect = new_plain_object(st);
             let ri = rect.index() as usize;
             for (field, v) in [
@@ -4453,13 +4721,26 @@ fn dom_method(
             }
             let ctx = new_plain_object(st);
             let ci = ctx.index() as usize;
-            for m in ["fillRect", "clearRect", "strokeRect",
-                      "beginPath", "closePath", "moveTo", "lineTo",
-                      "bezierCurveTo", "quadraticCurveTo", "arc",
-                      "arcTo", "ellipse", "rect", "fill", "stroke",
+            // recorded subset (T4 real rendering)
+            for (m, op) in [
+                ("fillRect", 1u8), ("strokeRect", 2), ("clearRect", 3),
+                ("fillText", 4), ("beginPath", 5), ("moveTo", 6),
+                ("lineTo", 7), ("arc", 8), ("rect", 9),
+                ("closePath", 10), ("fill", 11), ("stroke", 12),
+            ] {
+                let k = st.intern_name(m);
+                let f = make_native(
+                    st,
+                    Native::CanvasOp { node, ctx: ci as u32, op },
+                );
+                raw_set_prop(st, ci, k, f);
+            }
+            // still-noop tail (transforms, images, dashes...)
+            for m in ["bezierCurveTo", "quadraticCurveTo",
+                      "arcTo", "ellipse",
                       "clip", "save", "restore", "translate", "scale",
                       "rotate", "transform", "setTransform",
-                      "resetTransform", "drawImage", "fillText",
+                      "resetTransform", "drawImage",
                       "strokeText", "putImageData", "setLineDash"] {
                 let k = st.intern_name(m);
                 let f = make_native(st, Native::Noop);
@@ -4534,6 +4815,8 @@ fn dom_method(
                 None => d.nodes[pu].children.push(ni),
             }
             d.nodes[ni].parent = Some(pu);
+            d.mutated.push(pu);
+            queue_script_node(st, &d, ni);
             return Ok(newn);
         }
         "removeChild" => {
@@ -4564,6 +4847,8 @@ fn dom_method(
                 d.nodes[pu].children[i] = ni;
                 d.nodes[ni].parent = Some(pu);
                 d.nodes[oi_].parent = None;
+                d.mutated.push(pu);
+                queue_script_node(st, &d, ni);
             }
             return Ok(oldn);
         }
@@ -5110,13 +5395,20 @@ fn dom_set_prop(
             doc.borrow_mut().set_attr(node_us, &attr, &value);
             Ok(())
         }
-        n if n.starts_with("on") => Ok(()), // handler props: accepted
+        n if n.starts_with("on") => {
+            // handler props are real now: stored as expandos so the
+            // shell can fire them (script onload chains — N1) and
+            // scripts can read them back
+            st.dom_expando.insert((node_us as u32, key), v);
+            Ok(())
+        }
         "nodeValue" | "data" => {
             let value = to_display(st, v);
             let mut d = doc.borrow_mut();
             if d.nodes[node_us].tag.is_none() {
                 d.nodes[node_us].text = value;
                 d.version += 1;
+                d.mutated.push(node_us);
             }
             Ok(())
         }

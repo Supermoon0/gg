@@ -9,6 +9,7 @@ import base64
 import gzip
 import hashlib
 import json
+import re
 import os
 import socket
 import ssl
@@ -31,6 +32,140 @@ _CACHE_LOCK = threading.Lock()
 _CACHE_MAX_ENTRIES = 300
 _CACHE_MAX_BODY = 4 * 1024 * 1024
 _CACHE_DEFAULT_TTL = 300.0
+
+# --- cookie jar v2 (T3: attribute-complete, in-memory) ---
+# (domain, path, name) -> record. Spec-shaped semantics: Domain
+# suffix matching, Path boundaries, Expires/Max-Age, Secure,
+# HttpOnly (hidden from document.cookie), SameSite (Strict enforced
+# against a cross-site initiator; Lax approximated as send — our
+# subresource fetches act on the page's behalf). No public-suffix
+# list yet: same-site compares the last two labels.
+_COOKIES = {}
+_COOKIE_LOCK = threading.Lock()
+
+
+def _site_of(host):
+    parts = host.lower().rstrip(".").split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host.lower()
+
+
+def same_site(a, b):
+    return _site_of(a) == _site_of(b)
+
+
+def _cookie_expired(rec, now=None):
+    exp = rec.get("expires")
+    return exp is not None and exp <= (now or time.time())
+
+
+def store_cookie(host, line, scheme="https"):
+    """Record one Set-Cookie line with its attributes."""
+    host = host.lower()
+    parts = [p.strip() for p in line.split(";")]
+    if not parts or "=" not in parts[0]:
+        return
+    name, value = parts[0].split("=", 1)
+    name = name.strip()
+    if not name:
+        return
+    attrs = {}
+    for a in parts[1:]:
+        k, _, v = a.partition("=")
+        attrs[k.strip().lower()] = v.strip()
+    if "secure" in attrs and scheme != "https":
+        return
+    domain = attrs.get("domain", "").lstrip(".").lower()
+    host_only = not domain
+    if domain and host != domain \
+            and not host.endswith("." + domain):
+        return  # a host may not set cookies for unrelated domains
+    if host_only:
+        domain = host
+    path = attrs.get("path", "")
+    if not path.startswith("/"):
+        path = "/"
+    expires = None
+    if "max-age" in attrs:
+        try:
+            expires = time.time() + float(attrs["max-age"])
+        except ValueError:
+            pass
+    elif "expires" in attrs:
+        try:
+            from email.utils import parsedate_to_datetime
+            expires = parsedate_to_datetime(
+                attrs["expires"]).timestamp()
+        except (ValueError, TypeError):
+            pass
+    key = (domain, path, name)
+    with _COOKIE_LOCK:
+        if expires is not None and expires <= time.time():
+            _COOKIES.pop(key, None)
+            return
+        _COOKIES[key] = {
+            "value": value.strip(),
+            "secure": "secure" in attrs,
+            "httponly": "httponly" in attrs,
+            "samesite": attrs.get("samesite", "lax").lower() or "lax",
+            "expires": expires,
+            "host_only": host_only,
+        }
+
+
+def _cookie_matches(key, rec, host, scheme, path, initiator):
+    domain, cpath, _name = key
+    if rec["host_only"]:
+        if host != domain:
+            return False
+    elif host != domain and not host.endswith("." + domain):
+        return False
+    if not (path == cpath or cpath == "/"
+            or path.startswith(cpath.rstrip("/") + "/")):
+        return False
+    if rec["secure"] and scheme != "https":
+        return False
+    if rec["samesite"] == "strict" and initiator \
+            and not same_site(initiator, host):
+        return False
+    return not _cookie_expired(rec)
+
+
+def cookie_header(host, scheme="https", path="/", initiator=None):
+    """The Cookie: header value for this request ('' if none).
+    Longer paths first, per spec."""
+    host = host.lower()
+    path = path.split("?", 1)[0] or "/"
+    out = []
+    with _COOKIE_LOCK:
+        dead = [k for k, r in _COOKIES.items() if _cookie_expired(r)]
+        for k in dead:
+            del _COOKIES[k]
+        for key, rec in _COOKIES.items():
+            if _cookie_matches(key, rec, host, scheme, path, initiator):
+                out.append((key[1], key[2], rec["value"]))
+    out.sort(key=lambda t: -len(t[0]))
+    return "; ".join(f"{n}={v}" for (_p, n, v) in out)
+
+
+def cookies_for(host):
+    """name->value for document.cookie (HttpOnly excluded)."""
+    host = host.lower()
+    with _COOKIE_LOCK:
+        return {k[2]: r["value"] for k, r in _COOKIES.items()
+                if not r["httponly"] and not _cookie_expired(r)
+                and _cookie_matches(k, r, host, "https", "/", None)}
+
+
+def seed_cookies(host, pairs):
+    """JS document.cookie writes flowing back: host-only, path=/."""
+    host = host.lower()
+    with _COOKIE_LOCK:
+        for name, value in dict(pairs).items():
+            _COOKIES[(host, "/", name)] = {
+                "value": value, "secure": False, "httponly": False,
+                "samesite": "lax", "expires": None, "host_only": True,
+            }
+
 
 # --- disk cache (survives restarts; only explicit max-age responses,
 # so an asset CDN like pstatic hits disk while HTML stays fresh) ---
@@ -171,7 +306,8 @@ class URL:
 
         self.scheme, rest = url.split("://", 1)
         self.scheme = self.scheme.lower()
-        assert self.scheme in ("http", "https", "file"), \
+        assert self.scheme in ("http", "https", "file",
+                               "ws", "wss"), \
             f"unsupported scheme: {self.scheme}"
 
         if self.scheme == "file":
@@ -194,7 +330,7 @@ class URL:
         if "@" in authority:
             authority = authority.rsplit("@", 1)[1]
 
-        self.port = 80 if self.scheme == "http" else 443
+        self.port = 80 if self.scheme in ("http", "ws") else 443
         if authority.startswith("["):  # IPv6 literal: [::1] or [::1]:8080
             end = authority.find("]")
             if end < 0:
@@ -251,10 +387,13 @@ class URL:
         return URL(joined)
 
 
-def request_full(url, max_redirects=MAX_REDIRECTS, no_cache=False):
+def request_full(url, max_redirects=MAX_REDIRECTS, no_cache=False,
+                 method="GET", body=None, content_type=None,
+                 initiator=None):
     """Fetch a URL. Returns (headers: dict, body: bytes, final_url) —
     final_url differs from url after redirects; callers must use it as
-    the base for relative links."""
+    the base for relative links. initiator (a host) is the requesting
+    page's host for SameSite cookie decisions."""
     if url.scheme == "about":
         from .pages import about_page
         return {}, about_page(url.path).encode("utf-8"), url
@@ -273,7 +412,8 @@ def request_full(url, max_redirects=MAX_REDIRECTS, no_cache=False):
         with open(path, "rb") as f:
             return {}, f.read(), url
 
-    return _http_request(url, max_redirects, no_cache)
+    return _http_request(url, max_redirects, no_cache, method,
+                         body, content_type, initiator)
 
 
 def request_raw(url, max_redirects=MAX_REDIRECTS):
@@ -282,17 +422,94 @@ def request_raw(url, max_redirects=MAX_REDIRECTS):
     return headers, body
 
 
-def request_text(url, max_redirects=MAX_REDIRECTS, no_cache=False):
-    """Fetch and decode as text. Returns (headers, str, final_url)."""
-    headers, body, final_url = request_full(url, max_redirects, no_cache)
-    charset = "utf-8"
-    ctype = headers.get("content-type", "")
+_META_CHARSET_RE = re.compile(
+    rb"""<meta[^>]+charset\s*=\s*["']?([a-zA-Z0-9_\-]+)""", re.I)
+
+
+def sniff_charset(body, ctype=""):
+    """The document's charset: Content-Type header first, then a
+    <meta charset=...> / http-equiv sniff of the head (legacy Korean
+    sites are EUC-KR-with-silent-headers), utf-8 otherwise."""
     if "charset=" in ctype:
-        charset = ctype.split("charset=", 1)[1].split(";")[0].strip().strip('"')
+        return (ctype.split("charset=", 1)[1].split(";")[0]
+                .strip().strip('"'))
+    m = _META_CHARSET_RE.search(body[:2048])
+    if m:
+        return m.group(1).decode("ascii", errors="replace")
+    return "utf-8"
+
+
+def request_text(url, max_redirects=MAX_REDIRECTS, no_cache=False,
+                 method="GET", body=None, content_type=None,
+                 initiator=None):
+    """Fetch and decode as text. Returns (headers, str, final_url)."""
+    headers, body, final_url = request_full(
+        url, max_redirects, no_cache, method, body, content_type,
+        initiator)
+    charset = sniff_charset(body, headers.get("content-type", ""))
     try:
         return headers, body.decode(charset, errors="replace"), final_url
     except LookupError:
         return headers, body.decode("utf-8", errors="replace"), final_url
+
+
+class CorsError(Exception):
+    """A cross-origin fetch()/XHR response did not opt in via CORS."""
+
+
+def origin_of(url):
+    """The serialized origin of a URL ('null' for opaque schemes)."""
+    if url.scheme not in ("http", "https"):
+        return "null"
+    default = 80 if url.scheme == "http" else 443
+    port = "" if url.port == default else f":{url.port}"
+    return f"{url.scheme}://{url.host}{port}"
+
+
+def same_origin(a, b):
+    return (a.scheme, a.host, a.port) == (b.scheme, b.host, b.port)
+
+
+def cors_allows(page_url, target_url, resp_headers):
+    """The CORS response check for a simple cross-origin request:
+    Access-Control-Allow-Origin must be * or the page's origin.
+    Same-origin (and non-HTTP schemes, e.g. file: pages reading
+    file: fixtures) always pass."""
+    if same_origin(page_url, target_url):
+        return True
+    if target_url.scheme not in ("http", "https"):
+        return page_url.scheme == target_url.scheme
+    acao = resp_headers.get(
+        "access-control-allow-origin", "").strip()
+    return acao == "*" or (acao != "" and acao == origin_of(page_url))
+
+
+def fetch_for_page(page_url, target_url):
+    """A fetch()/XHR load on behalf of page_url: carries the page's
+    host as the SameSite initiator and enforces the CORS response
+    check (the fetch channel only issues simple GETs, so there is no
+    preflight). Embedded resources (script/img/link) are no-cors and
+    do NOT go through here. Returns (headers, text, final_url)."""
+    headers, text, final = request_text(
+        target_url, no_cache=True,
+        initiator=page_url.host or None)
+    if not cors_allows(page_url, final, headers):
+        raise CorsError(
+            f"CORS: {origin_of(final)} did not allow "
+            f"{origin_of(page_url)}")
+    return headers, text, final
+
+
+def request_post_text(url, data, initiator=None):
+    """POST an urlencoded form. Returns (headers, str, final_url)."""
+    if isinstance(data, dict):
+        data = urllib.parse.urlencode(data)
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    return request_text(
+        url, no_cache=True, method="POST", body=data,
+        content_type="application/x-www-form-urlencoded",
+        initiator=initiator)
 
 
 def request(url, max_redirects=MAX_REDIRECTS):
@@ -317,9 +534,12 @@ def _data_url(path):
     return {"content-type": meta or "text/plain"}, body
 
 
-def _http_request(url, redirects_left, no_cache=False):
+def _http_request(url, redirects_left, no_cache=False, method="GET",
+                  body=None, content_type=None, initiator=None):
     # fragments never reach the wire: exclude them from the cache key
     cache_key = f"{url.scheme}://{url.host}:{url.port}{url.path}"
+    if method != "GET":
+        no_cache = True
     if not no_cache:
         cached = _cache_get(cache_key)
         if cached is not None:
@@ -339,7 +559,8 @@ def _http_request(url, redirects_left, no_cache=False):
         if s is None:
             s = _connect(url)
         try:
-            result = _one_request(url, s, pool_key)
+            result = _one_request(url, s, pool_key, method,
+                                  body, content_type, initiator)
             break
         except (OSError, ssl.SSLError, ConnectionError) as e:
             try:
@@ -358,7 +579,12 @@ def _http_request(url, redirects_left, no_cache=False):
         if redirects_left <= 0:
             raise RuntimeError("too many redirects")
         target = url.resolve(headers["location"])
-        return _http_request(target, redirects_left - 1, no_cache)
+        # browsers turn a redirected POST into a GET (303 always;
+        # 301/302 in practice)
+        if method != "GET" and status in (301, 302, 303):
+            method, body, content_type = "GET", None, None
+        return _http_request(target, redirects_left - 1, no_cache,
+                             method, body, content_type, initiator)
 
     if headers.get("content-encoding", "").lower() == "gzip":
         body = gzip.decompress(body) if body else b""
@@ -376,23 +602,37 @@ def _safe_path(path):
     return urllib.parse.quote(path, safe="/?#[]@!$&'()*+,;=:%~._-")
 
 
-def _one_request(url, s, pool_key):
-    """Send one GET on an open socket; returns (status, headers, body).
-    Returns the socket to the pool when the response allows reuse."""
+def _one_request(url, s, pool_key, method="GET", body=None,
+                 content_type=None, initiator=None):
+    """Send one request on an open socket; returns (status, headers,
+    body). Returns the socket to the pool when the response allows
+    reuse."""
     host = f"[{url.host}]" if ":" in url.host else url.host
     default = 80 if url.scheme == "http" else 443
     if url.port != default:
         host += f":{url.port}"  # RFC 7230: Host carries non-default port
+    cookies = cookie_header(url.host, url.scheme, url.path, initiator)
+    cookie_line = f"Cookie: {cookies}\r\n" if cookies else ""
+    extra = ""
+    payload = b""
+    if body is not None:
+        payload = body if isinstance(body, bytes) \
+            else str(body).encode("utf-8")
+        ct = content_type or "application/x-www-form-urlencoded"
+        extra = (f"Content-Type: {ct}\r\n"
+                 f"Content-Length: {len(payload)}\r\n")
     req = (
-        f"GET {_safe_path(url.path)} HTTP/1.1\r\n"
+        f"{method} {_safe_path(url.path)} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
         f"Connection: keep-alive\r\n"
         f"User-Agent: {USER_AGENT}\r\n"
         f"Accept: text/html,*/*\r\n"
         f"Accept-Encoding: gzip\r\n"
+        f"{cookie_line}"
+        f"{extra}"
         f"\r\n"
     )
-    s.sendall(req.encode("utf-8"))
+    s.sendall(req.encode("utf-8") + payload)
 
     f = s.makefile("rb")
     statusline = f.readline().decode("latin-1")
@@ -409,7 +649,10 @@ def _one_request(url, s, pool_key):
         if ":" not in line:
             continue
         name, value = line.split(":", 1)
-        headers[name.strip().lower()] = value.strip()
+        lname = name.strip().lower()
+        if lname == "set-cookie":
+            store_cookie(url.host, value.strip(), url.scheme)
+        headers[lname] = value.strip()
 
     reusable = "close" not in headers.get("connection", "").casefold() \
         and statusline.startswith("HTTP/1.1")
@@ -464,3 +707,157 @@ def _read_chunked(f):
         out.append(_read_exact(f, size))
         f.readline()  # trailing CRLF after each chunk
     return b"".join(out)
+
+
+# --- WebSocket client (T5, RFC 6455) ---
+class WsClient:
+    """A real WebSocket client: HTTP Upgrade handshake, masked client
+    frames, text messages, ping/pong, close. Fragmented messages are
+    not reassembled yet (fin-only, documented)."""
+
+    _GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def __init__(self, url, timeout=10):
+        import hashlib
+        self.url = url
+        self.open = False
+        s = socket.create_connection((url.host, url.port),
+                                     timeout=timeout)
+        if url.scheme == "wss":
+            ctx = ssl.create_default_context()
+            s = ctx.wrap_socket(s, server_hostname=url.host)
+        key = base64.b64encode(os.urandom(16))
+        host = f"[{url.host}]" if ":" in url.host else url.host
+        default = 80 if url.scheme == "ws" else 443
+        if url.port != default:
+            host += f":{url.port}"
+        path = url.path or "/"
+        req = (
+            f"GET {_safe_path(path)} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key.decode()}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"\r\n"
+        )
+        s.sendall(req.encode("utf-8"))
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = s.recv(4096)
+            if not chunk:
+                raise ConnectionError("websocket handshake EOF")
+            resp = resp + chunk
+        head, _, extra = resp.partition(b"\r\n\r\n")
+        if b" 101 " not in head.split(b"\r\n", 1)[0]:
+            raise ConnectionError("websocket upgrade refused")
+        want = base64.b64encode(
+            hashlib.sha1(key + self._GUID).digest())
+        accept = b""
+        for line in head.split(b"\r\n"):
+            if line.lower().startswith(b"sec-websocket-accept"):
+                accept = line.split(b":", 1)[1].strip()
+        if accept != want:
+            raise ConnectionError("bad Sec-WebSocket-Accept")
+        s.setblocking(False)
+        self._s = s
+        self._buf = bytearray(extra)
+        self.open = True
+
+    def send_text(self, text):
+        payload = text.encode("utf-8")
+        mask = os.urandom(4)
+        n = len(payload)
+        if n < 126:
+            head = bytes([0x81, 0x80 | n])
+        elif n < 65536:
+            head = bytes([0x81, 0x80 | 126]) + n.to_bytes(2, "big")
+        else:
+            head = bytes([0x81, 0x80 | 127]) + n.to_bytes(8, "big")
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self._s.sendall(head + mask + masked)
+
+    def _send_raw(self, op, payload=b""):
+        mask = os.urandom(4)
+        head = bytes([0x80 | op, 0x80 | len(payload)])
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        try:
+            self._s.sendall(head + mask + masked)
+        except OSError:
+            pass
+
+    def poll(self, wait=0.0):
+        """Drain readable frames; returns [(kind, text)] where kind is
+        'message' or 'close'."""
+        import select
+        out = []
+        if not self.open:
+            return out
+        try:
+            r, _, _ = select.select([self._s], [], [], wait)
+            if r:
+                chunk = self._s.recv(65536)
+                if not chunk:
+                    self.open = False
+                    return [("close", "")]
+                self._buf += chunk
+        except (BlockingIOError, InterruptedError):
+            pass
+        except OSError:
+            self.open = False
+            return [("close", "")]
+        while True:
+            frame = self._parse_frame()
+            if frame is None:
+                break
+            op, payload = frame
+            if op == 1:
+                out.append(("message",
+                            payload.decode("utf-8", "replace")))
+            elif op == 8:
+                self._send_raw(8)
+                self.open = False
+                out.append(("close", ""))
+                break
+            elif op == 9:
+                self._send_raw(10, bytes(payload))
+        return out
+
+    def _parse_frame(self):
+        buf = self._buf
+        if len(buf) < 2:
+            return None
+        ln = buf[1] & 0x7F
+        off = 2
+        if ln == 126:
+            if len(buf) < 4:
+                return None
+            ln = int.from_bytes(buf[2:4], "big")
+            off = 4
+        elif ln == 127:
+            if len(buf) < 10:
+                return None
+            ln = int.from_bytes(buf[2:10], "big")
+            off = 10
+        masked = buf[1] & 0x80
+        if masked:
+            off += 4  # servers must not mask; tolerate anyway
+        if len(buf) < off + ln:
+            return None
+        op = buf[0] & 0x0F
+        payload = bytes(buf[off:off + ln])
+        if masked:
+            mask = bytes(buf[off - 4:off])
+            payload = bytes(b ^ mask[i % 4]
+                            for i, b in enumerate(payload))
+        del buf[:off + ln]
+        return op, payload
+
+    def close(self):
+        if self.open:
+            self._send_raw(8)
+            self.open = False
+        try:
+            self._s.close()
+        except OSError:
+            pass

@@ -29,6 +29,9 @@ DEFAULT_STYLE_SHEET = """
 head, script, style, title, meta, link, template, noscript { display: none; }
 input[type=hidden] { display: none; }
 input { height: 1.5em; }
+input[type=checkbox], input[type=radio] { width: 14px; height: 14px; }
+select { height: 1.5em; border-width: 1px; }
+option, optgroup { display: none; }
 
 html { display: block; }
 body { display: block; margin: 8px; }

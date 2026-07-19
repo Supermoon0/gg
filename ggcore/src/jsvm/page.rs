@@ -14,7 +14,8 @@ use super::parser;
 use super::value::Value;
 use super::vm::{
     self, call_value, call_value_this, exec, has_pending_work, host,
-    make_native, new_plain_object, pump, raw_set_prop, reject_fetch,
+    make_native, new_plain_object, pump, raw_get_prop,
+    raw_set_prop, reject_fetch,
     resolve_fetch, Ids, ModStore, Native, St, DOC_NODE,
 };
 
@@ -22,6 +23,40 @@ use super::vm::{
 const PUMP_BUDGET: usize = 200_000;
 
 /// Promise.all / Promise.race, built on the native new Promise + then.
+// T5: WebSocket over the shell delegation channel (real RFC6455 in
+// Python; open/message/close/error delivered via deliver_ws).
+const WS_PRELUDE: &str = r#"
+function WebSocket(url) {
+  this.url = '' + url;
+  this.readyState = 0;
+  this.bufferedAmount = 0;
+  this.protocol = '';
+  this.onopen = null; this.onmessage = null;
+  this.onclose = null; this.onerror = null;
+  this._id = __gg_ws_connect('' + url, this);
+}
+WebSocket.CONNECTING = 0; WebSocket.OPEN = 1;
+WebSocket.CLOSING = 2; WebSocket.CLOSED = 3;
+WebSocket.prototype.send = function (d) {
+  if (this.readyState !== 1) {
+    throw new Error('WebSocket is not open');
+  }
+  __gg_ws_send(this._id, '' + d);
+};
+WebSocket.prototype.close = function () {
+  if (this.readyState < 2) {
+    this.readyState = 2;
+    __gg_ws_close(this._id);
+  }
+};
+WebSocket.prototype.addEventListener = function (t, f) {
+  this['on' + t] = f;
+};
+WebSocket.prototype.removeEventListener = function (t, f) {
+  if (this['on' + t] === f) { this['on' + t] = null; }
+};
+"#;
+
 const PROMISE_PRELUDE: &str = r#"
 Promise.all = function (arr) {
   return new Promise(function (resolve, reject) {
@@ -287,10 +322,24 @@ TextEncoder.prototype.encode = function (s) {
 };
 function TextDecoder() {}
 TextDecoder.prototype.decode = function () { return ''; };
-function Worker() {}
-Worker.prototype.postMessage = function () {};
-Worker.prototype.terminate = function () {};
-Worker.prototype.addEventListener = function () {};
+function Worker(url) {
+  // real isolation: the shell runs the script in a separate VM
+  // (messages are strings; post objects as JSON — structured clone
+  // is a documented gap)
+  this.onmessage = null;
+  this.onerror = null;
+  this._id = __gg_worker_spawn('' + url, this);
+}
+Worker.prototype.postMessage = function (d) {
+  __gg_worker_post(
+    this._id, typeof d === 'string' ? d : JSON.stringify(d));
+};
+Worker.prototype.terminate = function () {
+  __gg_worker_term(this._id);
+};
+Worker.prototype.addEventListener = function (t, f) {
+  this['on' + t] = f;
+};
 function XMLHttpRequest() {
   this.readyState = 0;
   this.status = 0;
@@ -362,13 +411,24 @@ function DOMException(m, n) {
   this.message = '' + (m || '');
   this.name = '' + (n || 'Error');
 }
+// Real message delivery: portN.postMessage fires the peer's onmessage
+// as a macrotask. React 18's scheduler flushes work through this — a
+// swallowing stub would hang every createRoot render.
 function MessageChannel() {
-  this.port1 = { onmessage: null,
-    postMessage: function () {},
-    addEventListener: function () {} };
-  this.port2 = { onmessage: null,
-    postMessage: function () {},
-    addEventListener: function () {} };
+  var p1 = { onmessage: null, addEventListener: function () {} };
+  var p2 = { onmessage: null, addEventListener: function () {} };
+  p1.postMessage = function (data) {
+    setTimeout(function () {
+      if (p2.onmessage) p2.onmessage({ data: data });
+    }, 0);
+  };
+  p2.postMessage = function (data) {
+    setTimeout(function () {
+      if (p1.onmessage) p1.onmessage({ data: data });
+    }, 0);
+  };
+  this.port1 = p1;
+  this.port2 = p2;
 }
 function Blob() {}
 function File() {}
@@ -585,6 +645,14 @@ impl PageVm {
              Native::UriCoder { encode: true, component: false }),
             ("decodeURI",
              Native::UriCoder { encode: false, component: false }),
+            ("__gg_ws_connect", Native::HostFn(vm::host::WS_CONNECT)),
+            ("__gg_ws_send", Native::HostFn(vm::host::WS_SEND)),
+            ("__gg_ws_close", Native::HostFn(vm::host::WS_CLOSE)),
+            ("__gg_worker_spawn", Native::HostFn(vm::host::WK_SPAWN)),
+            ("__gg_worker_post", Native::HostFn(vm::host::WK_POST)),
+            ("__gg_worker_term", Native::HostFn(vm::host::WK_TERM)),
+            ("__gg_worker_post_self",
+             Native::HostFn(vm::host::WK_SELF_POST)),
         ] {
             let fv = make_native(&mut vm.st, n);
             vm.set_global(name, fv);
@@ -872,6 +940,7 @@ impl PageVm {
         }
         // Promise.all/race defined in JS on top of new Promise + then
         vm.run_source(PROMISE_PRELUDE).ok();
+        vm.run_source(WS_PRELUDE).ok();
         vm
     }
 
@@ -953,6 +1022,289 @@ impl PageVm {
 
     /// Parse + compile + run one script; returns its last expression
     /// statement value.
+    /// N1: dynamically injected <script> work queued since the last
+    /// drain — (external (node, src) list, inline (node, code) list).
+    pub fn take_pending_scripts(
+        &mut self,
+    ) -> (Vec<(u32, String)>, Vec<(u32, String)>) {
+        (
+            std::mem::take(&mut self.st.pending_ext_scripts),
+            std::mem::take(&mut self.st.pending_inline_scripts),
+        )
+    }
+
+    /// N1: fire a non-bubbling event (load/error) on a node — calls
+    /// the node's on<type> expando handler and addEventListener
+    /// registrations. Returns console output.
+    pub fn fire_node_event(
+        &mut self,
+        node: u32,
+        ty: &str,
+    ) -> Vec<String> {
+        let evt = vm::new_plain_object(&mut self.st);
+        let ei = evt.index() as usize;
+        for (f, v) in
+            [("type", ty.to_string()), ("target", String::new())]
+        {
+            let k = self.name_id(f);
+            if f == "target" {
+                let _ = v;
+                raw_set_prop(
+                    &mut self.st, ei, k, Value::dom_node(node),
+                );
+            } else {
+                let sv = vm::push_str(&mut self.st, v);
+                raw_set_prop(&mut self.st, ei, k, sv);
+            }
+        }
+        let mut handlers: Vec<Value> = Vec::new();
+        let onk = self.name_id(&format!("on{ty}"));
+        if let Some(&h) = self.st.dom_expando.get(&(node, onk)) {
+            if h.is_function() {
+                handlers.push(h);
+            }
+        }
+        if let Some(v) =
+            self.st.listeners.get(&(node, ty.to_string()))
+        {
+            handlers.extend(v.iter().copied());
+        }
+        for h in handlers {
+            if let Err(e) = vm::call_value_this(
+                &mut self.st,
+                &self.mods,
+                h,
+                Some(Value::dom_node(node)),
+                &[evt],
+            ) {
+                let msg = e.msg.clone();
+                self.st
+                    .logs
+                    .push(format!("[gg-js error] on{ty}: {msg}"));
+            }
+        }
+        std::mem::take(&mut self.st.logs)
+    }
+
+    /// T5: Worker work queued by page JS since the last drain —
+    /// (spawns (id, url), posts (id, data), terminations).
+    pub fn take_worker_work(
+        &mut self,
+    ) -> (Vec<(u32, String)>, Vec<(u32, String)>, Vec<u32>) {
+        (
+            std::mem::take(&mut self.st.worker_spawns),
+            std::mem::take(&mut self.st.worker_posts),
+            std::mem::take(&mut self.st.worker_terms),
+        )
+    }
+
+    /// T5: deliver a worker event (message/error) to the page's
+    /// Worker object. Returns console output.
+    pub fn deliver_worker(
+        &mut self,
+        id: u32,
+        kind: &str,
+        data: &str,
+    ) -> Vec<String> {
+        let Some(&obj) = self.st.worker_objects.get(&id) else {
+            return Vec::new();
+        };
+        if !obj.is_object() {
+            return Vec::new();
+        }
+        let oi = obj.index() as usize;
+        let evt = vm::new_plain_object(&mut self.st);
+        let ei = evt.index() as usize;
+        let tk = self.name_id("type");
+        let tv = vm::push_str(&mut self.st, kind.to_string());
+        raw_set_prop(&mut self.st, ei, tk, tv);
+        let dk = self.name_id("data");
+        let dv = vm::push_str(&mut self.st, data.to_string());
+        raw_set_prop(&mut self.st, ei, dk, dv);
+        let hk = self.name_id(&format!("on{kind}"));
+        let handler = raw_get_prop(&self.st, oi, hk);
+        if let Some(h) = handler {
+            if h.is_function() {
+                if let Err(e) = vm::call_value_this(
+                    &mut self.st,
+                    &self.mods,
+                    h,
+                    Some(obj),
+                    &[evt],
+                ) {
+                    let msg = e.msg.clone();
+                    self.st.logs.push(format!(
+                        "[gg-js error] worker on{kind}: {msg}"
+                    ));
+                }
+            }
+        }
+        std::mem::take(&mut self.st.logs)
+    }
+
+    /// T5 (worker side): make this VM a worker scope — postMessage
+    /// queues to self_posts.
+    pub fn init_worker_scope(&mut self) {
+        self.run_source(
+            "postMessage = __gg_worker_post_self;\n\
+             self.postMessage = postMessage;\n\
+             var onmessage = null;\n",
+        )
+        .ok();
+    }
+
+    /// T5 (worker side): call the worker's onmessage with {data}.
+    pub fn deliver_message(&mut self, data: &str) -> Vec<String> {
+        let key = self.name_id("onmessage");
+        let h = self.st.globals[key as usize];
+        if h.is_function() {
+            let evt = vm::new_plain_object(&mut self.st);
+            let ei = evt.index() as usize;
+            let dk = self.name_id("data");
+            let dv = vm::push_str(&mut self.st, data.to_string());
+            raw_set_prop(&mut self.st, ei, dk, dv);
+            if let Err(e) = vm::call_value_this(
+                &mut self.st,
+                &self.mods,
+                h,
+                None,
+                &[evt],
+            ) {
+                let msg = e.msg.clone();
+                self.st
+                    .logs
+                    .push(format!("[gg-js error] onmessage: {msg}"));
+            }
+        }
+        std::mem::take(&mut self.st.logs)
+    }
+
+    /// T5 (worker side): drain postMessage output.
+    pub fn take_self_posts(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.st.self_posts)
+    }
+
+    /// T5: WebSocket work queued by page JS since the last drain —
+    /// (connects (id, url), outbox (id, text), closes).
+    pub fn take_ws_work(
+        &mut self,
+    ) -> (Vec<(u32, String)>, Vec<(u32, String)>, Vec<u32>) {
+        (
+            std::mem::take(&mut self.st.ws_connects),
+            std::mem::take(&mut self.st.ws_outbox),
+            std::mem::take(&mut self.st.ws_closes),
+        )
+    }
+
+    /// T5: deliver a socket event (open/message/close/error) to the
+    /// JS WebSocket object. Returns console output.
+    pub fn deliver_ws(
+        &mut self,
+        id: u32,
+        kind: &str,
+        data: &str,
+    ) -> Vec<String> {
+        let Some(&obj) = self.st.ws_objects.get(&id) else {
+            return Vec::new();
+        };
+        if !obj.is_object() {
+            return Vec::new();
+        }
+        let oi = obj.index() as usize;
+        let state = match kind {
+            "open" => 1,
+            "close" | "error" => 3,
+            _ => -1,
+        };
+        if state >= 0 {
+            let k = self.name_id("readyState");
+            raw_set_prop(&mut self.st, oi, k, Value::int(state));
+        }
+        let evt = vm::new_plain_object(&mut self.st);
+        let ei = evt.index() as usize;
+        let tk = self.name_id("type");
+        let tv = vm::push_str(&mut self.st, kind.to_string());
+        raw_set_prop(&mut self.st, ei, tk, tv);
+        if kind == "message" {
+            let dk = self.name_id("data");
+            let dv = vm::push_str(&mut self.st, data.to_string());
+            raw_set_prop(&mut self.st, ei, dk, dv);
+        }
+        let hk = self.name_id(&format!("on{kind}"));
+        let handler = raw_get_prop(&self.st, oi, hk);
+        if let Some(h) = handler {
+            if h.is_function() {
+                if let Err(e) = vm::call_value_this(
+                    &mut self.st,
+                    &self.mods,
+                    h,
+                    Some(obj),
+                    &[evt],
+                ) {
+                    let msg = e.msg.clone();
+                    self.st.logs.push(format!(
+                        "[gg-js error] ws on{kind}: {msg}"
+                    ));
+                }
+            }
+        }
+        if kind == "close" || kind == "error" {
+            self.st.ws_objects.remove(&id);
+        }
+        std::mem::take(&mut self.st.logs)
+    }
+
+    /// T4: recorded canvas-2d commands for one canvas node
+    /// (op, a, b, c, d, e, text, style) — see Native::CanvasOp.
+    pub fn canvas_cmds(
+        &self,
+        node: u32,
+    ) -> Vec<(u8, f64, f64, f64, f64, f64, String, String)> {
+        self.st
+            .canvas_cmds
+            .get(&node)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// T4: canvas nodes that have any recorded drawing.
+    pub fn canvas_nodes(&self) -> Vec<u32> {
+        let mut v: Vec<u32> =
+            self.st.canvas_cmds.keys().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Shell pull: the page's document.cookie pairs (network-layer
+    /// cookie jar sync).
+    pub fn get_cookies(&self) -> Vec<(String, String)> {
+        self.st.cookies.clone()
+    }
+
+    /// Shell push: seed document.cookie from the network jar before
+    /// page scripts run (upsert by name, insertion order kept).
+    pub fn set_cookies(&mut self, pairs: Vec<(String, String)>) {
+        for (k, v) in pairs {
+            if let Some(slot) = self
+                .st
+                .cookies
+                .iter_mut()
+                .find(|(name, _)| *name == k)
+            {
+                slot.1 = v;
+            } else {
+                self.st.cookies.push((k, v));
+            }
+        }
+    }
+
+    /// Shell push on scroll: gBCR subtracts this to answer
+    /// viewport-relative coordinates.
+    pub fn set_scroll(&mut self, x: f64, y: f64) {
+        self.st.scroll_x = x;
+        self.st.scroll_y = y;
+    }
+
     /// Shell push after layout: real getBoundingClientRect geometry.
     pub fn set_layout_rects(
         &mut self,
@@ -1558,6 +1910,147 @@ mod tests {
             Ok(_) => println!("polyfill: OK"),
             Err(e) => println!("polyfill: {e}"),
         }
+    }
+
+    #[test]
+    #[ignore] // diagnostic: run with -- --ignored --nocapture (needs bench/js/react)
+    fn react_boot_diag() {
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../bench/js/react/");
+        let Ok(react) =
+            std::fs::read_to_string(format!("{base}react.production.min.js"))
+        else {
+            println!("react bundle missing, skip");
+            return;
+        };
+        let dom =
+            std::fs::read_to_string(format!("{base}react-dom.production.min.js"))
+                .unwrap();
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse(
+                "<html><body><div id=root></div></body></html>",
+            ),
+        ))));
+        let boot = "\
+            try {\n\
+              var e = React.createElement;\n\
+              var app = e('div', {id: 'app'},\n\
+                e('h1', null, 'hello from react'),\n\
+                e('p', {className: 'msg'}, 'count: ', String(1 + 1)));\n\
+              ReactDOM.render(app, document.getElementById('root'));\n\
+              console.log('BOOT-OK ' + \
+                document.getElementById('root').innerHTML);\n\
+            } catch (err) {\n\
+              console.log('BOOT-ERR ' + err + ' :: ' + (err && err.stack));\n\
+            }\n"
+            .to_string();
+        // Round 2: hooks + state + synthetic events under createRoot
+        let hooks = "\
+            try {\n\
+              var e = React.createElement;\n\
+              var renders = 0;\n\
+              function Counter() {\n\
+                var s = React.useState(0);\n\
+                renders++;\n\
+                React.useEffect(function() {\n\
+                  console.log('EFFECT ran, count=' + s[0]);\n\
+                }, [s[0]]);\n\
+                return e('button', {id: 'btn', onClick: function() {\n\
+                  s[1](s[0] + 1);\n\
+                }}, 'clicked ' + s[0]);\n\
+              }\n\
+              var host = document.createElement('div');\n\
+              host.id = 'hookroot';\n\
+              document.body.appendChild(host);\n\
+              var root = ReactDOM.createRoot ?\n\
+                ReactDOM.createRoot(host) : null;\n\
+              if (root) { root.render(e(Counter)); }\n\
+              else { ReactDOM.render(e(Counter), host); }\n\
+              window.__hookHost = host;\n\
+              window.__renders = function() { return renders; };\n\
+              console.log('HOOKS-MOUNT-QUEUED');\n\
+            } catch (err) {\n\
+              console.log('HOOKS-ERR ' + err + ' :: ' + (err && err.stack));\n\
+            }\n"
+            .to_string();
+        let logs = vm.run_scripts(&[react, dom, boot, hooks]);
+        for l in &logs {
+            println!("LOG {l}");
+        }
+        // createRoot renders async (scheduler) — pump the loop, then
+        // inspect the mounted output and fire a click.
+        for _ in 0..3 {
+            let (plogs, _) = vm.pump();
+            for l in &plogs {
+                println!("PUMP {l}");
+            }
+        }
+        let probe = "\
+            try {\n\
+              console.log('HOOKS-DOM ' + window.__hookHost.innerHTML);\n\
+              var btn = document.getElementById('btn');\n\
+              console.log('BTN ' + (btn ? btn.tagName : 'missing'));\n\
+              btn.dispatchEvent(new Event('click', {bubbles: true}));\n\
+            } catch (err) { console.log('PROBE-ERR ' + err); }\n"
+            .to_string();
+        let logs2 = vm.run_scripts(&[probe]);
+        for l in &logs2 {
+            println!("LOG {l}");
+        }
+        for _ in 0..3 {
+            let (plogs, _) = vm.pump();
+            for l in &plogs {
+                println!("PUMP {l}");
+            }
+        }
+        let after = "\
+            console.log('AFTER-CLICK ' + window.__hookHost.innerHTML + \
+              ' renders=' + window.__renders());\n"
+            .to_string();
+        for l in &vm.run_scripts(&[after]) {
+            println!("LOG {l}");
+        }
+    }
+
+    #[test]
+    fn spread_uses_iterator_protocol() {
+        // Set spread: dedup preserved by materialization
+        assert_eq!(
+            n("var s = new Set([1, 2, 2, 3]); [...s].length"), 3.0);
+        // string spread splits into characters
+        assert_eq!(n("[...'abc'].length * 10 + \
+                      ([...'ab'][1] === 'b' ? 1 : 0)"), 31.0);
+        // Map spread yields entries
+        assert_eq!(
+            n("var m = new Map([['a', 1], ['b', 2]]); \
+               var e = [...m]; e.length * 10 + e[1][1]"), 22.0);
+        // call spread over a Set
+        assert_eq!(
+            n("function f(a, b, c) { return a + b * 10 + c * 100; } \
+               f(...new Set([1, 2, 3]))"), 321.0);
+        // custom @@iterator object spreads through the protocol
+        assert_eq!(
+            n("var it = {}; it[Symbol.iterator] = function() { \
+                 var i = 0; return { next: function() { i++; \
+                   return i <= 2 ? {value: i * 5, done: false} \
+                                 : {value: undefined, done: true}; } }; }; \
+               var a = [...it]; a[0] + a[1]"), 15.0);
+        // arrays still pass through (and copy via concat)
+        assert_eq!(
+            n("var a = [1, 2]; var b = [...a, 3]; \
+               b.length * 100 + b[2] * 10 + (b === a ? 1 : 0)"), 330.0);
+    }
+
+    #[test]
+    fn private_brand_check() {
+        assert_eq!(
+            n("class A { #x = 1; static has(o) { return #x in o; } } \
+               A.has(new A()) * 10 + (A.has({}) ? 1 : 0)"), 10.0);
+        // brand check distinguishes unrelated classes
+        assert_eq!(
+            n("class A { #x = 1; static has(o) { return #x in o; } } \
+               class B { #y = 2; } \
+               (A.has(new B()) ? 1 : 0) + (A.has(new A()) ? 10 : 0)"),
+            10.0);
     }
 
     #[test]
@@ -3371,6 +3864,81 @@ console.log('B typeof it: ' + typeof it);
             .to_string()]);
         assert!(logs.contains(&"post 13 26 774 46".to_string()),
                 "{logs:?}");
+        // scrolled: gBCR answers viewport-relative coordinates
+        vm.set_scroll(3.0, 20.0);
+        let logs = vm.run_scripts(&["\
+            var r2 = document.getElementById('t')\
+                .getBoundingClientRect();\n\
+            console.log('scrolled ' + r2.x + ' ' + r2.top);\n"
+            .to_string()]);
+        assert!(logs.contains(&"scrolled 10 6".to_string()), "{logs:?}");
+    }
+
+    #[test]
+    fn injected_scripts_are_queued_and_load_fires() {
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<html><head></head><body></body></html>"),
+        ))));
+        let logs = vm.run_scripts(&["\
+            var s = document.createElement('script');\n\
+            s.src = 'https://cdn.example/app.js';\n\
+            s.onload = function () {\n\
+              console.log('LOADED ' + (this === s));\n\
+            };\n\
+            document.head.appendChild(s);\n\
+            var i = document.createElement('script');\n\
+            i.textContent = \"console.log('INLINE RAN')\";\n\
+            document.body.appendChild(i);\n\
+            var j = document.createElement('script');\n\
+            j.type = 'application/json';\n\
+            j.textContent = '{}';\n\
+            document.body.appendChild(j);\n"
+            .to_string()]);
+        assert!(
+            !logs.iter().any(|l| l.contains("error")),
+            "{logs:?}"
+        );
+        let (ext, inline) = vm.take_pending_scripts();
+        assert_eq!(ext.len(), 1, "{ext:?}");
+        assert_eq!(ext[0].1, "https://cdn.example/app.js");
+        assert_eq!(inline.len(), 1, "{inline:?}"); // json block skipped
+        assert!(inline[0].1.contains("INLINE RAN"));
+        // drain is one-shot
+        let (e2, i2) = vm.take_pending_scripts();
+        assert!(e2.is_empty() && i2.is_empty());
+        // load event reaches the onload expando with this=node
+        let logs = vm.fire_node_event(ext[0].0, "load");
+        assert!(logs.contains(&"LOADED true".to_string()), "{logs:?}");
+        // re-inserting the same node does not requeue it
+        let _ = vm.run_scripts(&["\
+            var s2 = document.getElementsByTagName('script')[0];\n\
+            document.body.appendChild(s2);\n"
+            .to_string()]);
+        let (e3, _) = vm.take_pending_scripts();
+        assert!(e3.is_empty(), "{e3:?}");
+    }
+
+    #[test]
+    fn cookie_shell_sync() {
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<p>x</p>"),
+        ))));
+        // network jar seeds document.cookie before scripts
+        vm.set_cookies(vec![("sid".into(), "abc".into())]);
+        let logs = vm.run_scripts(&["\
+            console.log('seeded ' + document.cookie);\n\
+            document.cookie = 'theme=dark';\n\
+            document.cookie = 'sid=xyz';\n"
+            .to_string()]);
+        assert!(logs.contains(&"seeded sid=abc".to_string()), "{logs:?}");
+        // JS writes flow back out (upsert keeps insertion order)
+        assert_eq!(
+            vm.get_cookies(),
+            vec![
+                ("sid".to_string(), "xyz".to_string()),
+                ("theme".to_string(), "dark".to_string()),
+            ]
+        );
     }
 
     #[test]

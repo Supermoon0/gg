@@ -53,6 +53,18 @@ def form_pairs(form):
     return pairs
 
 
+def submit_post(form):
+    """(action, urlencoded-body) for a method=post form, or None for
+    GET forms. multipart/file uploads are not supported yet."""
+    method = form.attributes.get("method", "get").lower()
+    if method != "post":
+        return None
+    action = form.attributes.get("action", "") or ""
+    body = "&".join(
+        f"{quote_plus(n)}={quote_plus(v)}" for n, v in form_pairs(form))
+    return action, body
+
+
 def submit_href(form):
     """The href a GET submit navigates to (action + query), or None
     when the form can't be submitted this way (method=post)."""

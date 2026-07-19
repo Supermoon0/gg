@@ -1,6 +1,6 @@
 """@font-face: extract descriptors from CSS text and register the
 fetched fonts with the native text engine. TTF/OTF only (fontdue has
-no woff/woff2 inflater) — other sources are skipped gracefully."""
+woff2 decompresses to ttf in Rust) — plain woff is still skipped."""
 
 import re
 
@@ -18,7 +18,7 @@ _DECL_RE = {
 _URL_RE = re.compile(r"url\(\s*['\"]?([^'\")]+)['\"]?\s*\)",
                      re.IGNORECASE)
 # sources fontdue can actually parse, most preferred first
-_LOADABLE = (".ttf", ".otf")
+_LOADABLE = (".ttf", ".otf", ".woff2")
 
 
 def parse_font_faces(css_texts):
@@ -43,7 +43,7 @@ def parse_font_faces(css_texts):
                  or u.startswith("data:")),
                 None)
             if url is None:
-                continue  # woff/woff2-only face: skip
+                continue  # woff(1)-only face: skip
             bold = False
             wm = _DECL_RE["weight"].search(body)
             if wm:

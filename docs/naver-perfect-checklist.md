@@ -1,5 +1,7 @@
 # 네이버 "완벽 구동" 체크리스트
 
+공략 설계(순서·구조·검증 전략): [naver-perfect-design.md](naver-perfect-design.md)
+
 목표 정의 — 3단계로 나눠서 "완벽"을 측정한다:
 
 | 단계 | 기준 | 필요한 마일스톤 | 상태 (07-16) |
@@ -115,8 +117,8 @@ class 2회) 문법 갭이 좁고, `display:grid`·`position:sticky`도 **0회**�
       memo만 무효화해 기존 variant id 유지) → 폰트 캐시 클리어 후
       첫 레이아웃. 미지 패밀리도 등록돼 있으면 통과(has_family).
       E2E: file:// 웹폰트가 p에 실적용·실측 폭 차이 확인.
-      갭: **woff/woff2 미지원**(fontdue에 인플레이터 없음 — 실사이트
-      대부분이 woff2라 로컬 검증 필요, 스킵은 무해), CSS 파일 기준
+      갭 해소(07-19): **woff2 디코드 지원**(woff2-patched → ttf 변환).
+      잔여는 woff(1), CSS 파일 기준
       상대경로(지금은 페이지 기준), unicode-range
 - [x] input `placeholder` 표시 — 07-11 ("검색어를 입력해 주세요." 회색 렌더,
       `input[type=hidden]` UA 룰 포함)
@@ -164,8 +166,10 @@ class 2회) 문법 갭이 좁고, `display:grid`·`position:sticky`도 **0회**�
       컨테이너 높이는 float 바닥 포함(클리어픽스형 봉쇄).
       갭: 인라인 흐름 안의 float, float 아래로 텍스트 재확장,
       margin 있는 float의 스택 x 근사
-- [ ] inline-block 정식 배치 (지금은 근사)
-- [ ] margin collapsing
+- [x] **inline-block 정식 배치** — 07-19: 폭 명시 박스가 라인의 원자
+      박스로(InlineBlockLayout), auto 폭은 인라인 폴백(float v1 게이트)
+- [x] **margin collapsing** — 07-19: 인접 형제 붕괴(양수 max/음수
+      min/혼합 합). 부모-자식 붕괴는 잔여
 - [x] ~~grid~~ (×0), ~~sticky~~ (×0) — 네이버 홈엔 없음, 스킵
 
 ---
@@ -174,8 +178,8 @@ class 2회) 문법 갭이 좁고, `display:grid`·`position:sticky`도 **0회**�
 
 문법 대형 관문은 전부 격파(ES2020 대부분: 클래스 상속·async/await 전 위치·
 spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴 롱테일:
-제너레이터 `function*`, private 필드(`#x` 추정), expression too deep 1건
-(tmp=250 고갈), 런타임 "yet" 부류(엔진 bail → 캐치 가능한 JS TypeError로
+제너레이터 `function*`, private 필드(`#x` 추정), ~~expression too deep~~
+(**07-19 u16 레지스터 파일로 영구 소멸** — react-dom 131KB 컴파일 실증), 런타임 "yet" 부류(엔진 bail → 캐치 가능한 JS TypeError로
 전환하는 캠페인이 systemic fix — polyfill anObject 장기전과 연결).
 
 ### 첫 관문 (실측: 지금 번들이 죽는 지점)
@@ -310,7 +314,7 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
       직후 주요 박스(Block/Image)의 (x,y,w,h)를 `Doc.set_layout_rects`
       로 Rust VM에 푸시(St.layout_rects) → 이후 이벤트 핸들러의 gBCR이
       실제 지오메트리 반환(E2E: 클릭 핸들러가 200×40 @21 읽음).
-      문서좌표 근사(스크롤 미반영 — 뷰포트 상대는 후속), 첫 레이아웃
+      07-19: 셸이 스크롤을 푸시(set_scroll)해 뷰포트 상대 좌표(스펙 일치), 첫 레이아웃
       전엔 기존 제로렉트. **덤 버그 수정: addEventListener 핸들러의
       this가 undefined였음** → click/라이프사이클 디스패치가 this=노드
       (window 센티널은 실제 window 객체 — 가짜 dom_node면 아레나 밖
@@ -382,8 +386,9 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
       radius·transform 등 — 모르는 속성은 보수적으로 지오메트리).
       3,506노드 실측: hover당 114→53ms(2.2×; diff+패치 14 + 리페인트
       34). 잔여: 리페인트 자체의 부분화(디스플레이 리스트 캐시 —
-      M6 스크롤 60fps와 합류), 라이브 틱의 구조 변이 경로는 여전히
-      전체 재구축
+      M6 스크롤 60fps와 합류), 라이브 틱의 구조 변이 경로도
+      07-19부터 서브트리 스플라이스 v1(refresh_partial — ≤32 서브트리
+      제자리 교체, 의심 시 전체 폴백); 부분 레이아웃은 잔여
 - [ ] winit 셸(shell.py --native)에도 라이브 루프 배선 (현재 tkinter만)
 - [x] **`transform`** (×646) — 07-18: translate/translateX/translateY/
       translate3d/matrix(e,f)의 이동 성분을 페인트 오프셋으로 적용
@@ -424,7 +429,9 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
       submit/button류 제외, checkbox/radio는 checked만, 한글
       percent-인코딩), action의 기존 쿼리 대체 후 resolve·이동.
       POST는 미지원 안내. file: 스킴이 쿼리를 경로에 섞던 버그 수정
-- [ ] 쿠키 세션 유지 (로그인은 범위 밖 — 별도 대공사)
+- [x] **쿠키 세션 유지 v1** — 07-19: net.py 쿠키 자(Set-Cookie 수집,
+      동일 호스트 Cookie 헤더) + document.cookie 양방향 동기화.
+      로그인(보안 속성 완전판)은 여전히 범위 밖
 - [ ] iframe (홈 셸엔 0개; 광고·로그인에서 등장 — 후순위)
 
 ---
@@ -487,18 +494,21 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
 이 문서는 네이버 홈 기준이다. 완주해도 웹 전체엔 다음이 남는다
 (네이버 홈 사용량 0이라 뺐지만 다른 곳에선 흔한 것들):
 
-- [ ] `display: grid` / `position: sticky` (GitHub·뉴스 사이트 도배 수준)
-- [ ] **테이블 레이아웃** (옛 사이트·정부 사이트 뼈대)
-- [ ] **`overflow: auto` 내부 스크롤 영역** (채팅창·사이드바)
+- [x] ~~`display: grid`~~ **v1** — 07-19: template-columns(px/fr/auto/
+      repeat)+gap, 행 우선 배치 · `position: sticky`는 흐름 렌더만(핀 잔여)
+- [x] **테이블 레이아웃 v1** — 07-19: 균등 컬럼+colspan, 행 그룹.
+      자동 컬럼 폭·rowspan 잔여
+- [x] **`overflow: auto`** — 07-19: hidden과 동일 클립(내부 스크롤 잔여)
 - [ ] 폼 컨트롤 렌더링 (`<select>`·체크박스·라디오)
 - [x] ~~트랜스파일 안 된 모던 JS~~ — 07-16: 구조 분해(선언·대입·for-of 헤드)·
-      async/await(전 위치)·클래스 상속·spread/rest **완료**. 잔여:
-      제너레이터·**ES 모듈**(import/export)
+      async/await(전 위치)·클래스 상속·spread/rest **완료**. 07-19:
+      **ES 모듈 v1**(정적 링커 — browser/esmodules.py) 추가. 잔여:
+      루프 안 yield, dynamic import()
 - [ ] Web Worker / Service Worker / WebAssembly
 - [ ] `<video>`/`<audio>`/WebGL (유튜브·지도류 — 사실상 별개 프로젝트)
 - [ ] iframe 문서 격리, CORS, 쿠키 전체 속성 (로그인·광고·임베드)
-- [ ] HTML5 오류 복구 알고리즘 완전판, quirks 모드, **EUC-KR 등 레거시 인코딩**,
-      RTL/양방향 텍스트
+- [ ] HTML5 오류 복구 알고리즘 완전판, quirks 모드, ~~EUC-KR~~(07-19:
+      meta 스니핑 + 파이썬 코덱), RTL/양방향 텍스트
 - [x] 진행 지표: **사이트 바스켓** — 07-16: `E:\gg\basket_test.py` 상설화
       (노드/스타일/페인트/텍스트/JS오류/시간 스코어보드). 8개 중 7개
       "읽을만함", 크래시 0. 정부24 저페인트는 mega-menu display:none
@@ -547,7 +557,10 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
 7. M5 입력/호버 — "쓸 수 있는 브라우저". 제너레이터·ES 모듈은 필요 사이트가
    나타날 때. M6 잔여(JIT·레이아웃 이식·GC)는 B단계 도달 후 측정해서 결정.
 
-*갱신: 2026-07-18 (오전: canvas 2D 스텁·Object.defineProperties/
+*갱신: 2026-07-19 — u16 레지스터(React 18 UMD 부팅·리렌더 E2E),
+ES 모듈 v1 링커, 테이블/grid/inline-block/margin collapsing v1,
+overflow:auto 클립, 쿠키 자+동기화, gBCR 뷰포트 상대, EUC-KR 스니핑.
+cargo 174 · smoke 170(GG_SKIP_NET=1+xvfb). 이전 갱신: 2026-07-18 (오전: canvas 2D 스텁·Object.defineProperties/
 getOwnPropertyNames 추가, M3 스텁류 실태 반영 — Observer/matchMedia/
 postMessage/scrollTo/getComputedStyle/XHR은 코드에 이미 있었는데 문서만
 미갱신이었음. + tkinter 폴백 폰트에 .size 부재 버그 수정.

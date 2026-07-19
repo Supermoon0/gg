@@ -1707,7 +1707,8 @@ impl Parser {
                 if !buf.is_empty() {
                     segs.push(Expr::Array(std::mem::take(&mut buf)));
                 }
-                segs.push(e);
+                // iterator protocol: [...set] / f(...str) materialize
+                segs.push(Expr::IterMat(Box::new(e)));
             } else {
                 buf.push(e);
             }
@@ -1754,6 +1755,11 @@ impl Parser {
                 Ok(Expr::Template(out))
             }
             Tok::Ident(name) => match name.as_str() {
+                // `#x in obj` brand check: private fields live under
+                // literal '#x' keys (see class desugar), so a private
+                // name in expression position lowers to that string —
+                // `in` then does the own-property brand test.
+                n if n.starts_with('#') => Ok(Expr::Str(n.to_string())),
                 "this" => Ok(Expr::This),
                 "true" => Ok(Expr::Bool(true)),
                 "false" => Ok(Expr::Bool(false)),
@@ -1976,7 +1982,8 @@ impl Parser {
                 if !buf.is_empty() {
                     segs.push(Expr::Array(std::mem::take(&mut buf)));
                 }
-                segs.push(e);
+                // iterator protocol: [...set] / f(...str) materialize
+                segs.push(Expr::IterMat(Box::new(e)));
             } else {
                 buf.push(e);
             }

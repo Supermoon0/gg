@@ -86,6 +86,29 @@ impl TextEngine {
         (id, w, h)
     }
 
+    /// Rasterize a display list into the image store (canvas 2D —
+    /// T4). Returns (image_id, w, h) like load_image.
+    fn load_canvas(
+        &mut self,
+        width: u32,
+        height: u32,
+        cmds: Vec<Cmd>,
+    ) -> (u32, u32, u32) {
+        let w = width.clamp(1, 4096);
+        let h = height.clamp(1, 4096);
+        let r = self.rasterize(w, h, (255, 255, 255), &cmds);
+        // RGB -> RGBA
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for px in r.buf.chunks_exact(3) {
+            rgba.extend_from_slice(px);
+            rgba.push(255);
+        }
+        let id = self.next_image;
+        self.next_image += 1;
+        self.images.insert(id, (w, h, rgba));
+        (id, w, h)
+    }
+
     fn font_id(&mut self, family: &str, bold: bool, italic: bool) -> u32 {
         self.store.variant_id(family, bold, italic)
     }
@@ -592,8 +615,12 @@ impl Doc {
                     || stype.contains("javascript")
                     || stype == "module"
                 {
+                    // module scripts are marked so the Python side can
+                    // run its static import linker on them
+                    let m = stype == "module";
                     if let Some(src) = node.attr("src") {
-                        out.push(("src".to_string(), src.to_string()));
+                        let kind = if m { "msrc" } else { "src" };
+                        out.push((kind.to_string(), src.to_string()));
                     } else {
                         let code: String = node
                             .children
@@ -601,7 +628,9 @@ impl Doc {
                             .map(|&c| doc.nodes[c].text.as_str())
                             .collect();
                         if !code.trim().is_empty() {
-                            out.push(("inline".to_string(), code));
+                            let kind =
+                                if m { "minline" } else { "inline" };
+                            out.push((kind.to_string(), code));
                         }
                     }
                 }
@@ -678,6 +707,123 @@ impl Doc {
         }
     }
 
+    /// N1: injected <script> work since the last drain —
+    /// (external (node, src), inline (node, code)).
+    fn take_pending_scripts(
+        &mut self,
+    ) -> (Vec<(u32, String)>, Vec<(u32, String)>) {
+        if self.use_ggjs {
+            self.ggvm().take_pending_scripts()
+        } else {
+            (Vec::new(), Vec::new())
+        }
+    }
+
+    /// N1: fire load/error on an injected script node; returns
+    /// console output from its handlers.
+    fn fire_node_event(&mut self, node: u32, ty: &str) -> Vec<String> {
+        if self.use_ggjs {
+            self.ggvm().fire_node_event(node, ty)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// T5: Worker work queued by page JS.
+    fn take_worker_work(
+        &mut self,
+    ) -> (Vec<(u32, String)>, Vec<(u32, String)>, Vec<u32>) {
+        if self.use_ggjs {
+            self.ggvm().take_worker_work()
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        }
+    }
+
+    /// T5: deliver a worker event into page JS.
+    fn deliver_worker(
+        &mut self,
+        id: u32,
+        kind: &str,
+        data: &str,
+    ) -> Vec<String> {
+        if self.use_ggjs {
+            self.ggvm().deliver_worker(id, kind, data)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// T5: WebSocket work queued by page JS.
+    fn take_ws_work(
+        &mut self,
+    ) -> (Vec<(u32, String)>, Vec<(u32, String)>, Vec<u32>) {
+        if self.use_ggjs {
+            self.ggvm().take_ws_work()
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        }
+    }
+
+    /// T5: deliver a WebSocket event into page JS.
+    fn deliver_ws(
+        &mut self,
+        id: u32,
+        kind: &str,
+        data: &str,
+    ) -> Vec<String> {
+        if self.use_ggjs {
+            self.ggvm().deliver_ws(id, kind, data)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// T4: recorded canvas-2d commands for a canvas node.
+    fn canvas_cmds(
+        &mut self,
+        node: u32,
+    ) -> Vec<(u8, f64, f64, f64, f64, f64, String, String)> {
+        if self.use_ggjs {
+            self.ggvm().canvas_cmds(node)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// T4: canvas nodes with recorded drawing.
+    fn canvas_nodes(&mut self) -> Vec<u32> {
+        if self.use_ggjs {
+            self.ggvm().canvas_nodes()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The page's document.cookie pairs (for network-jar sync).
+    fn get_cookies(&mut self) -> Vec<(String, String)> {
+        if self.use_ggjs {
+            self.ggvm().get_cookies()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Seed document.cookie from the shell's network cookie jar.
+    fn set_cookies(&mut self, pairs: Vec<(String, String)>) {
+        if self.use_ggjs {
+            self.ggvm().set_cookies(pairs);
+        }
+    }
+
+    /// Push the current scroll offset so getBoundingClientRect
+    /// answers viewport-relative coordinates.
+    fn set_scroll(&mut self, x: f64, y: f64) {
+        if self.use_ggjs {
+            self.ggvm().set_scroll(x, y);
+        }
+    }
+
     /// Shell-side hover update: mark the element under the pointer
     /// and its ancestors so `:hover` rules match on the next
     /// compute_styles. Pass None when the pointer leaves the page.
@@ -705,6 +851,15 @@ impl Doc {
         let mut d = self.doc.borrow_mut();
         if node_idx < d.nodes.len() {
             d.set_attr(node_idx, &name, &value);
+        }
+    }
+
+    /// Remove an attribute (checkbox untick etc.) — mirrors the
+    /// Python-side removal so page JS and form serialization agree.
+    fn remove_attr(&mut self, node_idx: usize, name: String) {
+        let mut d = self.doc.borrow_mut();
+        if node_idx < d.nodes.len() {
+            d.remove_attr(node_idx, &name);
         }
     }
 
@@ -874,6 +1029,63 @@ impl Doc {
         out
     }
 
+    /// N3: node indices touched since the last drain — structural
+    /// ops report the parent whose child list changed. Empty result
+    /// means no structural/attr/text mutations happened.
+    fn take_mutated(&mut self) -> Vec<u64> {
+        let mut d = self.doc.borrow_mut();
+        let mut v: Vec<u64> =
+            d.mutated.drain(..).map(|i| i as u64).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// N3: flat pre-order dump of ONE subtree (same row shape as
+    /// export; the subtree root's parent is -1). Lets the shell
+    /// splice small mutations into its tree without a full-DOM
+    /// marshal.
+    fn export_subtree(&self, root: u64) -> Vec<ExportedNode> {
+        let doc = self.doc.borrow();
+        let n = doc.nodes.len();
+        let root = root as usize;
+        if root >= n {
+            return Vec::new();
+        }
+        let mut out: Vec<ExportedNode> = Vec::new();
+        let mut map = vec![usize::MAX; n];
+        let mut stack = vec![root];
+        while let Some(idx) = stack.pop() {
+            let node = &doc.nodes[idx];
+            map[idx] = out.len();
+            let parent = match node.parent {
+                Some(p) if map[p] != usize::MAX => map[p] as i64,
+                _ => -1,
+            };
+            let (tag, text) = match &node.tag {
+                Some(t) => (Some(t.clone()), None),
+                None => (None, Some(node.text.clone())),
+            };
+            let style_pairs = node
+                .style
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            out.push((
+                parent,
+                idx as u64,
+                tag,
+                text,
+                node.attrs.clone(),
+                style_pairs,
+            ));
+            for &c in node.children.iter().rev() {
+                stack.push(c);
+            }
+        }
+        out
+    }
+
     /// Compact semantic snapshot for an AI agent: one entry per node
     /// that has a role, with a pre-computed accessible name, in document
     /// order. This is the AI-native primitive — it lets the agent read
@@ -964,9 +1176,59 @@ fn jsvm_run(src: &str) -> PyResult<Vec<String>> {
     }
 }
 
+/// T5: a real Web Worker — its own gg-js VM (no DOM), bridged to the
+/// page by the Python shell via postMessage strings.
+#[pyclass(unsendable)]
+struct GgWorker {
+    vm: jsvm::page::PageVm,
+}
+
+#[pymethods]
+impl GgWorker {
+    /// Run the worker's script source. Returns console output.
+    fn run_source(&mut self, src: &str) -> Vec<String> {
+        self.vm.run_scripts(&[src.to_string()])
+    }
+
+    /// Deliver a main->worker message (fires onmessage).
+    fn deliver(&mut self, data: &str) -> Vec<String> {
+        self.vm.deliver_message(data)
+    }
+
+    /// Drain worker->main postMessage output.
+    fn take_posts(&mut self) -> Vec<String> {
+        self.vm.take_self_posts()
+    }
+
+    /// Drive the worker's own event loop (timers/microtasks);
+    /// returns (console, pending fetches) like Doc.pump.
+    fn pump(&mut self) -> (Vec<String>, Vec<(u32, String)>) {
+        self.vm.pump()
+    }
+
+    fn resolve_fetch(&mut self, fetch_id: u32, status: u16,
+                     body: String) {
+        self.vm.resolve_fetch(fetch_id, status, body);
+    }
+
+    fn reject_fetch(&mut self, fetch_id: u32, message: String) {
+        self.vm.reject_fetch(fetch_id, message);
+    }
+}
+
+/// Create a worker VM (isolated scope, worker globals installed).
+#[pyfunction]
+fn new_worker() -> GgWorker {
+    let mut vm = jsvm::page::PageVm::new(None);
+    vm.init_worker_scope();
+    GgWorker { vm }
+}
+
 #[pymodule]
 fn ggcore(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Doc>()?;
+    m.add_class::<GgWorker>()?;
+    m.add_function(wrap_pyfunction!(new_worker, m)?)?;
     m.add_class::<TextEngine>()?;
     m.add_class::<NativeWindow>()?;
     m.add_function(wrap_pyfunction!(parse_html, m)?)?;
