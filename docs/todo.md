@@ -171,12 +171,16 @@
 
 ## P5 — 로드맵 T3~T5 (구 "비범위" — 전체 웹 목표로 범위 편입)
 
-- [ ] 로그인 — 쿠키 보안 속성 전체(HttpOnly/SameSite/Domain/Path), HTTPS 세션
-      (세션 쿠키 자 v1은 07-19 가동 — P1 항목). **로드맵 T3: 보안
-      모델(오리진·CORS·CSP)과 한 묶음 — "대충 v1" 금지 원칙**
-- [ ] iframe 문서 격리, CORS (광고·로그인·임베드)
-- [ ] Web Worker / Service Worker / WebAssembly
-- [ ] `<video>` / `<audio>` / WebGL (유튜브·지도류)
+- [ ] 로그인 — **07-19 T3 1차: 쿠키 속성 완전판(Domain/Path/
+      Expires/Secure/HttpOnly/SameSite) + POST 제출 + fetch CORS
+      가동.** 잔여: iframe 격리, CSP, multipart, 쿠키 영속화 —
+      완성 전까지 로그인 기능 비활성 유지("대충 v1" 금지 원칙)
+- [ ] iframe 문서 격리 (CORS는 07-19 fetch 채널 가동 — ACAO 검사)
+- [ ] Web Worker(별도 VM+postMessage 요건 — 가짜 격리 금지) /
+      Service Worker / WebAssembly
+- [ ] `<video>` / `<audio>` / WebGL (유튜브·지도류).
+      **07-19: canvas 2D 실렌더 v1 가동**(기록→래스터, 변환·
+      drawImage 잔여) · **WebSocket 실물 가동**(RFC6455 E2E)
 - [x] **EUC-KR 등 레거시 인코딩** — 07-19: Content-Type 헤더 우선 +
       헤더 침묵 시 첫 2KB에서 `<meta charset>`/http-equiv 스니핑
       (파이썬 코덱이 euc-kr 계열 전부 처리). 잔여: quirks 모드,

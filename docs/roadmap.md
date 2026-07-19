@@ -101,4 +101,24 @@ T1~T2는 "한 사람 + AI 페어"가 몇 달에 도달할 수 있는 영역이�
 기준을 미리 박아두는 것**이다 — 어느 티어에서 멈추더라도 그 티어까지는
 "완벽"하게.
 
-*작성: 2026-07-19. 현재 위치: T1 잔여 소탕 + T2 실증 대기(로컬 라운드).*
+## 진행 기록
+
+**라운드 2 (07-19 밤) — 티어 관통 1차:**
+- **T3 착수**: 쿠키 속성 완전판(Domain/Path/Expires/Secure/HttpOnly/
+  SameSite — 타 도메인 쿠키 설정 차단 포함), POST 폼 제출
+  (urlencoded, 리다이렉트 시 GET 전환), fetch/XHR CORS 검사
+  (ACAO — 3개 서비스 루프 전부). 잔여: iframe 격리, CSP,
+  multipart/파일 업로드, 쿠키 영속화. **로그인 기능은 T3 완성
+  전까지 계속 꺼둠(원칙)**
+- **T4 착수**: canvas 2D 실렌더 v1 — 드로잉 호출을 VM이 기록,
+  셸이 Rust 래스터라이저로 픽셀화해 대체 요소로 표시(fillRect/
+  stroke/path/fillText/arc; 변환·drawImage·부분 arc는 잔여).
+  video/audio/WebGL 미착수
+- **T5 착수**: **WebSocket 실물**(RFC6455 — 핸드셰이크·마스킹·
+  ping/pong·close, fetch식 위임 채널로 JS WebSocket API 완결,
+  로컬 에코 서버 E2E). Worker는 가짜 격리(동일 VM 공유 전역)로
+  만들 바에 미착수가 정직하다고 판단 — 별도 VM 인스턴스 +
+  postMessage 브리지가 요건. Service Worker/WASM 미착수
+
+*작성: 2026-07-19. 현재 위치: T1 잔여 소탕 + T2 실증 대기(로컬
+라운드) + T3~T5 1차 관통(위 기록).*
