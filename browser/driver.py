@@ -175,6 +175,9 @@ class Page:
             if native._service_websockets(self._doc, self.url):
                 mutated = True
                 continue
+            if native._service_workers(self._doc, self.url):
+                mutated = True
+                continue
             if not self._doc.has_pending_work():
                 break
             if time.monotonic() > deadline:

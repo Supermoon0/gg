@@ -349,6 +349,13 @@ pub(super) mod host {
     pub const WS_CONNECT: u16 = 130;
     pub const WS_SEND: u16 = 131;
     pub const WS_CLOSE: u16 = 132;
+    // Web Worker (T5): real isolation — the shell runs the worker in
+    // its own VM; these queue spawn/post/terminate for it
+    pub const WK_SPAWN: u16 = 140;
+    pub const WK_POST: u16 = 141;
+    pub const WK_TERM: u16 = 142;
+    /// postMessage *inside* a worker VM: queues to self_posts
+    pub const WK_SELF_POST: u16 = 143;
 }
 
 /// Hidden class: property layout shared by every object that acquired
@@ -527,6 +534,14 @@ pub(super) struct St {
     /// (op, a, b, c, d, e, text, style)
     pub(super) canvas_cmds: HashMap<
         u32, Vec<(u8, f64, f64, f64, f64, f64, String, String)>>,
+    /// Web Worker shell delegation (T5)
+    pub(super) worker_spawns: Vec<(u32, String)>,
+    pub(super) worker_posts: Vec<(u32, String)>,
+    pub(super) worker_terms: Vec<u32>,
+    pub(super) worker_objects: HashMap<u32, Value>,
+    pub(super) worker_next_id: u32,
+    /// outbox when THIS VM is a worker (postMessage global)
+    pub(super) self_posts: Vec<String>,
     /// WebSocket shell delegation (T5)
     pub(super) ws_connects: Vec<(u32, String)>,
     pub(super) ws_outbox: Vec<(u32, String)>,
@@ -643,6 +658,12 @@ impl St {
             pending_inline_scripts: Vec::new(),
             scripts_seen: std::collections::HashSet::new(),
             canvas_cmds: HashMap::new(),
+            worker_spawns: Vec::new(),
+            worker_posts: Vec::new(),
+            worker_terms: Vec::new(),
+            worker_objects: HashMap::new(),
+            worker_next_id: 1,
+            self_posts: Vec::new(),
             ws_connects: Vec::new(),
             ws_outbox: Vec::new(),
             ws_closes: Vec::new(),
@@ -3729,6 +3750,56 @@ fn host_fn(
                 }
             }
             Ok(new_array(st, out))
+        }
+        WK_SPAWN => {
+            let url = if argc > 0 {
+                to_display(st, st.regs[args_base])
+            } else {
+                String::new()
+            };
+            let obj = if argc > 1 {
+                st.regs[args_base + 1]
+            } else {
+                Value::UNDEFINED
+            };
+            let id = st.worker_next_id;
+            st.worker_next_id += 1;
+            st.worker_objects.insert(id, obj);
+            st.worker_spawns.push((id, url));
+            Ok(Value::number(id as f64))
+        }
+        WK_POST => {
+            let id = if argc > 0 {
+                st.regs[args_base].to_number_raw() as u32
+            } else {
+                0
+            };
+            let data = if argc > 1 {
+                to_display(st, st.regs[args_base + 1])
+            } else {
+                String::new()
+            };
+            st.worker_posts.push((id, data));
+            Ok(Value::UNDEFINED)
+        }
+        WK_TERM => {
+            let id = if argc > 0 {
+                st.regs[args_base].to_number_raw() as u32
+            } else {
+                0
+            };
+            st.worker_terms.push(id);
+            st.worker_objects.remove(&id);
+            Ok(Value::UNDEFINED)
+        }
+        WK_SELF_POST => {
+            let data = if argc > 0 {
+                to_display(st, st.regs[args_base])
+            } else {
+                String::new()
+            };
+            st.self_posts.push(data);
+            Ok(Value::UNDEFINED)
         }
         WS_CONNECT => {
             let url = if argc > 0 {

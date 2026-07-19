@@ -729,6 +729,31 @@ impl Doc {
         }
     }
 
+    /// T5: Worker work queued by page JS.
+    fn take_worker_work(
+        &mut self,
+    ) -> (Vec<(u32, String)>, Vec<(u32, String)>, Vec<u32>) {
+        if self.use_ggjs {
+            self.ggvm().take_worker_work()
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        }
+    }
+
+    /// T5: deliver a worker event into page JS.
+    fn deliver_worker(
+        &mut self,
+        id: u32,
+        kind: &str,
+        data: &str,
+    ) -> Vec<String> {
+        if self.use_ggjs {
+            self.ggvm().deliver_worker(id, kind, data)
+        } else {
+            Vec::new()
+        }
+    }
+
     /// T5: WebSocket work queued by page JS.
     fn take_ws_work(
         &mut self,
@@ -1151,9 +1176,59 @@ fn jsvm_run(src: &str) -> PyResult<Vec<String>> {
     }
 }
 
+/// T5: a real Web Worker — its own gg-js VM (no DOM), bridged to the
+/// page by the Python shell via postMessage strings.
+#[pyclass(unsendable)]
+struct GgWorker {
+    vm: jsvm::page::PageVm,
+}
+
+#[pymethods]
+impl GgWorker {
+    /// Run the worker's script source. Returns console output.
+    fn run_source(&mut self, src: &str) -> Vec<String> {
+        self.vm.run_scripts(&[src.to_string()])
+    }
+
+    /// Deliver a main->worker message (fires onmessage).
+    fn deliver(&mut self, data: &str) -> Vec<String> {
+        self.vm.deliver_message(data)
+    }
+
+    /// Drain worker->main postMessage output.
+    fn take_posts(&mut self) -> Vec<String> {
+        self.vm.take_self_posts()
+    }
+
+    /// Drive the worker's own event loop (timers/microtasks);
+    /// returns (console, pending fetches) like Doc.pump.
+    fn pump(&mut self) -> (Vec<String>, Vec<(u32, String)>) {
+        self.vm.pump()
+    }
+
+    fn resolve_fetch(&mut self, fetch_id: u32, status: u16,
+                     body: String) {
+        self.vm.resolve_fetch(fetch_id, status, body);
+    }
+
+    fn reject_fetch(&mut self, fetch_id: u32, message: String) {
+        self.vm.reject_fetch(fetch_id, message);
+    }
+}
+
+/// Create a worker VM (isolated scope, worker globals installed).
+#[pyfunction]
+fn new_worker() -> GgWorker {
+    let mut vm = jsvm::page::PageVm::new(None);
+    vm.init_worker_scope();
+    GgWorker { vm }
+}
+
 #[pymodule]
 fn ggcore(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Doc>()?;
+    m.add_class::<GgWorker>()?;
+    m.add_function(wrap_pyfunction!(new_worker, m)?)?;
     m.add_class::<TextEngine>()?;
     m.add_class::<NativeWindow>()?;
     m.add_function(wrap_pyfunction!(parse_html, m)?)?;

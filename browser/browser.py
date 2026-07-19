@@ -263,6 +263,7 @@ class Browser:
                 self._doc, self.url,
                 getattr(self, "_live_injected", 0))
             native._service_websockets(self._doc, self.url)
+            native._service_workers(self._doc, self.url)
             version = self._doc.dom_version()
             if version != self._dom_version:
                 self._dom_version = version

@@ -176,8 +176,10 @@
       가동.** 잔여: iframe 격리, CSP, multipart, 쿠키 영속화 —
       완성 전까지 로그인 기능 비활성 유지("대충 v1" 금지 원칙)
 - [ ] iframe 문서 격리 (CORS는 07-19 fetch 채널 가동 — ACAO 검사)
-- [ ] Web Worker(별도 VM+postMessage 요건 — 가짜 격리 금지) /
-      Service Worker / WebAssembly
+- [x] **Web Worker 실물** — 07-19: 워커별 독립 VM(GgWorker) +
+      postMessage 브리지, 워커 이벤트 루프·fetch 서비스. 격리
+      E2E 검증. 잔여: structured clone(현재 JSON 문자열)
+- [ ] Service Worker / WebAssembly
 - [ ] `<video>` / `<audio>` / WebGL (유튜브·지도류).
       **07-19: canvas 2D 실렌더 v1 가동**(기록→래스터, 변환·
       drawImage 잔여) · **WebSocket 실물 가동**(RFC6455 E2E)

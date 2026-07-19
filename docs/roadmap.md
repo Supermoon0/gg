@@ -116,9 +116,12 @@ T1~T2는 "한 사람 + AI 페어"가 몇 달에 도달할 수 있는 영역이�
   video/audio/WebGL 미착수
 - **T5 착수**: **WebSocket 실물**(RFC6455 — 핸드셰이크·마스킹·
   ping/pong·close, fetch식 위임 채널로 JS WebSocket API 완결,
-  로컬 에코 서버 E2E). Worker는 가짜 격리(동일 VM 공유 전역)로
-  만들 바에 미착수가 정직하다고 판단 — 별도 VM 인스턴스 +
-  postMessage 브리지가 요건. Service Worker/WASM 미착수
+  로컬 에코 서버 E2E). **Web Worker 실물**(같은 날 후속 —
+  GgWorker: 워커마다 자기 VM, postMessage 문자열 브리지 양방향,
+  워커 자체 이벤트 루프+fetch까지 서비스. E2E: 메인 전역이
+  워커에서 undefined = 격리 증명. 갭: structured clone은 JSON
+  문자열 근사, 워커 내 DOM 없음(스펙 일치)). Service Worker/
+  WASM 미착수
 
 *작성: 2026-07-19. 현재 위치: T1 잔여 소탕 + T2 실증 대기(로컬
 라운드) + T3~T5 1차 관통(위 기록).*

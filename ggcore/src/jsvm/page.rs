@@ -322,10 +322,24 @@ TextEncoder.prototype.encode = function (s) {
 };
 function TextDecoder() {}
 TextDecoder.prototype.decode = function () { return ''; };
-function Worker() {}
-Worker.prototype.postMessage = function () {};
-Worker.prototype.terminate = function () {};
-Worker.prototype.addEventListener = function () {};
+function Worker(url) {
+  // real isolation: the shell runs the script in a separate VM
+  // (messages are strings; post objects as JSON — structured clone
+  // is a documented gap)
+  this.onmessage = null;
+  this.onerror = null;
+  this._id = __gg_worker_spawn('' + url, this);
+}
+Worker.prototype.postMessage = function (d) {
+  __gg_worker_post(
+    this._id, typeof d === 'string' ? d : JSON.stringify(d));
+};
+Worker.prototype.terminate = function () {
+  __gg_worker_term(this._id);
+};
+Worker.prototype.addEventListener = function (t, f) {
+  this['on' + t] = f;
+};
 function XMLHttpRequest() {
   this.readyState = 0;
   this.status = 0;
@@ -634,6 +648,11 @@ impl PageVm {
             ("__gg_ws_connect", Native::HostFn(vm::host::WS_CONNECT)),
             ("__gg_ws_send", Native::HostFn(vm::host::WS_SEND)),
             ("__gg_ws_close", Native::HostFn(vm::host::WS_CLOSE)),
+            ("__gg_worker_spawn", Native::HostFn(vm::host::WK_SPAWN)),
+            ("__gg_worker_post", Native::HostFn(vm::host::WK_POST)),
+            ("__gg_worker_term", Native::HostFn(vm::host::WK_TERM)),
+            ("__gg_worker_post_self",
+             Native::HostFn(vm::host::WK_SELF_POST)),
         ] {
             let fv = make_native(&mut vm.st, n);
             vm.set_global(name, fv);
@@ -1065,6 +1084,104 @@ impl PageVm {
             }
         }
         std::mem::take(&mut self.st.logs)
+    }
+
+    /// T5: Worker work queued by page JS since the last drain —
+    /// (spawns (id, url), posts (id, data), terminations).
+    pub fn take_worker_work(
+        &mut self,
+    ) -> (Vec<(u32, String)>, Vec<(u32, String)>, Vec<u32>) {
+        (
+            std::mem::take(&mut self.st.worker_spawns),
+            std::mem::take(&mut self.st.worker_posts),
+            std::mem::take(&mut self.st.worker_terms),
+        )
+    }
+
+    /// T5: deliver a worker event (message/error) to the page's
+    /// Worker object. Returns console output.
+    pub fn deliver_worker(
+        &mut self,
+        id: u32,
+        kind: &str,
+        data: &str,
+    ) -> Vec<String> {
+        let Some(&obj) = self.st.worker_objects.get(&id) else {
+            return Vec::new();
+        };
+        if !obj.is_object() {
+            return Vec::new();
+        }
+        let oi = obj.index() as usize;
+        let evt = vm::new_plain_object(&mut self.st);
+        let ei = evt.index() as usize;
+        let tk = self.name_id("type");
+        let tv = vm::push_str(&mut self.st, kind.to_string());
+        raw_set_prop(&mut self.st, ei, tk, tv);
+        let dk = self.name_id("data");
+        let dv = vm::push_str(&mut self.st, data.to_string());
+        raw_set_prop(&mut self.st, ei, dk, dv);
+        let hk = self.name_id(&format!("on{kind}"));
+        let handler = raw_get_prop(&self.st, oi, hk);
+        if let Some(h) = handler {
+            if h.is_function() {
+                if let Err(e) = vm::call_value_this(
+                    &mut self.st,
+                    &self.mods,
+                    h,
+                    Some(obj),
+                    &[evt],
+                ) {
+                    let msg = e.msg.clone();
+                    self.st.logs.push(format!(
+                        "[gg-js error] worker on{kind}: {msg}"
+                    ));
+                }
+            }
+        }
+        std::mem::take(&mut self.st.logs)
+    }
+
+    /// T5 (worker side): make this VM a worker scope — postMessage
+    /// queues to self_posts.
+    pub fn init_worker_scope(&mut self) {
+        self.run_source(
+            "postMessage = __gg_worker_post_self;\n\
+             self.postMessage = postMessage;\n\
+             var onmessage = null;\n",
+        )
+        .ok();
+    }
+
+    /// T5 (worker side): call the worker's onmessage with {data}.
+    pub fn deliver_message(&mut self, data: &str) -> Vec<String> {
+        let key = self.name_id("onmessage");
+        let h = self.st.globals[key as usize];
+        if h.is_function() {
+            let evt = vm::new_plain_object(&mut self.st);
+            let ei = evt.index() as usize;
+            let dk = self.name_id("data");
+            let dv = vm::push_str(&mut self.st, data.to_string());
+            raw_set_prop(&mut self.st, ei, dk, dv);
+            if let Err(e) = vm::call_value_this(
+                &mut self.st,
+                &self.mods,
+                h,
+                None,
+                &[evt],
+            ) {
+                let msg = e.msg.clone();
+                self.st
+                    .logs
+                    .push(format!("[gg-js error] onmessage: {msg}"));
+            }
+        }
+        std::mem::take(&mut self.st.logs)
+    }
+
+    /// T5 (worker side): drain postMessage output.
+    pub fn take_self_posts(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.st.self_posts)
     }
 
     /// T5: WebSocket work queued by page JS since the last drain —

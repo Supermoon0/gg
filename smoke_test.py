@@ -1501,6 +1501,22 @@ if native.available():
           wsp.evaluate("window.__ws") == "안녕 ws",
           repr(wsp.evaluate("window.__ws")))
 
+    # --- T5: Web Worker — real isolation in a separate VM ---
+    wkp = Page(engine="ggjs")
+    wkp.goto(
+        "data:text/html,<html><body><p>wk</p><script>"
+        "window.__iso = 'main';"
+        "var w = new Worker('data:text/javascript,"
+        "var seen = typeof __iso; "
+        'onmessage = function (e) {'
+        ' postMessage(e.data + "/" + seen); }\');'
+        "w.onmessage = function (e) { window.__wk = e.data; };"
+        "w.postMessage('철수');"
+        "</script></body></html>")
+    check("T5 worker: separate VM round-trip, globals NOT shared",
+          wkp.evaluate("window.__wk") == "철수/undefined",
+          repr(wkp.evaluate("window.__wk")))
+
     # linked module output actually runs in gg-js
     check("driver: linked ES module executes",
           dp.evaluate("(function () { " + _linked

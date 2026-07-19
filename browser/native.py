@@ -189,6 +189,72 @@ def _link_module(code, kind, value, page_url, fetch_js, logs):
         return code
 
 
+# live worker VMs per (doc identity, worker id) — T5
+_WORKERS = {}
+
+
+def _service_workers(doc, base_url):
+    """T5: spawn queued Workers into their own VMs, relay
+    postMessage both ways, and drive worker event loops (timers +
+    fetch with the page's CORS rules). Returns True when anything
+    ran."""
+    if not hasattr(doc, "take_worker_work") or ggcore is None \
+            or not hasattr(ggcore, "new_worker"):
+        return False
+    from . import net
+    did = id(doc)
+    spawns, posts, terms = doc.take_worker_work()
+    ran = False
+
+    def page_deliver(wid, kind, data=""):
+        for line in doc.deliver_worker(wid, kind, data):
+            print(f"[js console] {line}")
+
+    for wid, url in spawns:
+        ran = True
+        try:
+            resolved = (base_url.resolve(url)
+                        if base_url is not None else net.URL(url))
+            _h, code, _f = net.request_text(resolved)
+            w = ggcore.new_worker()
+            for line in w.run_source(code):
+                print(f"[worker console] {line}")
+            _WORKERS[(did, wid)] = (w, resolved)
+        except Exception as e:
+            print(f"[gg] worker spawn failed: {url} "
+                  f"({type(e).__name__}: {e})")
+            page_deliver(wid, "error", str(e))
+    for wid, data in posts:
+        entry = _WORKERS.get((did, wid))
+        if entry is None:
+            continue
+        ran = True
+        for line in entry[0].deliver(data):
+            print(f"[worker console] {line}")
+    for wid in terms:
+        _WORKERS.pop((did, wid), None)
+        ran = True
+    for (d, wid), (w, wurl) in list(_WORKERS.items()):
+        if d != did:
+            continue
+        logs, fetches = w.pump()
+        for line in logs:
+            print(f"[worker console] {line}")
+        for fetch_id, furl in fetches:
+            ran = True
+            try:
+                _h, body, _f = net.fetch_for_page(
+                    wurl, wurl.resolve(furl))
+                w.resolve_fetch(fetch_id, 200, body)
+            except Exception as e:
+                w.reject_fetch(
+                    fetch_id, f"{type(e).__name__}: {e}")
+        for msg in w.take_posts():
+            ran = True
+            page_deliver(wid, "message", msg)
+    return ran
+
+
 # open WebSocket clients per (doc identity, ws id) — T5
 _WS_CLIENTS = {}
 
@@ -424,6 +490,9 @@ def settle_async(doc, css_sources, base_url, timeout=8.0, max_rounds=2000):
         if _service_websockets(doc, base_url):
             mutated = True
             continue  # ws handlers may queue more work
+        if _service_workers(doc, base_url):
+            mutated = True
+            continue  # worker replies may queue more work
         if not doc.has_pending_work():
             break
         if time.monotonic() > deadline:
