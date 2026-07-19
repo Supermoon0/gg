@@ -103,6 +103,7 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
                 doc.set_page_url(str(page_url))
             except Exception:
                 pass  # older wheels have no set_page_url
+        _seed_page_cookies(doc, page_url)
         deadline = time.perf_counter() + js_budget
         for i, code in enumerate(sources):
             if not fuel_safe and len(code) > 400_000:
@@ -126,6 +127,7 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
                 logs.extend(doc.fire_lifecycle())
             except Exception:
                 pass
+        _pull_page_cookies(doc, page_url)
 
     entries = doc.stylesheet_entries()
     hrefs = [value for kind, value in entries if kind == "link"]
@@ -143,6 +145,35 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
 
     doc.compute_styles(css_sources)
     return build_tree(doc.export()), doc, css_sources, logs
+
+
+def _seed_page_cookies(doc, page_url):
+    """document.cookie starts with this host's network-jar cookies."""
+    if page_url is None or not hasattr(doc, "set_cookies"):
+        return
+    try:
+        from . import net
+        host = net.URL(str(page_url)).host
+        pairs = list(net.cookies_for(host).items())
+        if pairs:
+            doc.set_cookies(pairs)
+    except Exception:
+        pass
+
+
+def _pull_page_cookies(doc, page_url):
+    """JS document.cookie writes flow back into the network jar so
+    later requests to this host carry them."""
+    if page_url is None or not hasattr(doc, "get_cookies"):
+        return
+    try:
+        from . import net
+        host = net.URL(str(page_url)).host
+        pairs = doc.get_cookies()
+        if pairs:
+            net.seed_cookies(host, pairs)
+    except Exception:
+        pass
 
 
 def refresh(doc, css_sources):
@@ -220,6 +251,7 @@ def settle_async(doc, css_sources, base_url, timeout=8.0, max_rounds=2000):
         if time.monotonic() > deadline:
             print("[js] event loop settle timed out")
             break
+    _pull_page_cookies(doc, base_url)
     return mutated
 
 

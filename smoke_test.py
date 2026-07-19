@@ -1086,6 +1086,29 @@ check("request path sanitized",
       "\r" not in net._safe_path("/a\r\nX: 1")
       and " " not in net._safe_path("/a b"))
 
+# --- cookie jar (network layer, exact host) ---
+net.store_cookie("a.example", "sid=abc; Path=/; HttpOnly")
+net.store_cookie("a.example", "theme=dark")
+net.store_cookie("b.example", "other=1")
+check("cookie jar: attributes stripped, host-scoped",
+      net.cookie_header("a.example") == "sid=abc; theme=dark"
+      and net.cookie_header("b.example") == "other=1",
+      net.cookie_header("a.example"))
+net.store_cookie("a.example", "sid=xyz")
+check("cookie jar: same name upserts",
+      net.cookie_header("a.example") == "sid=xyz; theme=dark",
+      net.cookie_header("a.example"))
+net.store_cookie("a.example", "theme=; Max-Age=0")
+check("cookie jar: Max-Age=0 deletes",
+      net.cookie_header("a.example") == "sid=xyz",
+      net.cookie_header("a.example"))
+net.store_cookie("a.example", "sec=1; Secure", scheme="http")
+check("cookie jar: Secure over http is dropped",
+      "sec" not in net.cookie_header("a.example"),
+      net.cookie_header("a.example"))
+check("cookie jar: unknown host sends nothing",
+      net.cookie_header("nowhere.example") == "")
+
 # --- Real network fetch (GG_SKIP_NET=1 for egress-limited CI) ---
 if os.environ.get("GG_SKIP_NET") == "1":
     print("[SKIP] real-network checks - GG_SKIP_NET=1")

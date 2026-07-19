@@ -399,6 +399,9 @@ class Shell:
         self.scroll = min(max(0, self.scroll), max_scroll)
         max_hscroll = max(self.content_width + HSTEP - w, 0)
         self.hscroll = min(max(0, self.hscroll), max_hscroll)
+        if self._doc is not None and hasattr(self._doc, "set_scroll"):
+            self._doc.set_scroll(float(self.hscroll),
+                                 float(self.scroll))
 
     def chrome_cmds(self, w, h):
         """Toolbar, status bar, and scrollbars — viewport-coordinate

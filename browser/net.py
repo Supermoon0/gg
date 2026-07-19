@@ -32,6 +32,57 @@ _CACHE_MAX_ENTRIES = 300
 _CACHE_MAX_BODY = 4 * 1024 * 1024
 _CACHE_DEFAULT_TTL = 300.0
 
+# --- cookie jar (session-scoped, exact-host, in-memory) ---
+_COOKIES = {}  # host -> {name: value}
+_COOKIE_LOCK = threading.Lock()
+
+
+def store_cookie(host, line, scheme="https"):
+    """Record one Set-Cookie line. v1: name=value only — attributes
+    are ignored except Secure (which drops the cookie on plain http)
+    and Max-Age=0/expired deletions."""
+    parts = [p.strip() for p in line.split(";")]
+    if not parts or "=" not in parts[0]:
+        return
+    name, value = parts[0].split("=", 1)
+    name = name.strip()
+    if not name:
+        return
+    attrs = {a.split("=", 1)[0].strip().lower():
+             (a.split("=", 1)[1].strip() if "=" in a else "")
+             for a in parts[1:]}
+    if "secure" in attrs and scheme != "https":
+        return
+    with _COOKIE_LOCK:
+        jar = _COOKIES.setdefault(host, {})
+        if attrs.get("max-age", "").lstrip("-").isdigit() \
+                and int(attrs["max-age"]) <= 0:
+            jar.pop(name, None)
+        else:
+            jar[name] = value.strip()
+
+
+def cookie_header(host):
+    """The Cookie: header value for this exact host ('' if none)."""
+    with _COOKIE_LOCK:
+        jar = _COOKIES.get(host)
+        if not jar:
+            return ""
+        return "; ".join(f"{k}={v}" for k, v in jar.items())
+
+
+def cookies_for(host):
+    with _COOKIE_LOCK:
+        return dict(_COOKIES.get(host, {}))
+
+
+def seed_cookies(host, pairs):
+    """Merge (name, value) pairs into the jar (JS document.cookie
+    writes flowing back to the network layer)."""
+    with _COOKIE_LOCK:
+        _COOKIES.setdefault(host, {}).update(dict(pairs))
+
+
 # --- disk cache (survives restarts; only explicit max-age responses,
 # so an asset CDN like pstatic hits disk while HTML stays fresh) ---
 _DISK_DIR = os.path.join(
@@ -383,6 +434,8 @@ def _one_request(url, s, pool_key):
     default = 80 if url.scheme == "http" else 443
     if url.port != default:
         host += f":{url.port}"  # RFC 7230: Host carries non-default port
+    cookies = cookie_header(url.host)
+    cookie_line = f"Cookie: {cookies}\r\n" if cookies else ""
     req = (
         f"GET {_safe_path(url.path)} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
@@ -390,6 +443,7 @@ def _one_request(url, s, pool_key):
         f"User-Agent: {USER_AGENT}\r\n"
         f"Accept: text/html,*/*\r\n"
         f"Accept-Encoding: gzip\r\n"
+        f"{cookie_line}"
         f"\r\n"
     )
     s.sendall(req.encode("utf-8"))
@@ -409,7 +463,10 @@ def _one_request(url, s, pool_key):
         if ":" not in line:
             continue
         name, value = line.split(":", 1)
-        headers[name.strip().lower()] = value.strip()
+        lname = name.strip().lower()
+        if lname == "set-cookie":
+            store_cookie(url.host, value.strip(), url.scheme)
+        headers[lname] = value.strip()
 
     reusable = "close" not in headers.get("connection", "").casefold() \
         and statusline.startswith("HTTP/1.1")

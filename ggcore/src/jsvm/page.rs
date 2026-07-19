@@ -964,6 +964,36 @@ impl PageVm {
 
     /// Parse + compile + run one script; returns its last expression
     /// statement value.
+    /// Shell pull: the page's document.cookie pairs (network-layer
+    /// cookie jar sync).
+    pub fn get_cookies(&self) -> Vec<(String, String)> {
+        self.st.cookies.clone()
+    }
+
+    /// Shell push: seed document.cookie from the network jar before
+    /// page scripts run (upsert by name, insertion order kept).
+    pub fn set_cookies(&mut self, pairs: Vec<(String, String)>) {
+        for (k, v) in pairs {
+            if let Some(slot) = self
+                .st
+                .cookies
+                .iter_mut()
+                .find(|(name, _)| *name == k)
+            {
+                slot.1 = v;
+            } else {
+                self.st.cookies.push((k, v));
+            }
+        }
+    }
+
+    /// Shell push on scroll: gBCR subtracts this to answer
+    /// viewport-relative coordinates.
+    pub fn set_scroll(&mut self, x: f64, y: f64) {
+        self.st.scroll_x = x;
+        self.st.scroll_y = y;
+    }
+
     /// Shell push after layout: real getBoundingClientRect geometry.
     pub fn set_layout_rects(
         &mut self,
@@ -3523,6 +3553,37 @@ console.log('B typeof it: ' + typeof it);
             .to_string()]);
         assert!(logs.contains(&"post 13 26 774 46".to_string()),
                 "{logs:?}");
+        // scrolled: gBCR answers viewport-relative coordinates
+        vm.set_scroll(3.0, 20.0);
+        let logs = vm.run_scripts(&["\
+            var r2 = document.getElementById('t')\
+                .getBoundingClientRect();\n\
+            console.log('scrolled ' + r2.x + ' ' + r2.top);\n"
+            .to_string()]);
+        assert!(logs.contains(&"scrolled 10 6".to_string()), "{logs:?}");
+    }
+
+    #[test]
+    fn cookie_shell_sync() {
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<p>x</p>"),
+        ))));
+        // network jar seeds document.cookie before scripts
+        vm.set_cookies(vec![("sid".into(), "abc".into())]);
+        let logs = vm.run_scripts(&["\
+            console.log('seeded ' + document.cookie);\n\
+            document.cookie = 'theme=dark';\n\
+            document.cookie = 'sid=xyz';\n"
+            .to_string()]);
+        assert!(logs.contains(&"seeded sid=abc".to_string()), "{logs:?}");
+        // JS writes flow back out (upsert keeps insertion order)
+        assert_eq!(
+            vm.get_cookies(),
+            vec![
+                ("sid".to_string(), "xyz".to_string()),
+                ("theme".to_string(), "dark".to_string()),
+            ]
+        );
     }
 
     #[test]

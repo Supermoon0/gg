@@ -678,6 +678,30 @@ impl Doc {
         }
     }
 
+    /// The page's document.cookie pairs (for network-jar sync).
+    fn get_cookies(&mut self) -> Vec<(String, String)> {
+        if self.use_ggjs {
+            self.ggvm().get_cookies()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Seed document.cookie from the shell's network cookie jar.
+    fn set_cookies(&mut self, pairs: Vec<(String, String)>) {
+        if self.use_ggjs {
+            self.ggvm().set_cookies(pairs);
+        }
+    }
+
+    /// Push the current scroll offset so getBoundingClientRect
+    /// answers viewport-relative coordinates.
+    fn set_scroll(&mut self, x: f64, y: f64) {
+        if self.use_ggjs {
+            self.ggvm().set_scroll(x, y);
+        }
+    }
+
     /// Shell-side hover update: mark the element under the pointer
     /// and its ancestors so `:hover` rules match on the next
     /// compute_styles. Pass None when the pointer leaves the page.

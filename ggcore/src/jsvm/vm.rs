@@ -520,6 +520,10 @@ pub(super) struct St {
     /// real geometry (document-origin approximation: scroll offset is
     /// not subtracted)
     pub(super) layout_rects: HashMap<u32, (f64, f64, f64, f64)>,
+    /// current viewport scroll offset (shell-pushed): rects above are
+    /// document coords; gBCR answers viewport-relative per spec
+    pub(super) scroll_x: f64,
+    pub(super) scroll_y: f64,
     /// Map/Set backing stores, keyed by the owning object's index
     /// (entries in insertion order; lookups are linear strict-eq)
     pub(super) map_data: HashMap<u32, Vec<(Value, Value)>>,
@@ -613,6 +617,8 @@ impl St {
             session_storage: HashMap::new(),
             cookies: Vec::new(),
             layout_rects: HashMap::new(),
+            scroll_x: 0.0,
+            scroll_y: 0.0,
             map_data: HashMap::new(),
             set_data: HashMap::new(),
             style_nodes: HashMap::new(),
@@ -4431,6 +4437,7 @@ fn dom_method(
                 .get(&node)
                 .copied()
                 .unwrap_or((0.0, 0.0, 0.0, 0.0));
+            let (x, y) = (x - st.scroll_x, y - st.scroll_y);
             let rect = new_plain_object(st);
             let ri = rect.index() as usize;
             for (field, v) in [

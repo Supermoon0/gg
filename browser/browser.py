@@ -523,6 +523,14 @@ class Browser:
         height = self.canvas.winfo_height()
         max_scroll = max(self.document.height + 2 * VSTEP - height, 0)
         self.scroll = min(max(0, self.scroll), max_scroll)
+        self._push_scroll()
+
+    def _push_scroll(self):
+        # gBCR answers viewport-relative coords: keep the JS engine's
+        # scroll offset current (cheap - two floats)
+        doc = getattr(self, "_doc", None)
+        if doc is not None and hasattr(doc, "set_scroll"):
+            doc.set_scroll(0.0, float(self.scroll))
 
     def scroll_by(self, delta):
         if self.window.focus_get() == self.url_entry:
