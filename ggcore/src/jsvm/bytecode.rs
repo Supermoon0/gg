@@ -13,6 +13,10 @@ pub enum Instr {
     Move { dst: u8, src: u8 },
     GetGlobal { dst: u8, atom: u16 },
     SetGlobal { atom: u16, src: u8 },
+    /// hoist a top-level `var`: mark defined (undefined-valued) unless
+    /// already defined — `var X = X || {}` must read undefined, and a
+    /// re-declaration in a later script must keep the existing value
+    DeclGlobal { atom: u16 },
     Add { dst: u8, a: u8, b: u8 },
     Sub { dst: u8, a: u8, b: u8 },
     Mul { dst: u8, a: u8, b: u8 },
@@ -70,6 +74,9 @@ pub enum Instr {
     /// dst = the `arguments` array (function prologue; reads the
     /// current frame's actual argument count).
     Arguments { dst: u8 },
+    /// the currently-executing closure (named function expressions
+    /// bind their own name inside the body — ES NFE semantics)
+    LoadSelf { dst: u8 },
     /// dst = a fresh object whose [[Prototype]] is ctor.prototype
     /// (the allocation half of `new`; the call half is CallThis).
     NewInstance { dst: u8, ctor: u8 },

@@ -107,6 +107,19 @@ pub fn compile(stmts: &[Stmt]) -> Result<Module, CompileError> {
     // Function declarations are hoisted: create them before running the
     // body so `foo(); function foo(){}` and mutual recursion work.
     c.hoist_func_decls(stmts)?;
+    // Top-level `var` names are hoisted as defined-with-undefined so
+    // `var X = X || {}` (Naver pc.veta NBP_CORP) reads undefined
+    // instead of throwing ReferenceError. DeclGlobal keeps any value
+    // an earlier script already set.
+    let mut top_vars = Vec::new();
+    hoist(stmts, &mut top_vars);
+    let mut seen = HashSet::new();
+    for name in top_vars {
+        if seen.insert(name.clone()) {
+            let a = c.atom(&name);
+            c.fx().emit(Instr::DeclGlobal { atom: a });
+        }
+    }
     for s in stmts {
         c.stmt(s)?;
         let f = c.fx();
@@ -2117,6 +2130,21 @@ impl Compiler {
                 let r = f.declare("arguments", BindKind::Var, true)?;
                 f.emit(Instr::Arguments { dst: r });
                 f.uses_arguments = true;
+            }
+        }
+        // ES named-function-expression semantics: the function's own
+        // name binds to itself inside the body (Babel _classCallCheck
+        // guards do `this instanceof t` from within `function t()`),
+        // unless a param or hoisted var shadows it
+        if !is_arrow {
+            if let Some(n) = &lit.name {
+                if !n.is_empty()
+                    && !lit.params.iter().any(|p| p == n)
+                    && !names.iter().any(|m| m == n)
+                {
+                    let r = f.declare(n, BindKind::Var, true)?;
+                    f.emit(Instr::LoadSelf { dst: r });
+                }
             }
         }
         for n in names {

@@ -255,6 +255,10 @@ pub(super) enum Native {
     /// uncurryThis pattern): remembers the method name id and
     /// dispatches when invoked with an explicit this via call/apply
     MethodRef(u32),
+    /// the genuine Object.prototype.toString: returns the receiver's
+    /// brand ("[object Array]" etc. — core-js classof / jQuery type
+    /// checks do `{}.toString.call(x)`)
+    BrandToString,
     /// callable `Object(x)`: coercion-ish (nullish -> {}, object -> x)
     ObjectCtor,
     /// callable `Array(n)` / `Array(a, b, ...)`
@@ -408,6 +412,7 @@ pub(super) struct KnownCtors {
     pub(super) string: Value,
     pub(super) number: Value,
     pub(super) boolean: Value,
+    pub(super) function: Value,
 }
 
 impl Default for KnownCtors {
@@ -420,6 +425,7 @@ impl Default for KnownCtors {
             string: Value::UNDEFINED,
             number: Value::UNDEFINED,
             boolean: Value::UNDEFINED,
+            function: Value::UNDEFINED,
         }
     }
 }
@@ -2420,6 +2426,116 @@ pub(super) fn lookup_prop(st: &St, oi: usize, key: u32) -> PropHit {
     PropHit::Missing
 }
 
+/// Expando lookup on the JS-visible Array.prototype object for array
+/// instances — our arrays carry no [[Prototype]] link, but core-js
+/// installs @@iterator/Symbol-keyed methods there and expects
+/// instances to see them.
+fn array_proto_hit(st: &St, key: u32) -> PropHit {
+    if !st.known.array.is_function() {
+        return PropHit::Missing;
+    }
+    match st.fn_protos.get(&st.known.array.index()) {
+        Some(p) if p.is_object() => {
+            lookup_prop(st, p.index() as usize, key)
+        }
+        _ => PropHit::Missing,
+    }
+}
+
+/// Property read on a primitive receiver. Returns an extraction stub
+/// only for names the builtin surface actually answers, consults
+/// String/Number/Boolean.prototype expandos next (core-js installs
+/// polyfills there), and yields undefined otherwise — a truthy stub
+/// for arbitrary keys derails feature detection (jQuery reads its
+/// expando off the string "ready" and skips wrapping the event).
+fn primitive_prop_read(st: &mut St, recv: Value, key: u32) -> Value {
+    let name = st.names[key as usize].clone();
+    let ctor = if recv.is_string() {
+        st.known.string
+    } else if recv.is_number() {
+        st.known.number
+    } else {
+        st.known.boolean
+    };
+    // identity type checks: "x".constructor === String
+    if name == "constructor" && ctor.is_function() {
+        return ctor;
+    }
+    let common = matches!(
+        name.as_str(),
+        "toString" | "valueOf" | "hasOwnProperty"
+            | "propertyIsEnumerable" | "isPrototypeOf"
+    );
+    let per_type = if recv.is_string() {
+        matches!(
+            name.as_str(),
+            "slice" | "substring" | "substr" | "charAt" | "charCodeAt"
+                | "codePointAt" | "indexOf" | "lastIndexOf" | "includes"
+                | "startsWith" | "endsWith" | "replace" | "replaceAll"
+                | "split" | "concat" | "trim" | "trimStart" | "trimEnd"
+                | "toLowerCase" | "toUpperCase" | "match" | "search"
+                | "repeat" | "padStart" | "padEnd" | "at"
+                | "localeCompare" | "normalize"
+        )
+    } else if recv.is_number() {
+        matches!(
+            name.as_str(),
+            "toFixed" | "toExponential" | "toPrecision"
+                | "toLocaleString"
+        )
+    } else {
+        false
+    };
+    if common || per_type {
+        return make_native(st, Native::MethodRef(key));
+    }
+    if ctor.is_function() {
+        if let Some(p) = st.fn_protos.get(&ctor.index()).copied() {
+            if p.is_object() {
+                if let PropHit::Data(v) =
+                    lookup_prop(st, p.index() as usize, key)
+                {
+                    return v;
+                }
+            }
+        }
+    }
+    Value::UNDEFINED
+}
+
+/// Object.prototype.toString brand of a value ("[object Array]" ...).
+fn brand_string(st: &St, v: Value) -> String {
+    let tag = if v.is_object() {
+        let o = &st.objects[v.index() as usize];
+        if o.is_array {
+            "Array"
+        } else if o.regex != REGEX_NONE {
+            "RegExp"
+        } else if o.promise != PROMISE_NONE {
+            "Promise"
+        } else {
+            "Object"
+        }
+    } else if v.is_function() {
+        "Function"
+    } else if v.is_string() {
+        "String"
+    } else if v.is_number() {
+        "Number"
+    } else if v.is_boolean() {
+        "Boolean"
+    } else if v.is_null() {
+        "Null"
+    } else if v.is_undefined() {
+        "Undefined"
+    } else if v.is_dom_node() {
+        "HTMLElement"
+    } else {
+        "Object"
+    };
+    format!("[object {tag}]")
+}
+
 /// The setter for `key` visible from `oi` (own first, then the chain),
 /// unless an own data property shadows it.
 fn lookup_setter(st: &St, oi: usize, key: u32) -> Option<Value> {
@@ -2530,7 +2646,11 @@ fn instance_of(st: &St, x: Value, ctor: Value) -> Result<bool, VmError> {
             && st.objects[x.index() as usize].is_array);
     }
     if ctor == k.object {
-        return Ok(x.is_object());
+        // functions are objects too (fn instanceof Object === true)
+        return Ok(x.is_object() || x.is_function());
+    }
+    if ctor == k.function {
+        return Ok(x.is_function());
     }
     if ctor == k.promise {
         return Ok(is_promise(st, x));
@@ -2558,7 +2678,9 @@ fn instance_of(st: &St, x: Value, ctor: Value) -> Result<bool, VmError> {
         }
         return Ok(false);
     }
-    Ok(false) // tolerate stub/non-callable RHS (spec: TypeError)
+    // spec: a non-callable RHS is a TypeError (Babel _classCallCheck
+    // relies on `this instanceof undefined` throwing, not false)
+    type_err("Right-hand side of 'instanceof' is not callable")
 }
 
 fn to_display(st: &mut St, v: Value) -> String {
@@ -2959,6 +3081,10 @@ fn do_native(
                 .map(|k| st.regs[args_base + k])
                 .collect();
             method_ref_dispatch(st, mods, Value::UNDEFINED, key, &args)
+        }
+        Native::BrandToString => {
+            let s = brand_string(st, Value::UNDEFINED);
+            Ok(push_str(st, s))
         }
         Native::FunctionCtor => Ok(make_native(st, Native::ReturnGlobal)),
         Native::ObjectCtor => {
@@ -3533,7 +3659,15 @@ fn host_fn(
             if !obj.is_object() && !obj.is_function() {
                 return err("defineProperty needs an object");
             }
-            let key_name = to_display(st, argv!(1));
+            // ToPropertyKey: object keys (polyfilled Symbols) keep
+            // their distinct tags, matching the computed-read path
+            let kv = argv!(1);
+            let kvp = if kv.is_object() {
+                to_primitive(st, mods, kv, false)?
+            } else {
+                kv
+            };
+            let key_name = to_display(st, kvp);
             let key = st.intern_name(&key_name);
             define_one_prop(st, obj, key, argv!(2))?;
             Ok(obj)
@@ -3774,10 +3908,16 @@ fn host_fn(
                     p
                 }
             } else if v.is_function() {
-                st.fn_proto_chain
-                    .get(&v.index())
-                    .copied()
-                    .unwrap_or(Value::UNDEFINED)
+                match st.fn_proto_chain.get(&v.index()).copied() {
+                    Some(p) => p,
+                    // an ordinary function's [[Prototype]] is
+                    // Function.prototype (core-js-pure walks this to
+                    // reach iterator prototypes — Naver search bundle)
+                    None if st.known.function.is_function() => {
+                        fn_prototype(st, st.known.function)
+                    }
+                    None => Value::UNDEFINED,
+                }
             } else {
                 Value::UNDEFINED
             })
@@ -5179,6 +5319,12 @@ pub(super) fn call_value_this(
         ClosureRec::Bound { .. } => unreachable!("handled above"),
         ClosureRec::Native(n) => {
             let n = *n;
+            if let Native::BrandToString = n {
+                // brands the explicit receiver: {}.toString.call(x)
+                let recv = this_explicit.unwrap_or(Value::UNDEFINED);
+                let s = brand_string(st, recv);
+                return Ok(push_str(st, s));
+            }
             if let Native::MethodRef(key) = n {
                 let recv = this_explicit.unwrap_or(Value::UNDEFINED);
                 // extracted call/apply/bind invoked ON a function
@@ -5671,6 +5817,13 @@ fn exec_loop(
                 st.globals[key] = reg!(src);
                 st.gdef[key] = true;
             }
+            Instr::DeclGlobal { atom } => {
+                let key = name!(atom) as usize;
+                if !st.gdef[key] {
+                    st.globals[key] = Value::UNDEFINED;
+                    st.gdef[key] = true;
+                }
+            }
             Instr::Add { dst, a, b } => {
                 let (mut x, mut y) = (reg!(a), reg!(b));
                 // `+` sees primitives: objects convert first (valueOf/
@@ -5797,6 +5950,9 @@ fn exec_loop(
                     .map(|k| st.regs[base + k])
                     .collect();
                 reg!(dst) = new_array(st, vals);
+            }
+            Instr::LoadSelf { dst } => {
+                reg!(dst) = Value::function(cur_cl);
             }
             Instr::NewInstance { dst, ctor } => {
                 let mut cv = reg!(ctor);
@@ -7311,6 +7467,13 @@ fn exec_loop(
                         {
                             st.globals[key_id as usize]
                         }
+                        // a plain object's computed `toString` is the
+                        // genuine Object.prototype.toString (brands)
+                        None if !st.objects[oi].is_array
+                            && text == "toString" =>
+                        {
+                            make_native(st, Native::BrandToString)
+                        }
                         // Object.prototype staples — core-js getMethod
                         // reads V["valueOf"] as a computed access, so
                         // GetIndex must mirror GetProp's fallback or
@@ -7342,6 +7505,23 @@ fn exec_loop(
                         {
                             make_native(st, Native::MethodRef(key_id))
                         }
+                        // core-js expandos on Array.prototype
+                        None if st.objects[oi].is_array
+                            && !matches!(
+                                array_proto_hit(st, key_id),
+                                PropHit::Missing
+                            ) =>
+                        {
+                            match array_proto_hit(st, key_id) {
+                                PropHit::Data(v) => v,
+                                PropHit::Getter(g) if g.is_function() => {
+                                    call_value_this(
+                                        st, mods, g, Some(ov), &[],
+                                    )?
+                                }
+                                _ => Value::UNDEFINED,
+                            }
+                        }
                         None => Value::UNDEFINED,
                     };
                 } else if ov.is_function() {
@@ -7367,13 +7547,26 @@ fn exec_loop(
                     // ToPropertyKey = ToPrimitive(string) then
                     // stringify — object keys with custom toString
                     // (polyfilled Symbol wrappers) must keep their
-                    // distinct tags, not collapse to [object Object]
+                    // distinct tags, not collapse to [object Object].
+                    // Accessor/chain-aware, with the Array.prototype
+                    // expando fallback (t[Symbol.iterator] on arrays)
                     let kvp = to_primitive(st, mods, kv, false)?;
                     let text = to_display(st, kvp);
                     let oi = ov.index() as usize;
                     let key_id = st.intern_name(&text);
-                    reg!(dst) = raw_get_prop(st, oi, key_id)
-                        .unwrap_or(Value::UNDEFINED);
+                    let mut hit = lookup_prop(st, oi, key_id);
+                    if matches!(hit, PropHit::Missing)
+                        && st.objects[oi].is_array
+                    {
+                        hit = array_proto_hit(st, key_id);
+                    }
+                    reg!(dst) = match hit {
+                        PropHit::Data(v) => v,
+                        PropHit::Getter(g) if g.is_function() => {
+                            call_value_this(st, mods, g, Some(ov), &[])?
+                        }
+                        _ => Value::UNDEFINED,
+                    };
                 } else if ov.is_dom_node() {
                     // document[key] / el[key]: same surface as GetProp
                     let text = to_display(st, kv);
@@ -7397,7 +7590,7 @@ fn exec_loop(
                             sref.encode_utf16().count() as i32)
                     } else {
                         let key_id = st.intern_name(&text);
-                        make_native(st, Native::MethodRef(key_id))
+                        primitive_prop_read(st, ov, key_id)
                     };
                 } else if ov.is_nullish() {
                     let text = to_display(st, kv);
@@ -7579,6 +7772,25 @@ fn exec_loop(
                         {
                             make_native(st, Native::MethodRef(key))
                         }
+                        // core-js expandos on the JS-visible
+                        // Array.prototype (@@iterator and friends)
+                        PropHit::Missing
+                            if is_arr
+                                && !matches!(
+                                    array_proto_hit(st, key),
+                                    PropHit::Missing
+                                ) =>
+                        {
+                            match array_proto_hit(st, key) {
+                                PropHit::Data(v) => v,
+                                PropHit::Getter(g) if g.is_function() => {
+                                    call_value_this(
+                                        st, mods, g, Some(ov), &[],
+                                    )?
+                                }
+                                _ => Value::UNDEFINED,
+                            }
+                        }
                         // regex literals expose extractable exec/test
                         // (core-js: uncurryThis(/^0x/i.exec))
                         PropHit::Missing
@@ -7589,6 +7801,16 @@ fn exec_loop(
                                 ) =>
                         {
                             make_native(st, Native::MethodRef(key))
+                        }
+                        // a plain object's `toString` is the genuine
+                        // Object.prototype.toString (brands); an
+                        // array's stays MethodRef (join semantics)
+                        PropHit::Missing
+                            if !is_arr
+                                && st.names[key as usize].as_str()
+                                    == "toString" =>
+                        {
+                            make_native(st, Native::BrandToString)
                         }
                         // Object.prototype staples on any object
                         // (`{}.hasOwnProperty` — core-js hasOwn)
@@ -7638,9 +7860,9 @@ fn exec_loop(
                 } else if ov.is_string() || ov.is_number()
                     || ov.is_boolean()
                 {
-                    // method extraction (`''.slice`, `(1).toString`):
-                    // a callable that dispatches on its receiver
-                    reg!(dst) = make_native(st, Native::MethodRef(key));
+                    // method extraction (`''.slice`, `(1).toString`)
+                    // for supported names; undefined for the rest
+                    reg!(dst) = primitive_prop_read(st, ov, key);
                 } else if ov.is_dom_node() {
                     let r = dom_get_prop(st, key, ov.index())?;
                     reg!(dst) = r;

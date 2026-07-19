@@ -663,12 +663,17 @@ impl PageVm {
         // Object.prototype staples as extractable values (webpack's
         // runtime does Object.prototype.hasOwnProperty.call(...))
         let oproto = vm::fn_prototype(&mut vm.st, object_ctor);
-        for m in ["hasOwnProperty", "toString", "valueOf",
+        for m in ["hasOwnProperty", "valueOf",
                   "propertyIsEnumerable", "isPrototypeOf"] {
             let k = vm.name_id(m);
             let f = make_native(&mut vm.st, Native::MethodRef(k));
             raw_set_prop(&mut vm.st, oproto.index() as usize, k, f);
         }
+        // the genuine Object.prototype.toString brands its receiver
+        // (core-js classof: `{}.toString.call([]) == '[object Array]'`)
+        let k = vm.name_id("toString");
+        let f = make_native(&mut vm.st, Native::BrandToString);
+        raw_set_prop(&mut vm.st, oproto.index() as usize, k, f);
         // Array.prototype.values/keys/entries as extractables
         // (iterator-helper polyfills read them off the prototype)
         let aproto = vm::fn_prototype(&mut vm.st, array_ctor);
@@ -718,6 +723,7 @@ impl PageVm {
         vm.st.known.window = window;
         let fctor = make_native(&mut vm.st, Native::FunctionCtor);
         vm.set_global("Function", fctor);
+        vm.st.known.function = fctor;
         // Function.prototype.call/apply/bind as extractable values
         // (core-js uncurryThis reads them off the prototype object)
         let fproto = vm::fn_prototype(&mut vm.st, fctor);
@@ -2748,8 +2754,94 @@ console.log('B typeof it: ' + typeof it);
             n("function F() {} (new F() instanceof F) ? 1 : 0"),
             1.0
         );
-        // non-callable RHS tolerates to false (07-16: SDK stubs)
-        assert_eq!(n("([] instanceof 5) ? 1 : 0"), 0.0);
+        // non-callable RHS is a TypeError (07-19: Babel _classCallCheck
+        // relies on `this instanceof undefined` throwing, not false)
+        assert_eq!(
+            n("var r; try { [] instanceof 5; r = 0 } \
+               catch (e) { r = (e instanceof TypeError) ? 1 : 2 } r"),
+            1.0
+        );
+    }
+
+    #[test]
+    fn naver_boot_gates() {
+        // gate 1: a function's [[Prototype]] is Function.prototype,
+        // terminating at Object.prototype -> null
+        assert_eq!(
+            n("var p = Object.getPrototypeOf(function () {}); \
+               (p === Function.prototype) ? 1 : 0"),
+            1.0
+        );
+        assert_eq!(
+            n("var p = Object.getPrototypeOf(function () {}); \
+               var q = Object.getPrototypeOf(p); \
+               (Object.getPrototypeOf(q) === null) ? 1 : 0"),
+            1.0
+        );
+        assert_eq!(n("(function(){} instanceof Object) ? 1 : 0"), 1.0);
+        assert_eq!(n("(function(){} instanceof Function) ? 1 : 0"), 1.0);
+        // gate 2a: instances see Array.prototype expandos
+        assert_eq!(
+            n("Array.prototype.__xy = 42; var v = [].__xy; \
+               delete Array.prototype.__xy; v"),
+            42.0
+        );
+        // gate 2b: defineProperty with an object key (polyfilled
+        // Symbol) matches the computed-read path
+        assert_eq!(
+            n("var sym = { toString: function () { return '@@t'; } }; \
+               var o = {}; \
+               Object.defineProperty(o, sym, { value: 9 }); \
+               o[sym]"),
+            9.0
+        );
+        // gate 2c: the genuine Object.prototype.toString brands
+        assert_eq!(
+            n("(Object.prototype.toString.call([]) \
+                 === '[object Array]') ? 1 : 0"),
+            1.0
+        );
+        assert_eq!(
+            n("(({}).toString.call([]) === '[object Array]') ? 1 : 0"),
+            1.0
+        );
+        assert_eq!(
+            n("(({}).toString.call(function(){}) \
+                 === '[object Function]') ? 1 : 0"),
+            1.0
+        );
+        // ...while a real array's own toString keeps join semantics
+        assert_eq!(n("([1,2].toString() === '1,2') ? 1 : 0"), 1.0);
+        // gate 3: arbitrary keys on primitives read undefined (jQuery
+        // expando feature detection), builtins still extract, and
+        // prototype expandos are visible
+        assert_eq!(
+            n("('ready'['jQuery361001'] === undefined) ? 1 : 0"),
+            1.0
+        );
+        assert_eq!(n("(typeof ''.slice === 'function') ? 1 : 0"), 1.0);
+        assert_eq!(n("('x'.constructor === String) ? 1 : 0"), 1.0);
+        assert_eq!(n("Number.prototype.__nn = 3; (5).__nn"), 3.0);
+        // gate 4: top-level `var X = X || {}` self-reference
+        assert_eq!(
+            n("var __NBP = __NBP || { ok: 1 }; __NBP.ok"),
+            1.0
+        );
+        // gate 5: named function expressions bind their own name
+        // (Babel _classCallCheck pattern boots)
+        assert_eq!(
+            n("var mk = function t(v) { \
+                 if (!(this instanceof t)) { \
+                   throw new TypeError('no new'); } \
+                 this.v = v; }; \
+               (new mk(7)).v"),
+            7.0
+        );
+        assert_eq!(
+            n("var r; var f = function t() { return typeof t; }; \
+               (f() === 'function') ? 1 : 0"),
+            1.0
+        );
     }
 
     #[test]

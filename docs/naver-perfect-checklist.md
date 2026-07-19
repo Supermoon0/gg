@@ -52,28 +52,40 @@ arguments → 라벨 블록/elision/no-in 경계.
 
 **07-19 부팅 관문 정밀 진단** (실네트워크, 웹팩 모듈 트레일 계측 —
 polyfill·preload 완주(705모듈), search는 regenerator 팩토리에서,
-main(react-dom 18.3.1)은 8번째 모듈 초기화에서 사망. 5개 관문 특정):
+main(react-dom 18.3.1)은 8번째 모듈 초기화에서 사망. 5개 관문 특정
+→ **같은 날 저녁 5개 전부 격파** — cargo 172/172(관문 회귀 테스트
+naver_boot_gates 추가), smoke 148, 건틀릿 무회귀(jsvm은 21→22로 개선:
+`[][Symbol.iterator]` 추출이 스펙 정합), basket 7/9 유지·네이버 페인트
+567→641. 이전 5개 오류 전부 소멸, 새 프런티어는 아래):
 
-1. **[S] `Object.getPrototypeOf(함수)`가 undefined** (vm.rs O_GET_PROTO
-   함수 분기) → core-js-pure toObject가 폭발, **search 번들 사망 지점**.
-   Function.prototype 실물 반환으로 해제. 관련: fn instanceof Object,
-   fn.constructor, fn.__proto__
-2. **[M] `new Set(배열)` 전역 파손 → react-dom 사망** (nonDelegatedEvents
-   초기화). 엔진 이음새 3개가 각각 core-js 이터레이터 룩업을 끊음:
-   (a) 배열 인스턴스가 Array.prototype expando를 못 봄, (b) defineProperty/
-   인덱싱이 객체(가짜 심볼) 키를 ToPropertyKey 안 함, (c) 추출된
-   `Object.prototype.toString.call([])`이 ''(브랜드 미지원 — '[object
-   Array]'가 최대 지렛대)
-3. **[M] 원시값 프로퍼티 읽기가 아무 키에나 truthy MethodRef 스텁 반환**
-   → jQuery ready 경로 사망(`"ready"[jQuery.expando]` truthy →
-   isPropagationStopped 호출) → **$(document).ready 전멸**. 지원 이름일
-   때만 스텁, 나머지 undefined로
-4. **[S] 최상위 `var X = X || {}` 호이스팅 버그** — pc.veta.core가
-   NBP_CORP를 **자체 정의**하는데 읽기가 먼저 죽음 (기존 "외부 전역
-   의존" 진단은 오진 — 스킵 범주 아님)
-5. **[S] 이름 있는 함수 표현식의 자기 이름 바인딩 부재** — babel
-   _classCallCheck에서 "Cannot call a class as a function" (gfp-core,
-   광고 SDK라 부팅 비차단). + instanceof 비호출가능 RHS는 TypeError로
+1. - [x] **[S] `Object.getPrototypeOf(함수)`가 undefined** → 07-19:
+   KnownCtors에 function 추가, O_GET_PROTO 함수 분기가 Function.prototype
+   실물 반환(→Object.prototype→null 체인 종결). fn instanceof
+   Object/Function도 참. **search 번들 regenerator 관문 소멸**
+2. - [x] **[M] `new Set(배열)` 전역 파손 → react-dom 사망** → 07-19
+   이음새 3개 모두: (a) 배열 인스턴스가 JS-가시 Array.prototype expando를
+   봄(GetProp/GetIndex/odd-key 3경로 + 접근자 인식), (b) defineProperty
+   키 ToPropertyKey(가짜 심볼 태그 보존 — 읽기 경로와 일치), (c)
+   진짜 Object.prototype.toString은 Native::BrandToString — 수신자
+   브랜드('[object Array]' 등) 반환, 배열 자신의 toString은 join 유지.
+   **"not iterable [P-iterate]" 관문 소멸**
+3. - [x] **[M] 원시값 프로퍼티 읽기가 아무 키에나 truthy 스텁** → 07-19:
+   primitive_prop_read — 지원 빌트인 이름·constructor(타입 생성자 반환)·
+   String/Number/Boolean.prototype expando(폴리필!)만 답하고 나머지
+   undefined. **jQuery ready 관문 소멸** ($(document).ready 실행됨)
+4. - [x] **[S] 최상위 `var X = X || {}` 호이스팅** → 07-19: DeclGlobal
+   명령 신설 — 최상위 var 이름을 본문 실행 전 defined-undefined로
+   (기존 값은 보존 — 번들 간 재선언 안전). **NBP_CORP 관문 소멸**
+5. - [x] **[S] NFE 자기 이름 바인딩 + instanceof 비호출가능 RHS** →
+   07-19: LoadSelf 명령(현재 클로저) — 파라미터/var 섀도잉 없을 때
+   함수 스코프에 자기 이름 바인딩, 캡처 시 셀 승격 경로 통과.
+   instanceof 비호출가능 RHS는 스펙대로 TypeError. **_classCallCheck
+   관문 소멸**
+
+**07-19 저녁 새 프런티어** (관문 5 격파 후 첫 재측정 — 콘솔 52→15줄,
+오류 6): `.keys() is not a function` ×3, `cannot read .IS_OP of
+undefined`, `Obj(#…) is not a function` ×2. react 마커 0·#container 4
+유지 — 다음 라운드는 이 3종 규명부터.
 
 후속: 동적 주입 `<script src>` 미실행(ndp-core/ntm — pump 프로토콜에
 script 종 추가 [M]), 정규식 lookaround/backref 31건 never-matching 강등
