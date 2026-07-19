@@ -750,16 +750,22 @@ for b in layout_tree_to_list(p2_doc, []):
 check("sibling margins collapse to the larger one",
       abs(p2["mc2"].y - (p2["mc1"].y + 20 + 30)) < 1,
       f"mc2.y={p2['mc2'].y:.0f} expected {p2['mc1'].y + 50:.0f}")
-check("table: three equal columns of the table width",
-      abs(p2["c12"].x - p2["c11"].x - 100) < 1
-      and abs(p2["c13"].x - p2["c11"].x - 200) < 1,
-      f"dx12={p2['c12'].x - p2['c11'].x:.0f}")
+check("table: similar content gives near-equal columns summing to "
+      "the table width",
+      abs(p2["c12"].x - p2["c11"].x - 100) < 15
+      and abs(p2["c13"].x - p2["c11"].x - 200) < 15
+      and abs((p2["c13"].x + p2["c13"].outer_width())
+              - (p2["c11"].x + 300)) < 2,
+      f"dx12={p2['c12'].x - p2['c11'].x:.0f} "
+      f"dx13={p2['c13'].x - p2['c11'].x:.0f}")
 check("table: second row sits below the first",
       p2["c21"].y > p2["c11"].y,
       f"r1={p2['c11'].y:.0f} r2={p2['c21'].y:.0f}")
-check("table: colspan=2 cell spans two column slots",
-      abs(p2["c22"].x - p2["c21"].x - 200) < 1,
-      f"dx={p2['c22'].x - p2['c21'].x:.0f}")
+check("table: colspan=2 cell spans the first two columns exactly",
+      abs((p2["c22"].x - p2["c21"].x)
+          - (p2["c13"].x - p2["c11"].x)) < 1,
+      f"span2={p2['c22'].x - p2['c21'].x:.0f} "
+      f"col01={p2['c13'].x - p2['c11'].x:.0f}")
 check("grid: px track then fr tracks share the rest minus gaps",
       abs(p2["g2"].x - p2["g1"].x - 110) < 1
       and abs(p2["g3"].x - p2["g1"].x - 260) < 1,
@@ -778,6 +784,71 @@ check("inline-block: the line grows to the box height",
 check("overflow:auto clips like hidden (v1)",
       p2["ovf"]._clips() and abs(p2["ovf"].height - 30) < 8,
       f"clips={p2['ovf']._clips()} h={p2['ovf'].height:.0f}")
+
+# --- layout v2: auto table columns / grid span / form controls ---
+V2_PAGE = """<html><body style="margin: 0">
+<table id=at style="width:400px">
+  <tr><td id=wide>a much much longer cell with plenty of text</td>
+      <td id=slim>x</td></tr>
+  <tr><td>second row long-ish content here</td><td>y</td></tr>
+</table>
+<div id=g2 style="display:grid; width:330px; gap:10px;
+     grid-template-columns: 100px 100px 100px">
+  <div id=sp2 style="grid-column: span 2; height:10px">wide</div>
+  <div id=sp1 style="height:10px">one</div>
+  <div id=nx style="height:10px">next row</div>
+</div>
+<form>
+  <input id=cb type=checkbox checked>
+  <input id=rd type=radio name=g checked>
+  <select id=sel><option>첫째</option>
+    <option selected>둘째 옵션</option></select>
+</form>
+</body></html>"""
+v2_dom = HTMLParser(V2_PAGE).parse()
+style(v2_dom, sorted(ua, key=cascade_priority))
+v2_doc = DocumentLayout(v2_dom)
+v2_doc.layout(800)
+v2 = {}
+for b in layout_tree_to_list(v2_doc, []):
+    if isinstance(b, BlockLayout) and isinstance(b.node, Element):
+        node_id = b.node.attributes.get("id")
+        if node_id:
+            v2[node_id] = b
+check("table v2: columns share width by content, not equally",
+      v2["wide"].outer_width() > v2["slim"].outer_width() * 2
+      and abs((v2["wide"].outer_width() + v2["slim"].outer_width())
+              - 400) < 2,
+      f"wide={v2['wide'].outer_width():.0f} "
+      f"slim={v2['slim'].outer_width():.0f}")
+check("grid v2: span 2 item covers two tracks plus the gap",
+      abs(v2["sp2"].outer_width() - 210) < 1
+      and abs(v2["sp1"].x - v2["sp2"].x - 220) < 1,
+      f"w={v2['sp2'].outer_width():.0f} dx={v2['sp1'].x - v2['sp2'].x:.0f}")
+check("grid v2: full row wraps the next item",
+      v2["nx"].y > v2["sp2"].y and abs(v2["nx"].x - v2["sp2"].x) < 1,
+      f"nx=({v2['nx'].x:.0f},{v2['nx'].y:.0f})")
+check("form controls: checkbox/radio get their 14px UA box",
+      abs(v2["cb"].width - 14) < 1 and abs(v2["rd"].width - 14) < 1,
+      f"cb={v2['cb'].width:.0f}")
+_cbc = v2["cb"].paint()
+check("form controls: checked checkbox paints mark strokes",
+      sum(1 for c in _cbc if type(c).__name__ == "DrawLine") >= 2
+      and any(getattr(c, "color", "") == "#1a73e8" for c in _cbc),
+      str([type(c).__name__ for c in _cbc]))
+_rdc = v2["rd"].paint()
+check("form controls: checked radio paints the inner dot",
+      sum(1 for c in _rdc if type(c).__name__ == "DrawOval") >= 3,
+      str([type(c).__name__ for c in _rdc]))
+_selc = v2["sel"].paint()
+_seltexts = [c.text for c in _selc if hasattr(c, "text")]
+check("form controls: select shows the selected option + arrow",
+      any("둘째" in t for t in _seltexts)
+      and any("▾" in t for t in _seltexts), str(_seltexts))
+check("form controls: option lists are display:none",
+      all(n.style.get("display") == "none"
+          for n in tree_to_list(v2_dom, [])
+          if isinstance(n, Element) and n.tag == "option"))
 
 # --- flex deep-dive: justify/align/shrink/basis/flex shorthand ---
 FLEX2_PAGE = """<html><body style="margin: 0">

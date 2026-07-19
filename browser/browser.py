@@ -633,7 +633,44 @@ class Browser:
             except Exception as e:
                 self.set_status(f"이동 실패: {e}")
             return
-        self.set_focus(forms.find_input(obj.node))
+        target = forms.find_input(obj.node)
+        if target is not None and self.toggle_control(target):
+            return
+        self.set_focus(target)
+
+    def toggle_control(self, node):
+        """Checkbox/radio click semantics: toggle (checkbox) or select
+        exclusively within the same-name group (radio). Mirrored into
+        the Rust DOM so form serialization and page JS see it.
+        Returns True when the click was consumed."""
+        itype = node.attributes.get("type", "").strip().casefold()
+        if itype == "checkbox":
+            if "checked" in node.attributes:
+                del node.attributes["checked"]
+                self.sync_attr(node, "checked", None)
+            else:
+                node.attributes["checked"] = "checked"
+                self.sync_attr(node, "checked", "checked")
+            self.repaint()
+            return True
+        if itype == "radio":
+            name = node.attributes.get("name", "")
+            form = forms.find_form(node) or self.nodes
+            if name:
+                for peer in tree_to_list(form, []):
+                    if (isinstance(peer, Element)
+                            and peer.tag == "input"
+                            and peer.attributes.get(
+                                "type", "").casefold() == "radio"
+                            and peer.attributes.get("name", "") == name
+                            and "checked" in peer.attributes):
+                        del peer.attributes["checked"]
+                        self.sync_attr(peer, "checked", None)
+            node.attributes["checked"] = "checked"
+            self.sync_attr(node, "checked", "checked")
+            self.repaint()
+            return True
+        return False
 
     # ---------- text input focus / typing ----------
 
@@ -797,8 +834,14 @@ class Browser:
         page JS reading the input sees the typed value."""
         doc = getattr(self, "_doc", None)
         ridx = getattr(node, "_ridx", None)
-        if doc is not None and ridx is not None \
-                and hasattr(doc, "set_attr"):
+        if doc is None or ridx is None:
+            return
+        if value is None:
+            if hasattr(doc, "remove_attr"):
+                doc.remove_attr(ridx, name)
+            elif hasattr(doc, "set_attr"):
+                doc.set_attr(ridx, name, "")
+        elif hasattr(doc, "set_attr"):
             doc.set_attr(ridx, name, value)
 
     def on_motion(self, event):

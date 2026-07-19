@@ -321,6 +321,27 @@ def gradient_color(value, default=""):
 _REPEAT_RE = re.compile(r"repeat\(\s*(\d+)\s*,([^)]*)\)")
 
 
+def _grid_span(spec, ntracks):
+    """grid-column -> how many tracks the item spans. v1: 'span N'
+    anywhere in the value, and numeric 'a / b' lines (the difference).
+    Explicit start positions are not honored — placement stays auto."""
+    s = spec.strip()
+    if not s:
+        return 1
+    m = re.search(r"span\s+(\d+)", s)
+    if m:
+        return max(min(int(m.group(1)), ntracks), 1)
+    if "/" in s:
+        a, _, b = s.partition("/")
+        try:
+            start, end = int(a.strip()), int(b.strip())
+            if end > start >= 1:
+                return min(end - start, ntracks)
+        except ValueError:
+            pass
+    return 1
+
+
 def layout_mode(node):
     if isinstance(node, Text):
         return "inline"
@@ -939,11 +960,38 @@ class BlockLayout:
         collect(node)
         return rows
 
+    def _cell_pref_width(self, cell, em):
+        """A cell's natural single-line width: its longest text run
+        (per-node fonts) or replaced-element width, plus a small
+        padding allowance. The auto table algorithm only needs a
+        RELATIVE weight per column, so this stays deliberately cheap."""
+        widest = 0.0
+        stack = [cell]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, Text):
+                font = cached_font(n)
+                run = sum(measure(font, w) + measure(font, " ")
+                          for w in n.text.split())
+                widest = max(widest, run)
+                continue
+            if not is_visible(n):
+                continue
+            if n.tag in ("img", "svg", "input"):
+                w = parse_size(n.style.get("width"), 0.0, em) \
+                    or _attr_px(n, "width") or 40.0
+                widest = max(widest, w)
+            stack.extend(n.children)
+        pad = parse_size(cell.style.get("padding-left"), 0, em) or 0
+        pad += parse_size(cell.style.get("padding-right"), 0, em) or 0
+        return widest + pad + 8  # breathing room like real UAs
+
     def _layout_table(self, node, em):
-        """Fixed-grid table v1: every column gets an equal share of the
-        content width (colspan spans that many shares); the row advances
-        by its tallest cell. No auto column sizing, border-spacing, or
-        rowspan yet."""
+        """Auto-width table v2: columns get the table width in
+        proportion to their content's natural width (colspan cells
+        spread their preference across the spanned columns); a column
+        never drops below a small floor. The row advances by its
+        tallest cell. No border-spacing or rowspan yet."""
         rows = self._table_rows(node)
 
         def cells_of(tr):
@@ -963,20 +1011,46 @@ class BlockLayout:
         if not ncols:
             self.height = 0
             return
-        col_w = self.width / ncols
+
+        # column preferences from content (spanning cells split theirs)
+        prefs = [0.0] * ncols
+        for tr in rows:
+            ci = 0
+            for cell in cells_of(tr):
+                span = min(span_of(cell), ncols - ci) or 1
+                share = self._cell_pref_width(cell, em) / span
+                for k in range(ci, min(ci + span, ncols)):
+                    prefs[k] = max(prefs[k], share)
+                ci += span
+        total = sum(prefs)
+        floor = min(20.0, self.width / ncols)
+        if total > 0:
+            widths = [max(p * self.width / total, floor)
+                      for p in prefs]
+            # floors may have overshot the table width: renormalize
+            over = sum(widths)
+            if over > self.width > 0:
+                widths = [w * self.width / over for w in widths]
+        else:
+            widths = [self.width / ncols] * ncols
+
+        starts = [self.x]
+        for w in widths[:-1]:
+            starts.append(starts[-1] + w)
         y = self.y
         for tr in rows:
-            x = self.x
             row_boxes = []
+            ci = 0
             for cell in cells_of(tr):
-                w = col_w * min(span_of(cell), ncols)
+                span = min(span_of(cell), ncols - ci) or 1
+                w = sum(widths[ci:ci + span])
                 box = BlockLayout(cell, self, None)
                 box.forced_width = w
-                box.flex_origin = (x, y)
+                box.flex_origin = (starts[ci], y)
                 self.children.append(box)
                 box.layout()
                 row_boxes.append(box)
-                x += w
+                ci += span
             y += max((b.outer_height() for b in row_boxes), default=0)
         self.height = y - self.y
         apply_relative_offsets(self.children)
@@ -1071,20 +1145,32 @@ class BlockLayout:
             x_starts.append(run)
             run += w + col_gap
         for item in items:
+            span = _grid_span(item.style.get("grid-column", ""),
+                              len(tracks))
+            if col + span > len(tracks) and col > 0:
+                # doesn't fit on this row: wrap first
+                y += max((b.outer_height() for b in row_boxes),
+                         default=0) + row_gap
+                row_boxes = []
+                col = 0
+            span = min(span, len(tracks) - col)
+            box = BlockLayout(item, self, None)
+            box.forced_width = (sum(tracks[col:col + span])
+                                + col_gap * (span - 1))
+            box.flex_origin = (x_starts[col], y)
+            self.children.append(box)
+            box.layout()
+            row_boxes.append(box)
+            col += span
             if col >= len(tracks):
                 y += max((b.outer_height() for b in row_boxes),
                          default=0) + row_gap
                 row_boxes = []
                 col = 0
-            box = BlockLayout(item, self, None)
-            box.forced_width = tracks[col]
-            box.flex_origin = (x_starts[col], y)
-            self.children.append(box)
-            box.layout()
-            row_boxes.append(box)
-            col += 1
         if row_boxes:
             y += max(b.outer_height() for b in row_boxes)
+        elif items:
+            y -= row_gap  # the loop closed the last row: drop its gap
         self.height = y - self.y
         apply_relative_offsets(self.children)
 
@@ -1284,7 +1370,79 @@ class BlockLayout:
             if bg_img:
                 cmds.append(bg_img)
 
-            if self.node.tag == "input":
+            itype = self.node.attributes.get(
+                "type", "").strip().casefold()
+            if self.node.tag == "input" \
+                    and itype in ("checkbox", "radio"):
+                # form controls draw themselves: a bordered square or
+                # circle, filled with a mark when checked
+                x2c, y2c = self.x + self.width, self.y + self.height
+                checked = "checked" in self.node.attributes
+                if itype == "radio":
+                    # ring: border-color disc with a white inset disc
+                    cmds.append(DrawOval(
+                        self.x, self.y, x2c, y2c, "#666666"))
+                    cmds.append(DrawOval(
+                        self.x + 1.5, self.y + 1.5,
+                        x2c - 1.5, y2c - 1.5, "#ffffff"))
+                    if checked:
+                        ix = (x2c - self.x) * 0.28
+                        cmds.append(DrawOval(
+                            self.x + ix, self.y + ix,
+                            x2c - ix, y2c - ix, "#1a73e8"))
+                else:
+                    cmds.append(DrawRect(
+                        self.x, self.y, x2c, y2c,
+                        "#1a73e8" if checked else "#ffffff", radius=2))
+                    if not checked:
+                        for (ax, ay, bx, by) in (
+                                (self.x, self.y, x2c, self.y),
+                                (self.x, y2c, x2c, y2c),
+                                (self.x, self.y, self.x, y2c),
+                                (x2c, self.y, x2c, y2c)):
+                            cmds.append(DrawLine(
+                                ax, ay, bx, by, "#666666", 1))
+                    else:
+                        # the check mark: two strokes
+                        w, h = x2c - self.x, y2c - self.y
+                        cmds.append(DrawLine(
+                            self.x + w * 0.22, self.y + h * 0.55,
+                            self.x + w * 0.42, self.y + h * 0.75,
+                            "#ffffff", 2))
+                        cmds.append(DrawLine(
+                            self.x + w * 0.42, self.y + h * 0.75,
+                            self.x + w * 0.80, self.y + h * 0.28,
+                            "#ffffff", 2))
+            elif self.node.tag == "select":
+                # closed dropdown: selected (or first) option's label
+                # plus a down arrow; the option list itself is
+                # display:none via the UA sheet (no popup yet)
+                label = ""
+                fallback = ""
+                for opt in self.node.children:
+                    if not (isinstance(opt, Element)
+                            and opt.tag == "option"):
+                        continue
+                    text = " ".join(
+                        t.text for t in opt.children
+                        if isinstance(t, Text)).strip()
+                    if not fallback:
+                        fallback = text
+                    if "selected" in opt.attributes:
+                        label = text
+                        break
+                label = label or fallback
+                font = cached_font(self.node)
+                ty = self.y + max(
+                    0.0, (self.height - font.metrics("linespace")) / 2)
+                if label:
+                    cmds.append(DrawText(
+                        self.x + 4, ty, label, font,
+                        safe_color(self.node.style.get("color"))))
+                cmds.append(DrawText(
+                    self.x + self.width - 14, ty, "▾", font,
+                    "#666666"))
+            elif self.node.tag == "input":
                 value = self.node.attributes.get("value", "")
                 text = value or self.node.attributes.get("placeholder", "")
                 font = cached_font(self.node)

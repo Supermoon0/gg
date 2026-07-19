@@ -760,6 +760,15 @@ impl Doc {
         }
     }
 
+    /// Remove an attribute (checkbox untick etc.) — mirrors the
+    /// Python-side removal so page JS and form serialization agree.
+    fn remove_attr(&mut self, node_idx: usize, name: String) {
+        let mut d = self.doc.borrow_mut();
+        if node_idx < d.nodes.len() {
+            d.remove_attr(node_idx, &name);
+        }
+    }
+
     /// Tell the JS engine the page URL so `location.*` is real.
     /// Call before run_scripts. No-op on the Boa path.
     fn set_page_url(&mut self, url: String) {
