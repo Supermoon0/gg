@@ -42,10 +42,13 @@
 - [ ] winit(native) 셸: 라이브 틱 루프 + 텍스트 입력 배선
 
 ### 3. 레이아웃 v1 → v2 (실사이트 피드백 기반)
-- [ ] 테이블 자동 컬럼 폭 (콘텐츠 기반 — 정부 사이트 검증)
-- [ ] grid `grid-column/row` span 배치
+- [x] 테이블 자동 컬럼 폭 — 07-19: 콘텐츠 natural width 비례 배분
+      (colspan 분산, 컬럼 바닥 20px). 정부 사이트 실검증은 로컬
+- [x] grid `grid-column: span N` 배치 — 07-19 (a/b 라인은 폭만,
+      명시 시작 위치는 auto 배치 유지)
 - [ ] float 잔여 (인라인 흐름 float, 텍스트 재확장)
-- [ ] 폼 컨트롤 렌더링 (`<select>`·체크박스·라디오)
+- [x] 폼 컨트롤 렌더링 — 07-19 (체크박스·라디오·select 닫힌 상태
+      + 클릭 토글)
 - [ ] `overflow: auto` 내부 스크롤 (클립은 완료 — 스크롤 상호작용)
 
 ### 4. 엔진 심화 (필요가 확인되는 순서로)
@@ -103,12 +106,12 @@
 
 - [x] **테이블 레이아웃 v1** — 07-19: table/display:table + tr/td·th
       (행 그룹 통과, display:table-row/cell 수용). 균등 컬럼 분할,
-      colspan은 그 배수 폭, 행 높이는 최고 셀. 잔여: 자동 컬럼 폭,
-      border-spacing, rowspan
+      colspan은 그 배수 폭, 행 높이는 최고 셀. 07-19 v2: 콘텐츠 비례
+      자동 컬럼 폭. 잔여: border-spacing, rowspan
 - [x] **`display: grid` v1** — 07-19: grid-template-columns
       (px/%/em·fr·auto=1fr·repeat(n,…)), gap/row-gap/column-gap.
-      자식을 행 우선 배치, 행 높이는 최고 아이템. 잔여: grid-area/
-      span 배치, 암시적 트랙 사이징
+      자식을 행 우선 배치, 행 높이는 최고 아이템. 07-19 v2: `grid-column:
+      span N`. 잔여: 명시 시작 위치·grid-area, 암시적 트랙 사이징
 - [ ] `position: sticky` — 현재 일반 흐름 렌더(초기 화면은 정상),
       스크롤 시 고정(pinning)은 디스플레이 리스트 캐시와 함께
 - [x] **margin collapsing** — 07-19: 인접 형제 마진 붕괴(CSS 2.1 —
@@ -120,7 +123,10 @@
 - [x] **`overflow: auto` 클리핑** — 07-19: hidden과 동일하게 클립
       (v1: 내부 스크롤은 아직 — 콘텐츠가 새어나오지만 않음)
 - [ ] float 잔여: 인라인 흐름 안의 float, float 아래 텍스트 재확장, margin 스택 근사
-- [ ] 폼 컨트롤 렌더링 (`<select>`·체크박스·라디오)
+- [x] **폼 컨트롤 렌더링** — 07-19: 체크박스/라디오(14px UA 박스,
+      체크 마크·내부 점, 클릭 토글 — 라디오는 그룹 배타, Rust DOM
+      미러), select 닫힌 상태(선택 옵션 라벨+화살표, option은
+      display:none). 잔여: select 드롭다운 팝업
 - [ ] `transition` / `@keyframes` 애니메이션 (시각 완성도)
 - [x] **웹폰트 woff2 디코드** — 07-19: woff2-patched(순수 러스트)로
       ttf 변환 후 fontdue 등록, 실패 시 폴스루. Lato 샘플 E2E.
