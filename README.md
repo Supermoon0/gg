@@ -96,6 +96,8 @@ white-space:nowrap, text-overflow:ellipsis
 
 ## 아직 없는 것 (다음 단계 후보)
 
+전체 우선순위별 목록: [통합 TODO 체크리스트](docs/todo.md)
+
 - **네이버 main(React) 번들 부팅** — 현재 프런티어, search 번들 관문 1개 +
   React DOM 초기화
 - 테이블 레이아웃, `display: grid`, `position: sticky`, margin collapsing,
