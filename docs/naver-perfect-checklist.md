@@ -570,4 +570,7 @@ basket_test.py (네이버 단건은 scratchpad diag 스크립트).
 30종 node v22 대조(CLAIM 20/20, 조용한 오답 0), CSS 실좌표 22/23
 (line-height 결함 ↑), 네이티브 래스터 PNG 4장. egress 게이트의 실체는
 소켓 차단이 아니라 허용목록 인터셉터의 text/plain 안내문(그래서 basket
-예외 0건·전원 "빈약")으로 규명.*
+예외 0건·전원 "빈약")으로 규명. 오후 egress 허용 후 net.py에 환경 프록시
+지원(CONNECT 터널) 추가 → smoke 148/149(잔여 1건은 https 전용 환경의
+plain-http 한계), basket 실측 7/9 읽을만함·크래시 0(나무위키는 Cloudflare
+봇월), 네이버 실렌더 PNG(546텍스트·웜 3.2s) 확보.*

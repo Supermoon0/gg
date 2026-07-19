@@ -61,12 +61,70 @@ def _pool_put(key, s):
         pass
 
 
+def _env_proxy(scheme):
+    """(host, port) of the environment proxy for this scheme, or None.
+    Managed/cloud environments route egress through HTTP(S)_PROXY;
+    without this the engine's raw sockets bypass the proxy and get
+    blocked by the network policy."""
+    var = "https_proxy" if scheme == "https" else "http_proxy"
+    val = os.environ.get(var) or os.environ.get(var.upper())
+    if not val:
+        return None
+    p = urllib.parse.urlsplit(val if "://" in val else "//" + val)
+    if not p.hostname:
+        return None
+    return p.hostname, p.port or 3128
+
+
+def _no_proxy(host):
+    val = os.environ.get("no_proxy") or os.environ.get("NO_PROXY") or ""
+    host = host.lower()
+    for entry in val.split(","):
+        entry = entry.strip().lower()
+        if not entry:
+            continue
+        if entry == "*":
+            return True
+        entry = entry.lstrip("*").lstrip(".")
+        if host == entry or host.endswith("." + entry):
+            return True
+    return False
+
+
 def _connect(url):
-    # create_connection resolves IPv4 and IPv6 alike
-    s = socket.create_connection((url.host, url.port), timeout=15)
+    proxy = None if _no_proxy(url.host) else _env_proxy(url.scheme)
+    if proxy is None:
+        # create_connection resolves IPv4 and IPv6 alike
+        s = socket.create_connection((url.host, url.port), timeout=15)
+        if url.scheme == "https":
+            ctx = ssl.create_default_context()
+            s = ctx.wrap_socket(s, server_hostname=url.host)
+        return s
+
+    s = socket.create_connection(proxy, timeout=15)
     if url.scheme == "https":
+        # CONNECT tunnel, then TLS to the origin through it
+        target = f"[{url.host}]" if ":" in url.host else url.host
+        s.sendall((f"CONNECT {target}:{url.port} HTTP/1.1\r\n"
+                   f"Host: {target}:{url.port}\r\n\r\n").encode("ascii"))
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = s.recv(4096)
+            if not chunk:
+                raise ConnectionError("proxy closed during CONNECT")
+            head += chunk
+            if len(head) > 65536:
+                raise ConnectionError("oversized CONNECT response")
+        statusline = head.split(b"\r\n", 1)[0].decode("latin-1")
+        parts = statusline.split(" ", 2)
+        code = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+        if code != 200:
+            raise ConnectionError(f"proxy CONNECT failed: {statusline}")
         ctx = ssl.create_default_context()
         s = ctx.wrap_socket(s, server_hostname=url.host)
+    else:
+        # plain http: speak to the proxy directly (absolute-form target)
+        s._gg_absolute_form = True
     return s
 
 
@@ -383,8 +441,12 @@ def _one_request(url, s, pool_key):
     default = 80 if url.scheme == "http" else 443
     if url.port != default:
         host += f":{url.port}"  # RFC 7230: Host carries non-default port
+    target = _safe_path(url.path)
+    if getattr(s, "_gg_absolute_form", False):
+        # plain-http via an environment proxy: absolute-form target
+        target = f"{url.scheme}://{host}{target}"
     req = (
-        f"GET {_safe_path(url.path)} HTTP/1.1\r\n"
+        f"GET {target} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
         f"Connection: keep-alive\r\n"
         f"User-Agent: {USER_AGENT}\r\n"
