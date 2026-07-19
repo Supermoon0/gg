@@ -684,6 +684,28 @@ impl Doc {
         }
     }
 
+    /// N1: injected <script> work since the last drain —
+    /// (external (node, src), inline (node, code)).
+    fn take_pending_scripts(
+        &mut self,
+    ) -> (Vec<(u32, String)>, Vec<(u32, String)>) {
+        if self.use_ggjs {
+            self.ggvm().take_pending_scripts()
+        } else {
+            (Vec::new(), Vec::new())
+        }
+    }
+
+    /// N1: fire load/error on an injected script node; returns
+    /// console output from its handlers.
+    fn fire_node_event(&mut self, node: u32, ty: &str) -> Vec<String> {
+        if self.use_ggjs {
+            self.ggvm().fire_node_event(node, ty)
+        } else {
+            Vec::new()
+        }
+    }
+
     /// The page's document.cookie pairs (for network-jar sync).
     fn get_cookies(&mut self) -> Vec<(String, String)> {
         if self.use_ggjs {

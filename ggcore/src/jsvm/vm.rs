@@ -506,6 +506,13 @@ pub(super) struct St {
     /// (dom node, name id) -> expando properties scripts hang on
     /// nodes (jQuery's `elem[expando] = id` data-cache key)
     pub(super) dom_expando: HashMap<(u32, u32), Value>,
+    /// dynamically injected <script> work the shell must run:
+    /// (node, src) for external, (node, code) for inline. Queued at
+    /// DOM insertion; drained by Doc.take_pending_scripts (N1).
+    pub(super) pending_ext_scripts: Vec<(u32, String)>,
+    pub(super) pending_inline_scripts: Vec<(u32, String)>,
+    /// script nodes already queued/run — a node never runs twice
+    pub(super) scripts_seen: std::collections::HashSet<u32>,
     /// (object index, name id) -> (getter, setter) accessor pair
     /// (Object.defineProperty with get/set; UNDEFINED = absent side)
     pub(super) accessors: HashMap<(u32, u32), (Value, Value)>,
@@ -612,6 +619,9 @@ impl St {
             fn_protos: HashMap::new(),
             fn_props: HashMap::new(),
             dom_expando: HashMap::new(),
+            pending_ext_scripts: Vec::new(),
+            pending_inline_scripts: Vec::new(),
+            scripts_seen: std::collections::HashSet::new(),
             accessors: HashMap::new(),
             local_storage: HashMap::new(),
             session_storage: HashMap::new(),
@@ -4154,6 +4164,44 @@ fn arg_string(st: &mut St, args_base: usize, argc: u8, k: usize)
     Ok(to_display(st, v))
 }
 
+/// N1: a <script> that lands in the tree is queued for the shell —
+/// external srcs are fetched in Python, inline bodies run at the next
+/// pump drain. A node is queued at most once.
+fn queue_script_node(st: &mut St, d: &dom::Document, c: usize) {
+    if d.nodes[c].tag.as_deref() != Some("script") {
+        return;
+    }
+    let cu = c as u32;
+    if st.scripts_seen.contains(&cu) {
+        return;
+    }
+    let stype = d.nodes[c]
+        .attr("type")
+        .unwrap_or("")
+        .to_lowercase();
+    if !(stype.is_empty()
+        || stype.contains("javascript")
+        || stype == "module")
+    {
+        return; // JSON data blocks etc.
+    }
+    st.scripts_seen.insert(cu);
+    if let Some(src) = d.nodes[c].attr("src") {
+        if !src.is_empty() {
+            st.pending_ext_scripts.push((cu, src.to_string()));
+            return;
+        }
+    }
+    let code: String = d.nodes[c]
+        .children
+        .iter()
+        .map(|&ch| d.nodes[ch].text.as_str())
+        .collect();
+    if !code.trim().is_empty() {
+        st.pending_inline_scripts.push((cu, code));
+    }
+}
+
 fn need_doc(st: &St) -> Result<Rc<RefCell<dom::Document>>, VmError> {
     match &st.doc {
         Some(d) => Ok(d.clone()),
@@ -4384,6 +4432,7 @@ fn dom_method(
             d.detach(c);
             d.nodes[c].parent = Some(node_us);
             d.nodes[node_us].children.push(c);
+            queue_script_node(st, &d, c);
             return Ok(child);
         }
         if key == ids.remove {
@@ -4552,6 +4601,7 @@ fn dom_method(
                 None => d.nodes[pu].children.push(ni),
             }
             d.nodes[ni].parent = Some(pu);
+            queue_script_node(st, &d, ni);
             return Ok(newn);
         }
         "removeChild" => {
@@ -4582,6 +4632,7 @@ fn dom_method(
                 d.nodes[pu].children[i] = ni;
                 d.nodes[ni].parent = Some(pu);
                 d.nodes[oi_].parent = None;
+                queue_script_node(st, &d, ni);
             }
             return Ok(oldn);
         }
@@ -5128,7 +5179,13 @@ fn dom_set_prop(
             doc.borrow_mut().set_attr(node_us, &attr, &value);
             Ok(())
         }
-        n if n.starts_with("on") => Ok(()), // handler props: accepted
+        n if n.starts_with("on") => {
+            // handler props are real now: stored as expandos so the
+            // shell can fire them (script onload chains — N1) and
+            // scripts can read them back
+            st.dom_expando.insert((node_us as u32, key), v);
+            Ok(())
+        }
         "nodeValue" | "data" => {
             let value = to_display(st, v);
             let mut d = doc.borrow_mut();

@@ -964,6 +964,70 @@ impl PageVm {
 
     /// Parse + compile + run one script; returns its last expression
     /// statement value.
+    /// N1: dynamically injected <script> work queued since the last
+    /// drain — (external (node, src) list, inline (node, code) list).
+    pub fn take_pending_scripts(
+        &mut self,
+    ) -> (Vec<(u32, String)>, Vec<(u32, String)>) {
+        (
+            std::mem::take(&mut self.st.pending_ext_scripts),
+            std::mem::take(&mut self.st.pending_inline_scripts),
+        )
+    }
+
+    /// N1: fire a non-bubbling event (load/error) on a node — calls
+    /// the node's on<type> expando handler and addEventListener
+    /// registrations. Returns console output.
+    pub fn fire_node_event(
+        &mut self,
+        node: u32,
+        ty: &str,
+    ) -> Vec<String> {
+        let evt = vm::new_plain_object(&mut self.st);
+        let ei = evt.index() as usize;
+        for (f, v) in
+            [("type", ty.to_string()), ("target", String::new())]
+        {
+            let k = self.name_id(f);
+            if f == "target" {
+                let _ = v;
+                raw_set_prop(
+                    &mut self.st, ei, k, Value::dom_node(node),
+                );
+            } else {
+                let sv = vm::push_str(&mut self.st, v);
+                raw_set_prop(&mut self.st, ei, k, sv);
+            }
+        }
+        let mut handlers: Vec<Value> = Vec::new();
+        let onk = self.name_id(&format!("on{ty}"));
+        if let Some(&h) = self.st.dom_expando.get(&(node, onk)) {
+            if h.is_function() {
+                handlers.push(h);
+            }
+        }
+        if let Some(v) =
+            self.st.listeners.get(&(node, ty.to_string()))
+        {
+            handlers.extend(v.iter().copied());
+        }
+        for h in handlers {
+            if let Err(e) = vm::call_value_this(
+                &mut self.st,
+                &self.mods,
+                h,
+                Some(Value::dom_node(node)),
+                &[evt],
+            ) {
+                let msg = e.msg.clone();
+                self.st
+                    .logs
+                    .push(format!("[gg-js error] on{ty}: {msg}"));
+            }
+        }
+        std::mem::take(&mut self.st.logs)
+    }
+
     /// Shell pull: the page's document.cookie pairs (network-layer
     /// cookie jar sync).
     pub fn get_cookies(&self) -> Vec<(String, String)> {
@@ -3561,6 +3625,50 @@ console.log('B typeof it: ' + typeof it);
             console.log('scrolled ' + r2.x + ' ' + r2.top);\n"
             .to_string()]);
         assert!(logs.contains(&"scrolled 10 6".to_string()), "{logs:?}");
+    }
+
+    #[test]
+    fn injected_scripts_are_queued_and_load_fires() {
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<html><head></head><body></body></html>"),
+        ))));
+        let logs = vm.run_scripts(&["\
+            var s = document.createElement('script');\n\
+            s.src = 'https://cdn.example/app.js';\n\
+            s.onload = function () {\n\
+              console.log('LOADED ' + (this === s));\n\
+            };\n\
+            document.head.appendChild(s);\n\
+            var i = document.createElement('script');\n\
+            i.textContent = \"console.log('INLINE RAN')\";\n\
+            document.body.appendChild(i);\n\
+            var j = document.createElement('script');\n\
+            j.type = 'application/json';\n\
+            j.textContent = '{}';\n\
+            document.body.appendChild(j);\n"
+            .to_string()]);
+        assert!(
+            !logs.iter().any(|l| l.contains("error")),
+            "{logs:?}"
+        );
+        let (ext, inline) = vm.take_pending_scripts();
+        assert_eq!(ext.len(), 1, "{ext:?}");
+        assert_eq!(ext[0].1, "https://cdn.example/app.js");
+        assert_eq!(inline.len(), 1, "{inline:?}"); // json block skipped
+        assert!(inline[0].1.contains("INLINE RAN"));
+        // drain is one-shot
+        let (e2, i2) = vm.take_pending_scripts();
+        assert!(e2.is_empty() && i2.is_empty());
+        // load event reaches the onload expando with this=node
+        let logs = vm.fire_node_event(ext[0].0, "load");
+        assert!(logs.contains(&"LOADED true".to_string()), "{logs:?}");
+        // re-inserting the same node does not requeue it
+        let _ = vm.run_scripts(&["\
+            var s2 = document.getElementsByTagName('script')[0];\n\
+            document.body.appendChild(s2);\n"
+            .to_string()]);
+        let (e3, _) = vm.take_pending_scripts();
+        assert!(e3.is_empty(), "{e3:?}");
     }
 
     #[test]

@@ -1215,6 +1215,34 @@ if native.available():
                       + "; return out; })()") == 54,
           repr(dp.evaluate("(function () { " + _linked
                            + "; return out; })()")))
+
+    # --- synthetic naver fixture: the full boot chain under one roof
+    #     (N1 injection chain -> React mount -> EAGER-DATA feed ->
+    #     stateful click). Skipped if the React bundles are absent.
+    _FX = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "bench", "naver-fixture", "index.html")
+    _REACT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "bench", "js", "react",
+                          "react.production.min.js")
+    if os.path.exists(_FX) and os.path.exists(_REACT):
+        fp = Page(engine="ggjs")
+        fp.goto("file://" + _FX)
+        check("fixture: 3-deep injected chain boots React",
+              fp.evaluate("typeof React") == "object"
+              and fp.evaluate("typeof ReactDOM") == "object",
+              repr(fp.evaluate("typeof React")))
+        feed = fp.text("#feed") or ""
+        check("fixture: React renders the EAGER-DATA feed",
+              "헤드라인 첫째 기사" in feed and "뉴스 헤드라인" in feed,
+              feed[:60])
+        check("fixture: headline count matches the JSON",
+              len(fp.query_all(".headline")) == 3)
+        fp.click(".headline")
+        check("fixture: click -> setState -> re-render",
+              "선택: 1" in (fp.text("#picked") or ""),
+              repr(fp.text("#picked")))
+    else:
+        print("[SKIP] naver fixture - react bundles not present")
 else:
     print("[SKIP] driver checks - native ggcore not built")
 

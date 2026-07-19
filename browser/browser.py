@@ -228,6 +228,7 @@ class Browser:
             return
         self._dom_version = self._doc.dom_version()
         self._live_idle = 0
+        self._live_injected = 0
         import time
         self._live_last = time.monotonic()
         gen = self._live_gen
@@ -256,6 +257,11 @@ class Browser:
                 except Exception as e:
                     self._doc.reject_fetch(
                         fetch_id, f"{type(e).__name__}: {e}")
+            # N1: scripts the page injected during this tick (the
+            # injected-count cap is per page generation)
+            _ran, self._live_injected = native._drain_injected_scripts(
+                self._doc, self.url,
+                getattr(self, "_live_injected", 0))
             version = self._doc.dom_version()
             if version != self._dom_version:
                 self._dom_version = version

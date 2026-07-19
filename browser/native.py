@@ -271,6 +271,7 @@ def settle_async(doc, css_sources, base_url, timeout=8.0, max_rounds=2000):
     import time
     deadline = time.monotonic() + timeout
     mutated = False
+    injected = 0
     for _ in range(max_rounds):
         logs, fetches = doc.pump()
         if logs:
@@ -286,6 +287,11 @@ def settle_async(doc, css_sources, base_url, timeout=8.0, max_rounds=2000):
                 except Exception as e:
                     doc.reject_fetch(fetch_id, f"{type(e).__name__}: {e}")
             continue  # resolving fetches queues more microtasks
+        ran, injected = _drain_injected_scripts(
+            doc, base_url, injected)
+        if ran:
+            mutated = True
+            continue  # injected code may queue more work
         if not doc.has_pending_work():
             break
         if time.monotonic() > deadline:
@@ -293,6 +299,53 @@ def settle_async(doc, css_sources, base_url, timeout=8.0, max_rounds=2000):
             break
     _pull_page_cookies(doc, base_url)
     return mutated
+
+
+# a page injecting more scripts than this per settle is treated as a
+# runaway ad chain, not an app boot (design risk table)
+_MAX_INJECTED_SCRIPTS = 50
+
+
+def _drain_injected_scripts(doc, base_url, injected):
+    """N1: fetch+run <script> elements the page injected since the
+    last drain. External srcs resolve against the page URL; a script
+    fires load on success and error on fetch failure (getScript-style
+    chaining). Returns (ran_any, new_injected_count)."""
+    if not hasattr(doc, "take_pending_scripts"):
+        return False, injected
+    from . import net
+    ext, inline = doc.take_pending_scripts()
+    if not ext and not inline:
+        return False, injected
+    ran = False
+    for _node, code in inline:
+        if injected >= _MAX_INJECTED_SCRIPTS:
+            break
+        injected += 1
+        ran = True
+        for line in doc.run_scripts([code]):
+            print(f"[js console] {line}")
+    for node, src in ext:
+        if injected >= _MAX_INJECTED_SCRIPTS:
+            print(f"[gg] injected-script cap reached, skipping {src}")
+            continue
+        injected += 1
+        ran = True
+        try:
+            resolved = (base_url.resolve(src)
+                        if base_url is not None else net.URL(src))
+            _h, code, _f = net.request_text(resolved)
+        except Exception as e:
+            print(f"[gg] injected script fetch failed: {src} "
+                  f"({type(e).__name__})")
+            for line in doc.fire_node_event(node, "error"):
+                print(f"[js console] {line}")
+            continue
+        for line in doc.run_scripts([code]):
+            print(f"[js console] {line}")
+        for line in doc.fire_node_event(node, "load"):
+            print(f"[js console] {line}")
+    return ran, injected
 
 
 def parse_and_style(html, fetch_stylesheets):
