@@ -304,9 +304,16 @@ _num_re = re.compile(r"-?\d+(?:\.\d+)?")
 
 
 def gradient_color(value, default=""):
-    """A gradient can't be painted, but its first color stop is a good
-    solid-fill approximation (buttons/headers read almost the same)."""
+    """A linear gradient can't be painted, but its first color stop is a
+    good solid-fill approximation (buttons/headers read almost the same).
+    A conic gradient is an angular sweep — nearly always a decorative
+    accent (corner ornaments, rings), so approximating it as a solid colour
+    paints the whole box in one arc's hue; naver's ornaments filled the
+    page purple over the news. Leave conic (and mostly-transparent) sweeps
+    unpainted."""
     if not value or "gradient(" not in value.casefold():
+        return default
+    if "conic-gradient(" in value.casefold():
         return default
     # first #hex, rgb()/rgba(), or named color inside the parens
     inner = value[value.find("(") + 1:]
@@ -1083,10 +1090,17 @@ class BlockLayout:
 
             bgcolor = self.node.style.get("background-color")
             if not bgcolor and "background" in self.node.style:
-                for token in self.node.style["background"].split():
-                    if safe_color(token, default=""):
-                        bgcolor = token
-                        break
+                bg = self.node.style["background"]
+                # a gradient's interior color tokens are stops, not the
+                # box fill — scanning them tokenwise picked a later
+                # gradient layer's colour and flooded the box (naver's
+                # gradient-border banner filled the page over the news).
+                # Defer any gradient to gradient_color's first-stop below.
+                if "gradient(" not in bg.casefold():
+                    for token in bg.split():
+                        if safe_color(token, default=""):
+                            bgcolor = token
+                            break
             color = safe_color(bgcolor, default="") if bgcolor else ""
             if not color:
                 # gradient background -> first stop as a solid fill
