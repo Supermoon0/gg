@@ -847,3 +847,17 @@ fast-forward를 무한 재렌더로 몰아넣음 — **250ms 가상시간 지평
 회귀: cargo 184/184, 헤드리스 smoke 143 PASS(네트워크 redirect만 환경 이슈).
 커밋: d66a952(regex/Image/SelectObj), d8ed33f(array/object 메서드+세틀 지평선),
 + reader 게이팅. **네이버 홈이 GG 엔진에서 진짜 자기 DOM으로 완전 렌더된다.**
+
+**07-20 심야2 — 활성 탭 검증: 버그 아님, 서버 데이터 충실 반영 확인**.
+"매 로드마다 다른 카테고리 탭(추천/책방/웹툰/패션뷰티)이 활성"이 결함인지
+정공법으로 소스까지 추적. `ContentHeaderView`의 활성 탭은 하드코딩이 아니라
+`window["EAGER-DATA"]["PC-FEED-WRAPPER"].blocks[0]["@code"]`에서 파생
+(`s=Ul.find(tab=>tab.blockCode===blocks[0]["@code"])`). 즉 네이버가 서버에서
+내려준 피드의 첫 블록 카테고리가 활성 탭이 됨. naver.com을 연속 fetch하니
+body 길이(234021→231382→212546)와 blocks[0] 코드(PC-FEED-CULTURE→
+PC-FEED-BEAUTY→…)가 매번 달라짐 — **네이버 서버가 요청마다 피드 리드
+카테고리를 로테이션**. 엔진은 `EAGER-DATA` 전역을 HTML에서 재정렬 없이 정확히
+읽어 그 탭을 활성화(engine blocks[0]==원본 HTML 확인). **결론: 활성 탭은
+네이버 서버 데이터를 충실히 반영한 것이지 렌더 결함이 아니며, "추천 고정"은
+실증(엔진이 사이트를 있는 그대로 구동)을 훼손함.** Math.random도 정상 동작
+(0.677… 반환) — 콘텐츠 매회 변동은 네이버 자신의 랜덤화. 실제 크롬도 동일.
