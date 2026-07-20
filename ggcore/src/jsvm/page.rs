@@ -109,6 +109,30 @@ function CustomEvent(type, opts) {
   this.detail = (opts || {}).detail;
 }
 CustomEvent.prototype = new Event('');
+function ErrorEvent(type, opts) {
+  Event.call(this, type, opts);
+  opts = opts || {};
+  this.message = '' + (opts.message || '');
+  this.filename = '' + (opts.filename || '');
+  this.lineno = opts.lineno || 0;
+  this.colno = opts.colno || 0;
+  this.error = opts.error !== undefined ? opts.error : null;
+}
+ErrorEvent.prototype = new Event('');
+function PromiseRejectionEvent(type, opts) {
+  Event.call(this, type, opts);
+  opts = opts || {};
+  this.promise = opts.promise !== undefined ? opts.promise : null;
+  this.reason = opts.reason;
+}
+PromiseRejectionEvent.prototype = new Event('');
+function MessageEvent(type, opts) {
+  Event.call(this, type, opts);
+  opts = opts || {};
+  this.data = opts.data;
+  this.origin = '' + (opts.origin || '');
+}
+MessageEvent.prototype = new Event('');
 // --- platform stub layer -------------------------------------------
 // Enough surface for feature-detecting bundles to take their happy
 // path. Intentionally absent: Proxy and Reflect (their absence routes
@@ -3057,6 +3081,17 @@ console.log('B typeof it: ' + typeof it);
             n("function f() {} f.hasOwnProperty('prototype') ? 1 : 0"),
             1.0
         );
+        // round 4: ErrorEvent/PromiseRejectionEvent/MessageEvent globals
+        // (error-reporting paths reference them; 'ErrorEvent is not
+        // defined' aborted React)
+        assert_eq!(
+            n("var e = new ErrorEvent('error', { message: 'x', lineno: 3 }); \
+               (e.message === 'x' && e.lineno === 3 \
+                && e instanceof Event) ? 1 : 0"),
+            1.0
+        );
+        assert_eq!(n("typeof PromiseRejectionEvent === 'function' ? 1 : 0"), 1.0);
+        assert_eq!(n("typeof MessageEvent === 'function' ? 1 : 0"), 1.0);
     }
 
     #[test]
