@@ -3045,6 +3045,18 @@ console.log('B typeof it: ' + typeof it);
                d.setUTCDate(25); d.getUTCDate()"),
             25.0
         );
+        // round 4: fn.toString()/valueOf() (bundles hash / feature-
+        // detect functions; missing threw '.toString() on Func')
+        assert_eq!(
+            n("function f() {} (typeof f.toString() === 'string' \
+               && f.toString().indexOf('function') === 0) ? 1 : 0"),
+            1.0
+        );
+        assert_eq!(n("function f() {} f.valueOf() === f ? 1 : 0"), 1.0);
+        assert_eq!(
+            n("function f() {} f.hasOwnProperty('prototype') ? 1 : 0"),
+            1.0
+        );
     }
 
     #[test]

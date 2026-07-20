@@ -6515,6 +6515,43 @@ fn exec_loop(
                         reg!(obj) = r;
                         continue;
                     }
+                    // Function.prototype.toString/valueOf and the
+                    // Object.prototype staples on a function receiver
+                    // (bundles hash/feature-detect via fn.toString())
+                    match st.names[key as usize].as_str() {
+                        "toString" => {
+                            reg!(obj) = push_str(
+                                st,
+                                "function () { [native code] }"
+                                    .to_string(),
+                            );
+                            continue;
+                        }
+                        "valueOf" => {
+                            reg!(obj) = ov;
+                            continue;
+                        }
+                        "hasOwnProperty" => {
+                            let a0 = base + obj as usize + 1;
+                            let k = if argc > 0 {
+                                to_display(st, st.regs[a0])
+                            } else {
+                                String::new()
+                            };
+                            let kid = st.intern_name(&k);
+                            let has = k == "prototype"
+                                || st.fn_props
+                                    .contains_key(&(ov.index(), kid));
+                            reg!(obj) = Value::boolean(has);
+                            continue;
+                        }
+                        "isPrototypeOf"
+                        | "propertyIsEnumerable" => {
+                            reg!(obj) = Value::boolean(false);
+                            continue;
+                        }
+                        _ => {}
+                    }
                 }
                 if ov.is_object() {
                     let oi = ov.index() as usize;
