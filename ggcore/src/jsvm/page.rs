@@ -970,6 +970,20 @@ impl PageVm {
             }
             vm.set_global("screen", scr);
             vm.set_object_prop(window, "screen", scr);
+
+            // viewport metrics: some observers/lazy loaders read these
+            // instead of documentElement.clientWidth/clientHeight.
+            for (f, n) in [
+                ("innerWidth", vm::VIEWPORT_W),
+                ("innerHeight", vm::VIEWPORT_H),
+                ("outerWidth", vm::VIEWPORT_W),
+                ("outerHeight", vm::VIEWPORT_H),
+                ("scrollX", 0), ("scrollY", 0),
+                ("pageXOffset", 0), ("pageYOffset", 0),
+                ("devicePixelRatio", 1),
+            ] {
+                vm.set_object_prop(window, f, Value::int(n));
+            }
         }
         // localStorage / sessionStorage (in-memory key-value)
         for (name, session) in [("localStorage", false),
@@ -2662,6 +2676,32 @@ console.log('B typeof it: ' + typeof it);
         assert!(logs.contains(&"touch 0".to_string()), "{logs:?}");
         assert!(logs.contains(&"tag 1".to_string()), "{logs:?}");
         assert!(logs.contains(&"ael 1".to_string()), "{logs:?}");
+    }
+
+    #[test]
+    fn document_element_parent_is_document() {
+        // documentElement.parentNode is the document (parentElement null).
+        // containsDeep walks parentNode to the document — the
+        // IntersectionObserver polyfill's _rootContainsTarget needs it, or
+        // lazy content never registers as on-screen.
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<html><body><p id=t>x</p></body></html>"),
+        ))));
+        let logs = vm.run_scripts(&["\
+            var de = document.documentElement;\n\
+            console.log('pn ' + (de.parentNode === document ? 1 : 0));\n\
+            console.log('pe ' + (de.parentElement === null ? 1 : 0));\n\
+            var t = document.getElementById('t');\n\
+            function contains(root, n){ while(n){ if(n===root) return 1; \
+              n = n.parentNode; } return 0; }\n\
+            console.log('cd ' + contains(document, t));\n\
+            console.log('cw ' + (document.documentElement.clientWidth > 0 \
+              ? 1 : 0));\n"
+            .to_string()]);
+        assert!(logs.contains(&"pn 1".to_string()), "{logs:?}");
+        assert!(logs.contains(&"pe 1".to_string()), "{logs:?}");
+        assert!(logs.contains(&"cd 1".to_string()), "{logs:?}");
+        assert!(logs.contains(&"cw 1".to_string()), "{logs:?}");
     }
 
     #[test]

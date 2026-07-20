@@ -679,6 +679,14 @@ pub(super) struct St {
 // js_budget in native.load_document still bounds the whole load.
 pub(super) const DEFAULT_FUEL: u64 = 400_000_000;
 
+// Layout viewport reported by documentElement.clientWidth/clientHeight and
+// window.innerWidth/innerHeight. The height is deliberately tall so a
+// headless full-page settle lets IntersectionObserver-gated ("lazy")
+// content — naver's feed/news blocks — see itself as on-screen and render,
+// instead of waiting for a scroll that never comes.
+pub(super) const VIEWPORT_W: i32 = 1280;
+pub(super) const VIEWPORT_H: i32 = 5000;
+
 const TY_UNDEFINED: usize = 0;
 const TY_BOOLEAN: usize = 1;
 const TY_NUMBER: usize = 2;
@@ -5237,8 +5245,21 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
             return Ok(obj);
         }
         "parentNode" | "parentElement" => {
-            return Ok(match doc.borrow().nodes[node_us].parent {
+            let is_parent_node = st.names[key as usize] == "parentNode";
+            let d = doc.borrow();
+            return Ok(match d.nodes[node_us].parent {
                 Some(p) => Value::dom_node(p as u32),
+                // documentElement.parentNode is the document node (real
+                // DOM); parentElement stays null. containsDeep walks
+                // parentNode up to the document, so without this the
+                // IntersectionObserver polyfill's _rootContainsTarget
+                // returns false and lazy content (naver's feed) never
+                // sees itself on-screen.
+                None if is_parent_node
+                    && d.nodes[node_us].tag.as_deref() == Some("html") =>
+                {
+                    Value::dom_node(DOC_NODE)
+                }
                 None => Value::NULL,
             });
         }
@@ -5399,6 +5420,44 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
         "nodeType" => {
             let is_el = doc.borrow().nodes[node_us].is_element();
             return Ok(Value::int(if is_el { 1 } else { 3 }));
+        }
+        "clientWidth" | "clientHeight" | "offsetWidth" | "offsetHeight"
+        | "scrollWidth" | "scrollHeight" | "clientTop" | "clientLeft"
+        | "offsetTop" | "offsetLeft" => {
+            let name = st.names[key as usize].as_str();
+            if name == "clientTop" || name == "clientLeft" {
+                return Ok(Value::int(0));
+            }
+            let want_h = name.ends_with("Height");
+            let want_pos = name == "offsetTop" || name == "offsetLeft";
+            // The documentElement (and body) report the layout viewport:
+            // the IntersectionObserver polyfill builds its root rect from
+            // `documentElement.clientWidth/clientHeight`, and an undefined
+            // value collapsed the viewport so nothing ever intersected and
+            // lazy content (naver's feed) never rendered.
+            let tag = doc.borrow().nodes[node_us].tag.clone();
+            if !want_pos
+                && matches!(tag.as_deref(), Some("html") | Some("body"))
+            {
+                return Ok(Value::int(if want_h {
+                    VIEWPORT_H
+                } else {
+                    VIEWPORT_W
+                }));
+            }
+            // other elements: their laid-out box, once layout geometry has
+            // been fed back via set_layout_rects; zero before first layout
+            if let Some(&(x, y, w, h)) = st.layout_rects.get(&node) {
+                let v = if want_pos {
+                    if name == "offsetTop" { y } else { x }
+                } else if want_h {
+                    h
+                } else {
+                    w
+                };
+                return Ok(Value::int(v as i32));
+            }
+            return Ok(Value::int(0));
         }
         _ => {}
     }
