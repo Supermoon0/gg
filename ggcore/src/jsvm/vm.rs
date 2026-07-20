@@ -338,6 +338,7 @@ pub(super) mod host {
     pub const O_DEFINE_PROPS: u16 = 50;
     pub const O_GET_OWN_NAMES: u16 = 51;
     pub const O_IS: u16 = 52;
+    pub const O_FROM_ENTRIES: u16 = 53;
     pub const A_ISARRAY: u16 = 60;
     pub const A_FROM: u16 = 61;
     pub const N_ISNAN: u16 = 80;
@@ -843,6 +844,25 @@ fn regex_index(st: &St, v: Value) -> Option<usize> {
     None
 }
 
+/// Recursively flatten nested arrays up to `depth` levels — the shared
+/// core of `Array.prototype.flat` and `.flatMap`. Non-array elements
+/// (and arrays past the depth limit) are pushed as-is.
+fn flatten_array(st: &St, elems: &[Value], depth: i64) -> Vec<Value> {
+    let mut out = Vec::new();
+    for &e in elems {
+        if depth > 0
+            && e.is_object()
+            && st.objects[e.index() as usize].is_array
+        {
+            let inner = st.objects[e.index() as usize].elems.clone();
+            out.extend(flatten_array(st, &inner, depth - 1));
+        } else {
+            out.push(e);
+        }
+    }
+    out
+}
+
 /// Rewrite a JS regex source into one the Rust `regex` crate accepts.
 /// JS and Rust's regex syntax diverge in a handful of common ways that
 /// otherwise force whole patterns to compile as never-matching:
@@ -1291,6 +1311,12 @@ fn next_due_timer(st: &St) -> Option<usize> {
 }
 
 /// Event-loop pump: drain microtasks, then fire the earliest timer
+/// Virtual-ms window that load-settling fast-forwards through. Timers due
+/// past it are treated as animation/polling (fired later, at frame pace),
+/// not initial content — big enough for real deferred init (React effects,
+/// short setTimeouts) yet well under typical ticker/animation intervals.
+pub(super) const SETTLE_HORIZON_MS: f64 = 250.0;
+
 /// (advancing the virtual clock), repeat until both are empty or the
 /// budget is hit. Returns the fetches issued this turn for the host to
 /// service; they move to `awaiting` until resolve_fetch settles them.
@@ -1300,6 +1326,15 @@ pub(super) fn pump(
     budget_max: usize,
 ) -> Vec<(u32, String)> {
     let mut budget = budget_max;
+    // Load-settle horizon: a self-rescheduling `setTimeout` (naver's
+    // AutoRolling headline ticker re-arms a fresh timer every few seconds,
+    // so the interval guard below can't catch it) would otherwise let the
+    // fast-forward fire it up to the budget, re-rendering forever. Timers
+    // due beyond this horizon of virtual time are animation/polling, not
+    // initial content — leave them for later so settling captures the
+    // first painted frame and terminates. Microtasks and fetches (the real
+    // data path) are never horizon-gated.
+    let horizon = st.now_ms + SETTLE_HORIZON_MS;
     // A setInterval never quiesces: re-arming it at `now + iv` and then
     // fast-forwarding to the next-due timer would fire it up to the whole
     // budget (200k) in one pump call — Naver's IntersectionObserver
@@ -1319,6 +1354,9 @@ pub(super) fn pump(
         // earliest timer that is not an already-fired interval
         let mut best: Option<usize> = None;
         for (i, t) in st.timers.iter().enumerate() {
+            if t.due_ms > horizon {
+                continue;
+            }
             if t.interval.is_some() && fired_intervals.contains(&t.id) {
                 continue;
             }
@@ -1434,10 +1472,14 @@ pub(super) fn reject_fetch(st: &mut St, fetch_id: u32, message: String) {
 pub(super) fn has_pending_work(st: &St) -> bool {
     // Intervals (setInterval) poll forever and never quiesce, so they do
     // not count as pending load-settle work — otherwise the settle loop
-    // would spin on them until its wall-clock deadline. One-shot timers,
+    // would spin on them until its wall-clock deadline. Likewise a one-shot
+    // timer due beyond the settle horizon (an animation/ticker re-arm, not
+    // initial content) is not pending load work. Near-due one-shots,
     // microtasks, and in-flight fetches are real pending work.
     !st.microtasks.is_empty()
-        || st.timers.iter().any(|t| t.interval.is_none())
+        || st.timers.iter().any(|t| {
+            t.interval.is_none() && t.due_ms <= st.now_ms + SETTLE_HORIZON_MS
+        })
         || !st.pending_fetches.is_empty()
         || !st.awaiting.is_empty()
 }
@@ -1989,6 +2031,67 @@ fn method_ref_dispatch(
                     Value::UNDEFINED
                 } else {
                     new_array(st, out)
+                });
+            }
+            "at" => {
+                let len = elems.len() as i64;
+                let mut i = args
+                    .first()
+                    .map(|v| v.to_number_raw() as i64)
+                    .unwrap_or(0);
+                if i < 0 {
+                    i += len;
+                }
+                return Ok(if i >= 0 && i < len {
+                    elems[i as usize]
+                } else {
+                    Value::UNDEFINED
+                });
+            }
+            "flat" => {
+                let depth = args
+                    .first()
+                    .map(|v| v.to_number_raw() as i64)
+                    .unwrap_or(1);
+                let out = flatten_array(st, &elems, depth);
+                return Ok(new_array(st, out));
+            }
+            "flatMap" => {
+                let cb = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let cb_this = args.get(1).copied();
+                let mut mapped = Vec::with_capacity(elems.len());
+                for (i, &e) in elems.iter().enumerate() {
+                    let v = call_value_this(
+                        st, mods, cb, cb_this,
+                        &[e, Value::int(i as i32), recv],
+                    )?;
+                    mapped.push(v);
+                }
+                let out = flatten_array(st, &mapped, 1);
+                return Ok(new_array(st, out));
+            }
+            "findLast" | "findLastIndex" => {
+                let cb = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let cb_this = args.get(1).copied();
+                let want_index = name == "findLastIndex";
+                for i in (0..elems.len()).rev() {
+                    let e = elems[i];
+                    let v = call_value_this(
+                        st, mods, cb, cb_this,
+                        &[e, Value::int(i as i32), recv],
+                    )?;
+                    if truthy(st, v) {
+                        return Ok(if want_index {
+                            Value::int(i as i32)
+                        } else {
+                            e
+                        });
+                    }
+                }
+                return Ok(if want_index {
+                    Value::int(-1)
+                } else {
+                    Value::UNDEFINED
                 });
             }
             _ => {
@@ -4023,6 +4126,55 @@ fn host_fn(
                 }
             }
             Ok(target)
+        }
+        O_FROM_ENTRIES => {
+            // Object.fromEntries(iterable): build an object from [k, v]
+            // pairs (an array of arrays, or a Map). Data selectors use it
+            // to reshape lists into keyed lookups.
+            let src = argv!(0);
+            let out = new_plain_object(st);
+            let oi = out.index() as usize;
+            let pairs: Vec<(Value, Value)> = if src.is_object() {
+                let siu = src.index();
+                let si = siu as usize;
+                if let Some(entries) = st.map_data.get(&siu) {
+                    entries.clone()
+                } else if st.objects[si].is_array {
+                    st.objects[si]
+                        .elems
+                        .clone()
+                        .iter()
+                        .map(|&e| {
+                            if e.is_object()
+                                && st.objects[e.index() as usize].is_array
+                            {
+                                let el =
+                                    &st.objects[e.index() as usize].elems;
+                                (
+                                    el.first()
+                                        .copied()
+                                        .unwrap_or(Value::UNDEFINED),
+                                    el.get(1)
+                                        .copied()
+                                        .unwrap_or(Value::UNDEFINED),
+                                )
+                            } else {
+                                (Value::UNDEFINED, Value::UNDEFINED)
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            for (k, v) in pairs {
+                let ks = to_display(st, k);
+                let atom = st.intern_name(&ks);
+                raw_set_prop(st, oi, atom, v);
+            }
+            Ok(out)
         }
         O_FREEZE => Ok(argv!(0)), // no-op (we don't enforce immutability)
         O_DEFINE_PROP => {
@@ -7404,6 +7556,80 @@ fn exec_loop(
                                     }
                                     acc
                                 }
+                                "at" => {
+                                    let elems =
+                                        st.objects[oi].elems.clone();
+                                    let len = elems.len() as i64;
+                                    let mut i = if argc > 0 {
+                                        num_of(arg0)? as i64
+                                    } else {
+                                        0
+                                    };
+                                    if i < 0 {
+                                        i += len;
+                                    }
+                                    if i >= 0 && i < len {
+                                        elems[i as usize]
+                                    } else {
+                                        Value::UNDEFINED
+                                    }
+                                }
+                                "flat" => {
+                                    let elems =
+                                        st.objects[oi].elems.clone();
+                                    let depth = if argc > 0 {
+                                        num_of(arg0)? as i64
+                                    } else {
+                                        1
+                                    };
+                                    let out =
+                                        flatten_array(st, &elems, depth);
+                                    new_array(st, out)
+                                }
+                                "flatMap" => {
+                                    let elems =
+                                        st.objects[oi].elems.clone();
+                                    let mut mapped =
+                                        Vec::with_capacity(elems.len());
+                                    for (i, &e) in elems.iter().enumerate()
+                                    {
+                                        let v = call_value_this(
+                                            st, mods, arg0, cb_this,
+                                            &[e, Value::int(i as i32), ov],
+                                        )?;
+                                        mapped.push(v);
+                                    }
+                                    let out =
+                                        flatten_array(st, &mapped, 1);
+                                    new_array(st, out)
+                                }
+                                "findLast" | "findLastIndex" => {
+                                    let elems =
+                                        st.objects[oi].elems.clone();
+                                    let want_index =
+                                        method == "findLastIndex";
+                                    let mut res = if want_index {
+                                        Value::int(-1)
+                                    } else {
+                                        Value::UNDEFINED
+                                    };
+                                    for i in (0..elems.len()).rev() {
+                                        let e = elems[i];
+                                        let v = call_value_this(
+                                            st, mods, arg0, cb_this,
+                                            &[e, Value::int(i as i32), ov],
+                                        )?;
+                                        if truthy(st, v) {
+                                            res = if want_index {
+                                                Value::int(i as i32)
+                                            } else {
+                                                e
+                                            };
+                                            break;
+                                        }
+                                    }
+                                    res
+                                }
                                 // real array iterators (core-js
                                 // es.array.iterator calls [].keys())
                                 "keys" | "values" | "entries" => {
@@ -7654,6 +7880,19 @@ fn exec_loop(
                             match ch {
                                 Some(c) => Value::int(c as i32),
                                 None => Value::number(f64::NAN),
+                            }
+                        }
+                        "at" => {
+                            let chars: Vec<char> = s.chars().collect();
+                            let len = chars.len() as i64;
+                            let mut i = num_of(av0)? as i64;
+                            if i < 0 {
+                                i += len;
+                            }
+                            if i >= 0 && i < len {
+                                push_str(st, chars[i as usize].to_string())
+                            } else {
+                                Value::UNDEFINED
                             }
                         }
                         "slice" | "substring" => {
@@ -8475,7 +8714,9 @@ fn exec_loop(
                                         | "sort" | "splice" | "shift"
                                         | "unshift" | "reverse" | "some"
                                         | "every" | "reduce"
-                                        | "lastIndexOf"
+                                        | "lastIndexOf" | "at" | "flat"
+                                        | "flatMap" | "findLast"
+                                        | "findLastIndex"
                                 ) =>
                         {
                             make_native(st, Native::MethodRef(key))
@@ -8582,15 +8823,20 @@ fn exec_loop(
                             .rev()
                             .take(8)
                             .map(|f| {
-                                mods.rc(f.module).module.protos
-                                    [f.proto as usize]
-                                    .name
-                                    .clone()
+                                format!(
+                                    "{}@{}:{}",
+                                    mods.rc(f.module).module.protos
+                                        [f.proto as usize]
+                                        .name,
+                                    f.module,
+                                    f.proto,
+                                )
                             })
                             .collect();
-                        let here = cmod.module.protos[pi as usize]
-                            .name
-                            .clone();
+                        let here = format!(
+                            "{}@{}:{}",
+                            cmod.module.protos[pi as usize].name, mi, pi,
+                        );
                         names.insert(0, here);
                         // dump a window of consts around ip so the
                         // failing site can be found in the source: the

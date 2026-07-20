@@ -400,6 +400,24 @@ function Image(w, h) {
   if (h != null) el.height = h;
   return el;
 }
+// structuredClone: a deep copy of plain data (arrays, objects, dates).
+// Data selectors/stores use it to snapshot state before mutating.
+function structuredClone(v) {
+  if (v === null || typeof v !== 'object') return v;
+  if (Array.isArray(v)) {
+    var a = [];
+    for (var i = 0; i < v.length; i++) a[i] = structuredClone(v[i]);
+    return a;
+  }
+  if (v instanceof Date) return new Date(v.getTime());
+  var o = {};
+  for (var k in v) {
+    if (Object.prototype.hasOwnProperty.call(v, k)) {
+      o[k] = structuredClone(v[k]);
+    }
+  }
+  return o;
+}
 function SVGElement() {}
 function Document() {}
 function HTMLDocument() {}
@@ -776,6 +794,7 @@ impl PageVm {
                 ("getPrototypeOf", Native::HostFn(host::O_GET_PROTO)),
                 ("setPrototypeOf", Native::HostFn(host::O_SET_PROTO)),
                 ("is", Native::HostFn(host::O_IS)),
+                ("fromEntries", Native::HostFn(host::O_FROM_ENTRIES)),
             ],
         );
         vm.st.known.object = object_ctor;
@@ -1451,6 +1470,47 @@ mod tests {
         assert_eq!(n(r"/\u{1F600}/u.test('😀') ? 1 : 0"), 1.0);
         // .source still reports the original JS pattern
         assert_eq!(n(r"/A/.source === 'A' ? 1 : 0"), 1.0);
+    }
+
+    #[test]
+    fn array_and_object_modern_methods() {
+        // Array.prototype.at (negative indexes)
+        assert_eq!(n("[1,2,3].at(-1)"), 3.0);
+        assert_eq!(n("[5,6,7].at(1)"), 6.0);
+        // flat / flatMap
+        assert_eq!(n("[[1],[2,3]].flat().length"), 3.0);
+        assert_eq!(
+            n("[1,2].flatMap(function(x){return [x,x*10];})\
+               .join(',') === '1,10,2,20' ? 1 : 0"),
+            1.0,
+        );
+        // findLast / findLastIndex
+        assert_eq!(n("[1,2,3,4].findLast(function(x){return x<3;})"), 2.0);
+        assert_eq!(
+            n("[1,2,3,4].findLastIndex(function(x){return x<3;})"),
+            1.0,
+        );
+        // Object.fromEntries
+        assert_eq!(
+            n("var o=Object.fromEntries([['a',1],['b',2]]); o.a*10+o.b"),
+            12.0,
+        );
+        // String.prototype.at
+        assert_eq!(n("'abc'.at(-1) === 'c' ? 1 : 0"), 1.0);
+        // structuredClone is a deep, independent copy
+        assert_eq!(n("structuredClone({a:[1,2]}).a[1]"), 2.0);
+        assert_eq!(
+            n("var s={x:{y:1}}; var c=structuredClone(s); \
+               c.x.y=9; s.x.y"),
+            1.0,
+        );
+        // extracted (uncurried) forms route through the same core
+        assert_eq!(
+            n("var f=[].flatMap; \
+               f.call([1,2],function(x){return [x];}).length"),
+            2.0,
+        );
+        assert_eq!(n("var a=[].at; a.call([9,8,7],-1)"), 7.0);
     }
 
     #[test]
@@ -4412,6 +4472,37 @@ console.log('B typeof it: ' + typeof it);
         assert!(!vm.has_pending_work());
         let (logs2, _) = vm.pump();
         assert_eq!(logs2, vec!["tick"]);
+    }
+
+    #[test]
+    fn settle_horizon_fires_near_defers_far() {
+        // load-settling fires timers due within the horizon but leaves
+        // far-future ones (animations/tickers) for frame-pace playback
+        let mut vm = PageVm::new(None);
+        vm.run_scripts(&["\
+            setTimeout(function(){ console.log('near'); }, 50);\n\
+            setTimeout(function(){ console.log('far'); }, 3000);\n"
+            .to_string()]);
+        let (logs, _) = vm.pump();
+        assert_eq!(logs, vec!["near"], "near fires, far deferred: {logs:?}");
+        // the far one-shot is past the horizon: not pending load work
+        assert!(!vm.has_pending_work());
+    }
+
+    #[test]
+    fn self_rescheduling_timer_does_not_spin() {
+        // naver's AutoRolling ticker re-arms a fresh setTimeout every few
+        // seconds; the fast-forward must not chase it forever. Its first
+        // re-arm (1000ms) is past the 250ms horizon, so settling quiesces.
+        let mut vm = PageVm::new(None);
+        vm.run_scripts(&["\
+            var n = 0;\n\
+            (function tick(){ n++; setTimeout(tick, 1000); })();\n\
+            setTimeout(function(){ console.log('n=' + n); }, 100);\n"
+            .to_string()]);
+        let (logs, _) = vm.pump();
+        assert_eq!(logs, vec!["n=1"], "ticker must not fast-forward: {logs:?}");
+        assert!(!vm.has_pending_work());
     }
 
     #[test]
