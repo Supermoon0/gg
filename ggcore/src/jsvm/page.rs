@@ -4289,6 +4289,42 @@ console.log('B typeof it: ' + typeof it);
     }
 
     #[test]
+    fn interval_fires_once_per_pump_and_settles() {
+        // A setInterval must not fast-forward to the event-loop budget
+        // during load settling (Naver's IntersectionObserver polyfill polls
+        // on one — the unbounded fast-forward cost ~50s per settle). Each
+        // pump fires it exactly once and the settle loop can terminate.
+        let mut vm = PageVm::new(None);
+        vm.run_scripts(
+            &["setInterval(function () { console.log('tick'); }, 100);"
+                .to_string()],
+        );
+        let (logs, _) = vm.pump();
+        assert_eq!(logs, vec!["tick"], "interval must fire once, not spin");
+        // an interval alone is steady-state polling, not pending load work
+        assert!(!vm.has_pending_work());
+        let (logs2, _) = vm.pump();
+        assert_eq!(logs2, vec!["tick"]);
+    }
+
+    #[test]
+    fn clear_interval_during_pump_stops_it() {
+        // in-place interval firing must keep clearInterval working: a
+        // one-shot that clears the interval removes it for good.
+        let mut vm = PageVm::new(None);
+        vm.run_scripts(&["\
+            var id = setInterval(function () { console.log('x'); }, 50);\n\
+            setTimeout(function () { clearInterval(id); }, 10);\n"
+            .to_string()]);
+        let (logs, _) = vm.pump();
+        // the t=10 clear runs before the t=50 tick, so no 'x' ever fires
+        assert!(!logs.iter().any(|l| l == "x"), "cleared: {logs:?}");
+        assert!(!vm.has_pending_work());
+        let (logs2, _) = vm.pump();
+        assert!(logs2.is_empty(), "interval stays cleared: {logs2:?}");
+    }
+
+    #[test]
     fn async_fetch_then_text_chain() {
         // fetch() defers to the host: pump reports it, we settle it, and
         // the .then(r => r.text()).then(t => ...) chain materializes.

@@ -1152,33 +1152,60 @@ pub(super) fn pump(
     budget_max: usize,
 ) -> Vec<(u32, String)> {
     let mut budget = budget_max;
+    // A setInterval never quiesces: re-arming it at `now + iv` and then
+    // fast-forwarding to the next-due timer would fire it up to the whole
+    // budget (200k) in one pump call — Naver's IntersectionObserver
+    // polyfill polls on one, which cost ~50s per settle. During load
+    // settling, fire each interval at most once per pump call (its effect
+    // is steady-state polling), leave it registered so clearInterval still
+    // finds it, and skip it for the rest of this call. has_pending_work
+    // ignores intervals so the settle loop can reach quiescence.
+    let mut fired_intervals: std::collections::HashSet<u32> =
+        std::collections::HashSet::new();
     loop {
         drain_microtasks(st, mods, &mut budget);
         if budget == 0 {
             st.logs.push("[gg-js] event-loop budget exceeded".to_string());
             break;
         }
-        match next_due_timer(st) {
-            None => break,
-            Some(i) => {
-                let t = st.timers.remove(i);
-                st.now_ms = st.now_ms.max(t.due_ms);
-                if let Some(iv) = t.interval {
-                    st.timer_seq += 1;
-                    st.timers.push(Timer {
-                        id: t.id,
-                        callback: t.callback,
-                        args: t.args.clone(),
-                        due_ms: st.now_ms + iv.max(0.0),
-                        seq: st.timer_seq,
-                        interval: Some(iv),
-                    });
+        // earliest timer that is not an already-fired interval
+        let mut best: Option<usize> = None;
+        for (i, t) in st.timers.iter().enumerate() {
+            if t.interval.is_some() && fired_intervals.contains(&t.id) {
+                continue;
+            }
+            match best {
+                None => best = Some(i),
+                Some(b) => {
+                    let bt = &st.timers[b];
+                    if (t.due_ms, t.seq) < (bt.due_ms, bt.seq) {
+                        best = Some(i);
+                    }
                 }
-                budget -= 1;
-                st.fuel = DEFAULT_FUEL; // fresh budget per timer callback
-                if let Err(e) = call_value(st, mods, t.callback, &t.args) {
-                    st.logs.push(format!("[gg-js error] {}", e.msg));
-                }
+            }
+        }
+        let Some(i) = best else { break };
+        budget -= 1;
+        st.fuel = DEFAULT_FUEL; // fresh budget per timer callback
+        if let Some(iv) = st.timers[i].interval {
+            // fire in place and re-arm for the next tick; mark it fired so
+            // it can't drive the clock again this call
+            let cb = st.timers[i].callback;
+            let args = st.timers[i].args.clone();
+            let id = st.timers[i].id;
+            st.now_ms = st.now_ms.max(st.timers[i].due_ms);
+            st.timer_seq += 1;
+            st.timers[i].due_ms = st.now_ms + iv.max(0.0);
+            st.timers[i].seq = st.timer_seq;
+            fired_intervals.insert(id);
+            if let Err(e) = call_value(st, mods, cb, &args) {
+                st.logs.push(format!("[gg-js error] {}", e.msg));
+            }
+        } else {
+            let t = st.timers.remove(i);
+            st.now_ms = st.now_ms.max(t.due_ms);
+            if let Err(e) = call_value(st, mods, t.callback, &t.args) {
+                st.logs.push(format!("[gg-js error] {}", e.msg));
             }
         }
     }
@@ -1257,8 +1284,12 @@ pub(super) fn reject_fetch(st: &mut St, fetch_id: u32, message: String) {
 }
 
 pub(super) fn has_pending_work(st: &St) -> bool {
+    // Intervals (setInterval) poll forever and never quiesce, so they do
+    // not count as pending load-settle work — otherwise the settle loop
+    // would spin on them until its wall-clock deadline. One-shot timers,
+    // microtasks, and in-flight fetches are real pending work.
     !st.microtasks.is_empty()
-        || !st.timers.is_empty()
+        || st.timers.iter().any(|t| t.interval.is_none())
         || !st.pending_fetches.is_empty()
         || !st.awaiting.is_empty()
 }
