@@ -823,3 +823,27 @@ height를 준다. 결과: **오버레이 소멸, 주요 뉴스(연합뉴스) 헤
 회귀: smoke 레이아웃/flex/absolute 전 항목 통과(% height auto·vh auto·중첩 절대
 포함), redirect 네트워크 테스트만 환경 이슈로 실패(레이아웃 무관). height=3878,
 cmds=510, text=373. **네이버 홈이 GG 엔진에서 완전한 페이지로 렌더된다.**
+
+**07-20 심야 — 정공법 완수: 뉴스 피드가 네이버 자체 React DOM으로 렌더 (리더 모드 졸업)**.
+사용자가 "완벽" + "정공법(JS 엔진 심화)"을 택함. 리더 모드(EAGER-DATA 텍스트
+주입) 대신 네이버 자신의 컴포넌트 트리가 피드를 그리게 만드는 게 목표. 정밀 진단
+결과 피드가 안 뜨는 건 CSS 그리드가 아니라 JS 엔진 결함이었다: React가 피드
+컴포넌트를 렌더 중 예외로 서브트리를 버림. bytecode 트레이스(GG_JS_TRACE에
+module:proto 태깅 추가)로 `AutoRolling` 컴포넌트까지 좁힘 — `e.children`가 빈
+배열이라 `child.key`에서 크래시. 원인은 데이터 셀렉터가 EAGER-DATA blocks→
+materials→items 변환에 쓰는 빌트인들이 엔진에 없어 변환이 실패→빈 children.
+**추가한 엔진 표면**: `Array.prototype.at/flat/flatMap/findLast/findLastIndex`
+(직접호출+추출형), `String.prototype.at`, `Object.fromEntries`, `structuredClone`,
+`Image` 생성자, `new`가 DOM-노드 반환 생성자를 존중(SelectObj), JS 정규식 번역
+(`\uXXXX`→`\u{XXXX}`·클래스 내 리터럴 `[`·`[^]`/`[]`·서로게이트 범위). 이어서
+피드가 뜨자 `AutoRolling` 헤드라인 티커(3초마다 새 setTimeout 재장전)가 세틀
+fast-forward를 무한 재렌더로 몰아넣음 — **250ms 가상시간 지평선** 도입:
+지평선 밖(애니메이션/폴링) 타이머는 프레임 페이스로 미루고 첫 페인트 프레임에서
+수렴, has_pending_work도 먼 미래 원샷을 무시. **결과: reader OFF에서 연합뉴스/
+관심사 피드가 썸네일 이미지 다단 카드 그리드로 네이티브 렌더**(NEWS_IN_PAINT
+4~10/20·각 롤러가 현재 헤드라인 1건씩 실제 네이버처럼 순환, imgs 53~57,
+뉴스스탠드 언론사 로고 6곳+1/4 페이지네이션). 리더 모드는 GG_READER=1 옵트인으로
+강등(주입 시 lazy 관찰자를 화면 밖으로 밀어 네이티브 카드를 못 뜨게 함).
+회귀: cargo 184/184, 헤드리스 smoke 143 PASS(네트워크 redirect만 환경 이슈).
+커밋: d66a952(regex/Image/SelectObj), d8ed33f(array/object 메서드+세틀 지평선),
++ reader 게이팅. **네이버 홈이 GG 엔진에서 진짜 자기 DOM으로 완전 렌더된다.**
