@@ -781,3 +781,29 @@ grow 선언이 하나도 없을 때만 auto-basis 아이템이 잔여를 균등�
 (겹침 0), Naver 레이아웃+페인트 ~20ms 유지, css_gauntlet 22/23 불변,
 flex smoke 6종 + 신규 `flex:1 0 0` vs 콘텐츠-형제 회귀 전부 통과.
 잔여 탭 폴리시(탭 간 여백)는 CSS-모듈 패딩 캐스케이드 심화 영역.
+
+**07-20 저녁 — 피드 lazy 렌더 파이프라인 심층 추적 + IntersectionObserver 언블록**.
+네이버 피드/뉴스 블록은 IntersectionObserver로 "화면에 보일 때"만 렌더되는데,
+관찰자가 영구히 "아무것도 안 보임"으로 판정해 142KB 페치 데이터가 있어도
+카드가 안 그려졌다. 폴리필 내부 메서드를 래핑해 실패 지점을 정확히 규명:
+`_rootIsInDom→true`, `_getRootRect→w=0 h=0`(뷰포트 붕괴), `_rootContainsTarget
+→false`(트리 미포함 판정). 두 DOM 원시 결함이 원인이었고 둘 다 수정:
+1. **뷰포트 메트릭**: `documentElement/body.clientWidth/clientHeight`(+ window
+   .innerWidth/innerHeight 등)가 undefined → 폴리필 root rect 붕괴. 1280×5000
+   레이아웃 뷰포트 보고(헤드리스 전체 세틀이 아래-폴드 lazy 블록도 보게 tall).
+   offsetWidth/Height·scrollWidth/Height·clientTop/Left·offsetTop/Left도 추가.
+2. **documentElement.parentNode**: null 반환 → 폴리필 containsDeep가 parentNode를
+   document까지 못 걸어올라감 → `_rootContainsTarget=false`. 실 DOM대로
+   `<html>.parentNode = document`(parentElement는 null 유지)로 수정.
+수정 후 `_getRootRect→1280×5000`, `_rootContainsTarget→true` 확인. 지오메트리
+피드백 루프(layout→set_layout_rects→re-settle)를 헤드리스 렌더에 넣으니 노드
+610→701, **하단 정책 푸터(회사소개·인재채용·이용약관·개인정보처리방침…) 신규 렌더**.
+회귀: document_element_parent_is_document(parentNode/parentElement/containsDeep/
+clientWidth), cargo 179/179.
+
+**잔여(피드 카드)의 정직한 정체**: (a) 관찰 대상이 인라인 `<a class=link_headline>`
+인데 지오메트리 푸시가 BlockLayout/ImageLayout만 수집 → 인라인 요소는 rect 0
+(파이프라인 한계, 부분 우회 검증함). (b) `/pc/lazy` 응답 자체가 미인증 기본값이라
+item 배열 대부분 비어있음(blocks-with-items=1). (c) lazy가 다층 캐스케이드(관찰→
+렌더→새 관찰자→…). 즉 단일 바운드 버그가 아니라 파이프라인 확장 + 인증 데이터 +
+다층 lazy의 합. 우리 JSON.parse·fetch→json→콜백 체인은 142KB에서 완벽 동작 확인.
