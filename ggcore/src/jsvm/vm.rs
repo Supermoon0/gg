@@ -4566,8 +4566,15 @@ fn dom_method(
                 node as usize
             };
             let mut out = Vec::new();
-            let mut stack: Vec<usize> =
-                d.nodes[start].children.iter().rev().copied().collect();
+            // document.getElementsByTagName must include the document
+            // element itself (Naver calls getElementsByTagName('html')
+            // [0] to get <html>); the element-receiver form is
+            // descendants-only per spec.
+            let mut stack: Vec<usize> = if node == DOC_NODE {
+                vec![start]
+            } else {
+                d.nodes[start].children.iter().rev().copied().collect()
+            };
             while let Some(i) = stack.pop() {
                 let hit = if by_tag {
                     (tag == "*" && d.nodes[i].is_element())
@@ -5071,6 +5078,16 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
                     "html"
                 };
                 return Ok(match find_tag(&doc.borrow(), tag) {
+                    Some(i) => Value::dom_node(i as u32),
+                    None => Value::NULL,
+                });
+            }
+            // React reads document.activeElement before every commit
+            // (getActiveElementDeep). We have no real focus model, so
+            // report body — a non-null Element, which is what React's
+            // guard `activeElement !== body` needs to short-circuit.
+            "activeElement" => {
+                return Ok(match find_tag(&doc.borrow(), "body") {
                     Some(i) => Value::dom_node(i as u32),
                     None => Value::NULL,
                 });
