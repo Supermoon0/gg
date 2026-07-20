@@ -3134,6 +3134,29 @@ console.log('B typeof it: ' + typeof it);
     }
 
     #[test]
+    fn create_element_ns_for_svg() {
+        // React creates every SVG node via createElementNS; a missing
+        // impl left the stateNode undefined and the commit phase threw
+        // '.classList of undefined'. Namespace is ignored (arg 1 = tag).
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<html><body></body></html>"),
+        ))));
+        let logs = vm.run_scripts(&["\
+            var e = document.createElementNS(\
+              'http://www.w3.org/2000/svg', 'svg');\n\
+            e.classList.add('ic');\n\
+            console.log(e.tagName + ' ' + e.className);\n"
+            .to_string()]);
+        assert!(
+            logs.iter().any(|s| {
+                let l = s.to_lowercase();
+                l.contains("svg") && l.contains("ic")
+            }),
+            "createElementNS logs: {logs:?}"
+        );
+    }
+
+    #[test]
     fn arithmetic() {
         assert_eq!(n("1 + 2 * 3"), 7.0);
         assert_eq!(n("(1 + 2) * 3"), 9.0);

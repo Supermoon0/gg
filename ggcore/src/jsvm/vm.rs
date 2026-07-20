@@ -4606,6 +4606,19 @@ fn dom_method(
                 doc.borrow_mut().new_element(tag, Vec::new(), None);
             return Ok(Value::dom_node(idx as u32));
         }
+        // createElementNS(ns, tag): our DOM has no namespaces, so the
+        // element is created by its local name (arg 1). React uses this
+        // for every SVG node — without it the SVG stateNode is undefined
+        // and the commit phase throws '.classList of undefined'.
+        if st.names[key as usize] == "createElementNS" {
+            let tag = arg_string(st, args_base, argc, 1)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let tag = if tag.is_empty() { "div".to_string() } else { tag };
+            let idx =
+                doc.borrow_mut().new_element(tag, Vec::new(), None);
+            return Ok(Value::dom_node(idx as u32));
+        }
         match st.names[key as usize].as_str() {
             "createTextNode" | "createComment" => {
                 let text = if argc > 0 {
@@ -5303,6 +5316,7 @@ fn is_doc_only_method(name: &str) -> bool {
     matches!(
         name,
         "createElement"
+            | "createElementNS"
             | "createTextNode"
             | "createComment"
             | "createDocumentFragment"
@@ -5323,6 +5337,7 @@ fn is_dom_method_name(name: &str) -> bool {
             | "dispatchEvent"
             | "getElementById"
             | "createElement"
+            | "createElementNS"
             | "createTextNode"
             | "createComment"
             | "createDocumentFragment"
