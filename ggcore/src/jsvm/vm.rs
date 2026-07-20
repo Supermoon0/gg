@@ -321,6 +321,7 @@ pub(super) mod host {
     pub const M_MAX: u16 = 19;
     pub const M_RANDOM: u16 = 20;
     pub const M_HYPOT: u16 = 21;
+    pub const M_CLZ32: u16 = 22;
     pub const O_KEYS: u16 = 40;
     pub const O_VALUES: u16 = 41;
     pub const O_ENTRIES: u16 = 42;
@@ -333,6 +334,7 @@ pub(super) mod host {
     pub const O_SET_PROTO: u16 = 49;
     pub const O_DEFINE_PROPS: u16 = 50;
     pub const O_GET_OWN_NAMES: u16 = 51;
+    pub const O_IS: u16 = 52;
     pub const A_ISARRAY: u16 = 60;
     pub const A_FROM: u16 = 61;
     pub const N_ISNAN: u16 = 80;
@@ -3585,6 +3587,14 @@ fn host_fn(
             }
             Ok(Value::number(sum.sqrt()))
         }
+        M_CLZ32 => {
+            // count leading zero bits of ToUint32(x); 32 for 0.
+            // React's lane iteration (31 - clz32(lanes)) loops forever
+            // without this — the highest set bit is never found.
+            let v = argv!(0);
+            let x = js_to_uint32(to_number(st, mods, v)?);
+            Ok(Value::int(x.leading_zeros() as i32))
+        }
         M_MIN | M_MAX => {
             let mut acc = if id == M_MIN { f64::INFINITY } else { f64::NEG_INFINITY };
             for k in 0..n {
@@ -3897,6 +3907,26 @@ fn host_fn(
                 }
             }
             Ok(out)
+        }
+        O_IS => {
+            // Object.is: SameValue (=== but NaN==NaN and -0 !== +0).
+            // React's bailout/shallowEqual lean on this heavily.
+            let x = argv!(0);
+            let y = argv!(1);
+            let same = if x.is_number() && y.is_number() {
+                let (a, b) = (x.to_number_raw(), y.to_number_raw());
+                if a.is_nan() && b.is_nan() {
+                    true
+                } else if a == 0.0 && b == 0.0 {
+                    // distinguish -0 from +0 by sign bit
+                    a.is_sign_negative() == b.is_sign_negative()
+                } else {
+                    a == b
+                }
+            } else {
+                strict_eq(st, x, y)
+            };
+            Ok(Value::boolean(same))
         }
         O_GET_PROTO => {
             let v = argv!(0);
@@ -5748,6 +5778,44 @@ fn exec_loop(
         // worker. Shared across the whole call tree via St, so nested
         // calls and pump callbacks all draw from one turn's budget.
         if st.fuel == 0 {
+            if std::env::var("GG_JS_TRACE").is_ok() {
+                let names: Vec<String> = std::iter::once(
+                    cmod.module.protos[pi as usize].name.clone(),
+                )
+                .chain(st.frames.iter().rev().take(6).map(|f| {
+                    mods.rc(f.module).module.protos[f.proto as usize]
+                        .name
+                        .clone()
+                }))
+                .collect();
+                let code = &cmod.module.protos[pi as usize].code;
+                let lo = ip.saturating_sub(30);
+                let hi = (ip + 4).min(code.len());
+                let dis: Vec<String> = code[lo..hi]
+                    .iter()
+                    .enumerate()
+                    .map(|(k, i)| format!("{}:{:?}", lo + k, i))
+                    .collect();
+                if let Ok(path) = std::env::var("GG_JS_DUMP") {
+                    let _ = std::fs::write(
+                        &path,
+                        code.iter()
+                            .enumerate()
+                            .map(|(k, i)| format!("{k}:{i:?}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
+                }
+                return err(format!(
+                    "script exceeded its instruction budget \
+                     [in {} | mi={} pi={} ip={} nparams={} len={}]\n{}",
+                    names.join(" <- "),
+                    mi, pi, ip,
+                    cmod.module.protos[pi as usize].nparams,
+                    code.len(),
+                    dis.join("\n")
+                ));
+            }
             return err("script exceeded its instruction budget");
         }
         st.fuel -= 1;
@@ -7965,11 +8033,26 @@ fn exec_loop(
                                 _ => None,
                             })
                             .collect();
+                        // full instruction window so the undefined's
+                        // origin (arg reg / global / upval) is visible
+                        let lo = ip.saturating_sub(5);
+                        let hi = (ip + 1)
+                            .min(cmod.module.protos[pi as usize].code.len());
+                        let dis: Vec<String> = cmod.module.protos
+                            [pi as usize]
+                            .code[lo..hi]
+                            .iter()
+                            .enumerate()
+                            .map(|(k, i)| format!("{}:{:?}", lo + k, i))
+                            .collect();
                         format!(
-                            " [in {} | mi={} pi={} ip={} | recent \
-                             props: {}]",
+                            " [in {} | mi={} pi={} ip={} nparams={} \
+                             | props: {} | {}]",
                             names.join(" <- "),
-                            mi, pi, ip, recent.join(".")
+                            mi, pi, ip,
+                            cmod.module.protos[pi as usize].nparams,
+                            recent.join("."),
+                            dis.join("  ")
                         )
                     } else {
                         String::new()

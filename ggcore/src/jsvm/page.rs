@@ -637,6 +637,7 @@ impl PageVm {
             ("max", Native::HostFn(host::M_MAX)),
             ("random", Native::HostFn(host::M_RANDOM)),
             ("hypot", Native::HostFn(host::M_HYPOT)),
+            ("clz32", Native::HostFn(host::M_CLZ32)),
         ]);
         vm.set_object_prop(math, "PI", Value::number(std::f64::consts::PI));
         vm.set_object_prop(math, "E", Value::number(std::f64::consts::E));
@@ -663,6 +664,7 @@ impl PageVm {
                 ("create", Native::HostFn(host::O_CREATE)),
                 ("getPrototypeOf", Native::HostFn(host::O_GET_PROTO)),
                 ("setPrototypeOf", Native::HostFn(host::O_SET_PROTO)),
+                ("is", Native::HostFn(host::O_IS)),
             ],
         );
         vm.st.known.object = object_ctor;
@@ -2919,6 +2921,31 @@ console.log('B typeof it: ' + typeof it);
             n("function f() { return arguments.callee === f ? 1 : 0; } \
                f()"),
             1.0
+        );
+        // round 3: Object.is SameValue (react bailout/shallowEqual)
+        assert_eq!(n("Object.is(3, 3) ? 1 : 0"), 1.0);
+        assert_eq!(n("Object.is(NaN, NaN) ? 1 : 0"), 1.0);
+        assert_eq!(n("Object.is(-0, 0) ? 1 : 0"), 0.0);
+        assert_eq!(n("Object.is(0, 0) ? 1 : 0"), 1.0);
+        assert_eq!(n("var o = {}; Object.is(o, o) ? 1 : 0"), 1.0);
+        assert_eq!(n("Object.is({}, {}) ? 1 : 0"), 0.0);
+        assert_eq!(n("(typeof Object.is === 'function') ? 1 : 0"), 1.0);
+        // round 3: Math.clz32 — react's lane iteration
+        // (31 - Math.clz32(lanes)) infinite-loops without it
+        assert_eq!(n("Math.clz32(1)"), 31.0);
+        assert_eq!(n("Math.clz32(2)"), 30.0);
+        assert_eq!(n("Math.clz32(0)"), 32.0);
+        assert_eq!(n("Math.clz32(1024)"), 21.0);
+        assert_eq!(n("31 - Math.clz32(1)"), 0.0);
+        assert_eq!(n("(typeof Math.clz32 === 'function') ? 1 : 0"), 1.0);
+        // the exact react lane loop terminates now
+        assert_eq!(
+            n("var lanes = 42, count = 0; \
+               while (lanes > 0 && count < 100) { \
+                 var i = 31 - Math.clz32(lanes); \
+                 lanes = lanes & ~(1 << i); count++; } \
+               count"),
+            3.0
         );
     }
 
