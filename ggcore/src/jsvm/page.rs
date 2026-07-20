@@ -983,6 +983,9 @@ impl PageVm {
         let base = self.st.regs.len();
         self.st.regs.resize(base + nregs, Value::UNDEFINED);
         self.st.fuel = vm::DEFAULT_FUEL; // fresh budget per top-level script
+        // sloppy-script semantics: top-level `this` is the window
+        // (webpack UMD wrappers pass it around as the global)
+        let this_v = self.st.known.window;
         let out = exec(
             &mut self.st,
             &self.mods,
@@ -990,7 +993,7 @@ impl PageVm {
             main,
             base,
             u32::MAX,
-            Value::UNDEFINED,
+            this_v,
             0,
         );
         self.st.regs.truncate(base);
@@ -2826,6 +2829,24 @@ console.log('B typeof it: ' + typeof it);
         assert_eq!(
             n("var __NBP = __NBP || { ok: 1 }; __NBP.ok"),
             1.0
+        );
+        // round 2 (07-20): top-level `this` is the window (webpack
+        // UMD wrappers pass it as the global)
+        assert_eq!(n("(this === window) ? 1 : 0"), 1.0);
+        // round 2: [].keys()/values()/entries()/@@iterator as METHOD
+        // CALLS (core-js es.array.iterator boots through these)
+        assert_eq!(n("[7,8].keys().next().value"), 0.0);
+        assert_eq!(n("[7,8].values().next().value"), 7.0);
+        assert_eq!(n("[7,8].entries().next().value[1]"), 7.0);
+        assert_eq!(n("[7,8]['@@iterator']().next().value"), 7.0);
+        // round 2: methods installed on Array.prototype via
+        // defineProperty are callable on instances
+        assert_eq!(
+            n("Object.defineProperty(Array.prototype, '__m', \
+               { value: function () { return this.length * 10; } }); \
+               var v = [1,2,3].__m(); \
+               delete Array.prototype.__m; v"),
+            30.0
         );
         // gate 5: named function expressions bind their own name
         // (Babel _classCallCheck pattern boots)

@@ -1644,7 +1644,9 @@ fn method_ref_dispatch(
                 }
                 return Ok(acc);
             }
-            "values" | "keys" | "entries" => {
+            "values" | "keys" | "entries" | "@@iterator" => {
+                // @@iterator: the fake-Symbol tag (prelude/core-js) —
+                // behaves as values
                 let arr = match name.as_str() {
                     "keys" => {
                         let ks: Vec<Value> = (0..elems.len())
@@ -1998,8 +2000,10 @@ fn method_ref_dispatch(
             }
             Ok(recv)
         }
-        // Array.prototype.values/keys/entries: real iterators
-        "values" | "keys" | "entries"
+        // Array.prototype.values/keys/entries/@@iterator: real
+        // iterators (@@iterator = the fake-Symbol tag core-js and the
+        // prelude install; behaves as values)
+        "values" | "keys" | "entries" | "@@iterator"
             if recv.is_object()
                 && st.objects[recv.index() as usize].is_array =>
         {
@@ -6017,7 +6021,25 @@ fn exec_loop(
             Instr::Call { func, argc } => {
                 let fv = reg!(func);
                 if !fv.is_function() {
-                    return type_err(format!("{fv:?} is not a function"));
+                    // name a few own props so the log identifies WHICH
+                    // object was called (module namespace, stub, ...)
+                    let hint = if fv.is_object() {
+                        let oi = fv.index() as usize;
+                        let shape = st.objects[oi].shape as usize;
+                        let mut ks: Vec<&str> = st.shapes[shape]
+                            .props
+                            .keys()
+                            .map(|&k| st.names[k as usize].as_str())
+                            .take(5)
+                            .collect();
+                        ks.sort_unstable();
+                        format!(" (props: {})", ks.join(","))
+                    } else {
+                        String::new()
+                    };
+                    return type_err(format!(
+                        "{fv:?} is not a function{hint}"
+                    ));
                 }
                 if matches!(
                     st.closures[fv.index() as usize],
@@ -6778,6 +6800,17 @@ fn exec_loop(
                                     }
                                     acc
                                 }
+                                // real array iterators (core-js
+                                // es.array.iterator calls [].keys())
+                                "keys" | "values" | "entries" => {
+                                    let args: Vec<Value> = (0..argc
+                                        as usize)
+                                        .map(|k| st.regs[a0 + k])
+                                        .collect();
+                                    method_ref_dispatch(
+                                        st, mods, ov, key, &args,
+                                    )?
+                                }
                                 _ => {
                                     done = false;
                                     Value::UNDEFINED
@@ -6786,6 +6819,23 @@ fn exec_loop(
                             if done {
                                 reg!(obj) = r;
                                 continue;
+                            }
+                            // core-js expandos on Array.prototype
+                            // (methods installed via defineProperty)
+                            if let PropHit::Data(f) =
+                                array_proto_hit(st, key)
+                            {
+                                if f.is_function() {
+                                    let args: Vec<Value> = (0..argc
+                                        as usize)
+                                        .map(|k| st.regs[a0 + k])
+                                        .collect();
+                                    let r = call_value_this(
+                                        st, mods, f, Some(ov), &args,
+                                    )?;
+                                    reg!(obj) = r;
+                                    continue;
+                                }
                             }
                         }
                         let mut m = raw_get_prop(st, oi, key);
@@ -6823,14 +6873,17 @@ fn exec_loop(
                                 reg!(obj) = r;
                                 continue;
                             }
+                            let b = brand_string(st, ov);
                             return type_err(format!(
-                                ".{}() is not a function",
+                                ".{}() is not a function (receiver {b})",
                                 st.names[key as usize]
                             ));
                         };
                         if !m.is_function() {
+                            let b = brand_string(st, ov);
                             return type_err(format!(
-                                ".{} is not a function",
+                                ".{} is not a function (receiver {b}, \
+                                 value {m:?})",
                                 st.names[key as usize]
                             ));
                         }
