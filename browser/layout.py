@@ -325,6 +325,35 @@ def gradient_color(value, default=""):
     return default
 
 
+def _child_is_block_level(child):
+    """Whether a child forces its container into block flow. Computed
+    display overrides the tag default, so `<li style="display:inline-block">`
+    is inline-level (an atomic box on a line), not a block — otherwise a
+    grid of inline-block cards would stack vertically."""
+    if not isinstance(child, Element):
+        return False
+    d = child.style.get("display", "")
+    if d in ("inline", "inline-block", "inline-flex", "inline-table"):
+        return False
+    if d in ("block", "flex", "grid", "table", "list-item"):
+        return True
+    return child.tag in BLOCK_ELEMENTS
+
+
+class _FlowMarker:
+    """Stand-in 'previous sibling' marking the bottom of an inline-block
+    row, so the next in-flow block clears the row. Never painted — only its
+    y/height feed the next box's vertical placement."""
+    __slots__ = ("y", "height", "pb", "bw", "margin_bottom")
+
+    def __init__(self, y, height):
+        self.y = y
+        self.height = height
+        self.pb = 0
+        self.bw = 0
+        self.margin_bottom = 0
+
+
 def layout_mode(node):
     if isinstance(node, Text):
         return "inline"
@@ -333,10 +362,7 @@ def layout_mode(node):
         return "flex"
     if display == "block" and node.children:
         return "block"
-    if any(isinstance(child, Element) and (
-            child.tag in BLOCK_ELEMENTS
-            or child.style.get("display", "") in ("block", "flex"))
-           for child in node.children):
+    if any(_child_is_block_level(child) for child in node.children):
         return "block"
     if node.tag in ("svg", "::before", "::after"):
         return "inline"  # replaced/synthesized: inline by nature
@@ -568,6 +594,10 @@ class BlockLayout:
         return node
 
     def layout(self):
+        # idempotent: inline-block sizing lays a box out once to measure,
+        # then again at its final position — start each pass from a clean
+        # child list so content isn't duplicated.
+        self.children = []
         node = self.node
         st = node.style
         em = parse_px(st.get("font-size", "16px"), 16.0)
@@ -679,12 +709,54 @@ class BlockLayout:
             # children must be visible while later siblings lay out
             previous = None
             self._floats = []  # (side, x, y, outer_w, outer_h)
+            ib_x = None        # inline-block run cursor (None = no run open)
+            ib_row_y = self.y
+            ib_row_h = 0
             for child in node.children:
                 if not is_visible(child):
                     continue
                 if is_out_of_flow(child):
                     self._document().abs_queue.append(child)
                     continue
+                # inline-block children flow horizontally and wrap into
+                # rows (card/column grids) rather than stacking. Each is a
+                # shrink-to-fit block placed at the run cursor.
+                cdisp = child.style.get("display", "") \
+                    if isinstance(child, Element) else ""
+                if cdisp in ("inline-block", "inline-flex", "inline-table") \
+                        and child.tag not in ("br", "img", "svg"):
+                    cem = parse_px(child.style.get("font-size"), em)
+                    w = parse_size(child.style.get("width"), self.width, cem)
+                    if w is None:
+                        try:
+                            w = min(
+                                _measure_content_width(
+                                    child, self._document()),
+                                self.width)
+                        except Exception:
+                            w = self.width
+                    if ib_x is None:
+                        ib_row_y = self.y if previous is None else (
+                            previous.y + previous.height + previous.pb
+                            + previous.bw + previous.margin_bottom)
+                        ib_x = 0
+                        ib_row_h = 0
+                    box = BlockLayout(child, self, None)
+                    box.forced_width = max(w, 0.0)
+                    box.flex_origin = (self.x + ib_x, ib_row_y)
+                    box.layout()
+                    if ib_x > 0 and ib_x + box.outer_width() > self.width:
+                        # wrap: re-anchor on the next row
+                        ib_row_y += ib_row_h
+                        ib_x = 0
+                        box.flex_origin = (self.x, ib_row_y)
+                        box.layout()
+                    self.children.append(box)
+                    ib_x += box.outer_width()
+                    ib_row_h = max(ib_row_h, box.outer_height())
+                    previous = _FlowMarker(ib_row_y, ib_row_h)
+                    continue
+                ib_x = None  # a block child closes any open inline-block run
                 fside = "none"
                 fw = None
                 if isinstance(child, Element):
@@ -1003,6 +1075,18 @@ class BlockLayout:
             if is_out_of_flow(node):
                 self._document().abs_queue.append(node)
                 return
+            _disp = node.style.get("display", "")
+            if node is not self.node and (
+                    node.tag == "input"
+                    or (_disp in ("inline-block", "inline-flex",
+                                  "inline-table")
+                        and node.tag not in ("img", "svg", "br"))):
+                # a descendant inline-block (or a replaced <input>) becomes
+                # an atomic box; the container node itself (node is
+                # self.node) falls through so its own children flow,
+                # avoiding infinite re-entry.
+                self.inline_block(node)
+                return
             if node.tag == "br":
                 self.new_line()
             elif node.tag == "img":
@@ -1042,6 +1126,20 @@ class BlockLayout:
         text = TextLayout(node, word, line, prev)
         line.children.append(text)
         self.cursor_x += w + measure(font, " ")
+
+    def inline_block(self, node):
+        line = self.children[-1]
+        prev = line.children[-1] if line.children else None
+        box = InlineBlockLayout(node, line, prev, self)
+        # wrap to a fresh line if it would overflow (unless already at the
+        # line start — an over-wide box just overflows its own line)
+        if self.cursor_x + box.width > self.width and self.cursor_x > 0:
+            self.new_line()
+            line = self.children[-1]
+            box.parent = line
+            box.previous = None
+        line.children.append(box)
+        self.cursor_x += box.width
 
     def image(self, node):
         img = getattr(node, "_img", None)  # (image_id, w, h) or None
@@ -1205,6 +1303,58 @@ class BlockLayout:
         return [DrawClipPop()] if self._clips() else []
 
 
+class InlineBlockLayout:
+    """`display:inline-block` — an atomic box in the inline flow. Its own
+    children lay out as a mini block (shrink-to-fit width unless a width is
+    given); it sits on the line's baseline like a replaced element and
+    wraps to the next line when it would overflow. This is what makes card
+    and column grids (naver's feed, news items) flow side by side instead
+    of stacking. The inner block is laid out once at the origin to measure,
+    then re-anchored to its final (x, y) once the line assigns them."""
+
+    def __init__(self, node, line, previous, container):
+        self.node = node
+        self.parent = line
+        self.previous = previous
+        self.font = None            # atomic: baseline-aligned like an image
+        self.x = 0
+        self.y = 0
+        self.margin_top = 0
+        self.margin_bottom = 0
+        em = parse_px(node.style.get("font-size", "16px"), 16.0)
+        avail = max(line.width, 1)
+        w = parse_size(node.style.get("width"), avail, em)
+        if w is None:
+            try:
+                w = _measure_content_width(node, container._document())
+            except Exception:
+                w = avail
+            w = min(w, avail)
+        inner = BlockLayout(node, container, None)
+        inner.forced_width = max(w, 0.0)
+        inner.flex_origin = (0, 0)
+        inner.layout()
+        self.inner = inner
+        self.children = [inner]
+        self.width = inner.outer_width()
+        self.height = inner.outer_height()
+
+    def layout(self):
+        # x flows from the previous item on the line; y is set afterward by
+        # the LineLayout (baseline), then place_inner() re-anchors the box.
+        if self.previous:
+            self.x = self.previous.x + self.previous.width
+        else:
+            self.x = self.parent.x
+
+    def place_inner(self):
+        self.inner.flex_origin = (self.x, self.y)
+        self.inner.layout()
+
+    def paint(self):
+        return []
+
+
 class LineLayout:
     def __init__(self, node, parent, previous):
         self.node = node
@@ -1262,6 +1412,13 @@ class LineLayout:
                 shift = free / 2 if align == "center" else free
                 for word in self.children:
                     word.x += shift
+
+        # inline-block boxes re-anchor their inner block once x (incl. any
+        # text-align shift) and the baseline y are final
+        for word in self.children:
+            place = getattr(word, "place_inner", None)
+            if place is not None:
+                place()
 
     def paint(self):
         return []
