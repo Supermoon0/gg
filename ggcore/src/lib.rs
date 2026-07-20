@@ -579,10 +579,15 @@ impl Doc {
         out
     }
 
-    /// ("inline", code) and ("src", url) entries in document order.
+    /// ("inline", code) and ("src", url) entries in EXECUTION order:
+    /// parser-order scripts first, then `defer` scripts (and modules,
+    /// which defer per spec) in document order — Naver's app bundles
+    /// are all defer and read inline-defined globals (EAGER-DATA.GV)
+    /// that appear later in the document.
     fn script_entries(&self) -> Vec<(String, String)> {
         let doc = self.doc.borrow();
         let mut out = Vec::new();
+        let mut deferred = Vec::new();
         let mut stack = vec![doc.root];
         while let Some(idx) = stack.pop() {
             let node = &doc.nodes[idx];
@@ -592,16 +597,29 @@ impl Doc {
                     || stype.contains("javascript")
                     || stype == "module"
                 {
-                    if let Some(src) = node.attr("src") {
-                        out.push(("src".to_string(), src.to_string()));
+                    let is_defer = node.attr("defer").is_some()
+                        || stype == "module";
+                    let entry = if let Some(src) = node.attr("src") {
+                        Some(("src".to_string(), src.to_string()))
                     } else {
                         let code: String = node
                             .children
                             .iter()
                             .map(|&c| doc.nodes[c].text.as_str())
                             .collect();
-                        if !code.trim().is_empty() {
-                            out.push(("inline".to_string(), code));
+                        if code.trim().is_empty() {
+                            None
+                        } else {
+                            Some(("inline".to_string(), code))
+                        }
+                    };
+                    if let Some(e) = entry {
+                        // defer without src is ignored per spec —
+                        // inline scripts always run in parser order
+                        if is_defer && e.0 == "src" {
+                            deferred.push(e);
+                        } else {
+                            out.push(e);
                         }
                     }
                 }
@@ -610,6 +628,7 @@ impl Doc {
                 stack.push(c);
             }
         }
+        out.extend(deferred);
         out
     }
 

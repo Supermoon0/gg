@@ -2863,6 +2863,13 @@ console.log('B typeof it: ' + typeof it);
                (f() === 'function') ? 1 : 0"),
             1.0
         );
+        // round 2: sloppy-mode arguments.callee (jindo Component.extend
+        // in Naver's search bundle saves it for re-invocation)
+        assert_eq!(
+            n("function f() { return arguments.callee === f ? 1 : 0; } \
+               f()"),
+            1.0
+        );
     }
 
     #[test]

@@ -576,7 +576,11 @@ pub(super) struct St {
 /// Default per-turn instruction budget (~a few hundred ms of hot loop).
 /// Generous enough for any real page script, small enough that a
 /// runaway loop dies fast. The host can lower it per session.
-pub(super) const DEFAULT_FUEL: u64 = 80_000_000;
+// Per-script instruction budget. 80M stopped Naver's app mid-boot once
+// the bundles started doing real work (07-20) — 400M keeps the runaway
+// backstop while letting a genuine app initialize; the wall-clock
+// js_budget in native.load_document still bounds the whole load.
+pub(super) const DEFAULT_FUEL: u64 = 400_000_000;
 
 const TY_UNDEFINED: usize = 0;
 const TY_BOOLEAN: usize = 1;
@@ -5953,7 +5957,15 @@ fn exec_loop(
                 let vals: Vec<Value> = (0..cur_argc as usize)
                     .map(|k| st.regs[base + k])
                     .collect();
-                reg!(dst) = new_array(st, vals);
+                let arr = new_array(st, vals);
+                // sloppy-mode arguments.callee (jindo's Component
+                // .extend saves it for re-invocation on subclasses).
+                // Deviation: enumerable here, non-enumerable in spec
+                let k = st.intern_name("callee");
+                raw_set_prop(
+                    st, arr.index() as usize, k, Value::function(cur_cl),
+                );
+                reg!(dst) = arr;
             }
             Instr::LoadSelf { dst } => {
                 reg!(dst) = Value::function(cur_cl);
