@@ -16,6 +16,8 @@ else:
     if not hasattr(ggcore, "parse_html"):
         ggcore = None
 
+import os
+
 from .html_parser import Element, Text, tree_to_list
 from .style import DEFAULT_STYLE_SHEET
 
@@ -62,9 +64,14 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
     import time
 
     # reader mode: app-shell pages carry their content as inline JSON;
-    # surface it as ordinary markup before parsing (no-op elsewhere)
-    from . import reader
-    html = reader.inject(html)
+    # surface it as ordinary markup before parsing (no-op elsewhere).
+    # The JS engine now renders naver's feed natively (real card grid with
+    # thumbnails), and the injected reader section pushes the feed's lazy
+    # observers off-screen so they never mount — so reader mode is now an
+    # opt-in fallback (GG_READER=1), not the default path.
+    if os.environ.get("GG_READER") == "1":
+        from . import reader
+        html = reader.inject(html)
 
     doc = ggcore.parse_html(html)
 
@@ -96,7 +103,6 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
         # gg-js has execution fuel (a runaway script is killed at its
         # instruction budget), so it may run scripts of any size. Boa
         # has no interrupt — keep the size guard there.
-        import os
         fuel_safe = os.environ.get("GGJS") == "1"
         if page_url:
             try:
