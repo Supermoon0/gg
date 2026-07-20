@@ -122,19 +122,42 @@ undefined`, `Obj(#…) is not a function` ×2. react 마커 0·#container 4
   해결. 실번들의 `x instanceof 없는생성자`(피처 디텍션)가 react 마운트
   경로에서 uncaught 유발 → 관용 false로 되돌림
 
-**07-20 현 프런티어**: 무한루프 소멸 후 react 리컨사일러가 실제로 돌며
-여러 계층을 통과(각 수정이 다음 null-read를 드러냄 = 700KB react를
-밑바닥 엔진에 얹는 전형적 양파 까기). 현재 사망점: react 이터레이터
-룩업 `x[Symbol.iterator]||x['@@iterator']`이 null 수신(리컨사일러가
-객체를 기대한 자리에 우리 엔진이 null 반환한 상류 데이터플로 갭 —
-GG_JS_TRACE로 `F<-rn<-gr<-pl` react 내부까지 국소화) + 앱 헬퍼
-`.length of undefined`(jQuery.each류, mi=2758). react 미커밋(마커
-0·#root 2·#container 4)이나 페이지 그레이스풀 디그러데이션(검색창+리더
-헤드라인, 무행·무크래시, 로드 1.5s). cargo 173/173, smoke 148, basket
-7/9(네이버 JS오류 6→1), 건틀릿 무회귀.
-진단 도구: `GG_JS_TRACE=1`(nullish/budget-초과 오류에 프레임 체인+
-mi/pi/ip, 사망 리스너 식별), `GG_JS_DUMP=<path>`(사망 프로토 바이트코드
-덤프) — env 미설정 시 0비용.
+**07-20 라운드 4 — react 렌더+커밋 페이즈 진입 (양파 까기 연속)**:
+이름 해석 디스어셈블러(GG_JS_DUMP가 atom→프로퍼티명·const→문자열)로
+각 null/undefined를 앱 소스 수준까지 역추적하며 연쇄 격파:
+- [x] **fancy-regex 2차 엔진** — `regex` 크레이트가 거부하는 백레퍼런스·
+  lookaround를 fancy-regex로. **date-fns 토크나이저 `/(\w)\1*|./g`가
+  never-matching으로 강등돼 `.match`가 null → 앱의 `for...of null`이
+  throw → react 렌더 중단**이었음. RegexRec.re를 CompiledRe{Std/Fancy/
+  Never} enum으로, 7개 호출부 통일. **이번 라운드 핵심 근본원인**
+- [x] **Date 세터** setUTCFullYear/Month/Date/Hours + 로컬 별칭 — date-fns
+  날짜 조립. 게터·setTime만 있고 컴포넌트 세터 전무였음
+- [x] **Function.prototype.toString/valueOf/hasOwnProperty** (CallMethod
+  경로) — 번들이 함수 해싱/피처 디텍션으로 `fn.toString()` 호출
+- [x] **ErrorEvent/PromiseRejectionEvent/MessageEvent** 전역 생성자 —
+  에러 리포팅 경로가 참조
+- [x] **window.dispatchEvent (WinDispatch) + EventTarget.prototype**
+  실동작 — react가 `window.dispatchEvent(errorEvent)`로 에러 보고
+- [x] **document.createElementNS** — react가 모든 SVG 노드를 이걸로 생성
+  (네이버 홈은 SVG 아이콘 다수). 미지원이라 SVG stateNode가 undefined →
+  **커밋 페이즈에서 `.classList of undefined`**. 네임스페이스 무시,
+  로컬명(arg1)으로 생성
+
+**07-20 라운드 4 현 프런티어**: react가 **렌더 완주 + 커밋 페이즈 진입**
+(settle 워크 1.4s→88s = react가 실제 파이버 트리를 대량 처리 중).
+현재 사망점: 커밋 경로의 클래스 토글 헬퍼(mi=3310)가 **undefined DOM
+노드**를 받아 `node.classList.add/remove` throw — react/앱이 실브라우저엔
+있는 노드를 참조하는데 우리 DOM엔 없어 undefined(id/ref 불일치). 별개로
+잔존: 앱 헬퍼 `.length of undefined`(jQuery.each류, mi≈2758). react
+미커밋(마커 0·#root 2·#container 4)이나 페이지 그레이스풀 디그러데이션
+유지(검색창+리더 헤드라인, 무크래시). **판단: react 완전 커밋은
+"이 노드가 왜 undefined인가"의 긴 꼬리(노드별 whack-a-mole, 빌드당
+~4분) + 렌더 88s의 실용성 문제로 다세션 리서치 규모. 무한루프·정규식
+같은 근본원인은 이번에 다 잡음.** cargo 174/174, smoke 148, basket 7/9,
+건틀릿 무회귀.
+진단 도구: `GG_JS_TRACE=1`(nullish/budget 오류에 프레임 체인 mi:pi+
+mi/pi/ip, 사망 리스너), `GG_JS_DUMP=<dir>`(사망 프로토+상위 콜러 4단
+**이름 해석** 바이트코드 덤프) — env 미설정 시 0비용.
 
 후속: 동적 주입 `<script src>` 미실행(ndp-core/ntm — pump 프로토콜에
 script 종 추가 [M]), 정규식 lookaround/backref 31건 never-matching 강등
