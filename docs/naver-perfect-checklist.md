@@ -87,6 +87,38 @@ naver_boot_gates 추가), smoke 148, 건틀릿 무회귀(jsvm은 21→22로 개�
 undefined`, `Obj(#…) is not a function` ×2. react 마커 0·#container 4
 유지 — 다음 라운드는 이 3종 규명부터.
 
+**07-20 라운드 2·3 — 4개 번들 전부 완주, react-dom 엔트리 실행**:
+- [x] **top-level `this` = window** (page.rs run_source) — 웹팩 UMD
+  래퍼가 전역으로 넘기는 this가 undefined라 AgentDetect류 최상위
+  IIFE가 `.IS_OP of undefined`로 사망하던 것 해소
+- [x] **`[].keys()/values()/entries()/@@iterator` 메서드 호출**
+  (CallMethod 배열 분기 + method_ref_dispatch @@iterator arm) —
+  core-js es.array.iterator가 이걸로 부팅. defineProperty로 심은
+  Array.prototype 메서드도 인스턴스에서 호출됨. `.keys() is not a
+  function` ×3 소멸
+- [x] **`arguments.callee`** (sloppy) — search 번들 jindo
+  Component.extend가 재호출용으로 저장. inner 모듈 1379 사망 해소
+- [x] **defer 스크립트 실행 순서** (lib.rs script_entries) — 앱 번들
+  전부 `defer`인데 뒤쪽 인라인 스크립트가 정의하는 전역
+  (`EAGER-DATA.GV`)을 읽음. 파서 순서 먼저 → defer 순서로 정렬.
+  `.login of undefined` 소멸
+- [x] **DEFAULT_FUEL 80M→400M** — 80M이 앱을 부팅 도중 끊었음
+- [x] **MessageChannel 실동작** (page.rs 프렐류드) — react-dom 18
+  스케줄러가 렌더 워크 루프 전체를 MessageChannel로 구동. no-op
+  스텁이라 react가 커밋을 못 하던 것 → 이제 스케줄러가 settle 중 실행
+- [x] **라이프사이클 이벤트 실물화** — target/currentTarget/bubbles/
+  preventDefault 등 표준 프로퍼티 부여
+
+**07-20 현 프런티어**: 4개 번들 완주 + react-dom 엔트리 실행 + 스케줄러
+가동. 남은 2개: (1) jQuery ready 콜백이 부르는 소형 지연컴파일 함수가
+`.length of undefined`(undefined 인자) — GG_JS_TRACE로 mi=2758/pi=0/
+ip=4까지 국소화, (2) react 스케줄러 워크가 settle 중 명령 예산 초과.
+react 미커밋(마커 0·#container 4)이나 페이지는 그레이스풀
+디그러데이션(검색창+리더 헤드라인 렌더, 무행). cargo 173/173, smoke
+148, 건틀릿 무회귀(css 22/23·net 14/14·jsvm CLAIM 20/20).
+진단 도구: `GG_JS_TRACE=1`이 nullish-read에 프레임 체인+mi/pi/ip,
+dispatch_simple에 사망 리스너 식별을 붙임(env 미설정 시 0비용).
+
 후속: 동적 주입 `<script src>` 미실행(ndp-core/ntm — pump 프로토콜에
 script 종 추가 [M]), 정규식 lookaround/backref 31건 never-matching 강등
 (fancy-regex 2차 엔진 [M], 서로게이트 클래스 강등은 무해 판명).
