@@ -1889,6 +1889,18 @@ fn method_ref_dispatch(
         v as usize
     };
     match name.as_str() {
+        "concat" => {
+            // String.prototype.concat: recv then each arg coerced to
+            // string. Reached via the extracted form (`"".concat.call(s,
+            // ...)` — jindo/core-js string helpers), which otherwise
+            // fell through to the unsupported-builtin error.
+            let mut out = s.clone();
+            for &a in args {
+                let piece = to_display(st, a);
+                out.push_str(&piece);
+            }
+            Ok(make_string(st, out))
+        }
         "slice" | "substring" => {
             let a = clamp(idx_arg(0), len);
             let b = if args.len() > 1 {
@@ -7555,8 +7567,15 @@ fn exec_loop(
                             push_str(st, s.replace(&from, &to))
                         }
                         "concat" => {
-                            let other = to_display(st, av0);
-                            push_str(st, format!("{s}{other}"))
+                            // variadic: recv then EVERY arg coerced to
+                            // string (was dropping all but the first)
+                            let mut out = s.clone();
+                            for k in 0..argc as usize {
+                                let v = st.regs[a0 + k];
+                                let piece = to_display(st, v);
+                                out.push_str(&piece);
+                            }
+                            push_str(st, out)
                         }
                         "substr" => {
                             let units: Vec<u16> =

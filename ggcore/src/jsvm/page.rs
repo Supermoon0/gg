@@ -1701,6 +1701,18 @@ mod tests {
     }
 
     #[test]
+    fn string_concat_is_variadic() {
+        // direct String.prototype.concat must fold ALL args, not just the
+        // first (Naver's bundles concat multi-part strings)
+        assert_eq!(
+            n("'n='.concat(4, '!', '?') === 'n=4!?' ? 1 : 0"), 1.0);
+        assert_eq!(n("'a'.concat('b', 'c', 'd') === 'abcd' ? 1 : 0"), 1.0);
+        // extracted form folds all args too
+        assert_eq!(
+            n("'x'.concat.call('p', 'q', 'r') === 'pqr' ? 1 : 0"), 1.0);
+    }
+
+    #[test]
     fn bound_constructor_new() {
         // Babel _construct: new (Function.bind.apply(C, [null, args]))
         assert_eq!(
