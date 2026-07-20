@@ -646,6 +646,10 @@ LAYOUT_PAGE = """<html><body style="margin: 0">
   <div id=fb>b</div>
   <div id=fc>c</div>
 </div>
+<div id=fxnav style="display: flex; width: 400px">
+  <a id=lbl style="flex: 0 0 auto">Label</a>
+  <div id=nav style="flex: 1 0 0">nav</div>
+</div>
 <div id=abs style="position: absolute; left: 50px; top: 300px;
      width: 80px">abs</div>
 </body></html>"""
@@ -671,6 +675,12 @@ check("flex row placement", fa.y == fb.y == fc.y and fa.x < fb.x < fc.x,
       f"x: {fa.x:.0f},{fb.x:.0f},{fc.x:.0f}")
 check("flex grow shares space", abs(fb.width - (774 - 100) / 2) < 1,
       f"fb.width={fb.width:.0f}")
+# a `flex:1 0 0` pane fills the row while a `flex:0 0 auto` label keeps
+# its content width (naver's nav tabs: the grow pane must not collapse)
+lbl, nav = boxes["lbl"], boxes["nav"]
+check("flex:1 0 0 grows past a content-sized sibling",
+      nav.width > 300 and lbl.width < 100 and lbl.x < nav.x,
+      f"lbl.width={lbl.width:.0f} nav.width={nav.width:.0f}")
 
 # --- float + clear (v1: width-bearing floats, block sidestep) ---
 FLOAT_PAGE = """<html><body style="margin: 0">

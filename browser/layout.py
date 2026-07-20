@@ -365,6 +365,59 @@ def apply_relative_offsets(children):
             translate(child, dx, dy)
 
 
+class _MeasureHolder:
+    """A throwaway layout parent used to size a subtree under a very wide
+    constraint (max-content measurement for flex items). Chains to the
+    real DocumentLayout only so BlockLayout._document() resolves."""
+    __slots__ = ("parent", "x", "y", "width", "definite_height")
+
+    def __init__(self, doc, width):
+        self.parent = doc
+        self.x = 0.0
+        self.y = 0.0
+        self.width = width
+        self.definite_height = None
+
+
+_MAXCONTENT = 100000.0
+
+
+def _measure_content_width(node, doc):
+    """Max-content (border-box) main size of `node`: lay its subtree out
+    under a very wide constraint so text does not wrap, then return the
+    widest content extent plus the node's own horizontal padding+border.
+    Absolute descendants are captured and discarded so the trial layout
+    never leaks boxes into the real render. Memoized per layout pass: a
+    node's max-content size is width-independent, so nested flex never
+    re-measures the same subtree (keeps deep flex trees from going
+    quadratic)."""
+    cache = getattr(doc, "_content_width_cache", None)
+    if cache is not None:
+        hit = cache.get(id(node))
+        if hit is not None:
+            return hit
+    holder = _MeasureHolder(doc, _MAXCONTENT)
+    box = BlockLayout(node, holder, None)
+    saved = doc.abs_queue
+    doc.abs_queue = []
+    try:
+        box.layout()
+    finally:
+        doc.abs_queue = saved
+    origin = box.x
+    m = 0.0
+    stack = list(box.children)
+    while stack:
+        b = stack.pop()
+        if isinstance(b, (TextLayout, ImageLayout)):
+            m = max(m, (b.x + getattr(b, "width", 0)) - origin)
+        stack.extend(getattr(b, "children", []))
+    result = m + box.pl + box.pr + 2 * box.bw
+    if cache is not None:
+        cache[id(node)] = result
+    return result
+
+
 class DocumentLayout:
     def __init__(self, node):
         self.node = node
@@ -389,6 +442,7 @@ class DocumentLayout:
                                 if height is not None else None)
         self.children = []
         self.abs_queue = []
+        self._content_width_cache = {}
         child = BlockLayout(self.node, self, None)
         self.children.append(child)
         child.layout()
@@ -749,18 +803,34 @@ class BlockLayout:
             apply_relative_offsets(self.children)
             return
 
-        # main size: flex-basis wins over width; None = content-sized
+        # main size: flex-basis (length) > width > max-content of the
+        # item's own content. Every item gets a definite base size; then
+        # flex-grow hands out positive free space and flex-shrink removes
+        # overflow. Sizing content items to their content (not an equal
+        # share of free space) is what lets a `flex:0 0 auto` label sit at
+        # its natural width while a `flex:1 0 0` sibling grows to fill the
+        # rest — without it the label swallowed the row and the grow item
+        # collapsed to zero (naver's nav tabs stacked at one x).
+        doc = self._document()
         specs = []
         grows = []
         shrinks = []
+        is_auto = []  # content-sized (no length basis, no width)
         for child in kid_nodes:
-            basis = child.style.get("flex-basis", "")
-            spec = parse_size(basis, self.width, em) \
-                if basis else None
-            if spec is None:
-                spec = parse_size(
-                    child.style.get("width"), self.width, em)
-            specs.append(spec)
+            basis = child.style.get("flex-basis", "").strip().casefold()
+            if basis and basis not in ("auto", "content", "max-content",
+                                       "fit-content", "min-content"):
+                base = parse_size(basis, self.width, em)
+            else:
+                base = None
+            auto = base is None
+            if base is None:
+                base = parse_size(child.style.get("width"), self.width, em)
+                auto = base is None
+            if base is None:
+                base = _measure_content_width(child, doc)
+            is_auto.append(auto)
+            specs.append(max(base or 0.0, 0.0))
 
             def _num(v, default):
                 try:
@@ -770,48 +840,44 @@ class BlockLayout:
             grows.append(_num(child.style.get("flex-grow"), 0.0))
             shrinks.append(_num(child.style.get("flex-shrink"), 1.0))
 
-        fixed_total = sum(s for s in specs if s is not None)
-        n_flex = sum(1 for s in specs if s is None)
         # note: match exact keywords — "wrap" is a substring of
         # "nowrap", which silently forced every container to wrap
         wrap_v = node.style.get("flex-wrap", "nowrap").strip().casefold()
         wrap = wrap_v in ("wrap", "wrap-reverse")
         total_grow = sum(grows)
 
-        if total_grow > 0 and not wrap:
-            # spec-style grow: positive free space distributed by
-            # factor. Content-sized items keep the legacy equal share
-            # so mixed rows still work.
-            legacy = 0.0
-            if n_flex:
-                legacy = max((self.width - fixed_total) / n_flex, 40.0)
-            widths = [s if s is not None else legacy for s in specs]
-            free = self.width - sum(widths)
-            if free > 0:
-                for i, g in enumerate(grows):
-                    widths[i] += free * g / total_grow
-            specs = widths
-            fixed_total = sum(specs)
-            n_flex = 0
-        grow = 0.0
-        if n_flex:
-            grow = max((self.width - fixed_total) / n_flex, 40.0)
+        # With no explicit flex-grow anywhere, content-sized (auto-basis)
+        # items share leftover space equally — real browsers leave the gap,
+        # but filling it keeps naive equal-column flex layouts working. When
+        # any item *does* declare grow, honour it exactly so a `flex:1 0 0`
+        # pane fills the row while a `flex:0 0 auto` label keeps its content
+        # width (the naver nav-tab case).
+        if total_grow > 0:
+            eff_grows = grows
+            eff_total = total_grow
+        else:
+            eff_grows = [1.0 if is_auto[i] else 0.0
+                         for i in range(len(specs))]
+            eff_total = sum(eff_grows)
 
         if not wrap:
-            # flex-shrink: a single overflowing line gives space back
-            # in proportion to shrink-factor x main size
-            sized = [s if s is not None else grow for s in specs]
-            overflow = sum(sized) - self.width
-            weights = [shrinks[i] * sized[i] for i in range(len(sized))]
-            wsum = sum(weights)
-            if overflow > 0 and wsum > 0:
-                specs = [
-                    max(sized[i] - overflow * weights[i] / wsum, 0.0)
-                    for i in range(len(sized))
-                ]
-                fixed_total = sum(specs)
-                n_flex = 0
-                grow = 0.0
+            free = self.width - sum(specs)
+            if free > 0 and eff_total > 0:
+                for i, g in enumerate(eff_grows):
+                    specs[i] += free * g / eff_total
+            elif free < 0:
+                # remove overflow in proportion to shrink-factor x base
+                weights = [shrinks[i] * specs[i]
+                           for i in range(len(specs))]
+                wsum = sum(weights)
+                if wsum > 0:
+                    specs = [
+                        max(specs[i] + free * weights[i] / wsum, 0.0)
+                        for i in range(len(specs))
+                    ]
+        grow = 0.0          # every item now carries a definite base size
+        n_flex = 0
+        fixed_total = sum(specs)
 
         # auto margins on flex items split the line's leftover space;
         # when grow items consume it (or items overflow into wrapping)
