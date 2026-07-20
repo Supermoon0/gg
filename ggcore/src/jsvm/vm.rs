@@ -235,6 +235,9 @@ pub(super) enum Native {
     /// window.addEventListener / removeEventListener (listeners keyed
     /// on WINDOW_NODE so lifecycle events can find them)
     WinEvent { add: bool },
+    /// window.dispatchEvent(ev): fire the WINDOW_NODE listeners for
+    /// ev.type (React reports errors via window.dispatchEvent)
+    WinDispatch,
     /// encodeURI(Component)/decodeURI(Component)
     UriCoder { encode: bool, component: bool },
     /// Map()/WeakMap() constructor (weak = no difference: no GC)
@@ -3416,6 +3419,33 @@ fn do_native(
                 v.retain(|&h| h != handler);
             }
             Ok(Value::UNDEFINED)
+        }
+        Native::WinDispatch => {
+            let ev = if argc > 0 {
+                st.regs[args_base]
+            } else {
+                Value::UNDEFINED
+            };
+            let ty = if ev.is_object() {
+                let tk = st.intern_name("type");
+                match raw_get_prop(st, ev.index() as usize, tk) {
+                    Some(t) => to_display(st, t).to_lowercase(),
+                    None => String::new(),
+                }
+            } else {
+                String::new()
+            };
+            let cbs = st
+                .listeners
+                .get(&(WINDOW_NODE, ty))
+                .cloned()
+                .unwrap_or_default();
+            let win = st.known.window;
+            for cb in cbs {
+                // a throwing error-listener must not abort the caller
+                let _ = call_value_this(st, mods, cb, Some(win), &[ev]);
+            }
+            Ok(Value::boolean(true))
         }
         Native::UriCoder { encode, component } => {
             let s = if argc > 0 {

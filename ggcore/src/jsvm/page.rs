@@ -359,6 +359,29 @@ XMLHttpRequest.prototype.send = function () {
 // DOM interface constructors: patch surfaces for polyfills
 // (real DOM nodes are engine values, not instances of these)
 function EventTarget() {}
+EventTarget.prototype.addEventListener = function (t, cb) {
+  if (typeof cb !== 'function') return;
+  if (!this.__lis) this.__lis = {};
+  if (!this.__lis[t]) this.__lis[t] = [];
+  this.__lis[t].push(cb);
+};
+EventTarget.prototype.removeEventListener = function (t, cb) {
+  var a = this.__lis && this.__lis[t];
+  if (!a) return;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] === cb) { a.splice(i, 1); break; }
+  }
+};
+EventTarget.prototype.dispatchEvent = function (e) {
+  var a = this.__lis && e && this.__lis[e.type];
+  if (a) {
+    if (e.target == null) e.target = this;
+    e.currentTarget = this;
+    var copy = a.slice();
+    for (var i = 0; i < copy.length; i++) copy[i].call(this, e);
+  }
+  return !(e && e.defaultPrevented);
+};
 function Node() {}
 function Element() {}
 function HTMLElement() {}
@@ -811,6 +834,8 @@ impl PageVm {
             let f = make_native(&mut vm.st, Native::WinEvent { add });
             vm.set_object_prop(window, m, f);
         }
+        let disp = make_native(&mut vm.st, Native::WinDispatch);
+        vm.set_object_prop(window, "dispatchEvent", disp);
         for m in ["postMessage", "scrollTo"] {
             let noop = make_native(&mut vm.st, Native::Noop);
             vm.set_object_prop(window, m, noop);
@@ -3092,6 +3117,20 @@ console.log('B typeof it: ' + typeof it);
         );
         assert_eq!(n("typeof PromiseRejectionEvent === 'function' ? 1 : 0"), 1.0);
         assert_eq!(n("typeof MessageEvent === 'function' ? 1 : 0"), 1.0);
+        // round 4: window.dispatchEvent (React reports errors this way)
+        assert_eq!(
+            n("var hit = 0; \
+               window.addEventListener('error', function () { hit = 1; }); \
+               window.dispatchEvent(new ErrorEvent('error', {})); hit"),
+            1.0
+        );
+        // EventTarget instances get a working event system
+        assert_eq!(
+            n("var t = new EventTarget(); var got = 0; \
+               t.addEventListener('x', function (e) { got = e.detail; }); \
+               t.dispatchEvent(new CustomEvent('x', { detail: 9 })); got"),
+            9.0
+        );
     }
 
     #[test]
