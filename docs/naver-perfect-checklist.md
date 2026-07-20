@@ -807,3 +807,19 @@ clientWidth), cargo 179/179.
 item 배열 대부분 비어있음(blocks-with-items=1). (c) lazy가 다층 캐스케이드(관찰→
 렌더→새 관찰자→…). 즉 단일 바운드 버그가 아니라 파이프라인 확장 + 인증 데이터 +
 다층 lazy의 합. 우리 JSON.parse·fetch→json→콜백 체인은 142KB에서 완벽 동작 확인.
+
+**07-20 밤 — 완성: 뉴스/피드가 화면에 실제로 그려짐 (오클루더 제거)**.
+남은 벽은 데이터가 아니라 **가시성**이었다. `EAGER-DATA`의 실제 연합뉴스
+헤드라인 13건이 이미 페인트되고 있었는데(NEWS_IN_PAINT=13), `position:absolute;
+height:100%` 장식 오버레이가 전체 페이지를 덮어 눈에 안 보였다. 원인은 절대
+요소의 % 높이가 컨테이닝 블록(=문서)에 대해 풀리는데, 헤드리스 전체-페이지
+렌더에서 문서 높이가 수천 px라 오버레이가 그만큼 부풀어 뉴스 위를 페인트한 것.
+`DocumentLayout._layout_positioned`에서 out-of-flow 레이아웃 동안 문서의
+definite_height를 null로 가려 그 %가 auto(콘텐츠 높이)로 폴백하게 수정. in-flow
+콘텐츠는 이미 배치돼 영향 없고, 각 절대 박스는 여전히 자식에게 자기 definite
+height를 준다. 결과: **오버레이 소멸, 주요 뉴스(연합뉴스) 헤드라인 + 관심사 피드가
+화면에 그대로 렌더** — NAVER 로고·검색창·로그인 패널·뉴스스탠드 탭·카테고리 탭·
+공지/Partners/Developers·웨일 브라우저·정책 푸터(© NAVER Corp.)까지 완결된 홈.
+회귀: smoke 레이아웃/flex/absolute 전 항목 통과(% height auto·vh auto·중첩 절대
+포함), redirect 네트워크 테스트만 환경 이슈로 실패(레이아웃 무관). height=3878,
+cmds=510, text=373. **네이버 홈이 GG 엔진에서 완전한 페이지로 렌더된다.**
