@@ -1666,6 +1666,23 @@ mod tests {
         assert_eq!(
             n("Object.getOwnPropertyNames([7, 8]).join(',') === '0,1' \
                ? 1 : 0"), 1.0);
+        // array `length` descriptor: writable data prop, not undefined.
+        // core-js's length setter reads `.writable` before mutating and
+        // throws "Cannot set read only .length" on an undefined descriptor,
+        // which aborts React's commit on Naver.
+        assert_eq!(
+            n("var d = Object.getOwnPropertyDescriptor([1, 2, 3], 'length'); \
+               d.value * 100 + (d.writable ? 10 : 0) + \
+               (d.enumerable ? 0 : 1)"), 311.0);
+        // array index descriptor: value + writable/enumerable/configurable
+        assert_eq!(
+            n("var d = Object.getOwnPropertyDescriptor(['a', 'b'], '1'); \
+               (d.value === 'b' ? 1 : 0) + (d.writable ? 2 : 0) + \
+               (d.enumerable ? 4 : 0)"), 7.0);
+        // out-of-range index -> undefined
+        assert_eq!(
+            n("Object.getOwnPropertyDescriptor([1], '5') === undefined \
+               ? 1 : 0"), 1.0);
     }
 
     #[test]
@@ -2663,6 +2680,44 @@ console.log('B typeof it: ' + typeof it);
         assert_eq!(
             n("var rv = [].reverse; var a = [1, 2, 3]; rv.call(a); a[0]"),
             3.0);
+    }
+
+    #[test]
+    fn array_iterators_honor_this_arg() {
+        // forEach/map/filter/some/every/find/findIndex accept a `thisArg`
+        // 2nd argument that becomes the callback's `this`. The
+        // IntersectionObserver polyfill (shipped by Naver) calls
+        // `this._observationTargets.forEach(function(){ this._x() }, this)`
+        // — without honoring thisArg the callback's `this` is undefined and
+        // it throws, aborting React's async work.
+        assert_eq!(
+            n("var o = {v: 10, sum: 0}; \
+               [1, 2, 3].forEach(function(x) { this.sum += x * this.v; }, o); \
+               o.sum"), 60.0);
+        assert_eq!(
+            n("var o = {m: 3}; \
+               [1, 2, 3].map(function(x) { return x * this.m; }, o) \
+               .reduce(function(a, b) { return a + b; }, 0)"), 18.0);
+        assert_eq!(
+            n("var o = {lo: 1, hi: 3}; \
+               [0, 2, 5].filter(function(x) { \
+                 return x >= this.lo && x <= this.hi; }, o).length"), 1.0);
+        assert_eq!(
+            n("var o = {t: 2}; \
+               ([1, 2, 3].some(function(x) { return x === this.t; }, o) \
+                ? 1 : 0) + \
+               ([1, 2, 3].every(function(x) { return x <= this.t; }, o) \
+                ? 0 : 10)"), 11.0);
+        assert_eq!(
+            n("var o = {want: 7}; \
+               [3, 7, 9].find(function(x) { return x === this.want; }, o) \
+               * 100 + \
+               [3, 7, 9].findIndex(function(x) { \
+                 return x === this.want; }, o)"), 701.0);
+        // uncurried form (core-js habit) must honor thisArg too
+        assert_eq!(
+            n("var fe = [].forEach; var o = {n: 0}; \
+               fe.call([1, 1, 1], function() { this.n++; }, o); o.n"), 3.0);
     }
 
     #[test]

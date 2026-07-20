@@ -1712,9 +1712,10 @@ fn method_ref_dispatch(
                     .first()
                     .copied()
                     .unwrap_or(Value::UNDEFINED);
+                let cb_this = args.get(1).copied();
                 for (i, &e) in elems.iter().enumerate() {
-                    let r = call_value(
-                        st, mods, cb,
+                    let r = call_value_this(
+                        st, mods, cb, cb_this,
                         &[e, Value::int(i as i32), recv],
                     )?;
                     let t = truthy(st, r);
@@ -1788,10 +1789,11 @@ fn method_ref_dispatch(
                         ".{name} callback is not a function"
                     ));
                 }
+                let cb_this = args.get(1).copied();
                 let mut out: Vec<Value> = Vec::new();
                 for (i, &el) in elems.iter().enumerate() {
-                    let r = call_value(
-                        st, mods, cb,
+                    let r = call_value_this(
+                        st, mods, cb, cb_this,
                         &[el, Value::int(i as i32), recv],
                     )?;
                     match name.as_str() {
@@ -3999,6 +4001,45 @@ fn host_fn(
             }
             let oi = obj.index() as usize;
             let key_name = to_display(st, argv!(1));
+            // Arrays keep `length` and integer indices outside the shape,
+            // so the slot lookup below misses them. core-js's array length
+            // setter reads `getOwnPropertyDescriptor(arr, "length").writable`
+            // before every mutation — an undefined descriptor makes it throw
+            // "Cannot set read only .length", which aborts React's commit.
+            if st.objects[oi].is_array {
+                if key_name == "length" {
+                    let n = st.objects[oi].elems.len() as i32;
+                    let out = new_plain_object(st);
+                    let pi = out.index() as usize;
+                    let f = Value::boolean(false);
+                    let vid = st.intern_name("value");
+                    let wid = st.intern_name("writable");
+                    let eid = st.intern_name("enumerable");
+                    let cid = st.intern_name("configurable");
+                    raw_set_prop(st, pi, vid, Value::int(n));
+                    raw_set_prop(st, pi, wid, Value::boolean(true));
+                    raw_set_prop(st, pi, eid, f);
+                    raw_set_prop(st, pi, cid, f);
+                    return Ok(out);
+                }
+                if let Ok(i) = key_name.parse::<usize>() {
+                    if i < st.objects[oi].elems.len() {
+                        let v = st.objects[oi].elems[i];
+                        let out = new_plain_object(st);
+                        let pi = out.index() as usize;
+                        let t = Value::boolean(true);
+                        let vid = st.intern_name("value");
+                        let wid = st.intern_name("writable");
+                        let eid = st.intern_name("enumerable");
+                        let cid = st.intern_name("configurable");
+                        raw_set_prop(st, pi, vid, v);
+                        raw_set_prop(st, pi, wid, t);
+                        raw_set_prop(st, pi, eid, t);
+                        raw_set_prop(st, pi, cid, t);
+                        return Ok(out);
+                    }
+                }
+            }
             let Some(&key) = st.name_ids.get(&key_name) else {
                 return Ok(Value::UNDEFINED);
             };
@@ -6778,6 +6819,12 @@ fn exec_loop(
                             } else {
                                 Value::UNDEFINED
                             };
+                            // forEach/map/filter/some/every/find/findIndex
+                            // take a `thisArg` (2nd arg) that becomes the
+                            // callback's `this`; the IntersectionObserver
+                            // polyfill relies on `.forEach(cb, this)`.
+                            let cb_this =
+                                if argc > 1 { Some(arg1) } else { None };
                             let mut done = true;
                             let r: Value = match method.as_str() {
                                 "pop" => st.objects[oi].elems.pop()
@@ -6952,8 +6999,8 @@ fn exec_loop(
                                         Vec::with_capacity(elems.len());
                                     for (i, &e) in elems.iter().enumerate()
                                     {
-                                        let v = call_value(
-                                            st, mods, arg0,
+                                        let v = call_value_this(
+                                            st, mods, arg0, cb_this,
                                             &[e, Value::int(i as i32), ov],
                                         )?;
                                         out.push(v);
@@ -6966,8 +7013,8 @@ fn exec_loop(
                                     let mut out = Vec::new();
                                     for (i, &e) in elems.iter().enumerate()
                                     {
-                                        let v = call_value(
-                                            st, mods, arg0,
+                                        let v = call_value_this(
+                                            st, mods, arg0, cb_this,
                                             &[e, Value::int(i as i32), ov],
                                         )?;
                                         if truthy(st, v) {
@@ -6984,8 +7031,8 @@ fn exec_loop(
                                     for (i, &e) in
                                         elems.iter().enumerate()
                                     {
-                                        let v = call_value(
-                                            st, mods, arg0,
+                                        let v = call_value_this(
+                                            st, mods, arg0, cb_this,
                                             &[e, Value::int(i as i32), ov],
                                         )?;
                                         let tv = truthy(st, v);
@@ -7005,8 +7052,8 @@ fn exec_loop(
                                         st.objects[oi].elems.clone();
                                     for (i, &e) in elems.iter().enumerate()
                                     {
-                                        call_value(
-                                            st, mods, arg0,
+                                        call_value_this(
+                                            st, mods, arg0, cb_this,
                                             &[e, Value::int(i as i32), ov],
                                         )?;
                                     }
@@ -7018,8 +7065,8 @@ fn exec_loop(
                                     let mut res = Value::UNDEFINED;
                                     for (i, &e) in elems.iter().enumerate()
                                     {
-                                        let v = call_value(
-                                            st, mods, arg0,
+                                        let v = call_value_this(
+                                            st, mods, arg0, cb_this,
                                             &[e, Value::int(i as i32), ov],
                                         )?;
                                         if truthy(st, v) {
@@ -7035,8 +7082,8 @@ fn exec_loop(
                                     let mut res = -1i32;
                                     for (i, &e) in elems.iter().enumerate()
                                     {
-                                        let v = call_value(
-                                            st, mods, arg0,
+                                        let v = call_value_this(
+                                            st, mods, arg0, cb_this,
                                             &[e, Value::int(i as i32), ov],
                                         )?;
                                         if truthy(st, v) {
@@ -7052,8 +7099,8 @@ fn exec_loop(
                                     let mut res = false;
                                     for (i, &e) in elems.iter().enumerate()
                                     {
-                                        let v = call_value(
-                                            st, mods, arg0,
+                                        let v = call_value_this(
+                                            st, mods, arg0, cb_this,
                                             &[e, Value::int(i as i32), ov],
                                         )?;
                                         if truthy(st, v) {
@@ -7069,8 +7116,8 @@ fn exec_loop(
                                     let mut res = true;
                                     for (i, &e) in elems.iter().enumerate()
                                     {
-                                        let v = call_value(
-                                            st, mods, arg0,
+                                        let v = call_value_this(
+                                            st, mods, arg0, cb_this,
                                             &[e, Value::int(i as i32), ov],
                                         )?;
                                         if !truthy(st, v) {
