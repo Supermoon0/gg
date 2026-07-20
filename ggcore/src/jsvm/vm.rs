@@ -2546,6 +2546,47 @@ fn brand_string(st: &St, v: Value) -> String {
     format!("[object {tag}]")
 }
 
+/// Debug disassembly: annotate an instruction with resolved names
+/// (property atoms, globals) and constant strings so minified bytecode
+/// reads. Diagnostic only (GG_JS_DUMP).
+fn annotate_instr(
+    st: &St,
+    gm: &[u32],
+    consts: &[Value],
+    instr: &Instr,
+) -> String {
+    let name = |atom: u16| -> String {
+        let nid = gm.get(atom as usize).copied().unwrap_or(u32::MAX);
+        st.names.get(nid as usize).cloned().unwrap_or_default()
+    };
+    let extra = match instr {
+        Instr::GetProp { atom, .. }
+        | Instr::SetProp { atom, .. }
+        | Instr::CallMethod { atom, .. } => format!("  ; .{}", name(*atom)),
+        Instr::GetGlobal { atom, .. }
+        | Instr::GetGlobalSafe { atom, .. }
+        | Instr::SetGlobal { atom, .. } => format!("  ; ${}", name(*atom)),
+        Instr::LoadConst { idx, .. } => {
+            let v = consts
+                .get(*idx as usize)
+                .copied()
+                .unwrap_or(Value::UNDEFINED);
+            if v.is_string() {
+                // read-only string peek (str_ref needs &mut for
+                // rope flattening; constants are already flat)
+                match st.strs.get(v.index() as usize) {
+                    Some(Str::Flat(s)) => format!("  ; \"{s}\""),
+                    _ => "  ; <str>".to_string(),
+                }
+            } else {
+                format!("  ; {v:?}")
+            }
+        }
+        _ => String::new(),
+    };
+    format!("{instr:?}{extra}")
+}
+
 /// The setter for `key` visible from `oi` (own first, then the chain),
 /// unless an own data property shadows it.
 fn lookup_setter(st: &St, oi: usize, key: u32) -> Option<Value> {
@@ -7755,15 +7796,28 @@ fn exec_loop(
                     };
                     if let Ok(dir) = std::env::var("GG_JS_DUMP") {
                         let dump = |lbl: &str, m: u32, p: u32| {
-                            let code =
-                                &mods.rc(m).module.protos[p as usize].code;
+                            let lm = mods.rc(m);
+                            let proto = &lm.module.protos[p as usize];
+                            let out = proto
+                                .code
+                                .iter()
+                                .enumerate()
+                                .map(|(k, i)| {
+                                    format!(
+                                        "{k}:{}",
+                                        annotate_instr(
+                                            st,
+                                            &lm.global_map,
+                                            &proto.consts,
+                                            i,
+                                        )
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
                             let _ = std::fs::write(
                                 format!("{dir}/{lbl}_{m}_{p}.txt"),
-                                code.iter()
-                                    .enumerate()
-                                    .map(|(k, i)| format!("{k}:{i:?}"))
-                                    .collect::<Vec<_>>()
-                                    .join("\n"),
+                                out,
                             );
                         };
                         dump("cur", mi, pi);
