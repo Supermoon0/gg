@@ -698,3 +698,50 @@ basket_test.py (네이버 단건은 scratchpad diag 스크립트).
 지원(CONNECT 터널) 추가 → smoke 148/149(잔여 1건은 https 전용 환경의
 plain-http 한계), basket 실측 7/9 읽을만함·크래시 0(나무위키는 Cloudflare
 봇월), 네이버 실렌더 PNG(546텍스트·웜 3.2s) 확보.*
+
+---
+
+## 07-20 — **네이버 React 커밋 달성** (B단계 실질 진입)
+
+네이버 홈 React(react-dom 18 `createRoot`, CSR)가 gg-js에서 **렌더+커밋을
+완주**한다. 빈 `#root`(정적 0노드) → 앱 컴포넌트 트리 **63~99노드** 커밋:
+`Layout-module__column_left/right`, `#newsstand`(ContentHeaderView),
+`#shopping`, `#feed`(FeedView), `MobileButtonView`(＂모바일 버전으로 보기＂)
+— 전부 네이버 실제 CSS-모듈 컴포넌트 출력. 번들 7종 **에러 0**, 언캐치드
+예외 0.
+
+**언블록한 엔진 갭 3종** (전부 회귀 테스트 + cargo 177/177):
+1. `getOwnPropertyDescriptor(배열,"length"/인덱스)` → `undefined` 반환.
+   배열 length/인덱스는 shape 밖에 저장돼 슬롯 조회가 놓쳤음. core-js의
+   배열 length 세터가 매 변경 전 `.writable`을 읽어 undefined면
+   "Cannot set read only .length" throw → React 커밋 중단. writable
+   데이터 디스크립터 합성으로 해소.
+2. 배열 이터레이터가 `thisArg`(2번째 인자)를 무시. forEach/map/filter/
+   some/every/find/findIndex가 콜백 `this`를 thisArg에 바인딩하도록 수정
+   (일반 디스패치 + uncurried 추출 경로 양쪽). 네이버가 싣는 W3C
+   IntersectionObserver 폴리필이 `forEach(fn, this)`로 `this._rootContains
+   Target`을 읽어서, thisArg 없으면 undefined→throw→React 비동기 작업 중단.
+3. `setInterval` 로드-세틀 무한 전진. pump가 quiescence까지 fast-forward
+   하는데 인터벌은 quiesce하지 않아 매 pump 콜에서 예산(200k)까지 발화
+   (IntersectionObserver 폴 인터벌 → 세틀당 ~50s 낭비). 인터벌은 pump 콜당
+   1회만 발화·등록 유지(clearInterval 정상)·has_pending_work에서 제외.
+
+**성능 관찰(측정)**: 페치 7종(feed/news JSON) 해소 후, 한 번의 setTimeout(0)
+콜백(=React 렌더+커밋 1틱, 가상시계 동결로 shouldYield 미발동→비분할)이
+**~78s / 명령어 13.8M**(≈175K명령어/s, 라운드1의 6.6M/s 대비 40× 저하).
+샘플링 프로파일러(임시)로 핫스팟 규명: 상위 2함수가 시간의 ~46% —
+(a) 네이버 앱 번들에 실린 **JS 재귀하강 JSON 파서**(≈350KB 페치 데이터를
+문자 단위 파싱; 우리 네이티브 JSON.parse가 아니라 앱 자체 파서),
+(b) `fn.apply(this, arguments)` 래퍼(≈35만 회 호출). 단일 이차식 버그가
+아니라 **어린 인터프리터의 분산된 호출/할당/조회 오버헤드 × 수백만 연산**.
+→ 근본 해결은 M6(JIT·인터프리터 스루풋) 영역. 렌더 자체는 **정확·완주**함.
+
+**측정 아티팩트 규명**: 이전 라운드의 "릴리스 빌드에서 DOM 게터 소실"은
+**grep 오판**이었다. 릴리스 LLVM이 짧은 문자열-리터럴 `match`를 인라인
+정수 즉치 비교로 컴파일해 리터럴 바이트가 .rodata에 연속 ASCII로 안 남음
+→ grep 불검출. 런타임 검증 결과 tagName/nodeType/classList/firstChild/
+childNodes/parentNode/documentElement/getElementById/activeElement **전부
+정상 동작**. DOM 리드 표면은 멀쩡했다.
+
+*상태: A 달성·B 실질 진입(첫 화면 React 컴포넌트 트리 렌더). 잔여 B는
+데이터-구동 콘텐츠 심화(피드/뉴스 카드 = 추가 API 라운드) + 성능(M6).*
