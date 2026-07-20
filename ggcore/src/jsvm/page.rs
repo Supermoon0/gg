@@ -471,6 +471,60 @@ Date.parse = function (s) {
   P.getUTCMinutes = P.getMinutes;
   P.getUTCSeconds = P.getSeconds;
   P.getUTCMilliseconds = P.getMilliseconds;
+  // setters — keep the untouched half (date or time) and recompute
+  // _t from civil days. UTC == local (tz 0). date-fns builds every
+  // date through setUTCFullYear/Month/Date/Hours.
+  P.setFullYear = function (y, m, d) {
+    var c = __gg_civil(day(this._t));
+    if (m === undefined) m = c[1] - 1;
+    if (d === undefined) d = c[2];
+    this._t = __gg_days(+y, (+m) + 1, +d) * 86400000
+      + mod(this._t, 86400000);
+    return this._t;
+  };
+  P.setMonth = function (m, d) {
+    var c = __gg_civil(day(this._t));
+    if (d === undefined) d = c[2];
+    this._t = __gg_days(c[0], (+m) + 1, +d) * 86400000
+      + mod(this._t, 86400000);
+    return this._t;
+  };
+  P.setDate = function (d) {
+    var c = __gg_civil(day(this._t));
+    this._t = __gg_days(c[0], c[1], +d) * 86400000
+      + mod(this._t, 86400000);
+    return this._t;
+  };
+  P.setHours = function (h, mi, s, ms) {
+    var H = h !== undefined ? +h : this.getHours();
+    var M = mi !== undefined ? +mi : this.getMinutes();
+    var S = s !== undefined ? +s : this.getSeconds();
+    var MS = ms !== undefined ? +ms : this.getMilliseconds();
+    this._t = day(this._t) * 86400000
+      + H * 3600000 + M * 60000 + S * 1000 + MS;
+    return this._t;
+  };
+  P.setMinutes = function (mi, s, ms) {
+    return P.setHours.call(this, this.getHours(), mi, s, ms);
+  };
+  P.setSeconds = function (s, ms) {
+    return P.setHours.call(this, this.getHours(),
+      this.getMinutes(), s, ms);
+  };
+  P.setMilliseconds = function (ms) {
+    return P.setHours.call(this, this.getHours(),
+      this.getMinutes(), this.getSeconds(), ms);
+  };
+  P.setYear = function (y) {
+    return P.setFullYear.call(this, y < 100 ? 1900 + (+y) : +y);
+  };
+  P.setUTCFullYear = P.setFullYear;
+  P.setUTCMonth = P.setMonth;
+  P.setUTCDate = P.setDate;
+  P.setUTCHours = P.setHours;
+  P.setUTCMinutes = P.setMinutes;
+  P.setUTCSeconds = P.setSeconds;
+  P.setUTCMilliseconds = P.setMilliseconds;
   function pad(n, w) {
     n = '' + n;
     while (n.length < (w || 2)) n = '0' + n;
@@ -2968,6 +3022,29 @@ console.log('B typeof it: ' + typeof it);
         );
         // and a plain regex still uses the fast std engine
         assert_eq!(n("'aabb'.match(/\\w/g).length"), 4.0);
+        // round 4: Date setters (date-fns builds dates via
+        // setUTCFullYear/Month/Date/Hours; missing setters threw
+        // '.setUTCFullYear is not a function' and aborted React)
+        assert_eq!(
+            n("var d = new Date(0); d.setUTCFullYear(2026); \
+               d.getUTCFullYear()"),
+            2026.0
+        );
+        assert_eq!(
+            n("var d = new Date(Date.UTC(2026, 0, 15)); \
+               d.setUTCMonth(6); d.getUTCMonth()"),
+            6.0
+        );
+        assert_eq!(
+            n("var d = new Date(0); d.setUTCHours(13, 30); \
+               d.getUTCHours() * 100 + d.getUTCMinutes()"),
+            1330.0
+        );
+        assert_eq!(
+            n("var d = new Date(Date.UTC(2026, 5, 20)); \
+               d.setUTCDate(25); d.getUTCDate()"),
+            25.0
+        );
     }
 
     #[test]
