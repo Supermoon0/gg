@@ -466,6 +466,17 @@ class DocumentLayout:
         each node at most once (nested absolutes on real pages like
         naver would otherwise loop forever). A hard cap bounds any
         pathological page."""
+        # An absolute element's `height:100%` (or any %) resolves against
+        # its containing block. We approximate that as the document, whose
+        # height in a headless full-page render is the whole (tall) page —
+        # so a decorative `position:absolute; height:100%` overlay ballooned
+        # to full height and painted over the news. Hide the document's
+        # definite height during out-of-flow layout so those percentages
+        # fall back to auto (content height); in-flow content is already
+        # laid out and unaffected, and each absolute box still gives its own
+        # children their own definite height.
+        saved_definite_height = self.definite_height
+        self.definite_height = None
         processed = set()
         i = 0
         while i < len(self.abs_queue) and len(processed) < 5000:
@@ -513,6 +524,7 @@ class DocumentLayout:
                       target_x - (box.x - box.pl - box.bw - box.ml),
                       target_y - (box.y - box.pt - box.bw
                                   - box.margin_top))
+        self.definite_height = saved_definite_height
 
     def paint(self):
         return []
