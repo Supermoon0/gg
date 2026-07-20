@@ -390,6 +390,16 @@ function HTMLAnchorElement() {}
 function HTMLScriptElement() {}
 function HTMLImageElement() {}
 function HTMLInputElement() {}
+// `new Image(w, h)` builds a real <img> DOM node, so feed/thumbnail
+// components (naver's news cards, many SPAs) that preload or insert an
+// image during render don't hit `Image is not defined` — a ReferenceError
+// there makes React discard the whole component subtree mid-render.
+function Image(w, h) {
+  var el = document.createElement('img');
+  if (w != null) el.width = w;
+  if (h != null) el.height = h;
+  return el;
+}
 function SVGElement() {}
 function Document() {}
 function HTMLDocument() {}
@@ -1416,6 +1426,51 @@ mod tests {
         let (v, _) = eval(src).unwrap();
         assert!(v.is_number(), "non-number result: {v:?} for {src}");
         v.to_number_raw()
+    }
+
+    #[test]
+    fn regex_js_syntax_translates_to_rust() {
+        // \uXXXX (4 bare hex, JS form) compiles and matches; Rust needs
+        // \u{XXXX} so without translation the whole pattern never matched
+        assert_eq!(n(r"/A/.test('A') ? 1 : 0"), 1.0);
+        assert_eq!(n(r"/A/.test('B') ? 1 : 0"), 0.0);
+        // the ubiquitous regex-escape class has a literal '[' inside it,
+        // which Rust reads as a nested class and rejects unless escaped
+        assert_eq!(
+            n(r"'a.b*c'.replace(/[\\^$.*+?()[\]{}|]/g, '_') === 'a_b_c' ? 1 : 0"),
+            1.0,
+        );
+        // JS empty-class semantics: [^] is any char, [] is never
+        assert_eq!(n(r"/[^]/.test('x') ? 1 : 0"), 1.0);
+        assert_eq!(n(r"/[]/.test('x') ? 1 : 0"), 0.0);
+        // a surrogate range is remapped to the astral plane, so an emoji
+        // (one scalar here) matches while a BMP char does not
+        assert_eq!(n("/[\\uD800-\\uDFFF]/.test('😀') ? 1 : 0"), 1.0);
+        assert_eq!(n("/[\\uD800-\\uDFFF]/.test('a') ? 1 : 0"), 0.0);
+        // already-braced \u{...} is left untouched
+        assert_eq!(n(r"/\u{1F600}/u.test('😀') ? 1 : 0"), 1.0);
+        // .source still reports the original JS pattern
+        assert_eq!(n(r"/A/.source === 'A' ? 1 : 0"), 1.0);
+    }
+
+    #[test]
+    fn image_constructor_builds_img_node() {
+        // new Image() must yield a usable <img> element (naver's thumbnail
+        // components construct one during render); needs a real document
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<html><body></body></html>"),
+        ))));
+        let logs = vm.run_scripts(&["\
+            var i = new Image();\n\
+            console.log('tag ' + String(i.tagName).toLowerCase());\n\
+            i.src = 'http://x/y.png';\n\
+            i.onload = function () {};\n\
+            console.log('src ' + (String(i.src).indexOf('y.png') >= 0 ? 1 : 0));\n\
+            console.log('ok ' + (new Image() ? 1 : 0));\n"
+            .to_string()]);
+        assert!(logs.contains(&"tag img".to_string()), "{logs:?}");
+        assert!(logs.contains(&"src 1".to_string()), "{logs:?}");
+        assert!(logs.contains(&"ok 1".to_string()), "{logs:?}");
     }
 
     #[test]

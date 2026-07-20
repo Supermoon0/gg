@@ -843,6 +843,145 @@ fn regex_index(st: &St, v: Value) -> Option<usize> {
     None
 }
 
+/// Rewrite a JS regex source into one the Rust `regex` crate accepts.
+/// JS and Rust's regex syntax diverge in a handful of common ways that
+/// otherwise force whole patterns to compile as never-matching:
+///   * `\uXXXX` (4 bare hex) -> `\u{XXXX}` (Rust requires the braces)
+///   * a literal `[` inside a class -> `\[` (Rust reads it as a nested
+///     class and errors; JS treats it as a literal). This is what makes
+///     the ubiquitous regex-escape `/[\\^$.*+?()[\]{}|]/g` compile.
+///   * `[^]` (JS "any char") -> `[\s\S]`, `[]` (JS "never") -> `[^\s\S]`
+///     (Rust rejects an empty class outright)
+///   * surrogate ranges like `[\uD800-\uDFFF]` -> the astral plane
+///     `[\u{10000}-\u{10FFFF}]`; in our scalar (UTF-8) string world an
+///     astral character is one scalar, not a surrogate pair, so this
+///     preserves the author's intent ("match astral chars"). Lone
+///     surrogate escapes become U+FFFD so the class still compiles.
+/// Escapes are copied through verbatim so `\d`, `\w`, `\x5c`, `\b`, and
+/// already-braced `\u{...}` are untouched.
+fn translate_js_regex(src: &str) -> String {
+    let cs: Vec<char> = src.chars().collect();
+    let n = cs.len();
+    let mut out = String::with_capacity(n + 8);
+    let mut i = 0;
+    let mut in_class = false;
+    while i < n {
+        let c = cs[i];
+        if c == '\\' && i + 1 < n {
+            let d = cs[i + 1];
+            if d == 'u' && i + 2 < n && cs[i + 2] == '{' {
+                // already braced: copy through to the closing '}'
+                out.push('\\');
+                out.push('u');
+                i += 2;
+                while i < n {
+                    out.push(cs[i]);
+                    let done = cs[i] == '}';
+                    i += 1;
+                    if done {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if d == 'u'
+                && i + 6 <= n
+                && cs[i + 2..i + 6].iter().all(|c| c.is_ascii_hexdigit())
+            {
+                let hex: String =
+                    cs[i + 2..i + 6].iter().collect::<String>().to_uppercase();
+                out.push_str(&format!("\\u{{{hex}}}"));
+                i += 6;
+                continue;
+            }
+            // any other escape: copy the pair verbatim
+            out.push('\\');
+            out.push(d);
+            i += 2;
+            continue;
+        }
+        if !in_class {
+            if c == '[' {
+                // JS empty-class special cases close at the first ']'
+                if i + 1 < n && cs[i + 1] == ']' {
+                    out.push_str("[^\\s\\S]"); // [] matches nothing
+                    i += 2;
+                    continue;
+                }
+                if i + 2 < n && cs[i + 1] == '^' && cs[i + 2] == ']' {
+                    out.push_str("[\\s\\S]"); // [^] matches anything
+                    i += 3;
+                    continue;
+                }
+                in_class = true;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // inside a character class
+        match c {
+            ']' => {
+                in_class = false;
+                out.push(']');
+            }
+            '[' => out.push_str("\\["), // literal in JS, nested-class in Rust
+            _ => out.push(c),
+        }
+        i += 1;
+    }
+    neutralize_surrogates(&out)
+}
+
+/// Map surrogate code points (never valid Rust scalars) to something
+/// compilable: full/half surrogate ranges become the astral plane, and
+/// any lone surrogate escape becomes U+FFFD. Operates on already
+/// brace-normalized `\u{XXXX}` output from `translate_js_regex`.
+fn neutralize_surrogates(s: &str) -> String {
+    let mut t = s.to_string();
+    for from in [
+        "\\u{D800}-\\u{DFFF}",
+        "\\u{D800}-\\u{DBFF}",
+        "\\u{DC00}-\\u{DFFF}",
+    ] {
+        t = t.replace(from, "\\u{10000}-\\u{10FFFF}");
+    }
+    if !t.contains("\\u{D") && !t.contains("\\u{d") {
+        return t;
+    }
+    let cs: Vec<char> = t.chars().collect();
+    let n = cs.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        if i + 3 < n && cs[i] == '\\' && cs[i + 1] == 'u' && cs[i + 2] == '{' {
+            let mut j = i + 3;
+            let mut hex = String::new();
+            while j < n && cs[j] != '}' {
+                hex.push(cs[j]);
+                j += 1;
+            }
+            if j < n && cs[j] == '}' {
+                let is_surr = u32::from_str_radix(&hex, 16)
+                    .map(|v| (0xD800..=0xDFFF).contains(&v))
+                    .unwrap_or(false);
+                if is_surr {
+                    out.push_str("\\u{FFFD}");
+                } else {
+                    for k in i..=j {
+                        out.push(cs[k]);
+                    }
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(cs[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Build a RegExp value from a JS pattern + flags. JS flags map to the
 /// `regex` crate's inline flags; `g` (global) is tracked separately.
 fn new_regex(
@@ -856,10 +995,11 @@ fn new_regex(
             inline.push(f);
         }
     }
+    let translated = translate_js_regex(pattern);
     let full = if inline.is_empty() {
-        pattern.to_string()
+        translated
     } else {
-        format!("(?{inline}){pattern}")
+        format!("(?{inline}){translated}")
     };
     let re = match regex::Regex::new(&full) {
         Ok(re) => CompiledRe::Std(re),
@@ -6394,8 +6534,17 @@ fn exec_loop(
                 reg!(dst) = obj;
             }
             Instr::SelectObj { dst, a, b } => {
+                // `new` yields the constructor's return value when it is an
+                // object, else the freshly allocated `this`. DOM nodes are
+                // objects too, so a factory constructor like
+                // `function Image(){ return document.createElement('img'); }`
+                // must return the node, not the empty `this`.
                 let (x, y) = (reg!(a), reg!(b));
-                reg!(dst) = if x.is_object() { x } else { y };
+                reg!(dst) = if x.is_object() || x.is_dom_node() {
+                    x
+                } else {
+                    y
+                };
             }
             Instr::Delete { dst, obj, key } => {
                 let (ov, kv) = (reg!(obj), reg!(key));
