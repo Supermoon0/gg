@@ -109,15 +109,32 @@ undefined`, `Obj(#…) is not a function` ×2. react 마커 0·#container 4
 - [x] **라이프사이클 이벤트 실물화** — target/currentTarget/bubbles/
   preventDefault 등 표준 프로퍼티 부여
 
-**07-20 현 프런티어**: 4개 번들 완주 + react-dom 엔트리 실행 + 스케줄러
-가동. 남은 2개: (1) jQuery ready 콜백이 부르는 소형 지연컴파일 함수가
-`.length of undefined`(undefined 인자) — GG_JS_TRACE로 mi=2758/pi=0/
-ip=4까지 국소화, (2) react 스케줄러 워크가 settle 중 명령 예산 초과.
-react 미커밋(마커 0·#container 4)이나 페이지는 그레이스풀
-디그러데이션(검색창+리더 헤드라인 렌더, 무행). cargo 173/173, smoke
-148, 건틀릿 무회귀(css 22/23·net 14/14·jsvm CLAIM 20/20).
-진단 도구: `GG_JS_TRACE=1`이 nullish-read에 프레임 체인+mi/pi/ip,
-dispatch_simple에 사망 리스너 식별을 붙임(env 미설정 시 0비용).
+**07-20 라운드 3b·3c — react 무한루프 격파, 리컨사일러 진입**:
+- [x] **Math.clz32 신설** — react lane 순회 `while(lanes){i=31-
+  clz32(lanes); lanes&=~(1<<i)}`가 clz32 부재로 최상위 비트를 못 찾아
+  엉뚱한 비트를 지워 **영원히 안 끝나던 무한루프**. settle 22s→1.4s.
+  GG_JS_TRACE로 workLoopSync→performUnitOfWork→beginWork 체인 국소화 후
+  루프 프로토 디스어셈블로 규명 — 이번 세션 최대 단일 성과
+- [x] **Object.is** — SameValue(=== + NaN==NaN + -0≠+0). react
+  bailout/shallowEqual이 직접 사용. `.is()` 미구현이라 throw하던 것
+- [x] **instanceof 비호출가능 RHS → false 복원** — 라운드1의 TypeError
+  던지기는 _classCallCheck용이었으나 NFE self-binding(LoadSelf)이 이미
+  해결. 실번들의 `x instanceof 없는생성자`(피처 디텍션)가 react 마운트
+  경로에서 uncaught 유발 → 관용 false로 되돌림
+
+**07-20 현 프런티어**: 무한루프 소멸 후 react 리컨사일러가 실제로 돌며
+여러 계층을 통과(각 수정이 다음 null-read를 드러냄 = 700KB react를
+밑바닥 엔진에 얹는 전형적 양파 까기). 현재 사망점: react 이터레이터
+룩업 `x[Symbol.iterator]||x['@@iterator']`이 null 수신(리컨사일러가
+객체를 기대한 자리에 우리 엔진이 null 반환한 상류 데이터플로 갭 —
+GG_JS_TRACE로 `F<-rn<-gr<-pl` react 내부까지 국소화) + 앱 헬퍼
+`.length of undefined`(jQuery.each류, mi=2758). react 미커밋(마커
+0·#root 2·#container 4)이나 페이지 그레이스풀 디그러데이션(검색창+리더
+헤드라인, 무행·무크래시, 로드 1.5s). cargo 173/173, smoke 148, basket
+7/9(네이버 JS오류 6→1), 건틀릿 무회귀.
+진단 도구: `GG_JS_TRACE=1`(nullish/budget-초과 오류에 프레임 체인+
+mi/pi/ip, 사망 리스너 식별), `GG_JS_DUMP=<path>`(사망 프로토 바이트코드
+덤프) — env 미설정 시 0비용.
 
 후속: 동적 주입 `<script src>` 미실행(ndp-core/ntm — pump 프로토콜에
 script 종 추가 [M]), 정규식 lookaround/backref 31건 never-matching 강등
