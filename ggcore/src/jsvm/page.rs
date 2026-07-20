@@ -362,13 +362,28 @@ function DOMException(m, n) {
   this.message = '' + (m || '');
   this.name = '' + (n || 'Error');
 }
+// A working MessageChannel: port.postMessage delivers to the OTHER
+// port's onmessage on a macrotask (setTimeout 0). react-dom 18's
+// scheduler drives its entire render work loop through this, so a
+// no-op stub silently prevents React from ever committing.
 function MessageChannel() {
-  this.port1 = { onmessage: null,
-    postMessage: function () {},
-    addEventListener: function () {} };
-  this.port2 = { onmessage: null,
-    postMessage: function () {},
-    addEventListener: function () {} };
+  function mkport() {
+    return { onmessage: null, _peer: null,
+      addEventListener: function (t, f) {
+        if (t === 'message') this.onmessage = f;
+      },
+      removeEventListener: function () {},
+      postMessage: function (d) {
+        var peer = this._peer;
+        setTimeout(function () {
+          if (peer.onmessage) peer.onmessage({ data: d });
+        }, 0);
+      },
+      start: function () {}, close: function () {} };
+  }
+  var p1 = mkport(), p2 = mkport();
+  p1._peer = p2; p2._peer = p1;
+  this.port1 = p1; this.port2 = p2;
 }
 function Blob() {}
 function File() {}
@@ -1128,10 +1143,6 @@ impl PageVm {
         if cbs.is_empty() {
             return;
         }
-        let evt = new_plain_object(&mut self.st);
-        let tk = self.name_id("type");
-        let tv = vm::intern(&mut self.st, ty);
-        raw_set_prop(&mut self.st, evt.index() as usize, tk, tv);
         // this = the registration target. The window "node" is a
         // sentinel index with no arena entry — hand those handlers the
         // real JS window object instead (a fake dom node would panic
@@ -1141,7 +1152,38 @@ impl PageVm {
         } else {
             Value::dom_node(node)
         };
-        for cb in cbs {
+        // a realistic Event: handlers read target/currentTarget and
+        // call preventDefault/stopPropagation (a bare {type} object
+        // makes `event.target.X` throw deep in app code)
+        let evt = new_plain_object(&mut self.st);
+        let ei = evt.index() as usize;
+        let tv = vm::intern(&mut self.st, ty);
+        let tgt = if node == vm::WINDOW_NODE {
+            self.st.known.window
+        } else {
+            Value::dom_node(node)
+        };
+        let noop = make_native(&mut self.st, Native::Noop);
+        for (k, v) in [
+            ("type", tv),
+            ("target", tgt),
+            ("currentTarget", tgt),
+            ("srcElement", tgt),
+            ("bubbles", Value::boolean(false)),
+            ("cancelable", Value::boolean(false)),
+            ("defaultPrevented", Value::boolean(false)),
+            ("eventPhase", Value::int(2)),
+            ("timeStamp", Value::number(self.st.now_ms)),
+            ("preventDefault", noop),
+            ("stopPropagation", noop),
+            ("stopImmediatePropagation", noop),
+        ] {
+            let kk = self.name_id(k);
+            raw_set_prop(&mut self.st, ei, kk, v);
+        }
+        let trace = std::env::var("GG_JS_TRACE").is_ok();
+        let n = cbs.len();
+        for (i, cb) in cbs.into_iter().enumerate() {
             if let Err(e) = call_value_this(
                 &mut self.st,
                 &self.mods,
@@ -1149,9 +1191,17 @@ impl PageVm {
                 Some(this_v),
                 &[evt],
             ) {
-                self.st
-                    .logs
-                    .push(format!("[gg-js error] {}", e.msg));
+                if trace {
+                    self.st.logs.push(format!(
+                        "[gg-js error] {} (listener {}/{} of \
+                         node {} '{}')",
+                        e.msg, i + 1, n, node, ty
+                    ));
+                } else {
+                    self.st
+                        .logs
+                        .push(format!("[gg-js error] {}", e.msg));
+                }
             }
         }
     }
@@ -4065,6 +4115,25 @@ console.log('B typeof it: ' + typeof it);
             .to_string()]);
         let (logs, _) = vm.pump();
         assert_eq!(logs, vec!["later"]);
+    }
+
+    #[test]
+    fn message_channel_delivers_to_peer_port() {
+        // react-dom 18's scheduler drives its work loop through
+        // MessageChannel: port2.postMessage must reach port1.onmessage
+        // on a later macrotask (not synchronously, not never)
+        let mut vm = PageVm::new(None);
+        let sync = vm.run_scripts(&["\
+            var c = new MessageChannel();\n\
+            c.port1.onmessage = function (e) { console.log('got ' + e.data); };\n\
+            console.log('before');\n\
+            c.port2.postMessage('ping');\n"
+            .to_string()]);
+        // synchronous run does NOT deliver the message
+        assert_eq!(sync, vec!["before"]);
+        // it arrives on the next macrotask, drained by the pump
+        let (logs, _) = vm.pump();
+        assert_eq!(logs, vec!["got ping"]);
     }
 
     #[test]

@@ -7932,8 +7932,50 @@ fn exec_loop(
                     let r = dom_get_prop(st, key, ov.index())?;
                     reg!(dst) = r;
                 } else if ov.is_nullish() {
+                    let trace = if std::env::var("GG_JS_TRACE").is_ok() {
+                        let mut names: Vec<String> = st
+                            .frames
+                            .iter()
+                            .rev()
+                            .take(8)
+                            .map(|f| {
+                                mods.rc(f.module).module.protos
+                                    [f.proto as usize]
+                                    .name
+                                    .clone()
+                            })
+                            .collect();
+                        let here = cmod.module.protos[pi as usize]
+                            .name
+                            .clone();
+                        names.insert(0, here);
+                        // dump a window of consts around ip so the
+                        // failing site can be found in the source: the
+                        // last string const loaded names the object
+                        let recent: Vec<String> = cmod.module.protos
+                            [pi as usize]
+                            .code[ip.saturating_sub(6)..ip]
+                            .iter()
+                            .filter_map(|instr| match instr {
+                                Instr::GetProp { atom, .. }
+                                | Instr::CallMethod { atom, .. } => Some(
+                                    st.names[name!(*atom) as usize]
+                                        .clone(),
+                                ),
+                                _ => None,
+                            })
+                            .collect();
+                        format!(
+                            " [in {} | mi={} pi={} ip={} | recent \
+                             props: {}]",
+                            names.join(" <- "),
+                            mi, pi, ip, recent.join(".")
+                        )
+                    } else {
+                        String::new()
+                    };
                     return type_err(format!(
-                        "cannot read .{} of {}",
+                        "cannot read .{} of {}{trace}",
                         st.names[key as usize],
                         if ov.is_null() { "null" } else { "undefined" },
                     ));
