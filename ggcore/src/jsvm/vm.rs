@@ -7732,14 +7732,18 @@ fn exec_loop(
                 } else if ov.is_nullish() {
                     let text = to_display(st, kv);
                     let tr = if std::env::var("GG_JS_TRACE").is_ok() {
-                        let names: Vec<String> = std::iter::once(
-                            cmod.module.protos[pi as usize].name.clone(),
-                        )
+                        let names: Vec<String> = std::iter::once(format!(
+                            "{}@{}:{}",
+                            cmod.module.protos[pi as usize].name, mi, pi
+                        ))
                         .chain(st.frames.iter().rev().take(6).map(|f| {
-                            mods.rc(f.module).module.protos
-                                [f.proto as usize]
-                                .name
-                                .clone()
+                            format!(
+                                "{}@{}:{}",
+                                mods.rc(f.module).module.protos
+                                    [f.proto as usize]
+                                    .name,
+                                f.module, f.proto
+                            )
                         }))
                         .collect();
                         format!(
@@ -7749,16 +7753,25 @@ fn exec_loop(
                     } else {
                         String::new()
                     };
-                    if let Ok(path) = std::env::var("GG_JS_DUMP") {
-                        let code = &cmod.module.protos[pi as usize].code;
-                        let _ = std::fs::write(
-                            &path,
-                            code.iter()
-                                .enumerate()
-                                .map(|(k, i)| format!("{k}:{i:?}"))
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        );
+                    if let Ok(dir) = std::env::var("GG_JS_DUMP") {
+                        let dump = |lbl: &str, m: u32, p: u32| {
+                            let code =
+                                &mods.rc(m).module.protos[p as usize].code;
+                            let _ = std::fs::write(
+                                format!("{dir}/{lbl}_{m}_{p}.txt"),
+                                code.iter()
+                                    .enumerate()
+                                    .map(|(k, i)| format!("{k}:{i:?}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                            );
+                        };
+                        dump("cur", mi, pi);
+                        for (n, f) in
+                            st.frames.iter().rev().take(4).enumerate()
+                        {
+                            dump(&format!("c{n}"), f.module, f.proto);
+                        }
                     }
                     return type_err(format!(
                         "cannot read [{text}] of {}{tr}",
