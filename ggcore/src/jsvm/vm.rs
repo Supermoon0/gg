@@ -8310,6 +8310,39 @@ fn exec_loop(
                     } else {
                         String::new()
                     };
+                    if let Ok(dir) = std::env::var("GG_JS_DUMP") {
+                        let dump = |lbl: &str, m: u32, p: u32| {
+                            let lm = mods.rc(m);
+                            let proto = &lm.module.protos[p as usize];
+                            let out = proto
+                                .code
+                                .iter()
+                                .enumerate()
+                                .map(|(k, i)| {
+                                    format!(
+                                        "{k}:{}",
+                                        annotate_instr(
+                                            st,
+                                            &lm.global_map,
+                                            &proto.consts,
+                                            i,
+                                        )
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let _ = std::fs::write(
+                                format!("{dir}/{lbl}_{m}_{p}.txt"),
+                                out,
+                            );
+                        };
+                        dump("cur", mi, pi);
+                        for (n, f) in
+                            st.frames.iter().rev().take(4).enumerate()
+                        {
+                            dump(&format!("c{n}"), f.module, f.proto);
+                        }
+                    }
                     return type_err(format!(
                         "cannot read .{} of {}{trace}",
                         st.names[key as usize],
