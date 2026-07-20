@@ -7731,8 +7731,37 @@ fn exec_loop(
                     };
                 } else if ov.is_nullish() {
                     let text = to_display(st, kv);
+                    let tr = if std::env::var("GG_JS_TRACE").is_ok() {
+                        let names: Vec<String> = std::iter::once(
+                            cmod.module.protos[pi as usize].name.clone(),
+                        )
+                        .chain(st.frames.iter().rev().take(6).map(|f| {
+                            mods.rc(f.module).module.protos
+                                [f.proto as usize]
+                                .name
+                                .clone()
+                        }))
+                        .collect();
+                        format!(
+                            " [in {} | mi={} pi={} ip={}]",
+                            names.join(" <- "), mi, pi, ip
+                        )
+                    } else {
+                        String::new()
+                    };
+                    if let Ok(path) = std::env::var("GG_JS_DUMP") {
+                        let code = &cmod.module.protos[pi as usize].code;
+                        let _ = std::fs::write(
+                            &path,
+                            code.iter()
+                                .enumerate()
+                                .map(|(k, i)| format!("{k}:{i:?}"))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        );
+                    }
                     return type_err(format!(
-                        "cannot read [{text}] of {}",
+                        "cannot read [{text}] of {}{tr}",
                         if ov.is_null() { "null" } else { "undefined" },
                     ));
                 } else if ov.is_number() || ov.is_boolean() {
