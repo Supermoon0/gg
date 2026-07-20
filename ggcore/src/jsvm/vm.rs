@@ -378,9 +378,101 @@ pub(super) const PROMISE_NONE: u32 = u32::MAX;
 /// Sentinel: an Obj that is not a RegExp.
 pub(super) const REGEX_NONE: u32 = u32::MAX;
 
+/// A compiled regex: the fast `regex` crate when it can handle the
+/// pattern, else `fancy-regex` for JS-only features (backreferences,
+/// lookaround) that `regex` rejects — date-fns's tokenizer uses
+/// `(\w)\1*`, and without backref support `.match` returns null and
+/// the app's `for...of` over it throws. `Never` is the last resort
+/// (truly uncompilable, e.g. lone surrogates that can't match UTF-8).
+pub(super) enum CompiledRe {
+    Std(regex::Regex),
+    Fancy(Box<fancy_regex::Regex>),
+    Never,
+}
+
+impl CompiledRe {
+    fn is_match(&self, s: &str) -> bool {
+        match self {
+            CompiledRe::Std(r) => r.is_match(s),
+            CompiledRe::Fancy(r) => r.is_match(s).unwrap_or(false),
+            CompiledRe::Never => false,
+        }
+    }
+    /// group strings (index 0 = whole match), None entry = unmatched
+    fn captures_owned(&self, s: &str) -> Option<Vec<Option<String>>> {
+        let grab = |caps: fancy_regex::Captures| -> Vec<Option<String>> {
+            (0..caps.len())
+                .map(|i| caps.get(i).map(|m| m.as_str().to_string()))
+                .collect()
+        };
+        match self {
+            CompiledRe::Std(r) => r.captures(s).map(|c| {
+                (0..c.len())
+                    .map(|i| c.get(i).map(|m| m.as_str().to_string()))
+                    .collect()
+            }),
+            CompiledRe::Fancy(r) => {
+                r.captures(s).ok().flatten().map(grab)
+            }
+            CompiledRe::Never => None,
+        }
+    }
+    /// byte offset of the first match, for String.search
+    fn find_start(&self, s: &str) -> Option<usize> {
+        match self {
+            CompiledRe::Std(r) => r.find(s).map(|m| m.start()),
+            CompiledRe::Fancy(r) => {
+                r.find(s).ok().flatten().map(|m| m.start())
+            }
+            CompiledRe::Never => None,
+        }
+    }
+    /// all whole-match substrings (global match / find_iter)
+    fn find_all(&self, s: &str) -> Vec<String> {
+        match self {
+            CompiledRe::Std(r) => {
+                r.find_iter(s).map(|m| m.as_str().to_string()).collect()
+            }
+            CompiledRe::Fancy(r) => r
+                .find_iter(s)
+                .filter_map(|m| m.ok())
+                .map(|m| m.as_str().to_string())
+                .collect(),
+            CompiledRe::Never => Vec::new(),
+        }
+    }
+    fn replace_all_str(&self, s: &str, rep: &str) -> String {
+        match self {
+            CompiledRe::Std(r) => r.replace_all(s, rep).into_owned(),
+            CompiledRe::Fancy(r) => r.replace_all(s, rep).into_owned(),
+            CompiledRe::Never => s.to_string(),
+        }
+    }
+    fn replace_first_str(&self, s: &str, rep: &str) -> String {
+        match self {
+            CompiledRe::Std(r) => r.replace(s, rep).into_owned(),
+            CompiledRe::Fancy(r) => r.replace(s, rep).into_owned(),
+            CompiledRe::Never => s.to_string(),
+        }
+    }
+    fn split_vec(&self, s: &str) -> Vec<String> {
+        match self {
+            CompiledRe::Std(r) => {
+                r.split(s).map(|p| p.to_string()).collect()
+            }
+            CompiledRe::Fancy(r) => r
+                .split(s)
+                .filter_map(|p| p.ok())
+                .map(|p| p.to_string())
+                .collect(),
+            CompiledRe::Never => vec![s.to_string()],
+        }
+    }
+}
+
 /// A compiled regular expression + JS flags.
 pub(super) struct RegexRec {
-    re: regex::Regex,
+    re: CompiledRe,
     global: bool,
     source: String,
     flags: String,
@@ -759,16 +851,22 @@ fn new_regex(
         format!("(?{inline}){pattern}")
     };
     let re = match regex::Regex::new(&full) {
-        Ok(re) => re,
+        Ok(re) => CompiledRe::Std(re),
         Err(_) => {
-            // JS-only syntax (lone surrogates, backrefs): degrade to a
-            // never-matching regex instead of killing the script —
-            // surrogate ranges cannot match UTF-8 text anyway
-            st.logs.push(format!(
-                "[gg] regex /{pattern}/{flags} unsupported - \
-                 treated as never-matching"
-            ));
-            regex::Regex::new("[^\\s\\S]").unwrap()
+            // `regex` rejected it — try fancy-regex (backreferences,
+            // lookaround). date-fns's `(\w)\1*` tokenizer lives here.
+            match fancy_regex::Regex::new(&full) {
+                Ok(fr) => CompiledRe::Fancy(Box::new(fr)),
+                Err(_) => {
+                    // truly uncompilable (e.g. lone surrogates that
+                    // can't match UTF-8 anyway) — never-matching
+                    st.logs.push(format!(
+                        "[gg] regex /{pattern}/{flags} unsupported - \
+                         treated as never-matching"
+                    ));
+                    CompiledRe::Never
+                }
+            }
         }
     };
     st.regexes.push(RegexRec {
@@ -1888,11 +1986,9 @@ fn method_ref_dispatch(
                 .unwrap_or_default();
             let out = if let Some(ri) = regex_index(st, pat) {
                 if st.regexes[ri].global {
-                    st.regexes[ri].re.replace_all(&s, rep.as_str())
-                        .into_owned()
+                    st.regexes[ri].re.replace_all_str(&s, rep.as_str())
                 } else {
-                    st.regexes[ri].re.replace(&s, rep.as_str())
-                        .into_owned()
+                    st.regexes[ri].re.replace_first_str(&s, rep.as_str())
                 }
             } else {
                 let needle = to_display(st, pat);
@@ -1904,11 +2000,7 @@ fn method_ref_dispatch(
             let pat = args.first().copied().unwrap_or(Value::UNDEFINED);
             let parts: Vec<Value> = if let Some(ri) = regex_index(st, pat)
             {
-                let raw: Vec<String> = st.regexes[ri]
-                    .re
-                    .split(&s)
-                    .map(|p| p.to_string())
-                    .collect();
+                let raw = st.regexes[ri].re.split_vec(&s);
                 raw.into_iter()
                     .map(|p| make_string(st, p))
                     .collect()
@@ -2103,14 +2195,7 @@ fn method_ref_dispatch(
                 .first()
                 .map(|&v| to_display(st, v))
                 .unwrap_or_default();
-            let groups: Option<Vec<Option<String>>> = st.regexes[ri]
-                .re
-                .captures(&subject)
-                .map(|caps| {
-                    caps.iter()
-                        .map(|m| m.map(|mm| mm.as_str().to_string()))
-                        .collect()
-                });
+            let groups = st.regexes[ri].re.captures_owned(&subject);
             Ok(match groups {
                 None => Value::NULL,
                 Some(gs) => {
@@ -6452,12 +6537,9 @@ fn exec_loop(
                             "exec" => {
                                 // collect owned strings first to release
                                 // the regex borrow before push_str mutates st
-                                let groups: Option<Vec<Option<String>>> =
-                                    st.regexes[ri].re.captures(&subject)
-                                        .map(|caps| caps.iter()
-                                            .map(|m| m.map(|mm|
-                                                mm.as_str().to_string()))
-                                            .collect());
+                                let groups = st.regexes[ri]
+                                    .re
+                                    .captures_owned(&subject);
                                 match groups {
                                     None => Value::NULL,
                                     Some(gs) => {
@@ -7206,10 +7288,7 @@ fn exec_loop(
                                     "String.match needs a regex arg (yet)");
                             };
                             if st.regexes[ri].global {
-                                let hits: Vec<String> = st.regexes[ri].re
-                                    .find_iter(&s)
-                                    .map(|m| m.as_str().to_string())
-                                    .collect();
+                                let hits = st.regexes[ri].re.find_all(&s);
                                 if hits.is_empty() {
                                     Value::NULL
                                 } else {
@@ -7218,11 +7297,8 @@ fn exec_loop(
                                     new_array(st, vals)
                                 }
                             } else {
-                                let groups: Option<Vec<Option<String>>> =
-                                    st.regexes[ri].re.captures(&s).map(|c|
-                                        c.iter().map(|m| m.map(|mm|
-                                            mm.as_str().to_string()))
-                                            .collect());
+                                let groups =
+                                    st.regexes[ri].re.captures_owned(&s);
                                 match groups {
                                     None => Value::NULL,
                                     Some(gs) => {
@@ -7238,9 +7314,9 @@ fn exec_loop(
                         }
                         "search" => {
                             match regex_index(st, av0) {
-                                Some(ri) => match st.regexes[ri].re.find(&s) {
-                                    Some(m) => Value::int(
-                                        s[..m.start()].chars().count() as i32),
+                                Some(ri) => match st.regexes[ri].re.find_start(&s) {
+                                    Some(b) => Value::int(
+                                        s[..b].chars().count() as i32),
                                     None => Value::int(-1),
                                 },
                                 None => {
@@ -7255,10 +7331,7 @@ fn exec_loop(
                         }
                         "split" => {
                             if let Some(ri) = regex_index(st, av0) {
-                                let parts: Vec<String> = st.regexes[ri].re
-                                    .split(&s)
-                                    .map(|p| p.to_string())
-                                    .collect();
+                                let parts = st.regexes[ri].re.split_vec(&s);
                                 let vals: Vec<Value> = parts.into_iter()
                                     .map(|p| push_str(st, p)).collect();
                                 new_array(st, vals)
@@ -7287,12 +7360,10 @@ fn exec_loop(
                                     .replace("$&", "${0}");
                                 let out = if st.regexes[ri].global {
                                     st.regexes[ri].re
-                                        .replace_all(&s, to.as_str())
-                                        .into_owned()
+                                        .replace_all_str(&s, to.as_str())
                                 } else {
                                     st.regexes[ri].re
-                                        .replace(&s, to.as_str())
-                                        .into_owned()
+                                        .replace_first_str(&s, to.as_str())
                                 };
                                 push_str(st, out)
                             } else {

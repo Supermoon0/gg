@@ -2946,6 +2946,28 @@ console.log('B typeof it: ' + typeof it);
                count"),
             3.0
         );
+        // round 4: backreferences (fancy-regex second-chance engine).
+        // date-fns's tokenizer /(\w)\1*|./g returned null without this,
+        // making the app's `for...of` over the tokens throw and abort
+        // React's render.
+        // 'yyyy-MM' tokenizes to ["yyyy", "-", "MM"] (3 tokens)
+        assert_eq!(
+            n("var m = 'yyyy-MM'.match(/(\\w)\\1*|./g); \
+               m === null ? -1 : m.length"),
+            3.0
+        );
+        assert_eq!(
+            n("/(\\w)\\1+/.test('aabb') ? 1 : 0"),
+            1.0
+        );
+        // lookahead also compiles now (was never-matching)
+        assert_eq!(
+            n("var r = 'foobar'.match(/foo(?=bar)/); \
+               r === null ? -1 : r[0].length"),
+            3.0
+        );
+        // and a plain regex still uses the fast std engine
+        assert_eq!(n("'aabb'.match(/\\w/g).length"), 4.0);
     }
 
     #[test]
@@ -3196,9 +3218,10 @@ console.log('B typeof it: ' + typeof it);
         assert_eq!(n("/(\\d+)/.exec('abc42')[1] === '42' ? 1 : 0"), 1.0);
         // regex is an object
         assert_eq!(n("typeof /x/ === 'object' ? 1 : 0"), 1.0);
-        // unsupported pattern degrades to never-matching (07-16 —
-        // a dead regex must not kill the whole script)
-        assert_eq!(n("/(a)\\1/.test('aa') ? 1 : 0"), 0.0);
+        // backreferences now work via the fancy-regex second-chance
+        // engine (07-20; previously degraded to never-matching)
+        assert_eq!(n("/(a)\\1/.test('aa') ? 1 : 0"), 1.0);
+        assert_eq!(n("/(a)\\1/.test('ab') ? 1 : 0"), 0.0);
     }
 
     #[test]
