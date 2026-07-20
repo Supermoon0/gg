@@ -766,3 +766,18 @@ install --break-system-packages --force-reinstall`로 명시 설치 필요.
 *상태: A 달성·B 실질 진입(첫 화면 React 컴포넌트 트리 + 카테고리/로그인/
 푸터 실렌더, 5779px). 잔여 B는 피드/뉴스 카드 데이터 심화 + 가로 레이아웃
 겹침(M1/CSS) + 성능(M6, 앱 자체 JSON 파서 ~78s).*
+
+**07-20 오후 — 가로 겹침의 진짜 원인은 flex 콘텐츠 사이징이었음(수정)**.
+뉴스스탠드/추천카테고리 탭 6개가 한 x(=63)에 완전 포개진 건 CSS 포지셔닝이
+아니라 **flexbox main-size 버그**였다. 진단(레이아웃 박스 실좌표 덤프): 탭
+내비는 `<ul flex>`(6 `<li>`)를 감싼 `<div flex:1 0 0>`인데, 형제
+`<a flex:0 0 auto>`(basis:auto)가 우리 엔진의 "legacy 균등분배"로 행 전체
+폭(790px)을 삼켜 `flex:1` 내비가 0px로 붕괴 → 탭 전원 x=63 스택.
+**수정**: flex 아이템마다 확정 base = flex-basis(길이) > width >
+**max-content**(초광폭 제약 하 서브레이아웃으로 실측, 레이아웃 패스당
+메모이즈). free는 flex-grow로 배분, overflow는 flex-shrink×base로 회수.
+grow 선언이 하나도 없을 때만 auto-basis 아이템이 잔여를 균등분배(순진한
+등폭 컬럼 레이아웃 + 기존 smoke 기대치 보존). 결과: **탭이 가로로 흐름**
+(겹침 0), Naver 레이아웃+페인트 ~20ms 유지, css_gauntlet 22/23 불변,
+flex smoke 6종 + 신규 `flex:1 0 0` vs 콘텐츠-형제 회귀 전부 통과.
+잔여 탭 폴리시(탭 간 여백)는 CSS-모듈 패딩 캐스케이드 심화 영역.
