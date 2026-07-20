@@ -2809,13 +2809,12 @@ console.log('B typeof it: ' + typeof it);
             n("function F() {} (new F() instanceof F) ? 1 : 0"),
             1.0
         );
-        // non-callable RHS is a TypeError (07-19: Babel _classCallCheck
-        // relies on `this instanceof undefined` throwing, not false)
-        assert_eq!(
-            n("var r; try { [] instanceof 5; r = 0 } \
-               catch (e) { r = (e instanceof TypeError) ? 1 : 2 } r"),
-            1.0
-        );
+        // non-callable RHS tolerates to false: bundles do
+        // `x instanceof MaybeMissingCtor` for feature detection, and
+        // throwing there aborts React's mount (07-20). The Babel
+        // _classCallCheck case is handled by NFE self-binding instead.
+        assert_eq!(n("([] instanceof 5) ? 1 : 0"), 0.0);
+        assert_eq!(n("([] instanceof undefined) ? 1 : 0"), 0.0);
     }
 
     #[test]

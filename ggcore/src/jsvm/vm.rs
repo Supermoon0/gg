@@ -2688,9 +2688,13 @@ fn instance_of(st: &St, x: Value, ctor: Value) -> Result<bool, VmError> {
         }
         return Ok(false);
     }
-    // spec: a non-callable RHS is a TypeError (Babel _classCallCheck
-    // relies on `this instanceof undefined` throwing, not false)
-    type_err("Right-hand side of 'instanceof' is not callable")
+    // A non-callable RHS is a TypeError per spec, but real bundles do
+    // `x instanceof MaybeMissingCtor` for feature detection (a DOM/SDK
+    // constructor this engine doesn't expose resolves to undefined) —
+    // throwing there aborts react's mount path. Tolerate with false;
+    // the Babel _classCallCheck case is already handled by named-
+    // function-expression self-binding making the ctor resolve.
+    Ok(false)
 }
 
 fn to_display(st: &mut St, v: Value) -> String {
