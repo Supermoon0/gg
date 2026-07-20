@@ -12,7 +12,7 @@ from .html_parser import Element, HTMLParser, Text, tree_to_list
 from .css_parser import CSSParser
 from .style import RuleIndex, cascade_priority, default_rules, style
 from .layout import (VSTEP, BlockLayout, DocumentLayout, ImageLayout,
-                     layout_tree_to_list, paint_tree)
+                     TextLayout, layout_tree_to_list, paint_tree)
 from .pages import error_page
 
 SCROLL_STEP = 90
@@ -450,17 +450,45 @@ class Browser:
         doc = getattr(self, "_doc", None)
         if doc is None or not hasattr(doc, "set_layout_rects"):
             return
-        rects = []
-        seen = set()
+        # ridx -> [min_x, min_y, max_x, max_y] union of the element's boxes
+        boxes = {}
+
+        def add(ridx, x, y, w, h):
+            if ridx is None:
+                return
+            b = boxes.get(ridx)
+            if b is None:
+                boxes[ridx] = [x, y, x + w, y + h]
+            else:
+                b[0] = min(b[0], x)
+                b[1] = min(b[1], y)
+                b[2] = max(b[2], x + w)
+                b[3] = max(b[3], y + h)
+
         for o in self.layout_list:
-            if not isinstance(o, (BlockLayout, ImageLayout)):
-                continue  # line/text boxes share their element's node
-            r = getattr(getattr(o, "node", None), "_ridx", None)
-            if r is None or r in seen:
-                continue
-            seen.add(r)
-            rects.append((r, float(o.x), float(o.y),
-                          float(o.width), float(o.height)))
+            if isinstance(o, (BlockLayout, ImageLayout)):
+                add(getattr(getattr(o, "node", None), "_ridx", None),
+                    o.x, o.y, o.width, o.height)
+            elif isinstance(o, TextLayout):
+                # inline elements (<a>, <span>) have no box of their own —
+                # they are laid out as words. Attribute each word's rect to
+                # its element-ancestor chain so getBoundingClientRect
+                # answers a real rect for inline links, not (0,0,0,0). Naver
+                # observes inline <a> headlines with IntersectionObserver to
+                # lazy-render its feed; a zero rect kept them off-screen
+                # forever.
+                cur = getattr(o, "node", None)
+                depth = 0
+                while cur is not None and depth < 6:
+                    if isinstance(cur, Element):
+                        add(getattr(cur, "_ridx", None),
+                            o.x, o.y, o.width, o.height)
+                    cur = getattr(cur, "parent", None)
+                    depth += 1
+
+        rects = [(r, float(b[0]), float(b[1]),
+                  float(b[2] - b[0]), float(b[3] - b[1]))
+                 for r, b in boxes.items()]
         doc.set_layout_rects(rects)
 
     def _push_display_list(self):
