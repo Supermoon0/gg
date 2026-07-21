@@ -1530,8 +1530,13 @@ class BlockLayout:
 
     def recurse(self, node):
         if isinstance(node, Text):
-            if node.style.get("white-space") == "pre":
+            ws = node.style.get("white-space", "normal")
+            if ws == "pre":
                 self.preformatted(node)
+            elif ws in ("pre-wrap", "pre-line"):
+                # both honor source newlines and still wrap; pre-line
+                # collapses runs of whitespace, pre-wrap preserves them
+                self.pre_wrapped(node, collapse=(ws == "pre-line"))
             else:
                 for word in node.text.split():
                     self.word(node, word)
@@ -1705,6 +1710,30 @@ class BlockLayout:
             text = TextLayout(node, raw_line, line, prev, keep_spaces=True)
             line.children.append(text)
             self.cursor_x += measure(font, raw_line)
+
+    def pre_wrapped(self, node, collapse):
+        """white-space: pre-wrap / pre-line. Each source newline forces a
+        break and long lines still wrap. pre-line collapses runs of
+        whitespace (emit split words); pre-wrap preserves them (emit
+        whitespace and word tokens verbatim, breaking between them)."""
+        font = cached_font(node)
+        for i, raw in enumerate(node.text.split("\n")):
+            if i > 0:
+                self.new_line()
+            if collapse:
+                for word in raw.split():
+                    self.word(node, word)
+                continue
+            for token in re.findall(r"\s+|\S+", raw):
+                w = measure(font, token)
+                if token.strip() and self.cursor_x + w > self.width \
+                        and self.cursor_x > 0:
+                    self.new_line()
+                line = self.children[-1]
+                prev = line.children[-1] if line.children else None
+                line.children.append(
+                    TextLayout(node, token, line, prev, keep_spaces=True))
+                self.cursor_x += w
 
     # ----- painting -----
 
