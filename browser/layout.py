@@ -2234,10 +2234,42 @@ class LineLayout:
                                 16.0))
         factor = line_height_factor(self.node, font_px)
         baseline = self.y + factor * max_ascent
-        for word in self.children:
-            word.y = baseline - ascent(word)
         max_descent = max(descent(w) for w in self.children)
         self.height = factor * (max_ascent + max_descent)
+        line_bottom = self.y + self.height
+
+        # vertical-align (CSS 2.1 §10.8): offset each inline box from the
+        # baseline. Default keeps the old baseline alignment; middle/top/
+        # bottom/sub/super/text-top/text-bottom move icons and scripts to
+        # the right height instead of all sitting on the baseline.
+        def valign(child):
+            n = child.node
+            src = n if isinstance(n, Element) else getattr(n, "parent", None)
+            v = (src.style.get("vertical-align", "")
+                 if isinstance(src, Element) else "")
+            return (v or "baseline").strip().casefold()
+
+        xhalf = font_px * 0.25          # ~ half the x-height
+        for word in self.children:
+            asc = ascent(word)
+            h = word.height
+            va = valign(word)
+            if va == "middle":
+                word.y = baseline - xhalf - h / 2
+            elif va == "top":
+                word.y = self.y
+            elif va == "bottom":
+                word.y = line_bottom - h
+            elif va == "text-top":
+                word.y = baseline - max_ascent
+            elif va == "text-bottom":
+                word.y = baseline + max_descent - h
+            elif va == "sub":
+                word.y = baseline - asc + font_px * 0.15
+            elif va == "super":
+                word.y = baseline - asc - font_px * 0.30
+            else:
+                word.y = baseline - asc
 
         # text-align — skipped during intrinsic-width measurement, where
         # the line box is _MAXCONTENT-wide and a right/center shift would

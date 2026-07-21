@@ -75,6 +75,8 @@ b, strong { font-weight: bold; }
 i, em, cite, var { font-style: italic; }
 small { font-size: 13px; }
 big { font-size: 20px; }
+sub { vertical-align: sub; font-size: 13px; }
+sup { vertical-align: super; font-size: 13px; }
 h1 a, h2 a, h3 a { }
 
 center { display: block; text-align: center; }
