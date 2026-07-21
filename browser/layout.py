@@ -381,6 +381,8 @@ def layout_mode(node):
     if display in ("table", "inline-table") and node.children \
             and _has_table_rows(node):
         return "table"
+    if display in ("grid", "inline-grid") and node.children:
+        return "grid"
     # -webkit-line-clamp / display:-webkit-box establish an inline context
     # whose wrapped lines we clamp; route them to inline flow (only when
     # every child is inline-level, which card titles always are).
@@ -453,6 +455,95 @@ def _nearest_positioned(layout_box):
 def is_out_of_flow(node):
     return (isinstance(node, Element)
             and node.style.get("position") in ("absolute", "fixed"))
+
+
+def _split_top_level(spec):
+    """Split a track list on spaces while keeping parenthesised groups
+    (minmax(...), repeat(...), fit-content(...)) intact."""
+    out, buf, depth = [], "", 0
+    for ch in spec:
+        if ch == "(":
+            depth += 1
+            buf += ch
+        elif ch == ")":
+            depth -= 1
+            buf += ch
+        elif ch.isspace() and depth == 0:
+            if buf:
+                out.append(buf)
+                buf = ""
+        else:
+            buf += ch
+    if buf:
+        out.append(buf)
+    return out
+
+
+def _grid_track_size(token, avail, em):
+    """One grid track -> ('fr', n) for flexible tracks or ('fixed', px)
+    for a resolved length. auto/min-content/max-content and unresolved
+    values become a flexible 1fr so the track still shares space rather
+    than collapsing."""
+    t = token.strip().casefold()
+    if t.endswith("fr"):
+        try:
+            return ("fr", max(float(t[:-2]), 0.0))
+        except ValueError:
+            return ("fr", 1.0)
+    if t.startswith("minmax(") and t.endswith(")"):
+        parts = t[7:-1].split(",")
+        if len(parts) == 2:
+            return _grid_track_size(parts[1], avail, em)  # the max
+    if t.startswith("fit-content(") and t.endswith(")"):
+        return _grid_track_size(t[12:-1], avail, em)
+    if t in ("auto", "min-content", "max-content", "fit-content"):
+        return ("fr", 1.0)
+    px = parse_size(token, avail, em)
+    if px is not None:
+        return ("fixed", max(px, 0.0))
+    return ("fr", 1.0)
+
+
+def _parse_grid_areas(spec):
+    """grid-template-areas -> a list of rows, each a list of area names
+    ('.' is an empty cell). Each quoted string is one row."""
+    rows = []
+    for m in re.finditer(r'"([^"]*)"|\'([^\']*)\'', spec or ""):
+        s = m.group(1) if m.group(1) is not None else m.group(2)
+        cells = s.split()
+        if cells:
+            rows.append(cells)
+    return rows
+
+
+def _parse_grid_tracks(spec, avail, em):
+    """Parse grid-template-columns into a list of track descriptors,
+    expanding repeat(N, tracks). Returns [] when there is no template."""
+    spec = (spec or "").strip()
+    if not spec or spec in ("none", "auto"):
+        return []
+    tokens, i = [], 0
+    parts = _split_top_level(spec)
+    for p in parts:
+        pl = p.casefold()
+        if pl.startswith("repeat(") and pl.endswith(")"):
+            inner = p[7:-1]
+            comma = inner.find(",")
+            if comma < 0:
+                continue
+            count_tok = inner[:comma].strip()
+            try:
+                count = int(count_tok)
+            except ValueError:
+                count = 1              # auto-fill/auto-fit: one pass
+            count = max(1, min(count, 64))
+            sub = _split_top_level(inner[comma + 1:].strip())
+            for _ in range(count):
+                for s in sub:
+                    tokens.append(_grid_track_size(s, avail, em))
+        else:
+            tokens.append(_grid_track_size(p, avail, em))
+    return tokens
 
 
 def translate(layout_obj, dx, dy):
@@ -860,6 +951,8 @@ class BlockLayout:
             self._layout_flex(node, em)
         elif mode == "table":
             self._layout_table(node, em)
+        elif mode == "grid":
+            self._layout_grid(node, em)
         elif mode == "block":
             # incremental placement: floats registered by earlier
             # children must be visible while later siblings lay out
@@ -1520,6 +1613,190 @@ class BlockLayout:
             except (ValueError, TypeError):
                 pass
         return 2.0
+
+    def _layout_grid(self, node, em):
+        """Simplified CSS Grid. Column tracks come from
+        grid-template-columns (or the columns half of the grid /
+        grid-template shorthand); fr tracks share the space left after
+        fixed tracks and column gaps. Items are placed left-to-right,
+        top-to-bottom, honouring an explicit numeric grid-column
+        start/end or span; row heights come from content. This turns the
+        common 2–3 column app shells (Wikipedia's Vector sidebar/content,
+        card grids) into real columns instead of a single stacked block."""
+        doc = self._document()
+        style = node.style
+
+        cols_spec = style.get("grid-template-columns", "")
+        if not cols_spec:
+            shorthand = style.get("grid-template") or style.get("grid") or ""
+            if "/" in shorthand:          # "<rows> / <columns>"
+                cols_spec = shorthand.split("/", 1)[1]
+        if "/" in cols_spec:              # a shorthand leaked into the key
+            cols_spec = cols_spec.split("/", 1)[1]
+        tracks = _parse_grid_tracks(cols_spec, self.width, em)
+        if not tracks:
+            tracks = [("fr", 1.0)]
+        ncols = len(tracks)
+
+        col_gap = parse_size(
+            style.get("column-gap") or style.get("grid-column-gap")
+            or self._gap_shorthand(style, 1), self.width, em) or 0.0
+        row_gap = parse_size(
+            style.get("row-gap") or style.get("grid-row-gap")
+            or self._gap_shorthand(style, 0), self.width, em) or 0.0
+
+        # resolve column widths: fixed tracks keep their px, fr tracks
+        # split the remaining space
+        gap_total = col_gap * max(ncols - 1, 0)
+        fixed = sum(v for kind, v in ((t[0], t[1] if len(t) > 1 else 0.0)
+                                      for t in tracks) if kind == "fixed")
+        fr_sum = sum(t[1] for t in tracks if t[0] == "fr")
+        free = max(self.width - gap_total - fixed, 0.0)
+        col_w = []
+        for t in tracks:
+            if t[0] == "fixed":
+                col_w.append(t[1])
+            else:
+                col_w.append(free * t[1] / fr_sum if fr_sum > 0 else 0.0)
+        col_x = []
+        cx = 0.0
+        for i in range(ncols):
+            col_x.append(cx)
+            cx += col_w[i] + col_gap
+
+        items = []
+        for child in node.children:
+            if not (isinstance(child, Element) and is_visible(child)):
+                continue
+            if is_out_of_flow(child):
+                self._queue_abs(child, self.x, self.y)
+                continue
+            items.append(child)
+
+        # placement: [child, col_start, col_span, row_start, row_span]
+        areas = _parse_grid_areas(style.get("grid-template-areas", ""))
+        placed = []
+        if areas:
+            # named areas: an item's grid-area name maps to the bounding
+            # box of the cells carrying that name
+            name_box = {}
+            for r, row in enumerate(areas):
+                for c, name in enumerate(row):
+                    if not name or name == "." or c >= ncols:
+                        continue
+                    if name in name_box:
+                        r0, r1, c0, c1 = name_box[name]
+                        name_box[name] = (min(r0, r), max(r1, r),
+                                          min(c0, c), max(c1, c))
+                    else:
+                        name_box[name] = (r, r, c, c)
+            next_r = len(areas)
+            for child in items:
+                ga = child.style.get("grid-area", "").split("/")[0].strip()
+                if ga in name_box:
+                    r0, r1, c0, c1 = name_box[ga]
+                    placed.append([child, c0, c1 - c0 + 1, r0, r1 - r0 + 1])
+                else:                     # not in the template: own row
+                    placed.append([child, 0, ncols, next_r, 1])
+                    next_r += 1
+        else:
+            # auto-flow, honouring an explicit numeric grid-column
+            cur_c, cur_r = 0, 0
+            for child in items:
+                cs_start, cs_span = self._grid_column(child, ncols)
+                if cs_start is None:
+                    if cur_c + cs_span > ncols and cur_c > 0:
+                        cur_c, cur_r = 0, cur_r + 1
+                    col = cur_c
+                    cur_c += cs_span
+                else:
+                    col = max(0, min(cs_start, ncols - 1))
+                    if col < cur_c:
+                        cur_r += 1
+                    cur_c = col + cs_span
+                    if cur_c > ncols:
+                        cur_c = ncols
+                span = max(1, min(cs_span, ncols - col))
+                placed.append([child, col, span, cur_r, 1])
+
+        nrows = max((p[3] + p[4] for p in placed), default=0)
+        row_h = [0.0] * nrows
+        for p in placed:
+            child, c0, cspan, r0, rspan = p
+            w = sum(col_w[c0:c0 + cspan]) + col_gap * (cspan - 1)
+            box = BlockLayout(child, self, None)
+            box.forced_width = max(w, 0.0)
+            box.flex_origin = (0.0, 0.0)
+            box.layout()
+            p.append(box)
+            if rspan == 1:
+                row_h[r0] = max(row_h[r0], box.outer_height())
+        for p in placed:                 # multi-row items grow their last row
+            child, c0, cspan, r0, rspan, box = p
+            if rspan > 1:
+                have = sum(row_h[r0:r0 + rspan]) + row_gap * (rspan - 1)
+                if box.outer_height() > have:
+                    row_h[r0 + rspan - 1] += box.outer_height() - have
+
+        row_y = [0.0] * nrows
+        y = 0.0
+        for r in range(nrows):
+            row_y[r] = y
+            y += row_h[r] + row_gap
+        total_h = (y - row_gap) if nrows else 0.0
+
+        self.children = []
+        for child, c0, cspan, r0, rspan, box in placed:
+            box.flex_origin = (self.x + col_x[c0], self.y + row_y[r0])
+            box.layout()
+            self.children.append(box)
+        self.height = max(total_h, 0.0)
+        apply_relative_offsets(self.children)
+
+    def _gap_shorthand(self, style, index):
+        """Value from the `gap` shorthand: index 0 = row, 1 = column
+        (one value applies to both)."""
+        parts = style.get("gap", "").split()
+        if not parts:
+            return ""
+        return parts[index] if index < len(parts) else parts[0]
+
+    def _grid_column(self, child, ncols):
+        """(start, span) for a grid item's column placement, 0-indexed.
+        start is None for auto-placement. Supports `grid-column: a / b`,
+        `grid-column: span n`, a bare line number, and the -start/-end
+        longhands; named lines and grid-area are treated as auto."""
+        gc = child.style.get("grid-column", "").strip()
+        start_raw = end_raw = ""
+        if gc:
+            if "/" in gc:
+                start_raw, end_raw = (s.strip() for s in gc.split("/", 1))
+            else:
+                start_raw = gc
+        start_raw = child.style.get("grid-column-start", "") or start_raw
+        end_raw = child.style.get("grid-column-end", "") or end_raw
+
+        def line_no(v):
+            try:
+                return int(v)
+            except (ValueError, TypeError):
+                return None
+
+        if start_raw.startswith("span"):
+            n = line_no(start_raw[4:].strip()) or 1
+            return (None, max(1, n))
+        s = line_no(start_raw)
+        if end_raw.startswith("span"):
+            n = line_no(end_raw[4:].strip()) or 1
+            span = max(1, n)
+        else:
+            e = line_no(end_raw)
+            span = max(1, e - s) if (s is not None and e is not None) else 1
+        if s is None:
+            return (None, span)
+        # grid lines are 1-based; negatives count from the end
+        idx = s - 1 if s > 0 else ncols + s
+        return (idx, span)
 
     # ----- inline layout -----
 
