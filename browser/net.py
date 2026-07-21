@@ -20,6 +20,46 @@ import urllib.parse
 USER_AGENT = "GGBrowser/0.1 (educational engine)"
 MAX_REDIRECTS = 8
 
+# --- cookie jar (host -> {name: value}) ---
+# A minimal session cookie store: Set-Cookie response headers are captured
+# here and replayed as a Cookie request header to the same host. Attributes
+# (Path/Domain/Expires/Secure) are ignored — enough for session continuity
+# across a page's requests and for document.cookie round-tripping.
+_COOKIE_JAR = {}
+
+
+def _cookie_header(host):
+    jar = _COOKIE_JAR.get(host)
+    if not jar:
+        return ""
+    pairs = "; ".join(f"{k}={v}" for k, v in jar.items())
+    return f"Cookie: {pairs}\r\n"
+
+
+def _store_set_cookie(host, values):
+    """Store one or more Set-Cookie header values (name=value; attrs...)."""
+    jar = _COOKIE_JAR.setdefault(host, {})
+    for sc in values:
+        first = sc.split(";", 1)[0].strip()
+        if "=" in first:
+            k, v = first.split("=", 1)
+            k = k.strip()
+            if k:
+                jar[k] = v.strip()
+
+
+def cookies_for(host):
+    """The `document.cookie` string for a host: `k=v; k2=v2`."""
+    jar = _COOKIE_JAR.get(host)
+    if not jar:
+        return ""
+    return "; ".join(f"{k}={v}" for k, v in jar.items())
+
+
+def set_cookie_from_js(host, cookie_str):
+    """Apply a `document.cookie = 'k=v; Path=/'` write to the jar."""
+    _store_set_cookie(host, [cookie_str])
+
 # --- connection pool ---
 _POOL = {}
 _POOL_LOCK = threading.Lock()
@@ -452,6 +492,7 @@ def _one_request(url, s, pool_key):
         f"User-Agent: {USER_AGENT}\r\n"
         f"Accept: text/html,*/*\r\n"
         f"Accept-Encoding: gzip\r\n"
+        f"{_cookie_header(url.host)}"
         f"\r\n"
     )
     s.sendall(req.encode("utf-8"))
@@ -464,6 +505,7 @@ def _one_request(url, s, pool_key):
     status = int(parts[1]) if len(parts) >= 2 else 0
 
     headers = {}
+    set_cookies = []
     while True:
         line = f.readline().decode("latin-1")
         if line in ("\r\n", "\n", ""):
@@ -471,7 +513,14 @@ def _one_request(url, s, pool_key):
         if ":" not in line:
             continue
         name, value = line.split(":", 1)
-        headers[name.strip().lower()] = value.strip()
+        lname = name.strip().lower()
+        # Set-Cookie legitimately repeats; the dict below keeps only the
+        # last, so collect them all for the jar separately.
+        if lname == "set-cookie":
+            set_cookies.append(value.strip())
+        headers[lname] = value.strip()
+    if set_cookies:
+        _store_set_cookie(url.host, set_cookies)
 
     reusable = "close" not in headers.get("connection", "").casefold() \
         and statusline.startswith("HTTP/1.1")
