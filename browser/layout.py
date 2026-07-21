@@ -724,17 +724,25 @@ class DocumentLayout:
                 continue
             processed.add(id(node))
 
-            # containing-block padding box (document/ICB when unpositioned)
-            if isinstance(cb, BlockLayout):
+            st = node.style
+            # position:fixed is laid out relative to the viewport, not a
+            # positioned ancestor or the whole (tall) page — so top:0 pins
+            # to the top of the first screen and bottom:0 to the bottom of
+            # the viewport (best a non-scrolling full-page render can do).
+            if st.get("position") == "fixed":
+                cb_x, cb_y = 0.0, 0.0
+                cb_w = self.viewport_width or self.width
+                cb_h = self.viewport_height or self.height
+            elif isinstance(cb, BlockLayout):
+                # containing-block padding box
                 cb_x = cb.x - cb.pl
                 cb_y = cb.y - cb.pt
                 cb_w = cb.width + cb.pl + cb.pr
                 cb_h = cb.height + cb.pt + cb.pb
-            else:
+            else:                     # document / initial containing block
                 cb_x, cb_y, cb_w, cb_h = self.x, self.y, self.width, \
                     self.height
 
-            st = node.style
             em = parse_px(st.get("font-size", "16px"), 16.0)
             left = parse_size(st.get("left"), cb_w, em)
             right = parse_size(st.get("right"), cb_w, em)
