@@ -976,6 +976,15 @@ class BlockLayout:
         if self.definite_height is not None:
             self.height = self.definite_height
 
+        # min-height / max-height clamp the used content height
+        # (CSS 2.1 §10.7)
+        maxh = self._content_height_limit(st.get("max-height"), em)
+        if maxh is not None:
+            self.height = min(self.height, maxh)
+        minh = self._content_height_limit(st.get("min-height"), em)
+        if minh is not None:
+            self.height = max(self.height, minh)
+
         # position: relative offsets the box visually; stored here and
         # applied by the parent after all siblings are placed
         if st.get("position") == "relative":
@@ -1007,6 +1016,28 @@ class BlockLayout:
             return parse_size(raw, base, em) if base is not None else None
         return parse_size(raw, 0, em)
 
+    def _content_height_limit(self, raw, em):
+        """A min-/max-height value as a *content* height px (the border
+        box less this box's padding and border), or None when auto/none
+        or its percentage base is unknown. Mirrors _specified_height's
+        base selection so vh/vw and % resolve the same way."""
+        raw = (raw or "").strip().casefold()
+        if not raw or raw in ("none", "auto"):
+            return None
+        if raw.endswith("vh") or raw.endswith("vw"):
+            doc = self._document()
+            base = (doc.viewport_height if raw.endswith("vh")
+                    else doc.viewport_width)
+            box = parse_size(raw, base, em) if base is not None else None
+        elif raw.endswith("%"):
+            base = self.parent.definite_height
+            box = parse_size(raw, base, em) if base is not None else None
+        else:
+            box = parse_size(raw, 0, em)
+        if box is None:
+            return None
+        return max(box - self.pt - self.pb - 2 * self.bw, 0.0)
+
     def _float_x(self, side, y, w):
         """Margin-edge x for a new float: after the floats already
         occupying this y, from the matching side."""
@@ -1036,17 +1067,36 @@ class BlockLayout:
                 continue
             kid_nodes.append(child)
 
+        # gap / row-gap / column-gap reserve fixed space between flex
+        # items before any free space is distributed (CSS Box Alignment
+        # §8). The `gap` shorthand is "<row> <column>" (one value = both).
+        gap_parts = node.style.get("gap", "").split()
+        row_gap = parse_size(
+            node.style.get("row-gap")
+            or (gap_parts[0] if gap_parts else ""), self.width, em) or 0.0
+        col_gap = parse_size(
+            node.style.get("column-gap")
+            or (gap_parts[1] if len(gap_parts) > 1
+                else gap_parts[0] if gap_parts else ""),
+            self.width, em) or 0.0
+
         if node.style.get("flex-direction", "row").startswith("column"):
-            # column flex behaves like block stacking
+            # column flex behaves like block stacking (with row-gap
+            # inserted between items)
             previous = None
-            for child in kid_nodes:
+            for i, child in enumerate(kid_nodes):
                 nxt = BlockLayout(child, self, previous)
                 self.children.append(nxt)
                 previous = nxt
             for child in self.children:
                 child.layout()
+            if row_gap and len(self.children) > 1:
+                for i, child in enumerate(self.children):
+                    if i:
+                        translate(child, 0, row_gap * i)
             self.height = sum(
-                child.outer_height() for child in self.children)
+                child.outer_height() for child in self.children) \
+                + row_gap * max(len(self.children) - 1, 0)
             apply_relative_offsets(self.children)
             return
 
@@ -1107,8 +1157,9 @@ class BlockLayout:
                          for i in range(len(specs))]
             eff_total = sum(eff_grows)
 
+        gap_total = col_gap * max(len(specs) - 1, 0)
         if not wrap:
-            free = self.width - sum(specs)
+            free = self.width - sum(specs) - gap_total
             if free > 0 and eff_total > 0:
                 for i, g in enumerate(eff_grows):
                     specs[i] += free * g / eff_total
@@ -1137,7 +1188,7 @@ class BlockLayout:
             for child in kid_nodes)
         auto_px = 0.0
         if n_auto:
-            free = self.width - fixed_total - grow * n_flex
+            free = self.width - fixed_total - grow * n_flex - gap_total
             auto_px = max(free / n_auto, 0.0)
 
         cx, row_y, row_h = self.x, self.y, 0.0
@@ -1145,11 +1196,15 @@ class BlockLayout:
         row_boxes = []
         for child, spec in zip(kid_nodes, specs):
             w = spec if spec is not None else grow
-            if wrap and cx + w > self.x + self.width and cx > self.x:
+            gap_before = col_gap if row_boxes else 0.0
+            if wrap and cx + gap_before + w > self.x + self.width \
+                    and cx > self.x:
                 rows.append((row_boxes, row_h))
                 row_boxes = []
-                row_y += row_h
+                row_y += row_h + row_gap
                 cx, row_h = self.x, 0.0
+                gap_before = 0.0
+            cx += gap_before
             box = BlockLayout(child, self, None)
             box.forced_width = w
             box.flex_auto_margin = auto_px
@@ -1176,7 +1231,8 @@ class BlockLayout:
                 continue
             if justify not in ("", "flex-start", "start", "normal",
                                "left") and not n_auto:
-                used = sum(b.outer_width() for b in boxes)
+                used = sum(b.outer_width() for b in boxes) \
+                    + col_gap * max(len(boxes) - 1, 0)
                 free = max(self.width - used, 0.0)
                 lead, gap = 0.0, 0.0
                 if justify in ("center",):
@@ -1694,6 +1750,10 @@ class BlockLayout:
         if not isinstance(self.node, Element):
             return False
         for axis in ("overflow", "overflow-x", "overflow-y"):
+            # note: overflow:auto is intentionally NOT clipped here — in a
+            # non-scrolling full-page render, clipping an auto scroll
+            # container to a possibly under-computed height would hide
+            # readable content, which is worse than letting it flow.
             if self.node.style.get(axis) in ("hidden", "clip", "scroll"):
                 return True
         return False
