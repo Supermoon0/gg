@@ -28,7 +28,9 @@ INHERITED_PROPERTIES = {
 DEFAULT_STYLE_SHEET = """
 head, script, style, title, meta, link, template, noscript { display: none; }
 input[type=hidden] { display: none; }
-input { height: 1.5em; }
+input { height: 1.5em; width: 175px; }
+input[type=checkbox], input[type=radio] { width: 13px; height: 13px; }
+textarea { width: 250px; height: 3em; }
 
 html { display: block; }
 body { display: block; margin: 8px; }

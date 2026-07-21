@@ -1850,7 +1850,10 @@ class InlineBlockLayout:
         self.margin_top = 0
         self.margin_bottom = 0
         em = parse_px(node.style.get("font-size", "16px"), 16.0)
-        avail = max(line.width, 1)
+        # the line box has not been laid out yet (its width is still 0), so
+        # resolve percentage widths against the container's content width —
+        # e.g. width:100% on an inline <input> fills its container
+        avail = max(getattr(container, "width", 0) or line.width, 1)
         w = parse_size(node.style.get("width"), avail, em)
         if w is None:
             try:
