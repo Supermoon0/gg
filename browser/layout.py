@@ -1388,13 +1388,22 @@ class BlockLayout:
                                         "").strip().casefold() or align
                 if mode in ("center",):
                     dy = (height - b.outer_height()) / 2
+                    if dy > 0:
+                        translate(b, 0, dy)
                 elif mode in ("flex-end", "end"):
                     dy = height - b.outer_height()
-                else:  # stretch/flex-start/baseline: top (no
-                    #     cross-size stretching yet)
-                    dy = 0.0
-                if dy > 0:
-                    translate(b, 0, dy)
+                    if dy > 0:
+                        translate(b, 0, dy)
+                elif mode in ("stretch", "normal", "auto", "") \
+                        and b.definite_height is None:
+                    # stretch (the default): an auto-height item grows to
+                    # the line's cross size, so a row of cards ends up
+                    # equal height (their backgrounds/borders fill)
+                    fill = height - b.margin_top - b.margin_bottom \
+                        - 2 * b.bw - b.pt - b.pb
+                    if fill > b.height:
+                        b.height = fill
+                # flex-start / baseline: top edge, no change
         apply_relative_offsets(self.children)
 
     def _layout_table(self, node, em):
