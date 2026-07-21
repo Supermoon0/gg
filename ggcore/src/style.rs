@@ -816,6 +816,15 @@ mod tests {
             "<p>x</p>",
         );
         assert_eq!(tag_style(&doc, "p")["font-weight"], "bold");
+        // a media condition written across lines (real sites format them
+        // this way) must still evaluate its features — a desktop viewport
+        // must NOT pick up a `max-width: 750px` mobile rule
+        let doc = styled(
+            "p{color:black}\n@media only screen\nand (min-width : 300px)\n\
+             and (max-width : 750px) {\n  p{color:blue}\n}",
+            "<p>x</p>",
+        );
+        assert_eq!(tag_style(&doc, "p")["color"], "black");
     }
 
     #[test]

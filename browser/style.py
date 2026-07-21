@@ -33,7 +33,18 @@ input { height: 1.5em; }
 html { display: block; }
 body { display: block; margin: 8px; }
 div, section, article, header, footer, nav, aside, main, figure,
-form, fieldset, table, address, dl, dd, dt, hr { display: block; }
+form, fieldset, address, dl, dd, dt, hr { display: block; }
+
+table { display: table; border-collapse: separate; }
+thead { display: table-header-group; }
+tbody { display: table-row-group; }
+tfoot { display: table-footer-group; }
+tr { display: table-row; }
+td, th { display: table-cell; }
+th { font-weight: bold; text-align: center; }
+caption { display: table-caption; text-align: center; }
+col { display: table-column; }
+colgroup { display: table-column-group; }
 
 h1 { display: block; font-size: 32px; font-weight: bold;
      margin-top: 21px; margin-bottom: 21px; }

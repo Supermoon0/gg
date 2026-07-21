@@ -698,8 +698,13 @@ impl<'a> CssParser<'a> {
     }
 
     fn media_query_matches(&self, q: &str) -> bool {
+        // normalize whitespace first: a query formatted across lines
+        // ("screen\nand (max-width:750px)") must still split on `and`,
+        // otherwise the feature is never tested and the query wrongly
+        // matches — leaking mobile rules onto desktop.
+        let norm = q.split_whitespace().collect::<Vec<_>>().join(" ");
         let mut ok = true;
-        for part in q.split(" and ") {
+        for part in norm.split(" and ") {
             let p = part.trim().trim_start_matches("only ").trim();
             if p.is_empty() || p == "screen" || p == "all" {
                 continue;

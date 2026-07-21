@@ -638,6 +638,11 @@ class CSSParser:
                    for q in cond.split(","))
 
     def _media_query(self, q):
+        # normalize whitespace first: a query formatted across lines
+        # ("screen\nand (max-width:750px)") must still split on `and`,
+        # otherwise the feature is never tested and the query wrongly
+        # matches — leaking mobile rules onto desktop
+        q = " ".join(q.split())
         ok = True
         for part in q.split(" and "):
             p = part.strip().replace("only ", "").strip()

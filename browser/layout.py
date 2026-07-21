@@ -354,12 +354,33 @@ class _FlowMarker:
         self.margin_bottom = 0
 
 
+def _has_table_rows(node):
+    """True when a display:table box has real table structure to lay out
+    (a row or cell somewhere inside, directly or through a row group).
+    A bare `::after{display:table}` clearfix or a `display:table`
+    centering wrapper with only block children has none, and stays in
+    normal flow instead of going through the table algorithm."""
+    for child in node.children:
+        if not isinstance(child, Element):
+            continue
+        d = child.style.get("display", "")
+        if d in ("table-row", "table-cell"):
+            return True
+        if d in ("table-row-group", "table-header-group",
+                 "table-footer-group") and _has_table_rows(child):
+            return True
+    return False
+
+
 def layout_mode(node):
     if isinstance(node, Text):
         return "inline"
     display = node.style.get("display", "")
     if display in ("flex", "inline-flex") and node.children:
         return "flex"
+    if display in ("table", "inline-table") and node.children \
+            and _has_table_rows(node):
+        return "table"
     # -webkit-line-clamp / display:-webkit-box establish an inline context
     # whose wrapped lines we clamp; route them to inline flow (only when
     # every child is inline-level, which card titles always are).
@@ -369,9 +390,22 @@ def layout_mode(node):
             and node.children \
             and not any(_child_is_block_level(c) for c in node.children):
         return "inline"
-    if display == "block" and node.children:
-        return "block"
+    # A block box lays out in block flow when it contains a block-level
+    # child; a block whose children are all inline-level (text, <a>, <b>,
+    # <span>, images…) establishes an inline formatting context so they
+    # share wrapped lines instead of each inline child being stacked on
+    # its own line.
     if any(_child_is_block_level(child) for child in node.children):
+        return "block"
+    # inline-block / inline-flex / inline-table direct children are laid
+    # out side by side (and wrapped into rows) by the block formatter's
+    # inline-block cursor — the card/column-grid path. Keep those in block
+    # flow rather than the line-based inline path.
+    if any(isinstance(child, Element)
+           and child.style.get("display", "") in (
+               "inline-block", "inline-flex", "inline-table")
+           and child.tag not in ("img", "svg", "br")
+           for child in node.children):
         return "block"
     if node.tag in ("svg", "::before", "::after"):
         return "inline"  # replaced/synthesized: inline by nature
@@ -441,11 +475,14 @@ def _measure_content_width(node, doc):
     holder = _MeasureHolder(doc, _MAXCONTENT)
     box = BlockLayout(node, holder, None)
     saved = doc.abs_queue
+    saved_m = getattr(doc, "_measuring", False)
     doc.abs_queue = []
+    doc._measuring = True
     try:
         box.layout()
     finally:
         doc.abs_queue = saved
+        doc._measuring = saved_m
     origin = box.x
     m = 0.0
     stack = list(box.children)
@@ -453,6 +490,42 @@ def _measure_content_width(node, doc):
         b = stack.pop()
         if isinstance(b, (TextLayout, ImageLayout)):
             m = max(m, (b.x + getattr(b, "width", 0)) - origin)
+        stack.extend(getattr(b, "children", []))
+    result = m + box.pl + box.pr + 2 * box.bw
+    if cache is not None:
+        cache[id(node)] = result
+    return result
+
+
+def _measure_min_width(node, doc):
+    """Min-content (border-box) width of `node`: lay its subtree out under
+    a near-zero constraint so every breakable run wraps, then return the
+    widest line (the longest unbreakable word or replaced element). This
+    is the floor a table column may shrink to before its content
+    overflows. Memoized per pass, alongside the max-content cache."""
+    cache = getattr(doc, "_min_width_cache", None)
+    if cache is not None:
+        hit = cache.get(id(node))
+        if hit is not None:
+            return hit
+    holder = _MeasureHolder(doc, 1.0)
+    box = BlockLayout(node, holder, None)
+    saved = doc.abs_queue
+    saved_m = getattr(doc, "_measuring", False)
+    doc.abs_queue = []
+    doc._measuring = True
+    try:
+        box.layout()
+    finally:
+        doc.abs_queue = saved
+        doc._measuring = saved_m
+    origin = box.x
+    m = 0.0
+    stack = list(box.children)
+    while stack:
+        b = stack.pop()
+        if isinstance(b, (TextLayout, ImageLayout)):
+            m = max(m, getattr(b, "width", 0.0))
         stack.extend(getattr(b, "children", []))
     result = m + box.pl + box.pr + 2 * box.bw
     if cache is not None:
@@ -485,6 +558,8 @@ class DocumentLayout:
         self.children = []
         self.abs_queue = []
         self._content_width_cache = {}
+        self._min_width_cache = {}
+        self._measuring = False
         child = BlockLayout(self.node, self, None)
         self.children.append(child)
         child.layout()
@@ -713,6 +788,8 @@ class BlockLayout:
         mode = layout_mode(node)
         if mode == "flex":
             self._layout_flex(node, em)
+        elif mode == "table":
+            self._layout_table(node, em)
         elif mode == "block":
             # incremental placement: floats registered by earlier
             # children must be visible while later siblings lay out
@@ -1077,6 +1154,244 @@ class BlockLayout:
                     translate(b, 0, dy)
         apply_relative_offsets(self.children)
 
+    def _layout_table(self, node, em):
+        """CSS table layout (auto algorithm). Rows are flattened through
+        row groups; columns are sized from each cell's min/max-content
+        width, then widened to fill an explicit table width or shrunk to
+        fit an overflowing one. Cells are placed on a column/row grid
+        (colspan and rowspan honoured), and each row's cells stretch to
+        the row's height so backgrounds fill. Site-agnostic: HN's page,
+        Wikipedia infoboxes, and any display:table layout all flow here
+        instead of stacking their cells as blocks."""
+        doc = self._document()
+        style = node.style
+
+        def disp(el):
+            return el.style.get("display", "") if isinstance(el, Element) \
+                else ""
+
+        # --- gather captions and rows (flattening row groups) ---
+        captions = []
+        rows = []          # [(row_element_or_None, [cell_elements])]
+        anon = []
+
+        def flush_anon():
+            if anon:
+                rows.append((None, list(anon)))
+                anon.clear()
+
+        def cells_of(row_el):
+            return [c for c in row_el.children
+                    if isinstance(c, Element) and is_visible(c)
+                    and disp(c) == "table-cell"]
+
+        def collect(container):
+            for c in container.children:
+                if not (isinstance(c, Element) and is_visible(c)):
+                    continue
+                d = disp(c)
+                if d in ("table-row-group", "table-header-group",
+                         "table-footer-group"):
+                    flush_anon()
+                    collect(c)
+                elif d == "table-row":
+                    flush_anon()
+                    rows.append((c, cells_of(c)))
+                elif d == "table-cell":
+                    anon.append(c)
+                elif d == "table-caption":
+                    captions.append(c)
+
+        collect(node)
+        flush_anon()
+        if not rows:                      # nothing table-shaped: skip
+            self.height = 0
+            return
+
+        # --- occupancy grid: assign each cell a (row, col), reserving the
+        #     span of colspan/rowspan cells so later cells shift past them
+        def ispan(el, name, cap):
+            try:
+                v = int(str(el.attributes.get(name, "1")).strip() or "1")
+            except (ValueError, TypeError):
+                v = 1
+            return max(1, min(v, cap))
+
+        nrows = len(rows)
+        placed = []        # {el, r, c, cs, rs}
+        occupied = set()
+        ncols = 0
+        for r, (_row_el, cell_els) in enumerate(rows):
+            c = 0
+            for el in cell_els:
+                while (r, c) in occupied:
+                    c += 1
+                cs = ispan(el, "colspan", 1000)
+                rs = ispan(el, "rowspan", nrows)
+                placed.append({"el": el, "r": r, "c": c, "cs": cs,
+                               "rs": rs})
+                for dr in range(rs):
+                    for dc in range(cs):
+                        occupied.add((r + dr, c + dc))
+                c += cs
+                ncols = max(ncols, c)
+        if ncols == 0:
+            self.height = 0
+            return
+
+        # --- column widths from min/max content, colspans distributed ---
+        pref = [0.0] * ncols
+        minw = [0.0] * ncols
+        for cell in placed:
+            cell["_p"] = _measure_content_width(cell["el"], doc)
+            cell["_m"] = _measure_min_width(cell["el"], doc)
+            if cell["cs"] == 1:
+                pref[cell["c"]] = max(pref[cell["c"]], cell["_p"])
+                minw[cell["c"]] = max(minw[cell["c"]], cell["_m"])
+        for cell in placed:
+            if cell["cs"] == 1:
+                continue
+            cols = range(cell["c"], cell["c"] + cell["cs"])
+            for arr, key in ((pref, "_p"), (minw, "_m")):
+                cur = sum(arr[i] for i in cols)
+                if cell[key] > cur:
+                    add = (cell[key] - cur) / cell["cs"]
+                    for i in cols:
+                        arr[i] += add
+
+        # --- border-spacing (separate model) or 0 when collapsed ---
+        collapse = (style.get("border-collapse", "").strip().casefold()
+                    == "collapse")
+        s = 0.0 if collapse else self._table_spacing(node, em)
+        spacing_x = s * (ncols + 1)
+
+        avail = self.width
+        explicit = (self.forced_width is not None
+                    or bool(style.get("width"))
+                    or bool(node.attributes.get("width")))
+        content_avail = max(avail - spacing_x, 0.0)
+        total_pref = sum(pref)
+        total_min = sum(minw)
+        if total_pref <= content_avail:
+            widths = pref[:]
+            extra = content_avail - total_pref
+            if explicit and extra > 0:
+                if total_pref > 0:
+                    for i in range(ncols):
+                        widths[i] += extra * pref[i] / total_pref
+                else:
+                    for i in range(ncols):
+                        widths[i] += extra / ncols
+        elif total_min <= content_avail:
+            span = total_pref - total_min
+            deficit = total_pref - content_avail
+            widths = []
+            for i in range(ncols):
+                room = pref[i] - minw[i]
+                cut = (deficit * room / span) if span > 0 \
+                    else (deficit / ncols)
+                widths.append(max(pref[i] - cut, minw[i]))
+        else:
+            widths = minw[:]     # overflow: honour min, table exceeds avail
+
+        used_content = sum(widths)
+        table_inner = used_content + spacing_x
+        if not explicit:
+            self.width = max(min(self.width, table_inner), 0.0)
+
+        # column x offsets (from the table's content-left edge)
+        col_x = [0.0] * ncols
+        cx = s
+        for i in range(ncols):
+            col_x[i] = cx
+            cx += widths[i] + s
+
+        # --- captions above the rows ---
+        self.children = []
+        cap_h = 0.0
+        for cap in captions:
+            box = BlockLayout(cap, self, None)
+            box.forced_width = self.width
+            box.flex_origin = (self.x, self.y + cap_h)
+            box.layout()
+            self.children.append(box)
+            cap_h += box.outer_height()
+
+        # --- pass 1: lay out cells at natural size, gather row heights ---
+        row_h = [0.0] * nrows
+        for cell in placed:
+            el, r, c, cs = cell["el"], cell["r"], cell["c"], cell["cs"]
+            w = sum(widths[c:c + cs]) + s * (cs - 1)
+            box = BlockLayout(el, self, None)
+            box.forced_width = max(w, 0.0)
+            box.flex_origin = (0.0, 0.0)
+            box.layout()
+            cell["box"] = box
+            cell["outer_h"] = box.outer_height()
+            if cell["rs"] == 1:
+                row_h[r] = max(row_h[r], cell["outer_h"])
+        # rowspan cells grow the last row they touch if they overflow
+        for cell in placed:
+            if cell["rs"] == 1:
+                continue
+            r, rs = cell["r"], cell["rs"]
+            have = sum(row_h[r:r + rs]) + s * (rs - 1)
+            if cell["outer_h"] > have:
+                row_h[r + rs - 1] += cell["outer_h"] - have
+
+        # row y offsets (from the table's content-top edge)
+        row_y = [0.0] * nrows
+        ry = cap_h + s
+        for r in range(nrows):
+            row_y[r] = ry
+            ry += row_h[r] + s
+        total_h = ry
+
+        # --- pass 2: place row backgrounds and cells at final positions ---
+        row_boxes = [None] * nrows
+        for r, (row_el, _cells) in enumerate(rows):
+            if row_el is None:
+                continue
+            rb = BlockLayout(row_el, self, None)
+            rb.x = self.x
+            rb.y = self.y + row_y[r]
+            rb.width = self.width
+            rb.height = row_h[r]
+            row_boxes[r] = rb
+            self.children.append(rb)
+        for cell in placed:
+            box, r, c = cell["box"], cell["r"], cell["c"]
+            box.flex_origin = (self.x + col_x[c], self.y + row_y[r])
+            box.layout()
+            span_h = sum(row_h[r:r + cell["rs"]]) + s * (cell["rs"] - 1)
+            fill = span_h - box.margin_top - box.margin_bottom \
+                - 2 * box.bw - box.pt - box.pb
+            if fill > box.height:
+                box.height = fill
+            parent = row_boxes[r]
+            (parent.children if parent is not None
+             else self.children).append(box)
+
+        self.height = total_h
+        apply_relative_offsets(self.children)
+
+    def _table_spacing(self, node, em):
+        """Horizontal/vertical gap between separated cells: the CSS
+        border-spacing, else the legacy cellspacing attribute, else the
+        2px browser default."""
+        bs = node.style.get("border-spacing", "").strip()
+        if bs:
+            val = parse_size(bs.split()[0], 0, em)
+            if val is not None:
+                return max(val, 0.0)
+        cs = node.attributes.get("cellspacing")
+        if cs is not None:
+            try:
+                return max(float(str(cs).replace("px", "").strip()), 0.0)
+            except (ValueError, TypeError):
+                pass
+        return 2.0
+
     # ----- inline layout -----
 
     def new_line(self):
@@ -1094,7 +1409,10 @@ class BlockLayout:
         else:
             if not is_visible(node):
                 return
-            if is_out_of_flow(node):
+            # queue only out-of-flow *descendants*; self.node is the box
+            # already being laid out (it was pulled off abs_queue), so its
+            # own children must flow here instead of re-queuing it
+            if node is not self.node and is_out_of_flow(node):
                 self._document().abs_queue.append(node)
                 return
             _disp = node.style.get("display", "")
@@ -1424,9 +1742,15 @@ class LineLayout:
         max_descent = max(descent(w) for w in self.children)
         self.height = factor * (max_ascent + max_descent)
 
-        # text-align
+        # text-align — skipped during intrinsic-width measurement, where
+        # the line box is _MAXCONTENT-wide and a right/center shift would
+        # push the words out to that width and inflate the measured extent
         align = self.node.style.get("text-align", "left")
-        if align in ("center", "right") and self.children:
+        try:
+            measuring = self.parent._document()._measuring
+        except Exception:
+            measuring = False
+        if not measuring and align in ("center", "right") and self.children:
             last = self.children[-1]
             used = (last.x + last.width) - self.x
             free = self.width - used
