@@ -2488,13 +2488,65 @@ class ImageLayout:
         else:
             self.x = self.parent.x
 
+    def _object_position(self, free_x, free_y):
+        """object-position -> (dx, dy) offset of the scaled image inside
+        its box, given the free space on each axis. Defaults to centered
+        (50% 50%); supports keywords, %, and lengths."""
+        val = self.node.style.get("object-position", "").strip().casefold()
+
+        def axis(tokens, i, free):
+            if len(tokens) > i:
+                t = tokens[i]
+                if t in ("left", "top"):
+                    return 0.0
+                if t in ("right", "bottom"):
+                    return free
+                if t == "center":
+                    return free / 2
+                if t.endswith("%"):
+                    try:
+                        return free * float(t[:-1]) / 100.0
+                    except ValueError:
+                        pass
+                px = parse_size(t, 0)
+                if px is not None:
+                    return px
+            return free / 2
+        toks = val.split() if val else []
+        return axis(toks, 0, free_x), axis(toks, 1, free_y)
+
     def paint(self):
         if effective_opacity(self.node) < 0.05:
             return []
         img = getattr(self.node, "_img", None)
         if img:
-            return [DrawImage(self.x, self.y, self.width, self.height,
-                              img[0])]
+            nw, nh = img[1], img[2]
+            bw, bh = self.width, self.height
+            fit = self.node.style.get(
+                "object-fit", "fill").strip().casefold()
+            if fit in ("fill", "") or not (nw and nh) or bw <= 0 or bh <= 0:
+                return [DrawImage(self.x, self.y, bw, bh, img[0])]
+            # scale the natural size into the box per object-fit
+            sx, sy = bw / nw, bh / nh
+            if fit == "cover":
+                s = max(sx, sy)
+            elif fit == "none":
+                s = 1.0
+            elif fit == "scale-down":
+                s = min(min(sx, sy), 1.0)
+            else:                       # contain (and any unknown value)
+                s = min(sx, sy)
+            dw, dh = nw * s, nh * s
+            ox, oy = self._object_position(bw - dw, bh - dh)
+            cmds = []
+            clip = dw > bw + 0.5 or dh > bh + 0.5   # cover/none overflow
+            if clip:
+                cmds.append(DrawClipPush(self.x, self.y,
+                                         self.x + bw, self.y + bh))
+            cmds.append(DrawImage(self.x + ox, self.y + oy, dw, dh, img[0]))
+            if clip:
+                cmds.append(DrawClipPop())
+            return cmds
         # synthesized icon boxes paint their background layer
         if getattr(self.node, "_bg", None):
             cmd = paint_background_image(
