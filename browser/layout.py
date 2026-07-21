@@ -1202,6 +1202,108 @@ class BlockLayout:
             return left_edge
         return max(right_edge - w, left_edge)
 
+    def _layout_flex_column(self, node, em, kids, row_gap):
+        """flex-direction:column — the flex algorithm on a vertical main
+        axis. Item base sizes come from layout; a definite container
+        height is handed out by flex-grow / removed by flex-shrink;
+        justify-content distributes leftover space down the column and
+        align-items/align-self place items across it (stretch fills the
+        width, center/end shrink-to-fit and shift). row-gap sits between
+        items."""
+        doc = self._document()
+        align = node.style.get("align-items", "stretch").strip().casefold()
+
+        def _num(v, default):
+            try:
+                return max(float(v), 0.0)
+            except (TypeError, ValueError):
+                return default
+
+        boxes, aligns = [], []
+        for child in kids:
+            a = child.style.get("align-self", "").strip().casefold() or align
+            aligns.append(a)
+            box = BlockLayout(child, self, None)
+            if a in ("stretch", "normal", "auto", ""):
+                box.forced_width = self.width          # fill the cross axis
+            elif not child.style.get("width"):
+                # non-stretch, auto width: shrink-to-fit so it can be
+                # centred/end-aligned (an explicit width is left to the box)
+                try:
+                    cw = _measure_content_width(child, doc)
+                except Exception:
+                    cw = self.width
+                box.forced_width = max(min(cw, self.width), 0.0)
+            box.flex_origin = (self.x, self.y)
+            box.layout()
+            boxes.append(box)
+            self.children.append(box)
+
+        n = len(boxes)
+        heights = [b.outer_height() for b in boxes]
+        gap_total = row_gap * max(n - 1, 0)
+
+        # grow / shrink against a definite container height
+        if self.definite_height is not None:
+            free = self.definite_height - sum(heights) - gap_total
+            if free > 0:
+                grows = [_num(c.style.get("flex-grow"), 0.0) for c in kids]
+                tg = sum(grows)
+                if tg > 0:
+                    for i, g in enumerate(grows):
+                        add = free * g / tg
+                        heights[i] += add
+                        boxes[i].height += add
+            elif free < 0:
+                shrinks = [_num(c.style.get("flex-shrink"), 1.0)
+                           for c in kids]
+                ws = [shrinks[i] * heights[i] for i in range(n)]
+                wsum = sum(ws)
+                if wsum > 0:
+                    for i in range(n):
+                        take = min(-free * ws[i] / wsum, heights[i])
+                        heights[i] -= take
+                        boxes[i].height = max(boxes[i].height - take, 0.0)
+
+        # justify-content down the main axis
+        total = sum(heights) + gap_total
+        free_v = max(self.definite_height - total, 0.0) \
+            if self.definite_height is not None else 0.0
+        justify = node.style.get(
+            "justify-content", "flex-start").strip().casefold()
+        lead, gap_extra = 0.0, 0.0
+        if free_v > 0 and n > 0:
+            if justify == "center":
+                lead = free_v / 2
+            elif justify in ("flex-end", "end"):
+                lead = free_v
+            elif justify == "space-between":
+                gap_extra = free_v / (n - 1) if n > 1 else 0.0
+            elif justify == "space-around":
+                gap_extra = free_v / n
+                lead = gap_extra / 2
+            elif justify == "space-evenly":
+                gap_extra = free_v / (n + 1)
+                lead = gap_extra
+
+        y = self.y + lead
+        for i, b in enumerate(boxes):
+            translate(b, 0, y - (b.y - b.margin_top - b.bw - b.pt))
+            a = aligns[i]
+            if a == "center":
+                dx = (self.width - b.outer_width()) / 2
+                if dx > 0:
+                    translate(b, dx, 0)
+            elif a in ("flex-end", "end"):
+                dx = self.width - b.outer_width()
+                if dx > 0:
+                    translate(b, dx, 0)
+            y += heights[i] + row_gap + gap_extra
+
+        self.height = self.definite_height \
+            if self.definite_height is not None else total
+        apply_relative_offsets(self.children)
+
     def _layout_flex(self, node, em):
         """Simplified flexbox: row direction, optional wrap, grow."""
         kid_nodes = []
@@ -1229,23 +1331,7 @@ class BlockLayout:
             self.width, em) or 0.0
 
         if node.style.get("flex-direction", "row").startswith("column"):
-            # column flex behaves like block stacking (with row-gap
-            # inserted between items)
-            previous = None
-            for i, child in enumerate(kid_nodes):
-                nxt = BlockLayout(child, self, previous)
-                self.children.append(nxt)
-                previous = nxt
-            for child in self.children:
-                child.layout()
-            if row_gap and len(self.children) > 1:
-                for i, child in enumerate(self.children):
-                    if i:
-                        translate(child, 0, row_gap * i)
-            self.height = sum(
-                child.outer_height() for child in self.children) \
-                + row_gap * max(len(self.children) - 1, 0)
-            apply_relative_offsets(self.children)
+            self._layout_flex_column(node, em, kid_nodes, row_gap)
             return
 
         # main size: flex-basis (length) > width > max-content of the
