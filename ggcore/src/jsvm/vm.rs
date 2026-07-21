@@ -459,6 +459,50 @@ impl CompiledRe {
             CompiledRe::Never => s.to_string(),
         }
     }
+    /// Matches with capture groups and byte start offset, for
+    /// `String.replace(re, fn)`. Each entry: (whole match, [group or None
+    /// per capture], byte start). `global=false` stops after the first.
+    fn captures_all(
+        &self,
+        s: &str,
+        global: bool,
+    ) -> Vec<(String, Vec<Option<String>>, usize)> {
+        let mut out = Vec::new();
+        match self {
+            CompiledRe::Std(r) => {
+                for caps in r.captures_iter(s) {
+                    let m0 = match caps.get(0) {
+                        Some(m) => m,
+                        None => continue,
+                    };
+                    let groups = (1..caps.len())
+                        .map(|i| caps.get(i).map(|g| g.as_str().to_string()))
+                        .collect();
+                    out.push((m0.as_str().to_string(), groups, m0.start()));
+                    if !global {
+                        break;
+                    }
+                }
+            }
+            CompiledRe::Fancy(r) => {
+                for caps in r.captures_iter(s).filter_map(|c| c.ok()) {
+                    let m0 = match caps.get(0) {
+                        Some(m) => m,
+                        None => continue,
+                    };
+                    let groups = (1..caps.len())
+                        .map(|i| caps.get(i).map(|g| g.as_str().to_string()))
+                        .collect();
+                    out.push((m0.as_str().to_string(), groups, m0.start()));
+                    if !global {
+                        break;
+                    }
+                }
+            }
+            CompiledRe::Never => {}
+        }
+        out
+    }
     fn split_vec(&self, s: &str) -> Vec<String> {
         match self {
             CompiledRe::Std(r) => {
@@ -585,6 +629,9 @@ pub(super) struct St {
     frames: Vec<Frame>,
     /// Armed exception handlers, innermost last (see Handler).
     handlers: Vec<Handler>,
+    /// Active `with (obj)` scopes, innermost last. A bare global read
+    /// consults these (innermost first) before the real global.
+    with_stack: Vec<Value>,
     /// Depth of nested native->JS re-entries (see MAX_NATIVE_DEPTH).
     native_depth: usize,
     /// Set by Native::PreventDefault during an event dispatch.
@@ -704,6 +751,7 @@ impl St {
             name_ids: HashMap::new(),
             frames: Vec::new(),
             handlers: Vec::new(),
+            with_stack: Vec::new(),
             native_depth: 0,
             default_prevented: false,
             closures: Vec::new(),
@@ -912,6 +960,17 @@ fn translate_js_regex(src: &str) -> String {
                     cs[i + 2..i + 6].iter().collect::<String>().to_uppercase();
                 out.push_str(&format!("\\u{{{hex}}}"));
                 i += 6;
+                continue;
+            }
+            if d == '0' && !(i + 2 < n && cs[i + 2].is_ascii_digit()) {
+                // JS `\0` is NUL (only when not the head of an octal/backref
+                // like `\0 1`). Rust's `regex` rejects a bare `\0`, which
+                // degraded the whole pattern to never-matching — this is what
+                // broke naver's URL-parser polyfill classes such as
+                // `/[\0-~]/` and `/[\0\t\n\r #%/:<>?@[\\]^|]/`. Emit the
+                // hex escape the `regex` crate accepts instead.
+                out.push_str("\\x00");
+                i += 2;
                 continue;
             }
             // any other escape: copy the pair verbatim
@@ -1784,6 +1843,81 @@ fn has_own_property(
 /// Invoke an extracted builtin (`var f = ''.slice; f.call(s, 1)`).
 /// Covers the methods polyfills actually extract; anything else names
 /// itself in the error so the next gap is visible.
+/// String.replace/replaceAll with a function replacement: for each match,
+/// call `f(match, p1..pN, offset, whole_string)` and splice in its return
+/// value. `matches` carries (whole, capture groups, byte start); the JS
+/// offset is reported in UTF-16 code units to match String.length/.slice.
+fn replace_with_fn(
+    st: &mut St,
+    mods: &ModStore,
+    s: &str,
+    matches: &[(String, Vec<Option<String>>, usize)],
+    f: Value,
+) -> Result<String, VmError> {
+    let mut out = String::new();
+    let mut last = 0usize;
+    let full = make_string(st, s.to_string());
+    for (whole, groups, start) in matches {
+        if *start < last {
+            continue; // never splice backwards (zero-width edge cases)
+        }
+        out.push_str(&s[last..*start]);
+        let mut cargs: Vec<Value> = Vec::with_capacity(groups.len() + 3);
+        cargs.push(make_string(st, whole.clone()));
+        for g in groups {
+            cargs.push(match g {
+                Some(x) => make_string(st, x.clone()),
+                None => Value::UNDEFINED,
+            });
+        }
+        let off16 = s[..*start].encode_utf16().count() as i32;
+        cargs.push(Value::int(off16));
+        cargs.push(full);
+        let r = call_value(st, mods, f, &cargs)?;
+        out.push_str(&to_display(st, r));
+        last = *start + whole.len();
+    }
+    out.push_str(&s[last..]);
+    Ok(out)
+}
+
+/// `new Function(p1, ..., pN, body)`: compile the params + body into a real
+/// callable closure in the *current* VM. Previously a stub that returned
+/// `window`, which broke any library doing runtime code generation — most
+/// visibly lodash `_.template`, whose final step is
+/// `Function(importKeys, source).apply(undefined, importValues)` (naver's
+/// search-autocomplete boot). Per spec the body is compiled in global scope,
+/// so it captures no local variables — only its declared params and globals.
+fn build_function(
+    st: &mut St,
+    mods: &ModStore,
+    params: &str,
+    body: &str,
+) -> Result<Value, VmError> {
+    let src = format!("(function anonymous({params}\n) {{\n{body}\n}})");
+    let ast = super::parser::parse_program(&src).map_err(|e| VmError {
+        msg: format!("{e:?}"),
+        value: None,
+        kind: "SyntaxError",
+    })?;
+    let module = super::compiler::compile(&ast).map_err(|e| VmError {
+        msg: format!("{e:?}"),
+        value: None,
+        kind: "SyntaxError",
+    })?;
+    let mi = load_module(st, mods, module);
+    let main = mods.rc(mi).module.main;
+    let nregs = mods.rc(mi).module.protos[main as usize].nregs as usize;
+    let base = st.regs.len();
+    st.regs.resize(base + nregs, Value::UNDEFINED);
+    let this_v = st.known.window;
+    // current fuel budget applies (no reset) so a runaway page can't buy
+    // more time by calling Function(); building the wrapper is cheap anyway
+    let out = exec(st, mods, mi, main, base, u32::MAX, this_v, 0);
+    st.regs.truncate(base);
+    out
+}
+
 fn method_ref_dispatch(
     st: &mut St,
     mods: &ModStore,
@@ -2279,10 +2413,30 @@ fn method_ref_dispatch(
         }),
         "replace" => {
             let pat = args.first().copied().unwrap_or(Value::UNDEFINED);
-            let rep = args
-                .get(1)
-                .map(|&v| to_display(st, v))
-                .unwrap_or_default();
+            let rep_val = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+            // function replacement: call rep(match, ...groups, offset, str)
+            // per match. Without this, a callback was coerced to the string
+            // "function..." and spliced in literally, which broke lodash's
+            // `_.template` (string.replace(reDelimiters, fn)) — the crash
+            // that stalled naver's search-autocomplete boot.
+            if rep_val.is_function() {
+                let out = if let Some(ri) = regex_index(st, pat) {
+                    let global = st.regexes[ri].global;
+                    let matches = st.regexes[ri].re.captures_all(&s, global);
+                    replace_with_fn(st, mods, &s, &matches, rep_val)?
+                } else {
+                    let needle = to_display(st, pat);
+                    match s.find(&needle) {
+                        Some(start) if !needle.is_empty() => {
+                            let m = vec![(needle, Vec::new(), start)];
+                            replace_with_fn(st, mods, &s, &m, rep_val)?
+                        }
+                        _ => s.clone(),
+                    }
+                };
+                return Ok(make_string(st, out));
+            }
+            let rep = to_display(st, rep_val);
             let out = if let Some(ri) = regex_index(st, pat) {
                 if st.regexes[ri].global {
                     st.regexes[ri].re.replace_all_str(&s, rep.as_str())
@@ -2616,6 +2770,32 @@ fn fn_static_lookup(st: &St, fidx: u32, key: u32) -> Option<Value> {
     None
 }
 
+/// A function's arity — its declared parameter count — for `func.length`.
+/// Without this, `func.length` read as undefined, so lodash's `overRest`
+/// computed `undefined - 1 = NaN` for its rest-arg start, emptied the
+/// rest-args array, and crashed naver's search-autocomplete boot on
+/// `.length of undefined`. Native/bound functions report 0 (unknown arity).
+fn fn_arity(st: &St, mods: &ModStore, func: Value) -> i32 {
+    if let ClosureRec::User { module, proto, .. } =
+        &st.closures[func.index() as usize]
+    {
+        mods.rc(*module).module.protos[*proto as usize].nparams as i32
+    } else {
+        0
+    }
+}
+
+/// A function's `.name` (empty for native/bound functions).
+fn fn_name(st: &St, mods: &ModStore, func: Value) -> String {
+    if let ClosureRec::User { module, proto, .. } =
+        &st.closures[func.index() as usize]
+    {
+        mods.rc(*module).module.protos[*proto as usize].name.clone()
+    } else {
+        String::new()
+    }
+}
+
 /// camelCase -> kebab-case (fontSize -> font-size)
 /// Resolve a possibly-relative URL against a base (page location).
 fn resolve_url(raw: &str, base: &str) -> String {
@@ -2798,6 +2978,25 @@ pub(super) enum PropHit {
     Data(Value),
     Getter(Value),
     Missing,
+}
+
+/// Resolve `key` through the active `with (obj)` scopes (innermost first):
+/// a with-object that owns the property shadows the real global. This is
+/// what lets lodash `_.template`'s compiled `with (obj) { ... }` read its
+/// interpolated variables from the data object. Data properties only —
+/// getters/setters on a with-object fall through to the normal global.
+fn with_lookup(st: &St, key: u32) -> Option<Value> {
+    for i in (0..st.with_stack.len()).rev() {
+        let obj = st.with_stack[i];
+        if obj.is_object() {
+            if let PropHit::Data(v) =
+                lookup_prop(st, obj.index() as usize, key)
+            {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 pub(super) fn lookup_prop(st: &St, oi: usize, key: u32) -> PropHit {
@@ -3525,7 +3724,30 @@ fn do_native(
             let s = brand_string(st, Value::UNDEFINED);
             Ok(push_str(st, s))
         }
-        Native::FunctionCtor => Ok(make_native(st, Native::ReturnGlobal)),
+        Native::FunctionCtor => {
+            // new Function(p1, ..., pN, body): compile a real closure. Falls
+            // back to the historical window-returning stub if the source
+            // won't parse (so `Function('return this')()` still works).
+            let (params, body) = if argc == 0 {
+                (String::new(), String::new())
+            } else {
+                let n = argc as usize;
+                let body_v = st.regs[args_base + n - 1];
+                let param_vs: Vec<Value> =
+                    (0..n - 1).map(|k| st.regs[args_base + k]).collect();
+                let body = to_display(st, body_v);
+                let params = param_vs
+                    .iter()
+                    .map(|&v| to_display(st, v))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                (params, body)
+            };
+            match build_function(st, mods, &params, &body) {
+                Ok(f) if f.is_function() => Ok(f),
+                _ => Ok(make_native(st, Native::ReturnGlobal)),
+            }
+        }
         Native::ObjectCtor => {
             let v = if argc > 0 {
                 st.regs[args_base]
@@ -6461,6 +6683,12 @@ fn exec_loop(
             Instr::Move { dst, src } => reg!(dst) = reg!(src),
             Instr::GetGlobal { dst, atom } => {
                 let key = name!(atom) as usize;
+                if !st.with_stack.is_empty() {
+                    if let Some(v) = with_lookup(st, key as u32) {
+                        reg!(dst) = v;
+                        continue;
+                    }
+                }
                 if !st.gdef[key] {
                     // `window.X = v; X` — the window object doubles as
                     // the global namespace (core-js installs polyfills
@@ -6478,6 +6706,12 @@ fn exec_loop(
             }
             Instr::GetGlobalSafe { dst, atom } => {
                 let key = name!(atom) as usize;
+                if !st.with_stack.is_empty() {
+                    if let Some(v) = with_lookup(st, key as u32) {
+                        reg!(dst) = v;
+                        continue;
+                    }
+                }
                 reg!(dst) = if st.gdef[key] {
                     st.globals[key]
                 } else {
@@ -6509,6 +6743,13 @@ fn exec_loop(
             }
             Instr::PopHandler => {
                 st.handlers.pop();
+            }
+            Instr::WithEnter { obj } => {
+                let o = reg!(obj);
+                st.with_stack.push(o);
+            }
+            Instr::WithExit => {
+                st.with_stack.pop();
             }
             Instr::Throw { src } => {
                 let v = reg!(src);
@@ -6690,9 +6931,13 @@ fn exec_loop(
                 // object, else the freshly allocated `this`. DOM nodes are
                 // objects too, so a factory constructor like
                 // `function Image(){ return document.createElement('img'); }`
-                // must return the node, not the empty `this`.
+                // must return the node, not the empty `this`. Functions are
+                // objects as well — `new Function(...)` (and any ctor that
+                // returns a closure) must yield the function, not empty this.
                 let (x, y) = (reg!(a), reg!(b));
-                reg!(dst) = if x.is_object() || x.is_dom_node() {
+                reg!(dst) = if x.is_object() || x.is_dom_node()
+                    || x.is_function()
+                {
                     x
                 } else {
                     y
@@ -7990,7 +8235,28 @@ fn exec_loop(
                             }
                         }
                         "replace" => {
-                            if let Some(ri) = regex_index(st, av0) {
+                            if av1.is_function() {
+                                // callback replacement (lodash _.template etc.)
+                                let out = if let Some(ri) = regex_index(st, av0)
+                                {
+                                    let g = st.regexes[ri].global;
+                                    let m = st.regexes[ri].re
+                                        .captures_all(&s, g);
+                                    replace_with_fn(st, mods, &s, &m, av1)?
+                                } else {
+                                    let needle = to_display(st, av0);
+                                    match s.find(&needle) {
+                                        Some(p) if !needle.is_empty() => {
+                                            let m = vec![
+                                                (needle, Vec::new(), p)];
+                                            replace_with_fn(
+                                                st, mods, &s, &m, av1)?
+                                        }
+                                        _ => s.clone(),
+                                    }
+                                };
+                                push_str(st, out)
+                            } else if let Some(ri) = regex_index(st, av0) {
                                 // JS $& (whole match) -> regex crate ${0}
                                 let to = to_display(st, av1)
                                     .replace("$&", "${0}");
@@ -8009,9 +8275,37 @@ fn exec_loop(
                             }
                         }
                         "replaceAll" => {
-                            let from = to_display(st, av0);
-                            let to = to_display(st, av1);
-                            push_str(st, s.replace(&from, &to))
+                            if av1.is_function() {
+                                let out = if let Some(ri) = regex_index(st, av0)
+                                {
+                                    let m = st.regexes[ri].re
+                                        .captures_all(&s, true);
+                                    replace_with_fn(st, mods, &s, &m, av1)?
+                                } else {
+                                    let needle = to_display(st, av0);
+                                    let mut m = Vec::new();
+                                    if !needle.is_empty() {
+                                        let mut from = 0;
+                                        while let Some(rel) =
+                                            s[from..].find(&needle)
+                                        {
+                                            let p = from + rel;
+                                            m.push((
+                                                needle.clone(),
+                                                Vec::new(),
+                                                p,
+                                            ));
+                                            from = p + needle.len();
+                                        }
+                                    }
+                                    replace_with_fn(st, mods, &s, &m, av1)?
+                                };
+                                push_str(st, out)
+                            } else {
+                                let from = to_display(st, av0);
+                                let to = to_display(st, av1);
+                                push_str(st, s.replace(&from, &to))
+                            }
                         }
                         "concat" => {
                             // variadic: recv then EVERY arg coerced to
@@ -8426,6 +8720,11 @@ fn exec_loop(
                         fn_static_lookup(st, ov.index(), key_id)
                     {
                         v
+                    } else if key_id == st.ids.length {
+                        Value::int(fn_arity(st, mods, ov))
+                    } else if text == "name" {
+                        let nm = fn_name(st, mods, ov);
+                        make_string(st, nm)
                     } else if matches!(
                         text.as_str(),
                         "call" | "apply" | "bind" | "toString" | "valueOf"
@@ -8794,6 +9093,11 @@ fn exec_loop(
                         fn_static_lookup(st, ov.index(), key)
                     {
                         v
+                    } else if key == st.ids.length {
+                        Value::int(fn_arity(st, mods, ov))
+                    } else if st.names[key as usize] == "name" {
+                        let nm = fn_name(st, mods, ov);
+                        make_string(st, nm)
                     } else if matches!(
                         st.names[key as usize].as_str(),
                         "call" | "apply" | "bind" | "toString"

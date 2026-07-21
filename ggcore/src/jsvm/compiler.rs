@@ -499,6 +499,10 @@ fn scan_stmt<'a>(
             scan_expr(test, ids, lits);
             scan_stmt(body, ids, lits);
         }
+        Stmt::With { obj, body } => {
+            scan_expr(obj, ids, lits);
+            scan_stmt(body, ids, lits);
+        }
         Stmt::For { init, test, update, body } => {
             if let Some(init) = init {
                 scan_stmt(init, ids, lits);
@@ -856,6 +860,10 @@ fn lower_new_stmt(s: &mut Stmt, n: &mut usize) {
         }
         Stmt::While { test, body } | Stmt::DoWhile { body, test } => {
             lower_new_expr(test, n);
+            lower_new_stmt(body, n);
+        }
+        Stmt::With { obj, body } => {
+            lower_new_expr(obj, n);
             lower_new_stmt(body, n);
         }
         Stmt::For { init, test, update, body } => {
@@ -2407,6 +2415,14 @@ impl Compiler {
                 Ok(())
             }
             Stmt::Block(body) => self.block_body(body),
+            Stmt::With { obj, body } => {
+                let rc = self.expr(obj)?;
+                self.fx().emit(Instr::WithEnter { obj: rc });
+                self.fx().tmp_top = self.fx().locals_end;
+                self.stmt(body)?;
+                self.fx().emit(Instr::WithExit);
+                Ok(())
+            }
             Stmt::If { test, cons, alt } => {
                 let rc = self.expr(test)?;
                 let jf = self

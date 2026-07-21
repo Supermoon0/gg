@@ -1468,8 +1468,125 @@ mod tests {
         assert_eq!(n("/[\\uD800-\\uDFFF]/.test('a') ? 1 : 0"), 0.0);
         // already-braced \u{...} is left untouched
         assert_eq!(n(r"/\u{1F600}/u.test('😀') ? 1 : 0"), 1.0);
+        // JS `\0` (NUL escape) must translate to `\x00`; a bare `\0` made
+        // Rust reject the class, degrading naver's URL-parser polyfill
+        // patterns like `/[\0-~]/` and `/[\0\t\n\r #%/:<>?@[\]^|]/` to
+        // never-matching (every URL char then read as "forbidden"/"non-ASCII").
+        assert_eq!(n(r"/[\0-~]/.test('A') ? 1 : 0"), 1.0);
+        assert_eq!(n(r"/[^\0-~]/.test('A') ? 1 : 0"), 0.0);
+        assert_eq!(n("/[^\\0-~]/.test('\u{AC00}') ? 1 : 0"), 1.0);
+        assert_eq!(n(r"/[\0#%:@]/.test('#') ? 1 : 0"), 1.0);
         // .source still reports the original JS pattern
         assert_eq!(n(r"/A/.source === 'A' ? 1 : 0"), 1.0);
+    }
+
+    #[test]
+    fn string_replace_with_function() {
+        // a function replacement must be CALLED per match, not coerced to
+        // the string "function..." and spliced in literally. lodash's
+        // `_.template` is `string.replace(reDelimiters, fn)`; the broken
+        // form stalled naver's search-autocomplete boot.
+        assert_eq!(
+            n(r"'a1b2c'.replace(/\d/g,function(m){return '<'+m+'>';})==='a<1>b<2>c'?1:0"),
+            1.0,
+        );
+        // capture groups arrive as args after the match
+        assert_eq!(
+            n(r"'x=5'.replace(/(\w)=(\d)/,function(m,a,b){return a+':'+b;})==='x:5'?1:0"),
+            1.0,
+        );
+        // no-capture regex: 2nd arg is the offset
+        assert_eq!(
+            n(r"'abc'.replace(/b/,function(m,off){return '['+off+']';})==='a[1]c'?1:0"),
+            1.0,
+        );
+        // string pattern + function replaces the first occurrence only
+        assert_eq!(
+            n(r"'hello'.replace('l',function(){return 'L';})==='heLlo'?1:0"),
+            1.0,
+        );
+        // replaceAll + function hits every occurrence
+        assert_eq!(
+            n(r"'a.b.c'.replaceAll('.',function(){return '-';})==='a-b-c'?1:0"),
+            1.0,
+        );
+        // lodash-style delimiter scan yields the callback output
+        assert_eq!(
+            n(r"'p<%=x%>q'.replace(/<%=([\s\S]+?)%>/g,function(m,c){return '{'+c+'}';})==='p{x}q'?1:0"),
+            1.0,
+        );
+        // plain string replacement still works (no regression)
+        assert_eq!(n(r"'aaa'.replace(/a/g,'b')==='bbb'?1:0"), 1.0);
+    }
+
+    #[test]
+    fn function_constructor_compiles_body() {
+        // `Function(...)` must compile a real callable, not return a stub —
+        // lodash `_.template` ends with `Function(keys, source).apply(...)`
+        // (called WITHOUT `new`, which is the shape that matters here).
+        assert_eq!(n("Function('a','b','return a+b')(2,3)"), 5.0);
+        assert_eq!(n("Function('x','return x*x')(4)"), 16.0);
+        // params supplied via apply (the exact lodash template call shape)
+        assert_eq!(
+            n("Function('a','b','return a*b').apply(null,[6,7])"),
+            42.0,
+        );
+        // multi-statement body with control flow
+        assert_eq!(
+            n("Function('a','var s=0;for(var i=0;i<a;i++)s+=i;return s;')(5)"),
+            10.0,
+        );
+        // zero params
+        assert_eq!(n("Function('return 42')()"), 42.0);
+        // `new Function` must work too (uses the constructor's return value)
+        assert_eq!(n("(new Function('a','b','return a+b'))(2,3)"), 5.0);
+    }
+
+    #[test]
+    fn function_length_is_arity() {
+        // func.length = declared parameter count. Missing this read as
+        // undefined, so lodash's overRest computed `undefined - 1 = NaN`,
+        // emptied its rest-args array, and crashed naver's search
+        // autocomplete on `.length of undefined`.
+        assert_eq!(n("(function(a,b){}).length"), 2.0);
+        assert_eq!(n("(function(){}).length"), 0.0);
+        assert_eq!(n("(function(a,b,c){}).length"), 3.0);
+        // arrow functions carry arity too
+        assert_eq!(n("((a,b)=>a+b).length"), 2.0);
+        // a returned closure keeps its arity (the exact overRest case)
+        assert_eq!(
+            n("(function(){ return function(x,y){}; })().length"),
+            2.0,
+        );
+        // and .name resolves for a named function
+        assert_eq!(n("(function foo(){}).name === 'foo' ? 1 : 0"), 1.0);
+        // the lodash overRest pattern now works end-to-end
+        assert_eq!(
+            n("function oR(f,s){s=Math.max(s===undefined?f.length-1:s,0);\
+               return function(){var a=arguments,n=Math.max(a.length-s,0),\
+               r=Array(n),i=-1;while(++i<n)r[i]=a[s+i];return f(a[0],r);};}\
+               var g=oR(function(o,src){return src.length;});g({},1,2,3)"),
+            3.0,
+        );
+    }
+
+    #[test]
+    fn with_statement_scopes_reads() {
+        // `with (obj)` resolves bare reads against obj first — lodash
+        // `_.template`'s compiled body depends on this.
+        assert_eq!(n("var o={a:10,b:20},r=0; with(o){ r=a+b; } r"), 30.0);
+        // a local still wins when obj lacks the name
+        assert_eq!(n("var o={a:1},x=5; with(o){ x=x+a; } x"), 6.0);
+        // inner with-object shadows the outer
+        assert_eq!(n("var r=0; with({a:1}){ with({a:2}){ r=a; } } r"), 2.0);
+        // with-scope does NOT leak past the block
+        assert_eq!(n("with({q:9}){} typeof q === 'undefined' ? 1 : 0"), 1.0);
+        // the lodash-template shape: with inside a Function-compiled body
+        assert_eq!(
+            n("var f=new Function('o','var s=0; with(o){ s=x+y; } return s;');\
+               f({x:3,y:4})"),
+            7.0,
+        );
     }
 
     #[test]
@@ -3043,10 +3160,14 @@ console.log('B typeof it: ' + typeof it);
     }
 
     #[test]
-    fn function_ctor_stub_yields_the_global() {
+    fn function_ctor_compiles_real_functions() {
+        // Function is a real constructor that compiles its body (was a stub
+        // returning the global). `Function('return this')` is now a genuine
+        // function; core-js/lodash reach the global via window/globalThis
+        // first, so this idiom returning undefined under strict `this` is
+        // fine — what matters is that Function actually compiles code.
         assert_eq!(n("typeof Function === 'function' ? 1 : 0"), 1.0);
-        assert_eq!(n("Function('return this')() === window ? 1 : 0"),
-                   1.0);
+        assert_eq!(n("Function('a','return a+1')(41)"), 42.0);
     }
 
     #[test]

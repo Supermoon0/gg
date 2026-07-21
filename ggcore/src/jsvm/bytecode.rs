@@ -126,6 +126,11 @@ pub enum Instr {
     PushHandler { catch_ip: u32, exc: u8 },
     /// Disarm the innermost handler (normal try-block completion).
     PopHandler,
+    /// Enter a `with (obj)` scope: bare global reads in the body first
+    /// look up `obj`. Balanced by WithExit.
+    WithEnter { obj: u8 },
+    /// Leave the innermost `with` scope.
+    WithExit,
     /// Throw the value in `src`.
     Throw { src: u8 },
     /// Like Call, but the callee gets `this` from register `recv` —

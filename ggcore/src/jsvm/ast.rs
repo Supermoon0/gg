@@ -158,6 +158,9 @@ pub enum Stmt {
         of: bool,
     },
     Block(Vec<Stmt>),
+    /// `with (obj) stmt` — names inside `body` that would otherwise be
+    /// global reads resolve against `obj` first (lodash `_.template`).
+    With { obj: Expr, body: Box<Stmt> },
     /// `label: stmt` — names the enclosed statement for labeled
     /// break/continue.
     Labeled { label: String, body: Box<Stmt> },

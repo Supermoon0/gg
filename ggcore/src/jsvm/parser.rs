@@ -580,6 +580,14 @@ impl Parser {
                     let body = Box::new(self.stmt()?);
                     Ok(Stmt::While { test, body })
                 }
+                "with" => {
+                    self.pos += 1;
+                    self.expect_punct(P::LParen)?;
+                    let obj = self.expr()?;
+                    self.expect_punct(P::RParen)?;
+                    let body = Box::new(self.stmt()?);
+                    Ok(Stmt::With { obj, body })
+                }
                 "do" => {
                     self.pos += 1;
                     let body = Box::new(self.stmt()?);
