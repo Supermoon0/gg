@@ -2326,7 +2326,36 @@ class LineLayout:
                 place()
 
     def paint(self):
-        return []
+        # inline-element backgrounds: an inline <span>/<a>/<mark> with a
+        # background-color never gets its own box, so its highlight was
+        # lost. Fill the rect its atoms span on this line, behind the
+        # glyphs (LineLayout.paint runs before the word children paint).
+        cmds = []
+        groups = {}          # id(el) -> [el, min_x, max_x]
+        block = self.node
+        for child in self.children:
+            n = getattr(child, "node", None)
+            anc = n.parent if isinstance(n, Text) else n
+            x0 = child.x
+            x1 = child.x + getattr(child, "width", 0)
+            while isinstance(anc, Element) and anc is not block:
+                bg = anc.style.get("background-color", "")
+                if bg and safe_color(bg, default=""):
+                    g = groups.get(id(anc))
+                    if g is None:
+                        groups[id(anc)] = [anc, x0, x1]
+                    else:
+                        g[1] = min(g[1], x0)
+                        g[2] = max(g[2], x1)
+                anc = getattr(anc, "parent", None)
+        for el, x0, x1 in groups.values():
+            if effective_opacity(el) < 0.05:
+                continue
+            color = safe_color(el.style.get("background-color"), default="")
+            if color and x1 > x0:
+                cmds.append(DrawRect(x0, self.y, x1, self.y + self.height,
+                                     color))
+        return cmds
 
 
 class TextLayout:
