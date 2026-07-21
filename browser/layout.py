@@ -2580,7 +2580,6 @@ def paint_tree(layout_object, display_list):
 
 
 def _paint_tree_inner(layout_object, display_list):
-    display_list.extend(layout_object.paint())
     # Paint each child subtree into its own group so positioned boxes
     # with a z-index can be reordered. Sorting per container (not
     # globally) approximates each positioned+z-index box establishing
@@ -2596,7 +2595,16 @@ def _paint_tree_inner(layout_object, display_list):
         groups.append((z, i, sub))
     if reorder:
         groups.sort(key=lambda g: (g[0], g[1]))
-    for _z, _i, sub in groups:
+    # CSS painting order §E.2: negative-z-index children paint behind the
+    # element's own background/border; everything else on top of it.
+    for z, _i, sub in groups:
+        if z >= 0:
+            break
+        display_list.extend(sub)
+    display_list.extend(layout_object.paint())
+    for z, _i, sub in groups:
+        if z < 0:
+            continue
         display_list.extend(sub)
     after = getattr(layout_object, "paint_after", None)
     if after is not None:
