@@ -360,6 +360,15 @@ def layout_mode(node):
     display = node.style.get("display", "")
     if display in ("flex", "inline-flex") and node.children:
         return "flex"
+    # -webkit-line-clamp / display:-webkit-box establish an inline context
+    # whose wrapped lines we clamp; route them to inline flow (only when
+    # every child is inline-level, which card titles always are).
+    if (display == "-webkit-box"
+            or node.style.get("-webkit-line-clamp")
+            or node.style.get("line-clamp")) \
+            and node.children \
+            and not any(_child_is_block_level(c) for c in node.children):
+        return "inline"
     if display == "block" and node.children:
         return "block"
     if any(_child_is_block_level(child) for child in node.children):
@@ -813,6 +822,19 @@ class BlockLayout:
         else:
             self.new_line()
             self.recurse(node)
+            # -webkit-line-clamp: N — keep the first N wrapped lines and
+            # mark the overflow with an ellipsis (card titles clamp to 2
+            # lines so a grid of cards stays uniform height).
+            clamp = st.get("-webkit-line-clamp") or st.get("line-clamp")
+            if clamp and clamp.strip().isdigit():
+                n_lines = int(clamp)
+                if n_lines >= 1 and len(self.children) > n_lines:
+                    self.children = self.children[:n_lines]
+                    last = self.children[-1]
+                    words = [w for w in last.children
+                             if isinstance(w, TextLayout)]
+                    if words:
+                        words[-1].word = words[-1].word.rstrip() + "…"
             for line in self.children:
                 line.layout()
             self.height = sum(line.height for line in self.children)
