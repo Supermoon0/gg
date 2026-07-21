@@ -55,6 +55,7 @@ class Shell:
         self.scroll = 0
         self.hscroll = 0
         self.content_width = 0
+        self.content_height = 0
         self.url = None
         self.url_text = ""
         self.caret = 0
@@ -205,6 +206,15 @@ class Shell:
         self.content_width = max(
             (o.x + o.width for o in self.layout_list
              if getattr(o, "width", None) is not None), default=w)
+        # tallest painted extent. A `height:100vh` root (wikipedia's page
+        # container) pins document.height to the viewport even when the
+        # article overflows ~10000px below it, so scrolling by the root's
+        # own height stops at the first screen. Measure the deepest laid-out
+        # box instead so scroll reaches the real bottom of the page.
+        self.content_height = max(
+            (o.y + o.height for o in self.layout_list
+             if getattr(o, "height", None) is not None),
+            default=self.document.height + 2 * VSTEP)
         self.clamp_scroll()
         self.dirty = True
 
@@ -388,6 +398,13 @@ class Shell:
 
     # ---------- frame ----------
 
+    def scroll_extent(self):
+        """Total scrollable page height in CSS px. Uses the deepest laid-out
+        box, not document.height, so content overflowing a viewport-pinned
+        (height:100vh) root stays reachable."""
+        doc = (self.document.height + 2 * VSTEP) if self.document else 0
+        return max(doc, self.content_height + VSTEP)
+
     def clamp_scroll(self):
         w, h = self.logical_size()
         content_h = max(h - TOOLBAR_H - STATUS_H, 1)
@@ -395,7 +412,7 @@ class Shell:
             self.scroll = 0
             self.hscroll = 0
             return
-        max_scroll = max(self.document.height + 2 * VSTEP - content_h, 0)
+        max_scroll = max(self.scroll_extent() - content_h, 0)
         self.scroll = min(max(0, self.scroll), max_scroll)
         max_hscroll = max(self.content_width + HSTEP - w, 0)
         self.hscroll = min(max(0, self.hscroll), max_hscroll)
@@ -408,7 +425,7 @@ class Shell:
 
         # scrollbar
         if self.document:
-            content = self.document.height + 2 * VSTEP
+            content = self.scroll_extent()
             if content > content_h:
                 bar_h = max(content_h * content_h / content, 24)
                 max_scroll = content - content_h
