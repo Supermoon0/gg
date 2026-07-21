@@ -418,6 +418,22 @@ def is_visible(node):
     return node.style.get("display", "inline") != "none"
 
 
+def _is_cjk(ch):
+    """Whether a character is CJK/Hangul/Kana — scripts written without
+    spaces, where a line may break between (almost) any two characters."""
+    o = ord(ch)
+    return (0x2E80 <= o <= 0x9FFF      # CJK radicals..unified ideographs
+            or 0xAC00 <= o <= 0xD7A3   # Hangul syllables
+            or 0x3040 <= o <= 0x30FF   # Hiragana + Katakana
+            or 0x3000 <= o <= 0x303F   # CJK symbols/punctuation
+            or 0xF900 <= o <= 0xFAFF   # CJK compatibility ideographs
+            or 0xFF00 <= o <= 0xFFEF)  # halfwidth/fullwidth forms
+
+
+def _has_cjk(word):
+    return any(_is_cjk(c) for c in word)
+
+
 def _nearest_positioned(layout_box):
     """The containing block of an absolutely-positioned box: the nearest
     ancestor layout box (inclusive of the box that queued it) whose node
@@ -1573,6 +1589,29 @@ class BlockLayout:
         font = cached_font(node)
         w = measure(font, word)
         nowrap = node.style.get("white-space") in ("nowrap", "pre")
+        # A run wider than the whole line can't fit however it wraps. Break
+        # it between characters when the script allows: CJK/Hangul/Kana
+        # always break between ideographs, and word-break:break-all /
+        # overflow-wrap:break-word|anywhere break any long token (long
+        # URLs, hashes). Otherwise it overflows as one word (as before).
+        if not nowrap and w > self.width and self.width > 0:
+            # word-break / overflow-wrap are inherited properties; this
+            # engine doesn't inherit them, so read the nearest ancestor
+            # that sets one (only reached for an over-wide word, so cheap)
+            def _anc(prop):
+                n = getattr(node, "parent", None)
+                while n is not None:
+                    v = n.style.get(prop) if hasattr(n, "style") else None
+                    if v:
+                        return v.strip().casefold()
+                    n = getattr(n, "parent", None)
+                return ""
+            wb = _anc("word-break")
+            ow = _anc("overflow-wrap") or _anc("word-wrap")
+            force = wb == "break-all" or ow in ("break-word", "anywhere")
+            if force or _has_cjk(word):
+                self._emit_broken(node, word, font, cjk_only=not force)
+                return
         if not nowrap and self.cursor_x + w > self.width \
                 and self.cursor_x > 0:
             self.new_line()
@@ -1581,6 +1620,36 @@ class BlockLayout:
         text = TextLayout(node, word, line, prev)
         line.children.append(text)
         self.cursor_x += w + measure(font, " ")
+
+    def _emit_broken(self, node, word, font, cjk_only):
+        """Emit a too-wide run split at break opportunities, wrapping
+        across lines. For cjk_only each CJK char is its own break point
+        while maximal runs of other characters stay whole; otherwise
+        every character may break. Segments carry no inter-segment space
+        (CJK is written without spaces)."""
+        if cjk_only:
+            segs, buf = [], ""
+            for ch in word:
+                if _is_cjk(ch):
+                    if buf:
+                        segs.append(buf)
+                        buf = ""
+                    segs.append(ch)
+                else:
+                    buf += ch
+            if buf:
+                segs.append(buf)
+        else:
+            segs = list(word)
+        for seg in segs:
+            sw = measure(font, seg)
+            if self.cursor_x + sw > self.width and self.cursor_x > 0:
+                self.new_line()
+            line = self.children[-1]
+            prev = line.children[-1] if line.children else None
+            line.children.append(
+                TextLayout(node, seg, line, prev, keep_spaces=True))
+            self.cursor_x += sw
 
     def inline_block(self, node):
         line = self.children[-1]
