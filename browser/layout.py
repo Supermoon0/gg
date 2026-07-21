@@ -418,6 +418,22 @@ def is_visible(node):
     return node.style.get("display", "inline") != "none"
 
 
+def _nearest_positioned(layout_box):
+    """The containing block of an absolutely-positioned box: the nearest
+    ancestor layout box (inclusive of the box that queued it) whose node
+    is positioned (position != static). None ⇒ the initial containing
+    block (the document). Its geometry is read only after the in-flow
+    pass, when every box is final."""
+    node = layout_box
+    while isinstance(node, BlockLayout):
+        n = node.node
+        if isinstance(n, Element) and n.style.get("position", "static") in (
+                "relative", "absolute", "fixed", "sticky"):
+            return node
+        node = node.parent
+    return None
+
+
 def is_out_of_flow(node):
     return (isinstance(node, Element)
             and node.style.get("position") in ("absolute", "fixed"))
@@ -569,67 +585,90 @@ class DocumentLayout:
 
     def _layout_positioned(self):
         """Lay out position:absolute/fixed boxes queued during layout.
-        Containing block ~ the document (approximation).
+
+        Each queued entry carries its containing block (the nearest
+        positioned ancestor, resolved in _nearest_positioned) and the
+        static position it would occupy in normal flow. Offsets and
+        percentage sizes resolve against the containing block's padding
+        box; an offset that is auto falls back to the static position, so
+        a box positioned only to leave the flow still appears where it
+        would have been rather than jumping to the page origin.
 
         Laying out an out-of-flow box can queue *more* out-of-flow
-        descendants onto abs_queue, so we drain it by index and process
-        each node at most once (nested absolutes on real pages like
-        naver would otherwise loop forever). A hard cap bounds any
-        pathological page."""
+        descendants, so we drain the queue by index and process each node
+        at most once (nested absolutes on real pages would otherwise loop
+        forever). A hard cap bounds any pathological page."""
         # An absolute element's `height:100%` (or any %) resolves against
-        # its containing block. We approximate that as the document, whose
+        # its containing block. When that block is the document — whose
         # height in a headless full-page render is the whole (tall) page —
-        # so a decorative `position:absolute; height:100%` overlay ballooned
-        # to full height and painted over the news. Hide the document's
-        # definite height during out-of-flow layout so those percentages
-        # fall back to auto (content height); in-flow content is already
-        # laid out and unaffected, and each absolute box still gives its own
-        # children their own definite height.
+        # a decorative `position:absolute; height:100%` overlay would
+        # balloon to full height and paint over the content. Hide the
+        # document's definite height during out-of-flow layout so those
+        # percentages fall back to auto (content height).
         saved_definite_height = self.definite_height
         self.definite_height = None
         processed = set()
         i = 0
         while i < len(self.abs_queue) and len(processed) < 5000:
-            node = self.abs_queue[i]
+            entry = self.abs_queue[i]
             i += 1
+            node, cb, static_x, static_y = entry
             if id(node) in processed:
                 continue
             processed.add(id(node))
+
+            # containing-block padding box (document/ICB when unpositioned)
+            if isinstance(cb, BlockLayout):
+                cb_x = cb.x - cb.pl
+                cb_y = cb.y - cb.pt
+                cb_w = cb.width + cb.pl + cb.pr
+                cb_h = cb.height + cb.pt + cb.pb
+            else:
+                cb_x, cb_y, cb_w, cb_h = self.x, self.y, self.width, \
+                    self.height
+
             st = node.style
             em = parse_px(st.get("font-size", "16px"), 16.0)
-            left = parse_size(st.get("left"), self.width, em)
-            right = parse_size(st.get("right"), self.width, em)
-            top = parse_size(st.get("top"), self.height, em)
-            bottom = parse_size(st.get("bottom"), self.height, em)
+            left = parse_size(st.get("left"), cb_w, em)
+            right = parse_size(st.get("right"), cb_w, em)
+            top = parse_size(st.get("top"), cb_h, em)
+            bottom = parse_size(st.get("bottom"), cb_h, em)
             if left is None and right is None and top is None \
                     and bottom is None:
-                # no offsets: skip (avoids overlaying the static flow)
+                # no offsets: an absolute box used only to leave the flow.
+                # Rendering it at its static position tends to overlay
+                # hidden/duplicated overlay panels, so skip it (a box with
+                # any explicit offset is positioned and does get placed).
                 continue
+
             box = BlockLayout(node, self, None)
-            spec_w = parse_size(st.get("width"), self.width, em)
+            spec_w = parse_size(st.get("width"), cb_w, em)
             if spec_w is not None:
                 box.forced_width = spec_w
             elif left is not None and right is not None:
-                box.forced_width = max(self.width - left - right, 40)
+                box.forced_width = max(cb_w - left - right, 0.0)
             else:
-                box.forced_width = max(
-                    self.width - (left or right or 0), 40)
+                # auto width: shrink-to-fit, capped to the containing block
+                try:
+                    mc = _measure_content_width(node, self)
+                except Exception:
+                    mc = cb_w
+                box.forced_width = max(min(mc, cb_w), 0.0)
             self.children.append(box)
             box.layout()
 
             if left is not None:
-                target_x = self.x + left
+                target_x = cb_x + left
             elif right is not None:
-                target_x = self.x + self.width - right - box.outer_width()
+                target_x = cb_x + cb_w - right - box.outer_width()
             else:
-                target_x = self.x
+                target_x = static_x
             if top is not None:
-                target_y = self.y + top
+                target_y = cb_y + top
             elif bottom is not None:
-                target_y = self.y + self.height - bottom \
-                    - box.outer_height()
+                target_y = cb_y + cb_h - bottom - box.outer_height()
             else:
-                target_y = self.y
+                target_y = static_y
             translate(box,
                       target_x - (box.x - box.pl - box.bw - box.ml),
                       target_y - (box.y - box.pt - box.bw
@@ -676,6 +715,14 @@ class BlockLayout:
         while not isinstance(node, DocumentLayout):
             node = node.parent
         return node
+
+    def _queue_abs(self, node, static_x, static_y):
+        """Queue an out-of-flow child for the positioned-layout pass,
+        remembering its containing block (nearest positioned ancestor)
+        and its static position (where it would sit in normal flow, used
+        when an offset is auto)."""
+        cb = _nearest_positioned(self)
+        self._document().abs_queue.append((node, cb, static_x, static_y))
 
     def layout(self):
         # idempotent: inline-block sizing lays a box out once to measure,
@@ -802,7 +849,10 @@ class BlockLayout:
                 if not is_visible(child):
                     continue
                 if is_out_of_flow(child):
-                    self._document().abs_queue.append(child)
+                    flow_y = self.y if previous is None else (
+                        previous.y + previous.height + previous.pb
+                        + previous.bw + previous.margin_bottom)
+                    self._queue_abs(child, self.x, flow_y)
                     continue
                 # inline-block children flow horizontally and wrap into
                 # rows (card/column grids) rather than stacking. Each is a
@@ -973,7 +1023,7 @@ class BlockLayout:
             if not is_visible(child):
                 continue
             if is_out_of_flow(child):
-                self._document().abs_queue.append(child)
+                self._queue_abs(child, self.x, self.y)
                 continue
             if isinstance(child, Text) and not child.text.strip():
                 continue
@@ -1413,7 +1463,9 @@ class BlockLayout:
             # already being laid out (it was pulled off abs_queue), so its
             # own children must flow here instead of re-queuing it
             if node is not self.node and is_out_of_flow(node):
-                self._document().abs_queue.append(node)
+                line = self.children[-1] if self.children else None
+                sy = line.y if line is not None else self.y
+                self._queue_abs(node, self.x + self.cursor_x, sy)
                 return
             _disp = node.style.get("display", "")
             if node is not self.node and (
