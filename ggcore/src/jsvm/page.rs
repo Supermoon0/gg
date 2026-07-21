@@ -1587,6 +1587,26 @@ mod tests {
                f({x:3,y:4})"),
             7.0,
         );
+        // a with-object does NOT leak into a function called from the body
+        // (with is lexical, not dynamic)
+        assert_eq!(
+            n("var o={x:1}; function f(){ return typeof x; } var r;\
+               with(o){ r=f(); } r==='undefined'?1:0"),
+            1.0,
+        );
+        // a write to a name the object owns updates the object
+        assert_eq!(n("var o={a:1}; with(o){ a=5; } o.a"), 5.0);
+        // an early return from inside `with` still closes the scope
+        assert_eq!(
+            n("function g(){ with({z:7}){ return z; } } g()"),
+            7.0,
+        );
+        // a throw inside `with` unwinds the scope (q not visible after)
+        assert_eq!(
+            n("var seen=1; try{ with({q:9}){ throw 0; } }catch(e){}\
+               typeof q==='undefined'?seen:0"),
+            1.0,
+        );
     }
 
     #[test]

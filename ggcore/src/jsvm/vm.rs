@@ -175,6 +175,9 @@ struct Frame {
     closure: u32,
     this_val: Value,
     argc: u8,
+    /// caller's with_stack base, so a callee never sees the caller's
+    /// `with (obj)` scopes (with is lexical, not dynamic).
+    with_base: usize,
 }
 
 /// An armed `try` handler: everything needed to resume the frame that
@@ -191,6 +194,10 @@ struct Handler {
     catch_ip: u32,
     exc_reg: u8,
     argc: u8,
+    /// with_stack state to restore when this handler catches (drops any
+    /// `with` scope entered inside the try but not yet exited).
+    with_base: usize,
+    with_len: usize,
 }
 
 pub(super) enum ClosureRec {
@@ -2985,8 +2992,8 @@ pub(super) enum PropHit {
 /// what lets lodash `_.template`'s compiled `with (obj) { ... }` read its
 /// interpolated variables from the data object. Data properties only —
 /// getters/setters on a with-object fall through to the normal global.
-fn with_lookup(st: &St, key: u32) -> Option<Value> {
-    for i in (0..st.with_stack.len()).rev() {
+fn with_lookup(st: &St, key: u32, base: usize) -> Option<Value> {
+    for i in (base..st.with_stack.len()).rev() {
         let obj = st.with_stack[i];
         if obj.is_object() {
             if let PropHit::Data(v) =
@@ -2994,6 +3001,21 @@ fn with_lookup(st: &St, key: u32) -> Option<Value> {
             {
                 return Some(v);
             }
+        }
+    }
+    None
+}
+
+/// Innermost with-object (>= base) that owns `key`, for `with`-scoped
+/// assignment. None if no active with-object has it.
+fn with_target(st: &St, key: u32, base: usize) -> Option<Value> {
+    for i in (base..st.with_stack.len()).rev() {
+        let obj = st.with_stack[i];
+        if obj.is_object()
+            && !matches!(lookup_prop(st, obj.index() as usize, key),
+                         PropHit::Missing)
+        {
+            return Some(obj);
         }
     }
     None
@@ -6461,12 +6483,15 @@ pub(super) fn exec(
 ) -> Result<Value, VmError> {
     let floor = st.frames.len();
     let hfloor = st.handlers.len();
+    let with_floor = st.with_stack.len();
     let (mut mi, mut pi, mut ip) = (mi0, pi0, 0usize);
     let (mut base, mut cl, mut this_v) = (base0, cl0, this0);
     let mut cur_argc = argc0;
+    let mut with_base = with_floor;
     loop {
         let r = exec_loop(
-            st, mods, mi, pi, ip, base, cl, this_v, floor, cur_argc,
+            st, mods, mi, pi, ip, base, cl, this_v, floor, with_base,
+            cur_argc,
         );
         let e = match r {
             Ok(v) => {
@@ -6474,6 +6499,7 @@ pub(super) fn exec(
                 // (a callback can return from inside `try` at `floor`,
                 // where no Return cleanup runs).
                 st.handlers.truncate(hfloor);
+                st.with_stack.truncate(with_floor);
                 return Ok(v);
             }
             Err(e) => e,
@@ -6485,11 +6511,14 @@ pub(super) fn exec(
             // fails with "stack overflow").
             st.frames.truncate(floor);
             st.handlers.truncate(hfloor);
+            st.with_stack.truncate(with_floor);
             return Err(e);
         }
         // Resume at the innermost armed catch with the thrown value.
         let h = st.handlers.pop().unwrap();
         st.frames.truncate(h.depth);
+        st.with_stack.truncate(h.with_len);
+        with_base = h.with_base;
         let exc = exception_value(st, e);
         st.regs[h.base + h.exc_reg as usize] = exc;
         mi = h.module;
@@ -6559,11 +6588,13 @@ fn exec_loop(
     cl0: u32,
     this0: Value,
     floor: usize,
+    with_base0: usize,
     argc0: u8,
 ) -> Result<Value, VmError> {
     let mut mi = mi0;
     let mut pi = pi0;
     let mut ip = ip0;
+    let mut cur_with_base = with_base0;
     let mut base = base0;
     let mut cur_cl = cl0;
     let mut this_v = this0;
@@ -6683,8 +6714,10 @@ fn exec_loop(
             Instr::Move { dst, src } => reg!(dst) = reg!(src),
             Instr::GetGlobal { dst, atom } => {
                 let key = name!(atom) as usize;
-                if !st.with_stack.is_empty() {
-                    if let Some(v) = with_lookup(st, key as u32) {
+                if st.with_stack.len() > cur_with_base {
+                    if let Some(v) =
+                        with_lookup(st, key as u32, cur_with_base)
+                    {
                         reg!(dst) = v;
                         continue;
                     }
@@ -6706,8 +6739,10 @@ fn exec_loop(
             }
             Instr::GetGlobalSafe { dst, atom } => {
                 let key = name!(atom) as usize;
-                if !st.with_stack.is_empty() {
-                    if let Some(v) = with_lookup(st, key as u32) {
+                if st.with_stack.len() > cur_with_base {
+                    if let Some(v) =
+                        with_lookup(st, key as u32, cur_with_base)
+                    {
                         reg!(dst) = v;
                         continue;
                     }
@@ -6739,6 +6774,8 @@ fn exec_loop(
                     catch_ip,
                     exc_reg: exc,
                     argc: cur_argc,
+                    with_base: cur_with_base,
+                    with_len: st.with_stack.len(),
                 });
             }
             Instr::PopHandler => {
@@ -6749,7 +6786,9 @@ fn exec_loop(
                 st.with_stack.push(o);
             }
             Instr::WithExit => {
-                st.with_stack.pop();
+                if st.with_stack.len() > cur_with_base {
+                    st.with_stack.pop();
+                }
             }
             Instr::Throw { src } => {
                 let v = reg!(src);
@@ -6758,7 +6797,19 @@ fn exec_loop(
             }
             Instr::SetGlobal { atom, src } => {
                 let key = name!(atom) as usize;
-                st.globals[key] = reg!(src);
+                let v = reg!(src);
+                // inside `with (obj)`, a write to a name the object owns
+                // updates that object, not the global
+                if st.with_stack.len() > cur_with_base {
+                    if let Some(obj) =
+                        with_target(st, key as u32, cur_with_base)
+                    {
+                        let oi = obj.index() as usize;
+                        raw_set_prop(st, oi, key as u32, v);
+                        continue;
+                    }
+                }
+                st.globals[key] = v;
                 st.gdef[key] = true;
             }
             Instr::DeclGlobal { atom } => {
@@ -7092,6 +7143,7 @@ fn exec_loop(
                             closure: cur_cl,
                             this_val: this_v,
                             argc: cur_argc,
+                            with_base: cur_with_base,
                         });
                         mi = cm;
                         pi = cp;
@@ -7099,6 +7151,7 @@ fn exec_loop(
                         base = new_base;
                         cur_cl = cl_idx;
                         cur_argc = argc;
+                        cur_with_base = st.with_stack.len();
                         // arrows keep their lexical this; plain calls get
                         // undefined (no receiver)
                         this_v = this_cap.unwrap_or(Value::UNDEFINED);
@@ -7178,6 +7231,7 @@ fn exec_loop(
                             closure: cur_cl,
                             this_val: this_v,
                             argc: cur_argc,
+                            with_base: cur_with_base,
                         });
                         mi = cm;
                         pi = cp;
@@ -7185,6 +7239,7 @@ fn exec_loop(
                         base = new_base;
                         cur_cl = cl_idx;
                         cur_argc = argc;
+                        cur_with_base = st.with_stack.len();
                         // arrows keep their lexical this; everything
                         // else gets the receiver the callee was read off
                         this_v = this_cap.unwrap_or(receiver);
@@ -8041,6 +8096,7 @@ fn exec_loop(
                                     closure: cur_cl,
                                     this_val: this_v,
                                     argc: cur_argc,
+                                    with_base: cur_with_base,
                                 });
                                 mi = cm;
                                 pi = cp;
@@ -8048,6 +8104,7 @@ fn exec_loop(
                                 base = new_base;
                                 cur_cl = cl_idx;
                                 cur_argc = argc;
+                                cur_with_base = st.with_stack.len();
                                 // arrow method keeps its lexical this
                                 this_v = this_cap.unwrap_or(ov);
                                 cmod = mods.rc(mi);
@@ -8396,11 +8453,15 @@ fn exec_loop(
             }
             Instr::Return { src } => {
                 let val = reg!(src);
+                // drop any `with` scope this frame left open (early return
+                // from inside `with (obj) { return ... }`)
+                st.with_stack.truncate(cur_with_base);
                 if st.frames.len() == floor {
                     return Ok(val);
                 }
                 let fr = st.frames.pop().unwrap();
                 cur_argc = fr.argc;
+                cur_with_base = fr.with_base;
                 // a return from inside `try` leaves its handlers armed;
                 // they die with the frame
                 while st.handlers.last().is_some_and(
@@ -8418,11 +8479,13 @@ fn exec_loop(
                 cmod = mods.rc(mi);
             }
             Instr::ReturnUndef => {
+                st.with_stack.truncate(cur_with_base);
                 if st.frames.len() == floor {
                     return Ok(Value::UNDEFINED);
                 }
                 let fr = st.frames.pop().unwrap();
                 cur_argc = fr.argc;
+                cur_with_base = fr.with_base;
                 while st.handlers.last().is_some_and(
                     |h| h.depth > st.frames.len(),
                 ) {
