@@ -868,16 +868,26 @@ class BlockLayout:
         spec = size("width")
         maxw = size("max-width")
         minw = size("min-width")
+        # box-sizing (CSS Box Sizing §3): border-box counts padding+border
+        # inside a specified width, content-box adds them outside. This
+        # engine defaults a bare width to border-box ("web reality": most
+        # sites ship `* { box-sizing: border-box }`), and honours an
+        # explicit box-sizing:content-box for the pages that opt out.
+        border_box = st.get("box-sizing", "").strip().casefold() \
+            != "content-box"
+
+        def to_border(v):
+            return v if border_box else v + edge
         if self.forced_width is not None:
             box_w = self.forced_width
         elif spec is not None:
-            box_w = spec  # treated as border-box (web reality)
+            box_w = to_border(spec)
         else:
             box_w = avail - self.ml - self.mr
         if maxw is not None:
-            box_w = min(box_w, maxw)
+            box_w = min(box_w, to_border(maxw))
         if minw is not None:
-            box_w = max(box_w, minw)
+            box_w = max(box_w, to_border(minw))
         box_w = max(box_w, edge)
 
         # auto horizontal margins: flex items absorb their line's free
@@ -948,11 +958,14 @@ class BlockLayout:
         self.width = max(box_w - edge, 0)
 
         # resolve a specified height before children lay out so they
-        # can resolve percentage heights against it
+        # can resolve percentage heights against it. box-sizing:border-box
+        # counts padding+border inside the height; content-box (default)
+        # is already the content height.
         spec_h = self._specified_height(st, em)
         if spec_h is not None:
             self.definite_height = max(
-                spec_h - self.pt - self.pb - 2 * self.bw, 0)
+                spec_h - (self.pt + self.pb + 2 * self.bw)
+                if border_box else spec_h, 0)
 
         mode = layout_mode(node)
         if mode == "flex":
