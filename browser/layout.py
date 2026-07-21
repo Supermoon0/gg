@@ -504,6 +504,23 @@ def _grid_track_size(token, avail, em):
     return ("fr", 1.0)
 
 
+def _parse_aspect_ratio(value):
+    """CSS aspect-ratio -> a width/height ratio (float), or None. Accepts
+    '16/9', '1.5', or '16 / 9' (an 'auto' prefix/keyword is ignored)."""
+    v = (value or "").strip()
+    if not v:
+        return None
+    m = re.search(r"([0-9]*\.?[0-9]+)\s*(?:/\s*([0-9]*\.?[0-9]+))?", v)
+    if not m:
+        return None
+    try:
+        a = float(m.group(1))
+        b = float(m.group(2)) if m.group(2) else 1.0
+        return a / b if b else None
+    except ValueError:
+        return None
+
+
 def _parse_grid_areas(spec):
     """grid-template-areas -> a list of rows, each a list of area names
     ('.' is an empty cell). Each quoted string is one row."""
@@ -1988,10 +2005,15 @@ class BlockLayout:
         h = parse_size(node.style.get("height"), 0.0, em)
         w = w if w is not None else _attr_px(node, "width")
         h = h if h is not None else _attr_px(node, "height")
+        # a CSS aspect-ratio overrides the natural ratio when deriving the
+        # missing dimension (responsive width:100%;aspect-ratio:16/9 media)
+        ar = _parse_aspect_ratio(node.style.get("aspect-ratio"))
         if w and not h:
-            h = w * natural_h / natural_w if natural_w else w
+            h = w / ar if ar else (
+                w * natural_h / natural_w if natural_w else w)
         elif h and not w:
-            w = h * natural_w / natural_h if natural_h else h
+            w = h * ar if ar else (
+                h * natural_w / natural_h if natural_h else h)
         elif not w and not h:
             w, h = float(natural_w), float(natural_h)
         # never overflow the containing block
