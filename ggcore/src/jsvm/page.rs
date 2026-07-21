@@ -1377,6 +1377,36 @@ impl PageVm {
 
     /// Fill location.* from the real page URL (loader calls this
     /// before scripts run).
+    /// Seed `document.cookie` from the network jar (a `k=v; k2=v2`
+    /// string) before page scripts run, so JS sees the server session.
+    pub fn seed_cookies(&mut self, s: &str) {
+        for pair in s.split(';') {
+            let pair = pair.trim();
+            if let Some((k, v)) = pair.split_once('=') {
+                let k = k.trim().to_string();
+                if k.is_empty() {
+                    continue;
+                }
+                let v = v.trim().to_string();
+                match self.st.cookies.iter_mut().find(|(ck, _)| *ck == k) {
+                    Some(e) => e.1 = v,
+                    None => self.st.cookies.push((k, v)),
+                }
+            }
+        }
+    }
+
+    /// Current `document.cookie` value as `k=v; k2=v2` (JS writes flow
+    /// back to the network jar through this).
+    pub fn cookies_string(&self) -> String {
+        self.st
+            .cookies
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
     pub fn set_page_url(&mut self, url: &str) {
         let (scheme, rest) =
             url.split_once("://").unwrap_or(("https", url));
@@ -1607,6 +1637,21 @@ mod tests {
                typeof q==='undefined'?seen:0"),
             1.0,
         );
+    }
+
+    #[test]
+    fn cookie_seed_and_read_roundtrip() {
+        // network jar <-> document.cookie bridge: seed before scripts,
+        // read back JS writes.
+        let mut vm = PageVm::new(None);
+        vm.seed_cookies("sid=abc; theme=dark");
+        assert_eq!(vm.cookies_string(), "sid=abc; theme=dark");
+        // re-seeding replaces an existing name and appends new ones
+        vm.seed_cookies("sid=xyz; lang=ko");
+        let s = vm.cookies_string();
+        assert!(s.contains("sid=xyz"), "{s}");
+        assert!(s.contains("theme=dark"), "{s}");
+        assert!(s.contains("lang=ko"), "{s}");
     }
 
     #[test]

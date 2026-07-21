@@ -109,6 +109,17 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
                 doc.set_page_url(str(page_url))
             except Exception:
                 pass  # older wheels have no set_page_url
+            # seed document.cookie from the network jar so page scripts
+            # see the server session before they run
+            try:
+                from . import net as _net
+                host = getattr(page_url, "host", None)
+                if host and hasattr(doc, "seed_cookies"):
+                    jar = _net.cookies_for(host)
+                    if jar:
+                        doc.seed_cookies(jar)
+            except Exception:
+                pass
         deadline = time.perf_counter() + js_budget
         for i, code in enumerate(sources):
             if not fuel_safe and len(code) > 400_000:
@@ -132,6 +143,19 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
                 logs.extend(doc.fire_lifecycle())
             except Exception:
                 pass
+        # fold any JS-set cookies back into the network jar for later
+        # requests to the same host
+        try:
+            from . import net as _net
+            host = getattr(page_url, "host", None) if page_url else None
+            if host and hasattr(doc, "read_cookies"):
+                js_ck = doc.read_cookies()
+                if js_ck:
+                    _net._store_set_cookie(
+                        host,
+                        [p.strip() for p in js_ck.split(";") if p.strip()])
+        except Exception:
+            pass
 
     entries = doc.stylesheet_entries()
     hrefs = [value for kind, value in entries if kind == "link"]

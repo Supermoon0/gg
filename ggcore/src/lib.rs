@@ -735,6 +735,21 @@ impl Doc {
         }
     }
 
+    /// Seed document.cookie from the network jar before scripts run.
+    fn seed_cookies(&mut self, cookies: String) {
+        if self.use_ggjs && !cookies.is_empty() {
+            self.ggvm().seed_cookies(&cookies);
+        }
+    }
+
+    /// Read document.cookie back (JS writes) to fold into the network jar.
+    fn read_cookies(&self) -> String {
+        self.ggjs
+            .as_ref()
+            .map(|vm| vm.cookies_string())
+            .unwrap_or_default()
+    }
+
     /// One real-time slice of the live event loop: fires timers/rAF
     /// due within the next dt_ms of virtual time. Returns (console
     /// output, fetches to service). The render loop calls this
