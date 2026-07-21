@@ -791,8 +791,15 @@ class BlockLayout:
             self.x = self.parent.x + self.ml + self.bw + self.pl
             if self.previous:
                 p = self.previous
-                self.y = (p.y + p.height + p.pb + p.bw + p.margin_bottom
-                          + self.margin_top + self.bw + self.pt)
+                # CSS 2.1 §8.3.1: adjacent vertical margins collapse. The
+                # gap between two in-flow block siblings is a single
+                # margin, not the sum — max of the positive parts plus the
+                # min of the negative parts (so equal 16px margins give a
+                # 16px gap, not 32px).
+                mb, mt = p.margin_bottom, self.margin_top
+                collapse = max(mb, mt, 0.0) + min(mb, mt, 0.0)
+                self.y = (p.y + p.height + p.pb + p.bw + collapse
+                          + self.bw + self.pt)
             else:
                 self.y = (self.parent.y + self.margin_top
                           + self.bw + self.pt)
