@@ -1102,6 +1102,7 @@ class BlockLayout:
             apply_relative_offsets(self.children)
         else:
             self.new_line()
+            self._ws_pending = False   # no space owed before the first atom
             self.recurse(node)
             # -webkit-line-clamp: N — keep the first N wrapped lines and
             # mark the overflow with an ellipsis (card titles clamp to 2
@@ -1862,8 +1863,23 @@ class BlockLayout:
                 # collapses runs of whitespace, pre-wrap preserves them
                 self.pre_wrapped(node, collapse=(ws == "pre-line"))
             else:
-                for word in node.text.split():
-                    self.word(node, word)
+                # collapse whitespace, but remember whether the source had
+                # any at each boundary so a space is inserted only where one
+                # existed: "<b>a</b><b>b</b>" -> "ab", "$<b>5</b>" -> "$5",
+                # while "hello <b>world</b>" keeps its space.
+                text = node.text
+                toks = text.split()
+                if not toks:
+                    if text:            # whitespace-only node: owes a space
+                        self._ws_pending = True
+                else:
+                    lead = text[:1].isspace()
+                    for i, word in enumerate(toks):
+                        sb = (i > 0) or lead \
+                            or getattr(self, "_ws_pending", False)
+                        self.word(node, word, space_before=sb)
+                        self._ws_pending = False
+                    self._ws_pending = text[-1:].isspace()
         else:
             if not is_visible(node):
                 return
@@ -1914,7 +1930,7 @@ class BlockLayout:
             for child in node.children:
                 self.recurse(child)
 
-    def word(self, node, word):
+    def word(self, node, word, space_before=True):
         font = cached_font(node)
         w = measure(font, word)
         nowrap = node.style.get("white-space") in ("nowrap", "pre")
@@ -1941,14 +1957,19 @@ class BlockLayout:
             if force or _has_cjk(word):
                 self._emit_broken(node, word, font, cjk_only=not force)
                 return
-        if not nowrap and self.cursor_x + w > self.width \
+        line = self.children[-1]
+        # a leading space only when the source had whitespace here and we
+        # are not at the start of a line
+        sp = measure(font, " ") if (space_before and line.children) else 0.0
+        if not nowrap and self.cursor_x + sp + w > self.width \
                 and self.cursor_x > 0:
             self.new_line()
+            sp = 0.0
         line = self.children[-1]
         prev = line.children[-1] if line.children else None
-        text = TextLayout(node, word, line, prev)
+        text = TextLayout(node, word, line, prev, keep_spaces=not space_before)
         line.children.append(text)
-        self.cursor_x += w + measure(font, " ")
+        self.cursor_x += sp + w
 
     def _emit_broken(self, node, word, font, cjk_only):
         """Emit a too-wide run split at break opportunities, wrapping
