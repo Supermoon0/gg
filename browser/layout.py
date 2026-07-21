@@ -332,6 +332,12 @@ def _child_is_block_level(child):
     grid of inline-block cards would stack vertically."""
     if not isinstance(child, Element):
         return False
+    # a floated element is block-level (float computes display to block),
+    # so `<p><img style="float:left">text</p>` puts the container in block
+    # flow and the image actually floats instead of sitting inline
+    if child.style.get("float", "none").strip().casefold() in (
+            "left", "right"):
+        return True
     d = child.style.get("display", "")
     if d in ("inline", "inline-block", "inline-flex", "inline-table"):
         return False
@@ -1055,10 +1061,21 @@ class BlockLayout:
                     if fside in ("left", "right"):
                         fw = parse_size(
                             child.style.get("width"), self.width, em)
-                if fside in ("left", "right") and fw is not None:
-                    # float: out of normal flow, anchored where the
-                    # flow currently ends (auto-width floats fall back
-                    # to normal flow — v1 gate)
+                        if fw is None:
+                            # auto-width float: shrink-to-fit, capped to the
+                            # containing block (floated <img>/<figure> size
+                            # to their content instead of stacking as blocks)
+                            try:
+                                fw = min(
+                                    _measure_content_width(
+                                        child, self._document()),
+                                    self.width)
+                            except Exception:
+                                fw = self.width
+                            fw = max(fw, 0.0)
+                if fside in ("left", "right"):
+                    # float: out of normal flow, anchored where the flow
+                    # currently ends
                     cur_y = self.y if previous is None else (
                         previous.y + previous.height + previous.pb
                         + previous.bw + previous.margin_bottom)
