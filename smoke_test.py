@@ -673,8 +673,12 @@ check("width is border-box", abs(center.width - 176) < 1,
 fa, fb, fc = boxes["fa"], boxes["fb"], boxes["fc"]
 check("flex row placement", fa.y == fb.y == fc.y and fa.x < fb.x < fc.x,
       f"x: {fa.x:.0f},{fb.x:.0f},{fc.x:.0f}")
-check("flex grow shares space", abs(fb.width - (774 - 100) / 2) < 1,
-      f"fb.width={fb.width:.0f}")
+# the two auto items grow from their content basis and together consume
+# all free space; each gets ~half, up to the b/c glyph-width difference
+check("flex grow shares space",
+      abs((fb.width + fc.width) - (774 - 100)) < 1
+      and abs(fb.width - fc.width) < 4,
+      f"fb.width={fb.width:.0f} fc.width={fc.width:.0f}")
 # a `flex:1 0 0` pane fills the row while a `flex:0 0 auto` label keeps
 # its content width (naver's nav tabs: the grow pane must not collapse)
 lbl, nav = boxes["lbl"], boxes["nav"]
