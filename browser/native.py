@@ -48,7 +48,7 @@ def build_tree(flat):
 
 
 def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
-                  page_url=None):
+                  page_url=None, viewport_width=1280.0):
     """Full native front half: parse -> scripts -> styles -> tree.
 
     fetch_css(hrefs) / fetch_js(srcs) -> {url: text} keep networking
@@ -147,13 +147,13 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
         if css:
             css_sources.append(css)
 
-    doc.compute_styles(css_sources)
+    doc.compute_styles(css_sources, viewport_width)
     return build_tree(doc.export()), doc, css_sources, logs
 
 
-def refresh(doc, css_sources):
+def refresh(doc, css_sources, viewport_width=1280.0):
     """Re-style and re-export after JS mutated the DOM."""
-    doc.compute_styles(css_sources)
+    doc.compute_styles(css_sources, viewport_width)
     return build_tree(doc.export())
 
 

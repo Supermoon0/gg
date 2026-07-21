@@ -56,6 +56,7 @@ class Shell:
         self.hscroll = 0
         self.content_width = 0
         self.content_height = 0
+        self._styled_width = 0.0
         self.url = None
         self.url_text = ""
         self.caret = 0
@@ -122,13 +123,15 @@ class Shell:
         prev = os.environ.get("GGJS")
         if native.async_available():
             os.environ["GGJS"] = "1"
+        self._styled_width = self.logical_size()[0]
         try:
             self.nodes, self._doc, self._css_sources, logs = \
                 native.load_document(
                     body,
                     lambda hrefs: _fetch_many(hrefs, url),
                     lambda srcs: _fetch_many(srcs, url),
-                    page_url=url)
+                    page_url=url,
+                    viewport_width=self._styled_width)
         finally:
             if prev is None:
                 os.environ.pop("GGJS", None)
@@ -140,7 +143,8 @@ class Shell:
         # Drive the event loop so fetch/timer-driven SPA content appears,
         # then rebuild the tree from the mutated DOM.
         if native.settle_async(self._doc, self._css_sources, url):
-            self.nodes = native.refresh(self._doc, self._css_sources)
+            self.nodes = native.refresh(
+                self._doc, self._css_sources, self._styled_width)
 
         self.apply_title()
         self.load_images(keep_cache=False)
@@ -194,6 +198,13 @@ class Shell:
         if self.nodes is None:
             return
         w, h = self.logical_size()
+        # width-dependent @media rules must re-evaluate when the window is
+        # resized across a breakpoint (styling is otherwise width-agnostic)
+        if self._doc is not None and w != getattr(self, "_styled_width", w):
+            self._styled_width = w
+            self.nodes = native.refresh(
+                self._doc, self._css_sources, w)
+            self.load_images(keep_cache=True)
         viewport_h = h - TOOLBAR_H - STATUS_H
         self.document = DocumentLayout(self.nodes)
         self.document.layout(max(w, 200),
