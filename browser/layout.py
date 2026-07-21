@@ -1392,21 +1392,60 @@ class BlockLayout:
             eff_total = sum(eff_grows)
 
         gap_total = col_gap * max(len(specs) - 1, 0)
+        n = len(specs)
         if not wrap:
             free = self.width - sum(specs) - gap_total
             if free > 0 and eff_total > 0:
-                for i, g in enumerate(eff_grows):
-                    specs[i] += free * g / eff_total
+                # grow: distribute positive free space, clamp each item to
+                # its max-width, freeze it, and redistribute the remainder
+                maxes = [parse_size(c.style.get("max-width"), self.width, em)
+                         for c in kid_nodes]
+                frozen = [eff_grows[i] <= 0 for i in range(n)]
+                rem = free
+                for _ in range(n + 1):
+                    act = [i for i in range(n) if not frozen[i]]
+                    tg = sum(eff_grows[i] for i in act)
+                    if not act or rem <= 0.5 or tg <= 0:
+                        break
+                    hit = False
+                    for i in act:
+                        add = rem * eff_grows[i] / tg
+                        if maxes[i] is not None \
+                                and specs[i] + add > maxes[i]:
+                            rem -= (maxes[i] - specs[i])
+                            specs[i] = maxes[i]
+                            frozen[i] = True
+                            hit = True
+                    if not hit:
+                        for i in act:
+                            specs[i] += rem * eff_grows[i] / tg
+                        break
             elif free < 0:
-                # remove overflow in proportion to shrink-factor x base
-                weights = [shrinks[i] * specs[i]
-                           for i in range(len(specs))]
-                wsum = sum(weights)
-                if wsum > 0:
-                    specs = [
-                        max(specs[i] + free * weights[i] / wsum, 0.0)
-                        for i in range(len(specs))
-                    ]
+                # shrink: remove overflow in proportion to shrink-factor x
+                # base, but never below an item's min-content width (so text
+                # can't be crushed into overlap); freeze and redistribute
+                mins = [_measure_min_width(c, doc) for c in kid_nodes]
+                frozen = [shrinks[i] <= 0 for i in range(n)]
+                need = -free
+                for _ in range(n + 1):
+                    act = [i for i in range(n)
+                           if not frozen[i] and specs[i] > mins[i]]
+                    w = [shrinks[i] * specs[i] for i in act]
+                    wsum = sum(w)
+                    if not act or need <= 0.5 or wsum <= 0:
+                        break
+                    hit = False
+                    for k, i in enumerate(act):
+                        take = need * w[k] / wsum
+                        if specs[i] - take < mins[i]:
+                            need -= (specs[i] - mins[i])
+                            specs[i] = mins[i]
+                            frozen[i] = True
+                            hit = True
+                    if not hit:
+                        for k, i in enumerate(act):
+                            specs[i] = max(specs[i] - need * w[k] / wsum, 0.0)
+                        break
         grow = 0.0          # every item now carries a definite base size
         n_flex = 0
         fixed_total = sum(specs)
