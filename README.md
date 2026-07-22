@@ -15,9 +15,9 @@
 python main.py                        # tkinter 셸, 홈 화면(about:home)
 python main.py https://naver.com      # tkinter 셸
 python main.py --native               # 러스트(winit) 창 셸
-python smoke_test.py                  # 헤드리스 파이프라인 테스트 (149종)
+python smoke_test.py                  # 헤드리스 파이프라인 테스트 (249종)
 python basket_test.py                 # 대표 사이트 렌더 측정 (9곳)
-cd ggcore && cargo test --lib         # 엔진 단위 테스트 (171종)
+cd ggcore && cargo test --lib         # 엔진 단위 테스트 (197종 + 진단용 2종 ignored)
 ```
 
 ## JavaScript — 자체 엔진 gg-js
@@ -34,6 +34,10 @@ Map/Set/WeakMap/WeakSet, Symbol(문자열 페이크 + 폴리필 공존), 정규�
 생성자·인스턴스 프로퍼티·추출 exec/test), **ToPrimitive/ToPropertyKey 시맨틱**
 (valueOf/toString 실호출), 레이블 문, 비트 연산, `arguments`, bind/call/apply
 uncurry 전 패턴, 배열·문자열·array-like의 메서드 추출(core-js `uncurryThis` 호환).
+`Proxy`는 객체·함수 target, `get`/`set`/`has`/`deleteProperty`/`ownKeys`/
+descriptor/prototype/확장성 trap, `apply`/`construct`, revocation을 VM 내부 연산에
+연결한다. `Reflect` 13개 메서드는 같은 내부 연산을 공유해 trap의 기본 위임과
+불변조건 검사를 보존한다.
 
 **웹 플랫폼**: DOM 트리 조작 전반(생성·삽입·복제·형제 탐색·expando·attributes
 컬렉션·앵커 URL 분해), 이벤트(add/removeEventListener·dispatchEvent·버블링·
@@ -41,16 +45,42 @@ attachEvent 레거시), location/navigator/history/performance, 타이머·rAF·
 fetch + XMLHttpRequest, localStorage/sessionStorage, document.cookie, classList,
 el.style/dataset 프록시, MutationObserver·IntersectionObserver·matchMedia 등
 플랫폼 스텁 레이어, 라이프사이클(readyState·DOMContentLoaded·load).
+parser-blocking/`async`/`defer`/module 스크립트의 fetch·실행·라이프사이클 순서를
+분리하고, 동적 `<script>`의 기본 async, `async=false`, load/error 이벤트를 지원한다.
+ES module은 상대 URL 해석, 병렬 fetch와 URL별 단일 평가 캐시, 정적 default/named/
+namespace import, named/default/star re-export, `import.meta.url`, 순환 그래프와
+namespace live export를 지원한다. `import()`은 리터럴과 런타임 계산식을 모두
+지원하며 계산식은 실행 시점에 URL/import map을 해석하고 fetch한다. Promise 오류
+전파, 동시 요청의 fetch·평가 캐시, top-level await의 의존성/DCL 대기,
+exact·prefix·scoped import maps도 같은 상태 머신을 쓴다. default·named·namespace
+import 읽기는 scope-aware getter로 연결되어 함수·구조분해·화살표 매개변수,
+catch·블록·for 선언과 객체/클래스 메서드의 shadowing을 보존한다. 객체 축약 속성과
+템플릿 표현식에서도 live 값을 읽으며 import 쓰기와 모듈 범위 재선언은 거절한다.
+정적 `with { type: "json" }`과 동적
+`import(url, { with: { type: "json" } })`은 JSON을 단일 default export 모듈로
+검증·평가하며, 지원하지 않는 속성·타입과 잘못된 JSON은 모듈 오류 또는 Promise
+`TypeError`로 정산한다. 문서별 런타임 그래프는 약한 참조로 수명 관리된다.
 
-**실전 검증**: 네이버 번들 파이프라인에서 **웹팩 런타임 구동 성공** —
-polyfill(core-js)·preload(jQuery) 번들이 끝까지 실행되고 앱이 리스너·타이머를
-등록하며 동적 스크립트를 주입하는 단계까지 도달. main(React) 부팅이 현재 프런티어.
+**실전 검증**: 네이버 번들 파이프라인에서 polyfill(core-js)·preload(jQuery)·
+웹팩 런타임과 react-dom 18 `createRoot`가 끝까지 실행된다. 빈 `#root`에서 실제
+React 컴포넌트 트리를 렌더·커밋하고, 뉴스·관심사 피드·로그인 패널·푸터까지
+네이버 자체 DOM으로 그린다. 번들 7종의 언캐치드 예외는 0이다.
 
 ## 네트워크
 
-소켓 위에 직접 구현한 HTTP/1.1: 호스트별 커넥션 풀(keep-alive), 메모리 캐시,
-디스크 캐시(명시적 max-age), 리다이렉트, chunked, gzip, `file:`/`about:`/`data:` 스킴.
-스타일시트는 스크립트 실행과 병렬로 프리페치된다.
+소켓 위에 직접 구현한 HTTP/1.1: 호스트별 커넥션 풀(keep-alive), 메모리·디스크
+개인 캐시(`no-store`/`private`/`no-cache`, `Vary`, ETag/Last-Modified 조건부
+재검증과 304 병합), GET/POST body, 301/302/303/307/308 리다이렉트 규칙,
+chunked, gzip, 취소 토큰과 전체 요청 timeout, `file:`/`about:`/`data:` 스킴.
+쿠키는 Domain/Path/Secure/HttpOnly/SameSite/Expires/Max-Age와 보안 접두사를
+적용하며, JS 쓰기는 속성을 보존한 채 네트워크 jar로 동기화된다. 스타일시트는
+스크립트 실행과 병렬로 프리페치된다. fetch/XHR에는 origin 비교, CORS 응답 검증,
+preflight, credentials 모드, mixed-content 차단을 적용한다. 공식 Public Suffix
+List의 exact/wildcard/exception/PRIVATE 규칙과 IDNA 정규화로 Domain supercookie를
+막고, SameSite는 스킴과 eTLD+1을 함께 비교한다.
+
+PSL 스냅샷은 `browser/data/public_suffix_list.dat`에 포함된다. 공식 목록으로
+갱신하려면 `python scripts/update_psl.py`를 실행한다.
 
 ## 렌더링 파이프라인
 
@@ -73,16 +103,25 @@ border-radius, box-shadow, gradient 색 폴백, overflow:hidden 클리핑, z-ind
 쌓임(컨테이너별 정렬), transform(translate/scale), opacity 게이트, line-height,
 white-space:nowrap, text-overflow:ellipsis
 
-**레이아웃**: 블록/인라인, 박스 모델, position(absolute/fixed/relative),
-플렉스박스(justify/align/shrink/basis 포함), **float + clear**, 대체 요소 CSS
-사이징, 이미지·SVG 인라인 배치
+**레이아웃**: 블록/인라인, 박스 모델, position(absolute/fixed/relative/**sticky**),
+플렉스박스(justify/align/shrink/basis 포함), **float + clear**, table의
+rowspan/colspan, grid 고정/fr track·named area·named line·양축 span과 충돌 없는
+자동 배치, 대체 요소 CSS 사이징, 이미지·SVG 인라인 배치. sticky subtree는
+상주 display list의 push/pop 경계로 보존해 Rust가 스크롤마다 위치를 계산하며
+hit-test도 같은 containing-block 제한 offset을 사용한다. Vertical margin은
+인접 형제뿐 아니라 부모–첫/마지막 자식, 중첩·빈 블록 체인과 양수/음수 혼합까지
+collapse하며 border·padding·overflow formatting context에서는 차단한다.
 
 **동적**: 라이브 틱 루프(타이머/rAF 발화 → DOM 변이 감지 → 부분 무효화 v1 →
-재렌더), 텍스트 입력 포커스·타이핑·캐럿, GET 폼 제출, 실측 getBoundingClientRect
+재렌더), Tab/Shift+Tab 순차 포커스와 Enter/Space 기본 동작, 텍스트 입력·캐럿,
+링크·버튼·체크박스·라디오 키보드 활성화, GET/POST 폼 제출
+(URL-encoded·text/plain·multipart 파일), 외부 `form=` owner, submit/reset/invalid
+이벤트와 required/type/pattern/min/max 길이·수치 검증, 실측 getBoundingClientRect
 
 **크롬**: 주소창, 히스토리, 세로/가로 스크롤(네이티브 셸은 Rust 상주 디스플레이
 리스트로 오프셋 전용 프레임), 링크 히트 테스트, EAGER-DATA 리더 모드(네이버
-헤드라인·피드 추출 렌더)
+헤드라인·피드 추출 렌더). 상위 탐색은 UI 스레드 밖에서 실행되며 새 탐색·중지로
+기존 요청을 취소한다. 뒤로/앞으로는 저장한 문서와 폼·스크롤 상태를 복원한다.
 
 ## 성능
 
@@ -96,13 +135,10 @@ white-space:nowrap, text-overflow:ellipsis
 
 ## 아직 없는 것 (다음 단계 후보)
 
-- **네이버 main(React) 번들 부팅** — 현재 프런티어, search 번들 관문 1개 +
-  React DOM 초기화
-- 테이블 레이아웃, `display: grid`, `position: sticky`, margin collapsing,
-  inline-block 정식 배치
-- ES 모듈, Proxy/Reflect(의도적 보류 — 반쪽 스텁은 폴리필 오판 유발)
-- baseline JIT, GC, 레이아웃 러스트 이식 (부팅 후 측정하며 결정)
-- transition/@keyframes, iframe, HTTP/2, `<video>`/WebGL, 로그인(쿠키 보안 속성)
+상세 우선순위와 완료 조건은 [개발 로드맵](docs/roadmap.md)에 체크리스트로 관리한다.
+
+- baseline JIT, GC, 레이아웃 러스트 이식 (React 실측 병목을 기준으로 결정)
+- transition/@keyframes, iframe, HTTP/2, `<video>`/WebGL, 로그인 호환성
 
 ## 네이티브 코어 빌드
 
@@ -113,5 +149,7 @@ maturin build --release -o dist
 pip install --force-reinstall dist\ggcore-*.whl
 ```
 
-검증 체인: `cargo test --lib` → 휠 빌드·설치 → `python smoke_test.py` →
+검증 체인: `cargo test --lib --no-default-features` → 휠 빌드·설치 →
+`python smoke_test.py` → `python validation/net_gauntlet.py` →
+`python validation/css_gauntlet.py` → `python validation/render_evidence.py` →
 `python basket_test.py`

@@ -79,8 +79,8 @@ pub fn compile_lazy(src: &LazySrc) -> Result<Module, CompileError> {
 }
 
 pub fn compile(stmts: &[Stmt]) -> Result<Module, CompileError> {
-    // `new` compiles directly (NewInstance + CallThis + SelectObj);
-    // the old IIFE lowering is gone so instances get real prototypes.
+    // `new` compiles directly to Construct; keeping construction as one
+    // VM operation is required for Proxy [[Construct]] semantics.
     let mut c = Compiler {
         module: Module {
             protos: Vec::new(),
@@ -3533,29 +3533,23 @@ impl Compiler {
                         return Ok(rexec);
                     }
                 }
-                // real `new`: allocate an instance whose [[Prototype]]
-                // is ctor.prototype, call ctor with this=instance, and
-                // let an explicit object return win
+                // Keep ctor + arguments contiguous (the ordinary call
+                // convention), then let the VM perform [[Construct]].
+                // This is observably different from a method call for a
+                // callable Proxy, whose `construct` trap must win over
+                // its `apply` trap.
                 let rc = self.fx().alloc()?;
                 self.expr_to(callee, rc)?;
-                let robj = self.fx().alloc()?;
-                self.fx().emit(Instr::NewInstance { dst: robj, ctor: rc });
-                let rf = self.fx().alloc()?;
-                self.fx().emit(Instr::Move { dst: rf, src: rc });
                 for a in args {
                     let ra = self.fx().alloc()?;
                     self.expr_to(a, ra)?;
                 }
-                self.fx().emit(Instr::CallThis {
-                    func: rf,
-                    recv: robj,
+                self.fx().emit(Instr::Construct {
+                    ctor: rc,
                     argc: args.len() as u8,
                 });
-                self.fx().emit(Instr::SelectObj {
-                    dst: robj, a: rf, b: robj,
-                });
-                self.fx().tmp_top = robj + 1;
-                Ok(robj)
+                self.fx().tmp_top = rc + 1;
+                Ok(rc)
             }
             Expr::Await(_) => self.err(
                 "await only supported at statement level in an async fn \

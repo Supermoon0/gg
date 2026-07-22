@@ -10,7 +10,8 @@ import tkinter.font
 from . import textengine
 from .colors import NAMED
 from .draw import (DrawBgImage, DrawClipPop, DrawClipPush, DrawImage,
-                   DrawLine, DrawOval, DrawRect, DrawText,
+                   DrawLine, DrawOval, DrawRect, DrawStickyPop,
+                   DrawStickyPush, DrawText,
                    translate_cmds)
 from .html_parser import Element, Text
 from .style import parse_px, parse_size
@@ -426,6 +427,118 @@ def is_visible(node):
     return node.style.get("display", "inline") != "none"
 
 
+def collapse_margins(*values):
+    """Collapse an adjoining vertical-margin set (CSS 2.1 §8.3.1)."""
+    vals = [float(v) for v in values if v is not None]
+    if not vals:
+        return 0.0
+    return max([0.0] + vals) + min([0.0] + vals)
+
+
+def _node_margin(node, side, avail):
+    if not isinstance(node, Element):
+        return 0.0
+    em = parse_px(node.style.get("font-size", "16px"), 16.0)
+    return parse_size(node.style.get("margin-" + side), avail, em) or 0.0
+
+
+def _node_edge_size(node, prop, avail):
+    if not isinstance(node, Element):
+        return 0.0
+    em = parse_px(node.style.get("font-size", "16px"), 16.0)
+    return parse_size(node.style.get(prop), avail, em) or 0.0
+
+
+def _margin_context_allows_children(node):
+    """Whether this node can collapse its block children's margins."""
+    if not isinstance(node, Element) or node.tag in ("html", "body"):
+        return False
+    if layout_mode(node) != "block":
+        return False
+    style = node.style
+    if style.get("overflow", "visible").strip().casefold() not in (
+            "", "visible"):
+        return False
+    if style.get("float", "none").strip().casefold() in ("left", "right"):
+        return False
+    if style.get("position", "static").strip().casefold() in (
+            "absolute", "fixed"):
+        return False
+    return style.get("display", "").strip().casefold() not in (
+        "flow-root", "inline-block", "inline-flex", "inline-grid",
+        "inline-table")
+
+
+def _flow_edge_children(node, reverse=False):
+    """Yield block children from one edge until inline content blocks it."""
+    children = reversed(node.children) if reverse else iter(node.children)
+    for child in children:
+        if not is_visible(child):
+            continue
+        if isinstance(child, Text):
+            if not child.text.strip():
+                continue
+            break
+        if is_out_of_flow(child) or child.style.get(
+                "float", "none").strip().casefold() in ("left", "right"):
+            continue
+        if not _child_is_block_level(child):
+            break
+        yield child
+
+
+def _node_is_empty_collapsible(node, avail, depth=0):
+    """Whether a normal-flow block's own top/bottom margins adjoin."""
+    if depth > 64 or not _margin_context_allows_children(node):
+        return False
+    style = node.style
+    for prop in ("padding-top", "padding-bottom", "border-width",
+                 "border-top-width", "border-bottom-width"):
+        if _node_edge_size(node, prop, avail) != 0:
+            return False
+    em = parse_px(style.get("font-size", "16px"), 16.0)
+    height = parse_size(style.get("height"), 0, em)
+    min_height = parse_size(style.get("min-height"), 0, em)
+    if (height is not None and height != 0) \
+            or (min_height is not None and min_height != 0):
+        return False
+    for child in node.children:
+        if not is_visible(child):
+            continue
+        if isinstance(child, Text):
+            if child.text.strip():
+                return False
+            continue
+        if is_out_of_flow(child) or child.style.get(
+                "float", "none").strip().casefold() in ("left", "right"):
+            continue
+        if not _child_is_block_level(child) \
+                or not _node_is_empty_collapsible(child, avail, depth + 1):
+            return False
+    return True
+
+
+def _collapsed_node_top_margin(node, avail, depth=0):
+    """Effective top margin including collapsible descendant/empty chains."""
+    own = _node_margin(node, "top", avail)
+    if depth > 64 or not _margin_context_allows_children(node):
+        return own
+    if _node_edge_size(node, "padding-top", avail) != 0 \
+            or _node_edge_size(node, "border-width", avail) != 0 \
+            or _node_edge_size(node, "border-top-width", avail) != 0:
+        return own
+    margins = [own]
+    for child in _flow_edge_children(node):
+        if child.style.get("clear", "none").strip().casefold() != "none":
+            break
+        margins.append(_collapsed_node_top_margin(child, avail, depth + 1))
+        if _node_is_empty_collapsible(child, avail, depth + 1):
+            margins.append(_node_margin(child, "bottom", avail))
+            continue
+        break
+    return collapse_margins(*margins)
+
+
 def _is_cjk(ch):
     """Whether a character is CJK/Hangul/Kana — scripts written without
     spaces, where a line may break between (almost) any two characters."""
@@ -465,16 +578,28 @@ def is_out_of_flow(node):
 
 def _split_top_level(spec):
     """Split a track list on spaces while keeping parenthesised groups
-    (minmax(...), repeat(...), fit-content(...)) intact."""
-    out, buf, depth = [], "", 0
+    (minmax(...), repeat(...), fit-content(...)) intact. CSS Grid line-name
+    groups are returned as their own tokens, including when authors omit
+    whitespace (`[content-start]1fr`)."""
+    out, buf, depth, bracket = [], "", 0, False
     for ch in spec:
-        if ch == "(":
+        if ch == "[" and depth == 0 and not bracket:
+            if buf:
+                out.append(buf)
+            buf = ch
+            bracket = True
+        elif ch == "]" and bracket:
+            buf += ch
+            out.append(buf)
+            buf = ""
+            bracket = False
+        elif ch == "(" and not bracket:
             depth += 1
             buf += ch
-        elif ch == ")":
+        elif ch == ")" and not bracket:
             depth -= 1
             buf += ch
-        elif ch.isspace() and depth == 0:
+        elif ch.isspace() and depth == 0 and not bracket:
             if buf:
                 out.append(buf)
                 buf = ""
@@ -539,34 +664,50 @@ def _parse_grid_areas(spec):
     return rows
 
 
-def _parse_grid_tracks(spec, avail, em):
-    """Parse grid-template-columns into a list of track descriptors,
-    expanding repeat(N, tracks). Returns [] when there is no template."""
+def _parse_grid_template(spec, avail, em):
+    """Parse a grid track template.
+
+    Returns ``(tracks, line_names)`` where line names map to every matching
+    zero-based grid-line index. Keeping all occurrences is important for
+    ``repeat()`` and for placements such as ``item 2`` / ``span item``.
+    """
     spec = (spec or "").strip()
     if not spec or spec in ("none", "auto"):
-        return []
-    tokens, i = [], 0
-    parts = _split_top_level(spec)
-    for p in parts:
-        pl = p.casefold()
-        if pl.startswith("repeat(") and pl.endswith(")"):
-            inner = p[7:-1]
-            comma = inner.find(",")
-            if comma < 0:
+        return [], {}
+    tracks, line_names = [], {}
+
+    def add_parts(parts):
+        for part in parts:
+            p = part.strip()
+            pl = p.casefold()
+            if p.startswith("[") and p.endswith("]"):
+                for name in p[1:-1].split():
+                    if name:
+                        line_names.setdefault(name, []).append(len(tracks))
                 continue
-            count_tok = inner[:comma].strip()
-            try:
-                count = int(count_tok)
-            except ValueError:
-                count = 1              # auto-fill/auto-fit: one pass
-            count = max(1, min(count, 64))
-            sub = _split_top_level(inner[comma + 1:].strip())
-            for _ in range(count):
-                for s in sub:
-                    tokens.append(_grid_track_size(s, avail, em))
-        else:
-            tokens.append(_grid_track_size(p, avail, em))
-    return tokens
+            if pl.startswith("repeat(") and pl.endswith(")"):
+                inner = p[7:-1]
+                comma = inner.find(",")
+                if comma < 0:
+                    continue
+                try:
+                    count = int(inner[:comma].strip())
+                except ValueError:
+                    count = 1          # auto-fill/auto-fit: one pass
+                count = max(1, min(count, 64))
+                sub = _split_top_level(inner[comma + 1:].strip())
+                for _ in range(count):
+                    add_parts(sub)
+                continue
+            tracks.append(_grid_track_size(p, avail, em))
+
+    add_parts(_split_top_level(spec))
+    return tracks, line_names
+
+
+def _parse_grid_tracks(spec, avail, em):
+    """Compatibility helper for callers interested only in track sizes."""
+    return _parse_grid_template(spec, avail, em)[0]
 
 
 def translate(layout_obj, dx, dy):
@@ -585,6 +726,57 @@ def apply_relative_offsets(children):
         dy = getattr(child, "rel_dy", 0)
         if dx or dy:
             translate(child, dx, dy)
+
+
+def _sticky_metrics(box):
+    """Return ``(normal_margin_top, max_margin_top, top_inset)``.
+
+    This engine has one document viewport and no independently scrolling
+    element boxes, so the containing block is the laid-out parent. The
+    bounds are computed after layout, when the parent's final height is
+    known, and are shared by painting and hit-testing.
+    """
+    if not isinstance(box, BlockLayout) or not isinstance(box.node, Element):
+        return None
+    style = box.node.style
+    if style.get("position", "static").strip().casefold() != "sticky":
+        return None
+    raw = style.get("top", "").strip().casefold()
+    if not raw or raw == "auto":
+        return None
+    doc = box._document()
+    em = parse_px(style.get("font-size", "16px"), 16.0)
+    base = doc.viewport_height
+    if base is None:
+        base = getattr(box.parent, "height", 0.0)
+    inset = parse_size(raw, base, em)
+    if inset is None:
+        return None
+    normal = box.y - box.pt - box.bw - box.margin_top
+    parent_bottom = (box.parent.y + box.parent.height
+                     + getattr(box.parent, "pb", 0.0))
+    maximum = max(normal, parent_bottom - box.outer_height())
+    return normal, maximum, inset
+
+
+def sticky_offset(layout_obj, scroll):
+    """Current vertical paint offset for a box inside sticky ancestors."""
+    total = 0.0
+    chain = []
+    cur = layout_obj
+    while cur is not None:
+        chain.append(cur)
+        cur = getattr(cur, "parent", None)
+    for box in reversed(chain):
+        metrics = _sticky_metrics(box)
+        if metrics is None:
+            continue
+        normal, maximum, inset = metrics
+        shifted_normal = normal + total
+        shifted_maximum = maximum + total
+        stuck = min(max(shifted_normal, scroll + inset), shifted_maximum)
+        total += stuck - shifted_normal
+    return total
 
 
 class _MeasureHolder:
@@ -839,6 +1031,10 @@ class BlockLayout:
         self.rel_dx = 0            # position:relative visual offset,
         self.rel_dy = 0            # applied by the parent after layout
         self.definite_height = None  # content height when specified
+        self._collapsed_top_children = set()
+        self._margin_through = False
+        self._through_anchor = 0.0
+        self._through_margins = ()
 
     def outer_height(self):
         return (self.margin_top + self.bw + self.pt + self.height
@@ -867,6 +1063,9 @@ class BlockLayout:
         # then again at its final position — start each pass from a clean
         # child list so content isn't duplicated.
         self.children = []
+        self._collapsed_top_children = set()
+        self._margin_through = False
+        self._through_margins = ()
         node = self.node
         st = node.style
         em = parse_px(st.get("font-size", "16px"), 16.0)
@@ -886,6 +1085,22 @@ class BlockLayout:
         mr_raw = st.get("margin-right", "0").strip()
         self.ml = size("margin-left") or 0
         self.mr = size("margin-right") or 0
+
+        mode = layout_mode(node)
+        if _margin_context_allows_children(node) \
+                and self.pt == 0 and self.bw == 0:
+            adjoining = [self.margin_top]
+            for child in _flow_edge_children(node):
+                if child.style.get(
+                        "clear", "none").strip().casefold() != "none":
+                    break
+                adjoining.append(_collapsed_node_top_margin(child, avail))
+                self._collapsed_top_children.add(child)
+                if _node_is_empty_collapsible(child, avail):
+                    adjoining.append(_node_margin(child, "bottom", avail))
+                    continue
+                break
+            self.margin_top = collapse_margins(*adjoining)
 
         edge = self.pl + self.pr + 2 * self.bw
         spec = size("width")
@@ -931,23 +1146,33 @@ class BlockLayout:
             elif mr_raw == "auto":
                 self.mr = max(space - self.ml, 0)
 
+        collapsed_with_parent = node in getattr(
+            self.parent, "_collapsed_top_children", ())
         if self.flex_origin is not None:
             base_x, base_y = self.flex_origin
             self.x = base_x + self.ml + self.bw + self.pl
             self.y = base_y + self.margin_top + self.bw + self.pt
         else:
             self.x = self.parent.x + self.ml + self.bw + self.pl
-            if self.previous:
+            if collapsed_with_parent:
+                self.y = self.parent.y + self.bw + self.pt
+            elif self.previous:
                 p = self.previous
                 # CSS 2.1 §8.3.1: adjacent vertical margins collapse. The
                 # gap between two in-flow block siblings is a single
                 # margin, not the sum — max of the positive parts plus the
                 # min of the negative parts (so equal 16px margins give a
                 # 16px gap, not 32px).
-                mb, mt = p.margin_bottom, self.margin_top
-                collapse = max(mb, mt, 0.0) + min(mb, mt, 0.0)
-                self.y = (p.y + p.height + p.pb + p.bw + collapse
-                          + self.bw + self.pt)
+                if getattr(p, "_margin_through", False):
+                    collapse = collapse_margins(
+                        *p._through_margins, self.margin_top)
+                    self.y = (p._through_anchor + collapse
+                              + self.bw + self.pt)
+                else:
+                    collapse = collapse_margins(
+                        p.margin_bottom, self.margin_top)
+                    self.y = (p.y + p.height + p.pb + p.bw + collapse
+                              + self.bw + self.pt)
             else:
                 self.y = (self.parent.y + self.margin_top
                           + self.bw + self.pt)
@@ -990,7 +1215,6 @@ class BlockLayout:
                 spec_h - (self.pt + self.pb + 2 * self.bw)
                 if border_box else spec_h, 0)
 
-        mode = layout_mode(node)
         if mode == "flex":
             self._layout_flex(node, em)
         elif mode == "table":
@@ -1007,6 +1231,10 @@ class BlockLayout:
             ib_row_h = 0
             for child in node.children:
                 if not is_visible(child):
+                    continue
+                # Formatting whitespace between block tags creates no box
+                # and must not interrupt adjoining sibling/parent margins.
+                if isinstance(child, Text) and not child.text.strip():
                     continue
                 if is_out_of_flow(child):
                     flow_y = self.y if previous is None else (
@@ -1109,9 +1337,26 @@ class BlockLayout:
                 previous = nxt
             # content height: bottom edge of the flow, extended to
             # cover float bottoms (clearfix-style containment)
-            flow_bottom = self.y if previous is None else (
-                previous.y + previous.height + previous.pb
-                + previous.bw + previous.margin_bottom)
+            can_collapse_bottom = (
+                _margin_context_allows_children(node)
+                and self.pb == 0 and self.bw == 0
+                and spec_h is None
+                and (_node_edge_size(node, "min-height", avail) == 0)
+                and isinstance(previous, BlockLayout))
+            if can_collapse_bottom:
+                if previous._margin_through:
+                    self.margin_bottom = collapse_margins(
+                        self.margin_bottom, *previous._through_margins)
+                    flow_bottom = previous._through_anchor
+                else:
+                    self.margin_bottom = collapse_margins(
+                        self.margin_bottom, previous.margin_bottom)
+                    flow_bottom = (previous.y + previous.height
+                                   + previous.pb + previous.bw)
+            else:
+                flow_bottom = self.y if previous is None else (
+                    previous.y + previous.height + previous.pb
+                    + previous.bw + previous.margin_bottom)
             float_bottom = max(
                 (fy + fh for (_, _, fy, _, fh) in self._floats),
                 default=self.y)
@@ -1149,6 +1394,32 @@ class BlockLayout:
         minh = self._content_height_limit(st.get("min-height"), em)
         if minh is not None:
             self.height = max(self.height, minh)
+
+        # A zero-height block with no border/padding has adjoining top and
+        # bottom margins. Preserve the whole set and the preceding border
+        # edge so the next sibling collapses across the empty box instead
+        # of paying two separate gaps.
+        if self.height == 0 and _node_is_empty_collapsible(node, avail):
+            self._margin_through = True
+            if collapsed_with_parent:
+                self._through_anchor = self.parent.y
+                self._through_margins = ()
+            elif getattr(self.previous, "_margin_through", False):
+                self._through_anchor = self.previous._through_anchor
+                self._through_margins = (
+                    *self.previous._through_margins,
+                    self.margin_top, self.margin_bottom)
+            elif self.previous is not None:
+                self._through_anchor = (
+                    self.previous.y + self.previous.height
+                    + self.previous.pb + self.previous.bw)
+                self._through_margins = (
+                    self.previous.margin_bottom,
+                    self.margin_top, self.margin_bottom)
+            else:
+                self._through_anchor = self.parent.y
+                self._through_margins = (
+                    self.margin_top, self.margin_bottom)
 
         # position: relative offsets the box visually; stored here and
         # applied by the parent after all siblings are placed
@@ -1805,28 +2076,32 @@ class BlockLayout:
         return 2.0
 
     def _layout_grid(self, node, em):
-        """Simplified CSS Grid. Column tracks come from
-        grid-template-columns (or the columns half of the grid /
-        grid-template shorthand); fr tracks share the space left after
-        fixed tracks and column gaps. Items are placed left-to-right,
-        top-to-bottom, honouring an explicit numeric grid-column
-        start/end or span; row heights come from content. This turns the
+        """CSS Grid with fixed/fr tracks, named lines and two-axis spans.
+        Explicit placements reserve an occupancy grid before row-major
+        auto-placement; row heights come from fixed tracks and content.
+        This turns the
         common 2–3 column app shells (Wikipedia's Vector sidebar/content,
         card grids) into real columns instead of a single stacked block."""
         doc = self._document()
         style = node.style
 
         cols_spec = style.get("grid-template-columns", "")
+        rows_spec = style.get("grid-template-rows", "")
         if not cols_spec:
             shorthand = style.get("grid-template") or style.get("grid") or ""
             if "/" in shorthand:          # "<rows> / <columns>"
                 cols_spec = shorthand.split("/", 1)[1]
+                if not rows_spec and '"' not in shorthand \
+                        and "'" not in shorthand:
+                    rows_spec = shorthand.split("/", 1)[0]
         if "/" in cols_spec:              # a shorthand leaked into the key
             cols_spec = cols_spec.split("/", 1)[1]
-        tracks = _parse_grid_tracks(cols_spec, self.width, em)
+        tracks, col_lines = _parse_grid_template(cols_spec, self.width, em)
         if not tracks:
             tracks = [("fr", 1.0)]
         ncols = len(tracks)
+        row_tracks, row_lines = _parse_grid_template(
+            rows_spec, self.definite_height or self.width, em)
 
         col_gap = parse_size(
             style.get("column-gap") or style.get("grid-column-gap")
@@ -1865,11 +2140,10 @@ class BlockLayout:
 
         # placement: [child, col_start, col_span, row_start, row_span]
         areas = _parse_grid_areas(style.get("grid-template-areas", ""))
-        placed = []
+        name_box = {}
         if areas:
             # named areas: an item's grid-area name maps to the bounding
             # box of the cells carrying that name
-            name_box = {}
             for r, row in enumerate(areas):
                 for c, name in enumerate(row):
                     if not name or name == "." or c >= ncols:
@@ -1880,37 +2154,100 @@ class BlockLayout:
                                           min(c0, c), max(c1, c))
                     else:
                         name_box[name] = (r, r, c, c)
-            next_r = len(areas)
-            for child in items:
-                ga = child.style.get("grid-area", "").split("/")[0].strip()
-                if ga in name_box:
-                    r0, r1, c0, c1 = name_box[ga]
-                    placed.append([child, c0, c1 - c0 + 1, r0, r1 - r0 + 1])
-                else:                     # not in the template: own row
-                    placed.append([child, 0, ncols, next_r, 1])
-                    next_r += 1
-        else:
-            # auto-flow, honouring an explicit numeric grid-column
-            cur_c, cur_r = 0, 0
-            for child in items:
-                cs_start, cs_span = self._grid_column(child, ncols)
-                if cs_start is None:
-                    if cur_c + cs_span > ncols and cur_c > 0:
-                        cur_c, cur_r = 0, cur_r + 1
-                    col = cur_c
-                    cur_c += cs_span
-                else:
-                    col = max(0, min(cs_start, ncols - 1))
-                    if col < cur_c:
-                        cur_r += 1
-                    cur_c = col + cs_span
-                    if cur_c > ncols:
-                        cur_c = ncols
-                span = max(1, min(cs_span, ncols - col))
-                placed.append([child, col, span, cur_r, 1])
+            # Template areas create implicit <area>-start/end named lines.
+            for name, (r0, r1, c0, c1) in name_box.items():
+                col_lines.setdefault(name + "-start", []).append(c0)
+                col_lines.setdefault(name + "-end", []).append(c1 + 1)
+                row_lines.setdefault(name + "-start", []).append(r0)
+                row_lines.setdefault(name + "-end", []).append(r1 + 1)
 
-        nrows = max((p[3] + p[4] for p in placed), default=0)
+        specs = []
+        for child in items:
+            ga = child.style.get("grid-area", "").strip()
+            if ga in name_box:
+                r0, r1, c0, c1 = name_box[ga]
+                specs.append([child, c0, c1 - c0 + 1,
+                              r0, r1 - r0 + 1])
+                continue
+            c0, cs = self._grid_axis(child, "column", ncols, col_lines)
+            row_count = max(len(row_tracks), len(areas), 1)
+            r0, rs = self._grid_axis(child, "row", row_count, row_lines)
+            specs.append([child, c0, cs, r0, rs])
+
+        occupied = set()
+        placed_by_index = [None] * len(specs)
+
+        def normalise(spec):
+            child, c0, cs, r0, rs = spec
+            cs = max(1, min(cs, ncols))
+            if c0 is not None:
+                c0 = max(0, min(c0, ncols - cs))
+            if r0 is not None:
+                r0 = max(0, r0)
+            return child, c0, cs, r0, max(1, rs)
+
+        specs = [normalise(s) for s in specs]
+
+        def fits(r0, c0, cs, rs):
+            return all((r, c) not in occupied
+                       for r in range(r0, r0 + rs)
+                       for c in range(c0, c0 + cs))
+
+        def reserve(index, child, c0, cs, r0, rs):
+            placed_by_index[index] = [child, c0, cs, r0, rs]
+            for r in range(r0, r0 + rs):
+                for c in range(c0, c0 + cs):
+                    occupied.add((r, c))
+
+        # Explicit placements reserve their cells before source-ordered
+        # auto placement, including when the explicit item appears later.
+        for i, (child, c0, cs, r0, rs) in enumerate(specs):
+            if c0 is not None and r0 is not None:
+                reserve(i, child, c0, cs, r0, rs)
+
+        cursor_r = cursor_c = 0
+        for i, (child, c0, cs, r0, rs) in enumerate(specs):
+            if placed_by_index[i] is not None:
+                continue
+            if c0 is not None:            # fixed column, find a free row
+                r = 0
+                while not fits(r, c0, cs, rs):
+                    r += 1
+                reserve(i, child, c0, cs, r, rs)
+                continue
+            if r0 is not None:            # fixed row, find a free column
+                found = None
+                for c in range(0, ncols - cs + 1):
+                    if fits(r0, c, cs, rs):
+                        found = c
+                        break
+                # Full Grid can create implicit columns here. This engine
+                # keeps the explicit width and overlaps only as a fallback.
+                reserve(i, child, found if found is not None else 0,
+                        cs, r0, rs)
+                continue
+
+            # Fully automatic row-major placement.
+            r, c = cursor_r, cursor_c
+            while True:
+                if c + cs > ncols:
+                    r, c = r + 1, 0
+                    continue
+                if fits(r, c, cs, rs):
+                    break
+                c += 1
+            reserve(i, child, c, cs, r, rs)
+            cursor_r, cursor_c = r, c + cs
+            if cursor_c >= ncols:
+                cursor_r, cursor_c = r + 1, 0
+
+        placed = [p for p in placed_by_index if p is not None]
+        nrows = max(len(row_tracks), len(areas),
+                    max((p[3] + p[4] for p in placed), default=0))
         row_h = [0.0] * nrows
+        for i, track in enumerate(row_tracks):
+            if track[0] == "fixed":
+                row_h[i] = track[1]
         for p in placed:
             child, c0, cspan, r0, rspan = p
             w = sum(col_w[c0:c0 + cspan]) + col_gap * (cspan - 1)
@@ -1951,42 +2288,121 @@ class BlockLayout:
             return ""
         return parts[index] if index < len(parts) else parts[0]
 
-    def _grid_column(self, child, ncols):
-        """(start, span) for a grid item's column placement, 0-indexed.
-        start is None for auto-placement. Supports `grid-column: a / b`,
-        `grid-column: span n`, a bare line number, and the -start/-end
-        longhands; named lines and grid-area are treated as auto."""
-        gc = child.style.get("grid-column", "").strip()
+    def _grid_axis(self, child, axis, track_count, line_names):
+        """Return ``(start, span)`` for a grid row or column.
+
+        Lines are zero-based internally. Positive/negative CSS line
+        numbers, repeated named lines, ``span N`` / ``span <name>``,
+        longhands, and the four-part ``grid-area`` shorthand are accepted.
+        """
+        prop = "grid-" + axis
+        gc = child.style.get(prop, "").strip()
         start_raw = end_raw = ""
         if gc:
             if "/" in gc:
                 start_raw, end_raw = (s.strip() for s in gc.split("/", 1))
             else:
                 start_raw = gc
-        start_raw = child.style.get("grid-column-start", "") or start_raw
-        end_raw = child.style.get("grid-column-end", "") or end_raw
+        area = [v.strip() for v in
+                child.style.get("grid-area", "").split("/")]
+        if len(area) > 1:
+            ai = 1 if axis == "column" else 0
+            ei = 3 if axis == "column" else 2
+            if not start_raw and ai < len(area):
+                start_raw = area[ai]
+            if not end_raw and ei < len(area):
+                end_raw = area[ei]
+        start_raw = child.style.get(prop + "-start", "") or start_raw
+        end_raw = child.style.get(prop + "-end", "") or end_raw
 
-        def line_no(v):
+        def integer(v):
             try:
                 return int(v)
             except (ValueError, TypeError):
                 return None
 
-        if start_raw.startswith("span"):
-            n = line_no(start_raw[4:].strip()) or 1
-            return (None, max(1, n))
-        s = line_no(start_raw)
-        if end_raw.startswith("span"):
-            n = line_no(end_raw[4:].strip()) or 1
-            span = max(1, n)
-        else:
-            e = line_no(end_raw)
-            span = max(1, e - s) if (s is not None and e is not None) else 1
-        if s is None:
-            return (None, span)
-        # grid lines are 1-based; negatives count from the end
-        idx = s - 1 if s > 0 else ncols + s
-        return (idx, span)
+        def parse_ref(raw):
+            tokens = (raw or "").split()
+            if not tokens or tokens[0].casefold() == "auto":
+                return None
+            is_span = tokens[0].casefold() == "span"
+            if is_span:
+                tokens = tokens[1:]
+            number = None
+            name = None
+            for token in tokens:
+                n = integer(token)
+                if n is not None:
+                    number = n
+                elif token.casefold() != "auto":
+                    name = token
+            return is_span, name, number
+
+        def numbered_line(number):
+            if number is None or number == 0:
+                return None
+            # There are track_count + 1 lines; -1 is the final line.
+            return number - 1 if number > 0 else track_count + 1 + number
+
+        def named_line(name, occurrence=1, after=None, before=None):
+            positions = list(line_names.get(name, ()))
+            if after is not None:
+                positions = [p for p in positions if p > after]
+            if before is not None:
+                positions = [p for p in positions if p < before]
+            if not positions:
+                return None
+            occurrence = occurrence or 1
+            if occurrence > 0:
+                i = min(occurrence - 1, len(positions) - 1)
+            else:
+                i = max(-len(positions), occurrence)
+            return positions[i]
+
+        def absolute(ref, role, anchor=None):
+            if ref is None or ref[0]:
+                return None
+            _span, name, number = ref
+            if name is not None:
+                # An unqualified named end searches forward from its start.
+                after = anchor if role == "end" and number is None else None
+                return named_line(name, number or 1, after=after)
+            return numbered_line(number)
+
+        start_ref, end_ref = parse_ref(start_raw), parse_ref(end_raw)
+        s = absolute(start_ref, "start")
+        e = absolute(end_ref, "end", s)
+
+        if start_ref is not None and start_ref[0] and e is not None:
+            _span, name, number = start_ref
+            if name is not None:
+                s = named_line(name, number or -1, before=e)
+            else:
+                s = e - max(number or 1, 1)
+        if end_ref is not None and end_ref[0] and s is not None:
+            _span, name, number = end_ref
+            if name is not None:
+                e = named_line(name, number or 1, after=s)
+            else:
+                e = s + max(number or 1, 1)
+
+        if s is not None and e is not None:
+            if e < s:
+                s, e = e, s
+            return s, max(e - s, 1)
+        if s is not None:
+            return s, 1
+        if e is not None:
+            return e - 1, 1
+        # A span without an anchor still informs auto-placement width.
+        for ref in (start_ref, end_ref):
+            if ref is not None and ref[0] and ref[1] is None:
+                return None, max(ref[2] or 1, 1)
+        return None, 1
+
+    def _grid_column(self, child, ncols):
+        """Backward-compatible column placement helper."""
+        return self._grid_axis(child, "column", ncols, {})
 
     # ----- inline layout -----
 
@@ -2781,16 +3197,25 @@ def paint_tree(layout_object, display_list):
     if isinstance(layout_object, BlockLayout):
         style = getattr(layout_object.node, "style", None)
         tf = style.get("transform") if style else None
-        if tf and tf != "none":
-            dx, dy, hidden = parse_transform(
-                tf, layout_object.width, layout_object.height)
-            if hidden:
-                return display_list
-            if dx or dy:
-                sub = _paint_tree_inner(layout_object, [])
-                translate_cmds(sub, dx, dy)
+        sticky = _sticky_metrics(layout_object)
+        if (tf and tf != "none") or sticky is not None:
+            sub = _paint_tree_inner(layout_object, [])
+            if tf and tf != "none":
+                dx, dy, hidden = parse_transform(
+                    tf, layout_object.width, layout_object.height)
+                if hidden:
+                    return display_list
+                if dx or dy:
+                    translate_cmds(sub, dx, dy)
+            if sticky is not None:
+                normal, maximum, inset = sticky
+                display_list.append(DrawStickyPush(
+                    normal, maximum, inset))
                 display_list.extend(sub)
-                return display_list
+                display_list.append(DrawStickyPop())
+            else:
+                display_list.extend(sub)
+            return display_list
     return _paint_tree_inner(layout_object, display_list)
 
 

@@ -83,6 +83,11 @@ pub enum Instr {
     /// dst = a if a is an object else b (a ctor's explicit object
     /// return wins over the fresh instance, per spec).
     SelectObj { dst: u8, a: u8, b: u8 },
+    /// `new ctor(args...)`: ctor sits in `ctor`, arguments follow it,
+    /// and the constructed value replaces ctor.  Unlike the historical
+    /// NewInstance + CallThis lowering this preserves the distinction
+    /// between a Proxy's [[Call]] and [[Construct]] traps.
+    Construct { ctor: u8, argc: u8 },
     /// dst = `a in b` — own-property membership.
     In { dst: u8, a: u8, b: u8 },
     /// dst = `delete obj[key]` — removes an own property (the object

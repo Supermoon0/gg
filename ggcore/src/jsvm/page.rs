@@ -13,10 +13,34 @@ use super::compiler;
 use super::parser;
 use super::value::Value;
 use super::vm::{
-    self, call_value, call_value_this, exec, has_pending_work, host,
-    make_native, new_plain_object, pump, raw_set_prop, reject_fetch,
-    resolve_fetch, Ids, ModStore, Native, St, DOC_NODE,
+    self, call_value_this, exec, has_pending_work, host,
+    make_native, new_plain_object, pump, pump_microtasks, raw_get_prop,
+    raw_set_prop,
+    reject_fetch, resolve_fetch, resolve_fetch_full, Ids, ModStore, Native,
+    PendingFetch, St, DOC_NODE,
 };
+
+type HostFetch = (
+    u32,
+    String,
+    String,
+    String,
+    Vec<(String, String)>,
+    String,
+    String,
+);
+
+fn host_fetch(request: PendingFetch) -> HostFetch {
+    (
+        request.fetch_id,
+        request.url,
+        request.method,
+        request.body,
+        request.headers,
+        request.mode,
+        request.credentials,
+    )
+}
 
 /// Event-loop budget per settle turn (total microtasks + timers fired).
 const PUMP_BUDGET: usize = 200_000;
@@ -135,8 +159,9 @@ function MessageEvent(type, opts) {
 MessageEvent.prototype = new Event('');
 // --- platform stub layer -------------------------------------------
 // Enough surface for feature-detecting bundles to take their happy
-// path. Intentionally absent: Proxy and Reflect (their absence routes
-// Babel/core-js to safer fallbacks than a half-stub would).
+// path. Proxy and Reflect are installed natively below: advertising
+// them here is now safe because reads/writes/calls/construction all
+// route through their actual internal operations.
 function MutationObserver(cb) { this._cb = cb; }
 MutationObserver.prototype.observe = function () {};
 MutationObserver.prototype.disconnect = function () {};
@@ -321,6 +346,7 @@ function XMLHttpRequest() {
   this.responseText = '';
   this.response = '';
   this._headers = {};
+  this.withCredentials = false;
 }
 XMLHttpRequest.prototype.open = function (method, url) {
   this._method = method;
@@ -338,13 +364,19 @@ XMLHttpRequest.prototype.addEventListener = function (ty, cb) {
   if (ty === 'load') this.onload = cb;
   if (ty === 'error') this.onerror = cb;
 };
-XMLHttpRequest.prototype.send = function () {
+XMLHttpRequest.prototype.send = function (body) {
   var self = this;
-  fetch(this._url).then(function (r) {
+  fetch(this._url, {
+    method: this._method || 'GET',
+    headers: this._headers,
+    body: body,
+    mode: 'cors',
+    credentials: this.withCredentials ? 'include' : 'same-origin'
+  }).then(function (r) {
+    self.status = r.status;
     return r.text();
   }).then(function (t) {
     self.readyState = 4;
-    self.status = 200;
     self.responseText = t;
     self.response = t;
     if (self.onreadystatechange) self.onreadystatechange();
@@ -807,6 +839,33 @@ impl PageVm {
             ],
         );
         vm.st.known.array = array_ctor;
+        vm.install_callable(
+            "Proxy",
+            Native::ProxyCtor,
+            &[("revocable", Native::ProxyRevocable)],
+        );
+        vm.install_object("Reflect", &[
+            ("apply", Native::Reflect(vm::reflect::APPLY)),
+            ("construct", Native::Reflect(vm::reflect::CONSTRUCT)),
+            ("defineProperty",
+             Native::Reflect(vm::reflect::DEFINE_PROPERTY)),
+            ("deleteProperty",
+             Native::Reflect(vm::reflect::DELETE_PROPERTY)),
+            ("get", Native::Reflect(vm::reflect::GET)),
+            ("getOwnPropertyDescriptor",
+             Native::Reflect(vm::reflect::GET_OWN_PROPERTY_DESCRIPTOR)),
+            ("getPrototypeOf",
+             Native::Reflect(vm::reflect::GET_PROTOTYPE_OF)),
+            ("has", Native::Reflect(vm::reflect::HAS)),
+            ("isExtensible",
+             Native::Reflect(vm::reflect::IS_EXTENSIBLE)),
+            ("ownKeys", Native::Reflect(vm::reflect::OWN_KEYS)),
+            ("preventExtensions",
+             Native::Reflect(vm::reflect::PREVENT_EXTENSIONS)),
+            ("set", Native::Reflect(vm::reflect::SET)),
+            ("setPrototypeOf",
+             Native::Reflect(vm::reflect::SET_PROTOTYPE_OF)),
+        ]);
         // Object.prototype staples as extractable values (webpack's
         // runtime does Object.prototype.hasOwnProperty.call(...))
         let oproto = vm::fn_prototype(&mut vm.st, object_ctor);
@@ -1051,12 +1110,68 @@ impl PageVm {
     /// The host (Python driver) performs the actual HTTP for each fetch
     /// and calls resolve_fetch/reject_fetch, then pumps again.
     pub fn pump(&mut self) -> (Vec<String>, Vec<(u32, String)>) {
-        let fetches = pump(&mut self.st, &self.mods, PUMP_BUDGET);
+        let (logs, requests) = self.pump_requests();
+        let fetches = requests
+            .into_iter()
+            .map(|request| (request.0, request.1))
+            .collect();
+        (logs, fetches)
+    }
+
+    pub fn pump_requests(&mut self) -> (Vec<String>, Vec<HostFetch>) {
+        let fetches = pump(&mut self.st, &self.mods, PUMP_BUDGET)
+            .into_iter()
+            .map(host_fetch)
+            .collect();
         (std::mem::take(&mut self.st.logs), fetches)
+    }
+
+    pub fn pump_microtasks_requests(
+        &mut self,
+    ) -> (Vec<String>, Vec<HostFetch>) {
+        let fetches = pump_microtasks(&mut self.st, &self.mods, PUMP_BUDGET)
+            .into_iter()
+            .map(host_fetch)
+            .collect();
+        (std::mem::take(&mut self.st.logs), fetches)
+    }
+
+    /// Return and reset the opt-in GG_JS_PROFILE instruction samples.
+    /// The final number is an estimated bytecode-instruction count.
+    pub fn take_profile(&mut self) -> Vec<(String, u32, u32, u64)> {
+        let mut rows: Vec<_> = self.st.take_profile_samples()
+            .into_iter()
+            .map(|((module, proto), samples)| {
+                let loaded = self.mods.rc(module);
+                let name = loaded.module.protos
+                    .get(proto as usize)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                (name, module, proto, samples.saturating_mul(16_384))
+            })
+            .collect();
+        rows.sort_by(|a, b| b.3.cmp(&a.3));
+        rows
+    }
+
+    pub fn global_number(&mut self, name: &str) -> Option<f64> {
+        let id = self.st.intern_name(name) as usize;
+        let value = self.st.globals[id];
+        value.is_number().then(|| value.to_number_raw())
     }
 
     pub fn resolve_fetch(&mut self, fetch_id: u32, status: u16, body: String) {
         resolve_fetch(&mut self.st, fetch_id, status, body);
+    }
+
+    pub fn resolve_fetch_full(
+        &mut self,
+        fetch_id: u32,
+        status: u16,
+        url: String,
+        body: String,
+    ) {
+        resolve_fetch_full(&mut self.st, fetch_id, status, url, body);
     }
 
     pub fn reject_fetch(&mut self, fetch_id: u32, message: String) {
@@ -1181,10 +1296,27 @@ impl PageVm {
     /// event.preventDefault() or an onclick returned false.
     pub fn dispatch_click(&mut self, idx: usize) -> (Vec<String>, bool, bool)
     {
+        self.dispatch_event(idx, "click", true, true, None)
+    }
+
+    /// Dispatch a host-initiated DOM event. Form submit/reset/invalid use
+    /// this same path as clicks so inline handlers, bubbling listeners and
+    /// preventDefault() all share one cancellation model.
+    pub fn dispatch_event(
+        &mut self,
+        idx: usize,
+        event_type: &str,
+        bubbles: bool,
+        cancelable: bool,
+        submitter: Option<usize>,
+    ) -> (Vec<String>, bool, bool) {
         let Some(doc) = self.st.doc.clone() else {
             return (Vec::new(), false, false);
         };
-        let chain: Vec<(u32, Option<String>)> = {
+        let event_type = event_type.to_ascii_lowercase();
+        let inline_name = format!("on{event_type}");
+        let handler_key = self.name_id(&inline_name);
+        let chain: Vec<(u32, Option<String>, Option<Value>)> = {
             let d = doc.borrow();
             if idx >= d.nodes.len() {
                 return (Vec::new(), false, false);
@@ -1192,9 +1324,16 @@ impl PageVm {
             let mut out = Vec::new();
             let mut cur = Some(idx);
             while let Some(i) = cur {
-                let onclick =
-                    d.nodes[i].attr("onclick").map(str::to_string);
-                out.push((i as u32, onclick));
+                let inline = d.nodes[i]
+                    .attr(&inline_name)
+                    .map(str::to_string);
+                let property = self.st.dom_expando
+                    .get(&(i as u32, handler_key)).copied()
+                    .filter(|handler| handler.is_function());
+                out.push((i as u32, inline, property));
+                if !bubbles {
+                    break;
+                }
                 cur = d.nodes[i].parent;
             }
             out
@@ -1206,31 +1345,83 @@ impl PageVm {
         let ev_idx = ev.index() as usize;
         let type_key = self.name_id("type");
         let target_key = self.name_id("target");
+        let current_key = self.name_id("currentTarget");
+        let bubbles_key = self.name_id("bubbles");
+        let cancelable_key = self.name_id("cancelable");
+        let prevented_key = self.name_id("defaultPrevented");
+        let submitter_key = self.name_id("submitter");
         let pd_key = self.name_id("preventDefault");
-        let click_s = vm::intern(&mut self.st, "click");
-        raw_set_prop(&mut self.st, ev_idx, type_key, click_s);
+        let stop_key = self.name_id("stopPropagation");
+        let stop_now_key = self.name_id("stopImmediatePropagation");
+        let type_value = vm::intern(&mut self.st, &event_type);
+        raw_set_prop(&mut self.st, ev_idx, type_key, type_value);
         raw_set_prop(
             &mut self.st,
             ev_idx,
             target_key,
             Value::dom_node(idx as u32),
         );
-        let pd = make_native(&mut self.st, Native::PreventDefault);
+        raw_set_prop(
+            &mut self.st,
+            ev_idx,
+            bubbles_key,
+            Value::boolean(bubbles),
+        );
+        raw_set_prop(
+            &mut self.st,
+            ev_idx,
+            cancelable_key,
+            Value::boolean(cancelable),
+        );
+        raw_set_prop(
+            &mut self.st,
+            ev_idx,
+            prevented_key,
+            Value::boolean(false),
+        );
+        let submitter_value = submitter
+            .filter(|&node| node < doc.borrow().nodes.len())
+            .map(|node| Value::dom_node(node as u32))
+            .unwrap_or(Value::NULL);
+        raw_set_prop(
+            &mut self.st,
+            ev_idx,
+            submitter_key,
+            submitter_value,
+        );
+        let pd = make_native(
+            &mut self.st,
+            if cancelable {
+                Native::PreventDefault
+            } else {
+                Native::Noop
+            },
+        );
         raw_set_prop(&mut self.st, ev_idx, pd_key, pd);
+        let noop = make_native(&mut self.st, Native::Noop);
+        raw_set_prop(&mut self.st, ev_idx, stop_key, noop);
+        raw_set_prop(&mut self.st, ev_idx, stop_now_key, noop);
         self.set_global("event", ev);
 
         let mut handled = false;
         let mut prevented = false;
-        for (node, onclick) in chain {
-            if let Some(src) = onclick {
+        for (node, inline, property) in chain {
+            raw_set_prop(
+                &mut self.st,
+                ev_idx,
+                current_key,
+                Value::dom_node(node),
+            );
+            if let Some(src) = inline {
                 handled = true;
                 // run as a function body: `event` is the argument and
                 // `return false` prevents the default action
                 let wrapped =
                     format!("(function (event) {{ {src}\n }})(event)");
                 match self.run_source(&wrapped) {
-                    Ok(v) if v.is_boolean() && !v.as_bool() => {
+                    Ok(v) if cancelable && v.is_boolean() && !v.as_bool() => {
                         prevented = true;
+                        self.st.default_prevented = true;
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -1238,10 +1429,23 @@ impl PageVm {
                     }
                 }
             }
+            if let Some(handler) = property {
+                handled = true;
+                self.st.fuel = vm::DEFAULT_FUEL;
+                if let Err(e) = call_value_this(
+                    &mut self.st,
+                    &self.mods,
+                    handler,
+                    Some(Value::dom_node(node)),
+                    &[ev],
+                ) {
+                    self.st.logs.push(format!("[gg-js error] {}", e.msg));
+                }
+            }
             let handlers = self
                 .st
                 .listeners
-                .get(&(node, "click".to_string()))
+                .get(&(node, event_type.clone()))
                 .cloned()
                 .unwrap_or_default();
             for h in handlers {
@@ -1259,8 +1463,16 @@ impl PageVm {
                     self.st.logs.push(format!("[gg-js error] {}", e.msg));
                 }
             }
+            if self.st.default_prevented {
+                raw_set_prop(
+                    &mut self.st,
+                    ev_idx,
+                    prevented_key,
+                    Value::boolean(true),
+                );
+            }
         }
-        if self.st.default_prevented {
+        if cancelable && self.st.default_prevented {
             prevented = true;
         }
         (std::mem::take(&mut self.st.logs), handled, prevented)
@@ -1272,22 +1484,68 @@ impl PageVm {
     /// then window `load`. The loader calls this once after all
     /// scripts ran — app bundles bootstrap from these.
     pub fn fire_lifecycle(&mut self) -> Vec<String> {
+        let mut logs = self.fire_dom_content_loaded();
+        logs.extend(self.fire_load());
+        logs
+    }
+
+    /// Parser completion waits for defer/module scripts, but not async or
+    /// dynamically inserted scripts. Keep this phase separate from load so
+    /// the host loader can preserve that ordering.
+    pub fn fire_dom_content_loaded(&mut self) -> Vec<String> {
+        if self.st.ready_state != "loading" {
+            return Vec::new();
+        }
         self.st.ready_state = "interactive";
+        self.dispatch_simple(vm::DOC_NODE, "readystatechange");
         self.dispatch_simple(vm::DOC_NODE, "domcontentloaded");
         self.dispatch_simple(vm::WINDOW_NODE, "domcontentloaded");
+        std::mem::take(&mut self.st.logs)
+    }
+
+    /// Window load follows all initial external scripts, including async
+    /// scripts and scripts inserted during initial execution.
+    pub fn fire_load(&mut self) -> Vec<String> {
+        if self.st.ready_state == "complete" {
+            return Vec::new();
+        }
+        if self.st.ready_state == "loading" {
+            let mut logs = self.fire_dom_content_loaded();
+            self.st.ready_state = "complete";
+            self.dispatch_simple(vm::DOC_NODE, "readystatechange");
+            self.dispatch_simple(vm::WINDOW_NODE, "load");
+            self.dispatch_simple(vm::DOC_NODE, "load");
+            logs.extend(std::mem::take(&mut self.st.logs));
+            return logs;
+        }
         self.st.ready_state = "complete";
+        self.dispatch_simple(vm::DOC_NODE, "readystatechange");
         self.dispatch_simple(vm::WINDOW_NODE, "load");
         self.dispatch_simple(vm::DOC_NODE, "load");
         std::mem::take(&mut self.st.logs)
     }
 
     fn dispatch_simple(&mut self, node: u32, ty: &str) {
-        let cbs = self
+        let property_key = self.name_id(&format!("on{ty}"));
+        let property = if node == vm::WINDOW_NODE {
+            raw_get_prop(
+                &self.st,
+                self.st.known.window.index() as usize,
+                property_key,
+            )
+        } else {
+            self.st.dom_expando.get(&(node, property_key)).copied()
+        };
+        let mut cbs = Vec::new();
+        if let Some(handler) = property.filter(|value| value.is_function()) {
+            cbs.push(handler);
+        }
+        cbs.extend(self
             .st
             .listeners
             .get(&(node, ty.to_string()))
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_default());
         if cbs.is_empty() {
             return;
         }
@@ -1370,8 +1628,27 @@ impl PageVm {
         &mut self,
         dt_ms: f64,
     ) -> (Vec<String>, Vec<(u32, String)>) {
-        let fetches =
-            vm::pump_bounded(&mut self.st, &self.mods, 10_000, dt_ms);
+        let (logs, requests) = self.tick_requests(dt_ms);
+        let fetches = requests
+            .into_iter()
+            .map(|request| (request.0, request.1))
+            .collect();
+        (logs, fetches)
+    }
+
+    pub fn tick_requests(
+        &mut self,
+        dt_ms: f64,
+    ) -> (Vec<String>, Vec<HostFetch>) {
+        let fetches = vm::pump_bounded(
+            &mut self.st,
+            &self.mods,
+            10_000,
+            dt_ms,
+        )
+        .into_iter()
+        .map(host_fetch)
+        .collect();
         (std::mem::take(&mut self.st.logs), fetches)
     }
 
@@ -1396,8 +1673,7 @@ impl PageVm {
         }
     }
 
-    /// Current `document.cookie` value as `k=v; k2=v2` (JS writes flow
-    /// back to the network jar through this).
+    /// Current document.cookie-visible value as `k=v; k2=v2`.
     pub fn cookies_string(&self) -> String {
         self.st
             .cookies
@@ -1405,6 +1681,12 @@ impl PageVm {
             .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join("; ")
+    }
+
+    /// Drain the original document.cookie setter strings for the host.
+    /// Seeded network cookies never enter this queue.
+    pub fn take_cookie_writes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.st.cookie_writes)
     }
 
     pub fn set_page_url(&mut self, url: &str) {
@@ -1475,6 +1757,88 @@ mod tests {
         let (v, _) = eval(src).unwrap();
         assert!(v.is_number(), "non-number result: {v:?} for {src}");
         v.to_number_raw()
+    }
+
+    #[test]
+    fn proxy_and_reflect_internal_operations() {
+        assert_eq!(
+            n("(typeof Proxy === 'function' && typeof Reflect === 'object') ? 1 : 0"),
+            1.0,
+        );
+        assert_eq!(
+            n("var target={x:2}; var p=new Proxy(target,{\
+               get:function(t,k,r){return k==='x'?Reflect.get(t,k,r)+3:Reflect.get(t,k,r);},\
+               set:function(t,k,v,r){return Reflect.set(t,k,v*2,r);}});\
+               p.x=4; p.x*10+target.x"),
+            118.0,
+        );
+        assert_eq!(
+            n("var log=''; var t={a:1}; var p=new Proxy(t,{\
+               has:function(t,k){log+='h';return k==='virtual'||Reflect.has(t,k);},\
+               deleteProperty:function(t,k){log+='d';return Reflect.deleteProperty(t,k);}});\
+               var h=('virtual' in p)&&('a' in p); delete p.a;\
+               (h?100:0)+(t.a===undefined?10:0)+log.length"),
+            113.0,
+        );
+        assert_eq!(
+            n("var p=new Proxy({a:1,b:2},{ownKeys:function(){return ['b','a','z'];}});\
+               Reflect.ownKeys(p).join(',')==='b,a,z'?1:0"),
+            1.0,
+        );
+        assert_eq!(
+            n("var p=new Proxy({a:1,b:2},{ownKeys:function(){return ['b','a','z'];}});\
+               Object.keys(p).join(',')==='b,a'?1:0"),
+            1.0,
+        );
+        assert_eq!(
+            n("function add(a,b){return a+b;}\
+               var p=new Proxy(add,{apply:function(t,th,args){\
+                 return Reflect.apply(t,th,args)+1;}}); p(20,21)"),
+            42.0,
+        );
+        assert_eq!(
+            n("function F(x){this.x=x;}\
+               var P=new Proxy(F,{construct:function(t,args,n){\
+                 return {x:args[0]+2};}}); (new P(40)).x"),
+            42.0,
+        );
+        assert_eq!(
+            n("function F(x){this.x=x;} var P=new Proxy(F,{});\
+               var v=Reflect.construct(P,[42]); v.x"),
+            42.0,
+        );
+        assert_eq!(
+            n("var r=Proxy.revocable({x:1},{}); var p=r.proxy;\
+               var before=p.x; r.revoke(); var caught=0;\
+               try{p.x;}catch(e){caught=1;} before+41*caught"),
+            42.0,
+        );
+        assert_eq!(
+            n("var t={x:1}; var p=new Proxy(t,{});\
+               var d=Reflect.getOwnPropertyDescriptor(p,'x');\
+               var a=Reflect.defineProperty(p,'y',{value:40});\
+               var b=Reflect.preventExtensions(t);\
+               var c=Reflect.set(t,'z',9);\
+               d.value+(a?1:0)+(b?0:10)+(c?100:0)+p.y"),
+            42.0,
+        );
+        assert_eq!(
+            n("var score=0;\
+               var a=[1]; var pa=new Proxy(a,{ownKeys:function(){return [];}});\
+               try{Reflect.ownKeys(pa);}catch(e){if(e instanceof TypeError)score+=1;}\
+               var t={x:1}; Reflect.preventExtensions(t);\
+               var ph=new Proxy(t,{has:function(){return false;}});\
+               try{'x' in ph;}catch(e){if(e instanceof TypeError)score+=10;}\
+               var pd=new Proxy(t,{getOwnPropertyDescriptor:function(){return undefined;}});\
+               try{Reflect.getOwnPropertyDescriptor(pd,'x');}\
+               catch(e){if(e instanceof TypeError)score+=100;}\
+               var pe=new Proxy({},{preventExtensions:function(){return true;}});\
+               try{Reflect.preventExtensions(pe);}\
+               catch(e){if(e instanceof TypeError)score+=1000;}\
+               function F(){} var pc=new Proxy(F,{construct:function(){return 1;}});\
+               try{new pc();}catch(e){if(e instanceof TypeError)score+=10000;} score"),
+            11111.0,
+        );
     }
 
     #[test]
@@ -1643,15 +2007,34 @@ mod tests {
     fn cookie_seed_and_read_roundtrip() {
         // network jar <-> document.cookie bridge: seed before scripts,
         // read back JS writes.
-        let mut vm = PageVm::new(None);
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<p>cookie bridge</p>"),
+        ))));
         vm.seed_cookies("sid=abc; theme=dark");
         assert_eq!(vm.cookies_string(), "sid=abc; theme=dark");
+        assert!(vm.take_cookie_writes().is_empty());
         // re-seeding replaces an existing name and appends new ones
         vm.seed_cookies("sid=xyz; lang=ko");
         let s = vm.cookies_string();
         assert!(s.contains("sid=xyz"), "{s}");
         assert!(s.contains("theme=dark"), "{s}");
         assert!(s.contains("lang=ko"), "{s}");
+
+        vm.run_scripts(&[
+            "document.cookie = 'fresh=1; Path=/app; SameSite=Strict';"
+                .to_string(),
+        ]);
+        assert_eq!(
+            vm.take_cookie_writes(),
+            vec!["fresh=1; Path=/app; SameSite=Strict"]
+        );
+        assert!(vm.take_cookie_writes().is_empty());
+
+        vm.run_scripts(&[
+            "document.cookie = 'bad=x\\r\\nX-Injected: yes';".to_string(),
+        ]);
+        assert!(!vm.cookies_string().contains("bad="));
+        assert!(vm.take_cookie_writes().is_empty());
     }
 
     #[test]
@@ -1932,6 +2315,18 @@ mod tests {
         assert_eq!(
             n("var o = {v: 6}; Object.defineProperty(o, 'x', \
                {get: function() { return this.v * 7; }}); o.x"), 42.0);
+        // Computed reads must use the same accessor-aware lookup. Module
+        // namespace imports use ns["export"] and exposed this gap.
+        assert_eq!(
+            n("var o = {v: 6}; Object.defineProperty(o, 'x', \
+               {get: function() { return this.v * 7; }}); o['x']"), 42.0);
+        // Method-call lookup also invokes an accessor before checking that
+        // the resulting value is callable (module namespaces expose
+        // exported functions this way).
+        assert_eq!(
+            n("var o = {}; Object.defineProperty(o, 'f', \
+               {get: function() { return function(x) { return x + 1; }; }}); \
+               o.f(41)"), 42.0);
         // setter intercepts writes
         assert_eq!(
             n("var o = {}; Object.defineProperty(o, 'y', \
@@ -3092,6 +3487,67 @@ console.log('B typeof it: ' + typeof it);
     }
 
     #[test]
+    fn lifecycle_phases_are_separate_and_idempotent() {
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<p>x</p>"),
+        ))));
+        vm.run_scripts(&["\
+            document.addEventListener('DOMContentLoaded', function () {\n\
+              console.log('dcl:' + document.readyState);\n\
+            });\n\
+            document.onreadystatechange = function () {\n\
+              console.log('state:' + document.readyState);\n\
+            };\n\
+            window.onload = function () {\n\
+              console.log('property-load:' + document.readyState);\n\
+            };\n\
+            window.addEventListener('load', function () {\n\
+              console.log('load:' + document.readyState);\n\
+            });\n"
+            .to_string()]);
+        assert_eq!(
+            vm.fire_dom_content_loaded(),
+            vec!["state:interactive", "dcl:interactive"]
+        );
+        assert!(vm.fire_dom_content_loaded().is_empty());
+        assert_eq!(
+            vm.fire_load(),
+            vec!["state:complete", "property-load:complete", "load:complete"]
+        );
+        assert!(vm.fire_load().is_empty());
+    }
+
+    #[test]
+    fn script_properties_and_property_load_handler_work() {
+        let (mut vm, doc) = dom_vm("<html><body></body></html>");
+        let logs = vm.run_scripts(&["\
+            var s = document.createElement('script');\n\
+            console.log('default:' + s.async);\n\
+            s.id = 'dynamic-script';\n\
+            s.async = false;\n\
+            s.text = 'console.log(42)';\n\
+            s.onload = function () { console.log('property-load'); };\n\
+            s.addEventListener('load', function () {\n\
+              console.log('listener-load');\n\
+            });\n\
+            document.body.appendChild(s);\n\
+            console.log('final:' + s.async + ':' + s.text);\n"
+            .to_string()]);
+        assert_eq!(
+            logs,
+            vec!["default:true", "final:false:console.log(42)"]
+        );
+        let script = doc
+            .borrow()
+            .get_element_by_id("dynamic-script")
+            .unwrap();
+        assert_eq!(
+            vm.dispatch_event(script, "load", false, false, None).0,
+            vec!["property-load", "listener-load"]
+        );
+    }
+
+    #[test]
     fn live_tick_paces_raf() {
         let mut vm = PageVm::new(None);
         vm.run_scripts(&["\
@@ -3112,6 +3568,28 @@ console.log('B typeof it: ' + typeof it);
         // generator done: further ticks stay quiet
         let (logs, _) = vm.tick(100.0);
         assert!(logs.is_empty(), "{logs:?}");
+    }
+
+    #[test]
+    fn settle_pump_limits_self_rescheduling_raf_to_one_frame() {
+        let mut vm = PageVm::new(None);
+        vm.run_scripts(&["\
+            function frame() {\n\
+                console.log('frame');\n\
+                requestAnimationFrame(frame);\n\
+            }\n\
+            requestAnimationFrame(frame);\n"
+            .to_string()]);
+
+        let (logs, fetches) = vm.pump();
+        assert_eq!(logs, vec!["frame"]);
+        assert!(fetches.is_empty());
+        assert!(!vm.has_pending_work());
+
+        let (logs, fetches) = vm.pump();
+        assert_eq!(logs, vec!["frame"]);
+        assert!(fetches.is_empty());
+        assert!(!vm.has_pending_work());
     }
 
     #[test]
@@ -3827,6 +4305,17 @@ console.log('B typeof it: ' + typeof it);
         assert_eq!(
             n("function add(a, b) { return a + b; } add.call(null, 4, 5)"),
             9.0);
+        // Hot transpiler wrapper: preserve receiver and the complete
+        // arguments object while taking the in-loop apply fast path.
+        assert_eq!(
+            n("function target(a,b){return this.base+a+b+arguments.length;} \
+               function wrap(){return target.apply(this,arguments);} \
+               var o={base:10,wrap:wrap}; o.wrap(2,3)"), 17.0);
+        assert_eq!(
+            n("function target(a){return a+arguments[2];} \
+               function wrap(){return target.apply(null,arguments);} \
+               var total=0; for(var i=0;i<1000;i++){total+=wrap(1,2,3);} \
+               total"), 4000.0);
         // spread in a plain call
         assert_eq!(
             n("function add(a, b, c) { return a + b + c; } \
@@ -4746,6 +5235,71 @@ console.log('B typeof it: ' + typeof it);
     }
 
     #[test]
+    fn fetch_options_and_response_url_reach_the_host_bridge() {
+        let mut vm = PageVm::new(None);
+        vm.run_scripts(&["\
+            fetch('/api', {
+              method: 'POST', body: 'x=1', mode: 'cors',
+              credentials: 'include',
+              headers: {'Content-Type': 'text/plain', 'X-Token': 'abc'}
+            }).then(function (r) {
+              console.log(r.status + ' ' + r.url);
+            });\n"
+            .to_string()]);
+        let (_logs, requests) = vm.pump_requests();
+        assert_eq!(requests.len(), 1);
+        let (fid, url, method, body, headers, mode, credentials) =
+            requests[0].clone();
+        assert_eq!(url, "/api");
+        assert_eq!(method, "POST");
+        assert_eq!(body, "x=1");
+        assert_eq!(mode, "cors");
+        assert_eq!(credentials, "include");
+        assert!(headers.contains(&(
+            "Content-Type".to_string(),
+            "text/plain".to_string()
+        )));
+        assert!(headers.contains(&(
+            "X-Token".to_string(),
+            "abc".to_string()
+        )));
+        vm.resolve_fetch_full(
+            fid,
+            201,
+            "https://api.example/final".to_string(),
+            "ok".to_string(),
+        );
+        let (logs, more) = vm.pump();
+        assert!(more.is_empty());
+        assert_eq!(logs, vec!["201 https://api.example/final"]);
+    }
+
+    #[test]
+    fn xhr_method_headers_body_and_credentials_use_fetch_bridge() {
+        let mut vm = PageVm::new(None);
+        vm.run_scripts(&["\
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', '/xhr');
+            xhr.setRequestHeader('Content-Type', 'text/plain');
+            xhr.withCredentials = true;
+            xhr.send('payload');\n"
+            .to_string()]);
+        let (_logs, requests) = vm.pump_requests();
+        assert_eq!(requests.len(), 1);
+        let (_fid, url, method, body, headers, mode, credentials) =
+            requests[0].clone();
+        assert_eq!(url, "/xhr");
+        assert_eq!(method, "POST");
+        assert_eq!(body, "payload");
+        assert_eq!(mode, "cors");
+        assert_eq!(credentials, "include");
+        assert!(headers.contains(&(
+            "Content-Type".to_string(),
+            "text/plain".to_string()
+        )));
+    }
+
+    #[test]
     fn async_dom_mutation_via_timer() {
         // the payoff: a timer callback mutates the DOM (the SPA pattern)
         let (mut vm, doc) = dom_vm(
@@ -5148,5 +5702,52 @@ console.log('B typeof it: ' + typeof it);
         let a = doc.borrow().get_element_by_id("x").unwrap();
         let (_, handled, prevented) = vm.dispatch_click(a);
         assert!(handled && prevented);
+    }
+
+    #[test]
+    fn host_form_events_bubble_and_are_cancelable() {
+        let (mut vm, doc) = dom_vm(
+            "<html><body><div id=outer><form id=f>\
+             <button id=s>send</button></form></div></body></html>",
+        );
+        vm.run_scripts(&["\
+            var f = document.getElementById('f');\n\
+            f.addEventListener('submit', function (e) {\n\
+              console.log(e.type + '|' + e.target.id + '|' +\n\
+                e.currentTarget.id + '|' + e.submitter.id + '|' +\n\
+                e.bubbles + '|' + e.cancelable);\n\
+              e.preventDefault();\n\
+            });\n\
+            document.getElementById('outer').addEventListener(\n\
+              'submit', function () { console.log('bubbled'); });\n"
+            .to_string()]);
+        let form = doc.borrow().get_element_by_id("f").unwrap();
+        let submitter = doc.borrow().get_element_by_id("s").unwrap();
+        let (logs, handled, prevented) = vm.dispatch_event(
+            form,
+            "submit",
+            true,
+            true,
+            Some(submitter),
+        );
+        assert!(handled && prevented);
+        assert_eq!(
+            logs,
+            vec!["submit|f|f|s|true|true", "bubbled"],
+        );
+
+        vm.run_scripts(&["\
+            document.getElementById('f').addEventListener(\n\
+              'invalid', function () { console.log('bad bubble'); });\n"
+            .to_string()]);
+        let (logs, handled, prevented) = vm.dispatch_event(
+            submitter,
+            "invalid",
+            false,
+            true,
+            None,
+        );
+        assert!(!handled && !prevented);
+        assert!(logs.is_empty());
     }
 }

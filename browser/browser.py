@@ -7,12 +7,14 @@ import tkinter.font
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from . import forms, native, net, textengine, webfonts
+from . import forms, keyboard, native, navigation, net, textengine, webfonts
 from .html_parser import Element, HTMLParser, Text, tree_to_list
 from .css_parser import CSSParser
+from .draw import DrawStickyPop, DrawStickyPush
 from .style import RuleIndex, cascade_priority, default_rules, style
 from .layout import (VSTEP, BlockLayout, DocumentLayout, ImageLayout,
-                     TextLayout, layout_tree_to_list, paint_tree)
+                     TextLayout, layout_tree_to_list, paint_tree,
+                     sticky_offset)
 from .pages import error_page
 
 SCROLL_STEP = 90
@@ -46,10 +48,16 @@ class Browser:
         self.focus_node = None
         self.history = []
         self.history_index = -1
+        self.navigation_timeout = net.DEFAULT_TIMEOUT
+        self._navigation = navigation.NavigationController()
+        self._navigation_poll = None
+        self._loading_token = None
         self.url = None
         self._doc = None            # native (Rust) document handle
         self._css_sources = []
         self._img_by_src = {}
+        self._load_timings = {}
+        self._deferred_resources = False
         self.default_rules = default_rules()
         self._layout_width = 0
         self._resize_job = None
@@ -87,6 +95,7 @@ class Browser:
         self.back_btn = make_btn("←", self.go_back)
         self.fwd_btn = make_btn("→", self.go_forward)
         make_btn("⟳", self.reload)
+        make_btn("✕", self.cancel_navigation)
         make_btn("⌂", lambda: self.load_url_string(HOME_URL))
 
         self.url_var = tkinter.StringVar()
@@ -116,28 +125,105 @@ class Browser:
             url = net.URL("about:home")
         self.load(url)
 
-    def load(self, url, add_to_history=True, no_cache=False):
+    def load(self, url, add_to_history=True, no_cache=False, *,
+             method="GET", body=None, headers=None, timeout=None):
+        self._snapshot_history_entry()
         self.set_status(f"로딩 중... {url}")
         self.window.update_idletasks()
+        initiator = getattr(self, "url", None)
+        if initiator is not None and not getattr(initiator, "host", None):
+            initiator = None
+        timeout = self.navigation_timeout if timeout is None else timeout
+        context = {
+            "url": url, "add_to_history": add_to_history,
+            "timeout": timeout,
+        }
+
+        def fetch(token):
+            return net.request_text(
+                url, no_cache=no_cache, method=method, body=body,
+                headers=headers, site_for_cookies=initiator,
+                top_level_navigation=True, timeout=timeout,
+                cancel_token=token)
+
+        pending = self._navigation.start(fetch, context)
+        self._schedule_navigation_poll()
+        return pending.future
+
+    def _schedule_navigation_poll(self):
+        if self._navigation_poll is None:
+            self._navigation_poll = self.window.after(
+                16, self._poll_navigation)
+
+    def _poll_navigation(self):
+        self._navigation_poll = None
+        pending = self._navigation.take_ready()
+        if pending is None:
+            if self._navigation.active:
+                self._schedule_navigation_poll()
+            return
+        context = pending.context
+        url = context["url"]
         try:
-            headers, body, url = net.request_text(url, no_cache=no_cache)
+            _headers, page_body, url = pending.future.result()
             # url is now the post-redirect URL: relative links, history
             # and the address bar must all use it as the base
-        except Exception as e:
-            body = error_page(str(url), f"{type(e).__name__}: {e}")
+        except net.RequestCancelled:
+            self.set_status("탐색 취소됨")
+            return
+        except Exception as exc:
+            page_body = error_page(
+                str(url), f"{type(exc).__name__}: {exc}")
+        self._loading_token = pending.token
         try:
-            self.render_page(url, body)
+            self.render_page(url, page_body)
         except Exception:
-            body = error_page(str(url), traceback.format_exc(limit=5))
-            self.render_page(url, body)
+            page_body = error_page(str(url), traceback.format_exc(limit=5))
+            self.render_page(url, page_body)
+        finally:
+            self._loading_token = None
 
-        if add_to_history:
+        if context["add_to_history"]:
             self.history = self.history[:self.history_index + 1]
-            self.history.append(url)
+            self.history.append(navigation.HistoryEntry(url, page_body))
             self.history_index = len(self.history) - 1
+        elif 0 <= self.history_index < len(self.history):
+            self.history[self.history_index] = navigation.HistoryEntry(
+                url, page_body)
+        self._update_nav_buttons()
+
+    def cancel_navigation(self):
+        if self._navigation.cancel():
+            self.set_status("탐색 취소됨")
+
+    def _snapshot_history_entry(self):
+        if not (0 <= self.history_index < len(self.history)):
+            return
+        entry = self.history[self.history_index]
+        entry.scroll = float(self.scroll)
+        entry.form_state = navigation.capture_form_state(
+            getattr(self, "nodes", None))
+
+    def _restore_history_entry(self, entry):
+        self.render_page(entry.url, entry.body)
+        changed = navigation.restore_form_state(
+            self.nodes, entry.form_state,
+            set_attr=(self._doc.set_attr if self._doc is not None else None),
+            remove_attr=(self._doc.remove_attr
+                         if self._doc is not None
+                         and hasattr(self._doc, "remove_attr") else None))
+        if changed and self._doc is not None:
+            self.nodes = native.refresh(self._doc, self._css_sources)
+        if changed:
+            self.relayout()
+        self.scroll = entry.scroll
+        self.clamp_scroll()
+        self.draw()
         self._update_nav_buttons()
 
     def render_page(self, url, body):
+        render_started = time.perf_counter()
+        self._load_timings = {}
         self.url = url
         self.url_var.set(str(url))
         self._reset_interaction()
@@ -149,20 +235,19 @@ class Browser:
             if native.async_available():
                 os.environ["GGJS"] = "1"
             try:
+                load_timings = {}
                 self.nodes, self._doc, self._css_sources, js_logs = \
                     native.load_document(
                         body,
                         lambda hrefs: self.fetch_stylesheets(hrefs, url),
                         lambda srcs: self.fetch_scripts(srcs, url),
-                        page_url=url)
+                        page_url=url, timings=load_timings)
             finally:
                 if prev is None:
                     os.environ.pop("GGJS", None)
                 else:
                     os.environ["GGJS"] = prev
-            # drive fetch/timer-driven SPA content, then rebuild the tree
-            if native.settle_async(self._doc, self._css_sources, url):
-                self.nodes = native.refresh(self._doc, self._css_sources)
+            self._load_timings = load_timings
             self._hover_rules = any(
                 ":hover" in s for s in self._css_sources)
             self._focus_rules = any(
@@ -187,6 +272,8 @@ class Browser:
             self._focus_rules = any(
                 ":focus" in repr(sel) for sel, _ in rules)
 
+        self._form_defaults = forms.capture_defaults(self.nodes)
+
         title = "GG Browser"
         for node in tree_to_list(self.nodes, []):
             if isinstance(node, Element) and node.tag == "title":
@@ -197,17 +284,27 @@ class Browser:
                 break
         self.window.title(title)
 
-        self.load_images(self.nodes, url)
-        self._load_web_fonts(url)
-
+        # First paint must not wait for every async request, image, and web
+        # font. The live loop materializes those after this frame is visible.
+        self._deferred_resources = textengine.available()
         self.scroll = 0
         self.relayout()
+        self._load_timings["first_paint"] = \
+            (time.perf_counter() - render_started) * 1000.0
+        if self._load_timings:
+            summary = " ".join(
+                f"{name}={value:.1f}ms"
+                for name, value in self._load_timings.items())
+            print(f"[perf] {url} {summary}")
         mode = []
         if native.available():
             mode.append("rust")
         if textengine.available():
             mode.append("raster")
-        self.set_status("완료" + (f" ({'+'.join(mode)})" if mode else ""))
+        self.set_status("첫 화면" +
+                        (f" ({'+'.join(mode)})" if mode else "") +
+                        (" · 나머지 로딩 중" if self._deferred_resources
+                         else ""))
         self._start_live_loop()
 
     # --- M4: live event loop ------------------------------------------
@@ -225,6 +322,10 @@ class Browser:
         self._live_gen = getattr(self, "_live_gen", 0) + 1
         if (self._doc is None or not hasattr(self._doc, "tick")
                 or not native.async_available()):
+            if self._deferred_resources:
+                gen = self._live_gen
+                self.window.after(
+                    1, lambda: self._finish_deferred_resources(gen))
             return
         self._dom_version = self._doc.dom_version()
         self._live_idle = 0
@@ -234,10 +335,23 @@ class Browser:
         self.window.after(self._LIVE_INTERVAL_MS,
                           lambda: self._live_tick(gen))
 
+    def _finish_deferred_resources(self, gen):
+        """Load non-critical resources only after the first frame exists."""
+        if gen != getattr(self, "_live_gen", 0) \
+                or not self._deferred_resources:
+            return
+        started = time.perf_counter()
+        self._deferred_resources = False
+        self.load_images(self.nodes, self.url, keep_cache=True)
+        self._load_web_fonts(self.url)
+        self.relayout()
+        self._load_timings["deferred_resources"] = \
+            (time.perf_counter() - started) * 1000.0
+        self.set_status("완료")
+
     def _live_tick(self, gen):
         if gen != getattr(self, "_live_gen", 0) or self._doc is None:
             return  # a newer page took over
-        from . import net as _net
         import time
         try:
             # advance virtual time by real elapsed time (capped), so
@@ -245,25 +359,33 @@ class Browser:
             now = time.monotonic()
             dt = min((now - self._live_last) * 1000.0, 1000.0)
             self._live_last = now
-            logs, fetches = self._doc.tick(dt)
+            logs, fetches = native.pump_script_requests(self._doc, dt)
+            native.sync_cookie_writes(self._doc, self.url)
             for line in logs:
                 print(f"[js live] {line}")
-            for fetch_id, furl in fetches:
-                try:
-                    _h, body, _f = _net.request_text(
-                        self.url.resolve(furl))
-                    self._doc.resolve_fetch(fetch_id, 200, body)
-                except Exception as e:
-                    self._doc.reject_fetch(
-                        fetch_id, f"{type(e).__name__}: {e}")
+            for request in fetches:
+                native.service_script_fetch(
+                    self._doc, self.url, request,
+                    network_timeout=self.navigation_timeout)
             version = self._doc.dom_version()
-            if version != self._dom_version:
+            changed = version != self._dom_version
+            if changed:
                 self._dom_version = version
                 self._live_idle = 0
                 self.nodes = native.refresh(self._doc, self._css_sources)
                 self._remap_marks()
+            if changed or self._deferred_resources:
+                first_resources = self._deferred_resources
+                started = time.perf_counter()
+                self._deferred_resources = False
                 self.load_images(self.nodes, self.url, keep_cache=True)
+                if first_resources:
+                    self._load_web_fonts(self.url)
                 self.relayout()
+                if first_resources:
+                    self._load_timings["deferred_resources"] = \
+                        (time.perf_counter() - started) * 1000.0
+                    self.set_status("완료")
             else:
                 self._live_idle += 1
         except Exception as e:
@@ -290,8 +412,14 @@ class Browser:
 
         def fetch(src):
             try:
-                _, data = net.request_raw(url.resolve(src))
+                _, data = net.request_raw(
+                    url.resolve(src), site_for_cookies=url,
+                    top_level_navigation=False,
+                    timeout=self.navigation_timeout,
+                    cancel_token=self._loading_token)
                 return data
+            except net.RequestCancelled:
+                raise
             except Exception:
                 return b""
 
@@ -321,13 +449,16 @@ class Browser:
         fetched = {}
         if not srcs:
             return fetched
-        self.set_status(f"스크립트 {len(srcs)}개 병렬 로딩...")
-        self.window.update_idletasks()
-
         def fetch(src):
             try:
-                _, code = net.request(url.resolve(src))
+                _, code = net.request(
+                    url.resolve(src), site_for_cookies=url,
+                    top_level_navigation=False,
+                    timeout=self.navigation_timeout,
+                    cancel_token=self._loading_token)
                 return code
+            except net.RequestCancelled:
+                raise
             except Exception:
                 return ""
 
@@ -346,8 +477,14 @@ class Browser:
 
         def fetch(href):
             try:
-                _, css = net.request(url.resolve(href))
+                _, css = net.request(
+                    url.resolve(href), site_for_cookies=url,
+                    top_level_navigation=False,
+                    timeout=self.navigation_timeout,
+                    cancel_token=self._loading_token)
                 return css
+            except net.RequestCancelled:
+                raise
             except Exception:
                 return ""
 
@@ -403,15 +540,17 @@ class Browser:
 
     def go_back(self):
         if self.history_index > 0:
+            self.cancel_navigation()
+            self._snapshot_history_entry()
             self.history_index -= 1
-            self.load(self.history[self.history_index],
-                      add_to_history=False)
+            self._restore_history_entry(self.history[self.history_index])
 
     def go_forward(self):
         if self.history_index < len(self.history) - 1:
+            self.cancel_navigation()
+            self._snapshot_history_entry()
             self.history_index += 1
-            self.load(self.history[self.history_index],
-                      add_to_history=False)
+            self._restore_history_entry(self.history[self.history_index])
 
     def _update_nav_buttons(self):
         self.back_btn.config(
@@ -433,7 +572,11 @@ class Browser:
                     css_texts.append(" ".join(
                         c.text for c in n.children if isinstance(c, Text)))
         def fetch(u):
-            _, body = net.request_raw(url.resolve(u))
+            _, body = net.request_raw(
+                url.resolve(u), site_for_cookies=url,
+                top_level_navigation=False,
+                timeout=self.navigation_timeout,
+                cancel_token=self._loading_token)
             return body
         try:
             loaded = webfonts.load_web_fonts(css_texts, fetch)
@@ -519,12 +662,23 @@ class Browser:
             return
 
         self.canvas.delete("all")
+        sticky_shift = 0.0
+        sticky_stack = []
         for cmd in self.display_list:
-            if cmd.top > self.scroll + height:
+            if isinstance(cmd, DrawStickyPush):
+                delta = cmd.offset(self.scroll - sticky_shift)
+                sticky_stack.append(delta)
+                sticky_shift += delta
                 continue
-            if cmd.bottom < self.scroll:
+            if isinstance(cmd, DrawStickyPop):
+                if sticky_stack:
+                    sticky_shift -= sticky_stack.pop()
                 continue
-            cmd.execute(self.scroll, self.canvas)
+            if cmd.top + sticky_shift > self.scroll + height:
+                continue
+            if cmd.bottom + sticky_shift < self.scroll:
+                continue
+            cmd.execute(self.scroll - sticky_shift, self.canvas)
         bar = self.scrollbar_rect(width, height)
         if bar:
             self.canvas.create_rectangle(
@@ -582,7 +736,8 @@ class Browser:
     def hit_test(self, x, y):
         objs = [o for o in self.layout_list
                 if o.x <= x < o.x + o.width
-                and o.y <= y < o.y + o.height]
+                and o.y + sticky_offset(o, self.scroll) <= y
+                < o.y + sticky_offset(o, self.scroll) + o.height]
         return objs[-1] if objs else None
 
     def find_link(self, node):
@@ -615,8 +770,21 @@ class Browser:
         if not obj:
             self.set_focus(None)
             return
+        clicked_ridx = self._ridx_of(obj.node)
+        self.set_focus(keyboard.focus_target(obj.node))
+        default_node = self._node_by_ridx(clicked_ridx) or obj.node
+        return self.activate_node(default_node)
+
+    def _node_by_ridx(self, ridx):
+        if ridx is None:
+            return None
+        return next((node for node in tree_to_list(self.nodes, [])
+                     if getattr(node, "_ridx", None) == ridx), None)
+
+    def activate_node(self, default_node):
+        """Dispatch click and then run the element's browser default action."""
         if self._doc is not None:
-            target = obj.node
+            target = default_node
             while target is not None and not (
                     isinstance(target, Element)
                     and hasattr(target, "_ridx")):
@@ -632,11 +800,15 @@ class Browser:
                     print(f"[js console] {line}")
                 if handled:
                     self.refresh_after_js()
+                    default_node = next((node for node in
+                                         tree_to_list(self.nodes, [])
+                                         if getattr(node, "_ridx", None)
+                                         == target._ridx), default_node)
                 if prevented:
                     # a handler called preventDefault() (or an onclick
                     # returned false): suppress the default navigation
                     return
-        href = self.find_link(obj.node)
+        href = self.find_link(default_node)
         if href:
             if href.startswith(("javascript:", "mailto:")):
                 self.set_status(f"지원하지 않는 링크: {href}")
@@ -646,7 +818,18 @@ class Browser:
             except Exception as e:
                 self.set_status(f"이동 실패: {e}")
             return
-        self.set_focus(forms.find_input(obj.node))
+        input_node = forms.find_input(default_node)
+        if input_node is not None \
+                and input_node.attributes.get("type", "").lower() == "file":
+            self.choose_file(input_node)
+            return
+        checkable = forms.find_checkable(default_node)
+        resetter = forms.find_resetter(default_node)
+        submitter = forms.find_submitter(default_node)
+        if checkable is not None or resetter is not None \
+                or submitter is not None:
+            self.activate_form_control(checkable or resetter or submitter)
+            return
 
     # ---------- text input focus / typing ----------
 
@@ -660,6 +843,8 @@ class Browser:
         self._hover_rules = False
         self._focus_rules = False
         self._py_rule_index = None
+        self._selected_files = {}
+        self._form_defaults = {}
 
     def _drop_focus(self):
         """The node tree was rebuilt: the focused node is orphaned."""
@@ -676,7 +861,8 @@ class Browser:
         self.focus_node = None
         self._hover_node = None
         self._hover_marks = []
-        if focus_ridx is None and hover_ridx is None:
+        selected_files = getattr(self, "_selected_files", {})
+        if focus_ridx is None and hover_ridx is None and not selected_files:
             return
         for n in tree_to_list(self.nodes, []):
             r = getattr(n, "_ridx", None)
@@ -687,6 +873,8 @@ class Browser:
                 self.focus_node = n
             if r == hover_ridx:
                 self._hover_node = n
+            if r in selected_files:
+                n._selected_file = selected_files[r]
 
     @staticmethod
     def _ridx_of(node):
@@ -759,6 +947,38 @@ class Browser:
         else:
             self.repaint()
 
+    @staticmethod
+    def _is_descendant(node, ancestor):
+        while node is not None:
+            if node is ancestor:
+                return True
+            node = node.parent
+        return False
+
+    def _scroll_focus_into_view(self, node):
+        boxes = [obj for obj in self.layout_list
+                 if self._is_descendant(getattr(obj, "node", None), node)]
+        if not boxes:
+            return
+        top = min(obj.y for obj in boxes)
+        bottom = max(obj.y + obj.height for obj in boxes)
+        height = max(self.canvas.winfo_height(), 1)
+        if top < self.scroll:
+            self.scroll = top
+        elif bottom > self.scroll + height:
+            self.scroll = bottom - height
+        self.clamp_scroll()
+        self.draw()
+
+    def focus_next(self, reverse=False):
+        node = keyboard.next_focus(
+            self.nodes, self.focus_node, reverse=reverse)
+        self.set_focus(node)
+        node = self.focus_node
+        if node is not None:
+            self._scroll_focus_into_view(node)
+        return node
+
     def repaint(self):
         """Rebuild the display list without restyling or relayout —
         enough for focus caret and typed-text changes."""
@@ -769,15 +989,46 @@ class Browser:
         self.draw()
 
     def on_key(self, event):
+        if event.keysym in ("Tab", "ISO_Left_Tab"):
+            reverse = (event.keysym == "ISO_Left_Tab"
+                       or bool(getattr(event, "state", 0) & 0x1))
+            self.focus_next(reverse=reverse)
+            return "break"
         node = self.focus_node
         if node is None:
+            if event.keysym == "space":
+                self.scroll_by(-600 if getattr(event, "state", 0) & 0x1
+                               else 600)
+                return "break"
             return None
-        if event.keysym == "Return":
-            self.submit_form(node)
-            return "break"
         if event.keysym == "Escape":
             self.set_focus(None)
             return "break"
+        if event.keysym == "Return":
+            action = keyboard.key_action(node, "Enter")
+            if action == "activate":
+                self.activate_node(node)
+            elif action == "submit":
+                self.submit_form(node)
+            elif action == "newline":
+                self._append_text(node, "\n")
+            else:
+                return None
+            return "break"
+        if event.keysym == "space":
+            action = keyboard.key_action(node, "Space")
+            if action == "activate":
+                self.activate_node(node)
+            elif action == "text":
+                self._append_text(node, " ")
+            elif action == "scroll":
+                self.scroll_by(-600 if getattr(event, "state", 0) & 0x1
+                               else 600)
+            else:
+                return None
+            return "break"
+        if not keyboard.is_text_editable(node):
+            return None
         value = node.attributes.get("value", "")
         if event.keysym == "BackSpace":
             if not value:
@@ -792,18 +1043,104 @@ class Browser:
         self.repaint()
         return "break"
 
-    def submit_form(self, node):
+    def _append_text(self, node, text):
+        value = node.attributes.get("value", "") + text
+        node.attributes["value"] = value
+        self.sync_attr(node, "value", value)
+        self.repaint()
+
+    def submit_form(self, node, submitter=None):
         form = forms.find_form(node)
         if form is None:
             return
-        href = forms.submit_href(form)
-        if href is None:
-            self.set_status("POST 폼은 아직 지원하지 않습니다")
+        try:
+            if submitter is None:
+                submitter = next((candidate for candidate in
+                                  tree_to_list(self.nodes, [])
+                                  if forms.find_submitter(candidate)
+                                  is candidate
+                                  and forms.form_owner(candidate) is form),
+                                 None)
+            activation = forms.activate_submission(
+                form, self.url, submitter=submitter,
+                dispatch_event=self._dispatch_form_event,
+                refresh_tree=self._fresh_form_tree)
+            self._finish_form_activation(activation)
+        except Exception as e:
+            self.set_status(f"폼 제출 실패: {e}")
+
+    def activate_form_control(self, control):
+        try:
+            activation = forms.activate_control(
+                control, self.url, self._form_defaults,
+                dispatch_event=self._dispatch_form_event,
+                refresh_tree=self._fresh_form_tree,
+                set_attr=(self._doc.set_attr if self._doc else None),
+                remove_attr=(self._doc.remove_attr if self._doc is not None
+                             and hasattr(self._doc, "remove_attr") else None))
+            self._finish_form_activation(activation)
+        except Exception as exc:
+            self.set_status(f"폼 동작 실패: {exc}")
+
+    def _dispatch_form_event(self, *args):
+        result = native.dispatch_dom_event(self._doc, *args)
+        for line in result[0]:
+            print(f"[js console] {line}")
+        return result
+
+    def _fresh_form_tree(self):
+        if self._doc is None:
+            return self.nodes
+        return native.build_tree(self._doc.export())
+
+    def _finish_form_activation(self, activation):
+        if activation is None:
+            return
+        if activation.invalid:
+            token = activation.invalid[0]
+            first = token if isinstance(token, Element) else next(
+                (node for node in tree_to_list(self.nodes, [])
+                 if getattr(node, "_ridx", None) == token), None)
+            if first is not None:
+                self.set_focus(first)
+                self.set_status(forms.validation_message(first))
+            if activation.handled and self._doc is not None:
+                self.refresh_after_js()
+            return
+        if activation.prevented:
+            if activation.handled and self._doc is not None:
+                self.refresh_after_js()
+            return
+        if activation.changed:
+            if self._doc is not None:
+                self.nodes = native.refresh(self._doc, self._css_sources)
+                self._remap_marks()
+            self.relayout()
+            return
+        submission = activation.submission
+        if submission is not None:
+            self.load(
+                self.url.resolve(submission.target),
+                method=submission.method, body=submission.body,
+                headers=submission.headers)
+
+    def choose_file(self, node):
+        """Attach a file only after an explicit native file-picker choice."""
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(parent=self.window)
+        if not path:
             return
         try:
-            self.load(self.url.resolve(href))
-        except Exception as e:
-            self.set_status(f"이동 실패: {e}")
+            with open(path, "rb") as file:
+                data = file.read()
+            forms.attach_file(node, os.path.basename(path), data)
+            ridx = getattr(node, "_ridx", None)
+            if ridx is not None:
+                self._selected_files[ridx] = node._selected_file
+            self.sync_attr(node, "value", node.attributes["value"])
+            self.repaint()
+        except OSError as exc:
+            self.set_status(f"파일 열기 실패: {exc}")
 
     def sync_attr(self, node, name, value):
         """Mirror a Python-side attribute change into the Rust DOM so
@@ -843,4 +1180,7 @@ class Browser:
     def start(self, url_string=None):
         self.window.update()  # realize widgets so canvas has a size
         self.load_url_string(url_string or HOME_URL)
-        self.window.mainloop()
+        try:
+            self.window.mainloop()
+        finally:
+            self._navigation.shutdown()

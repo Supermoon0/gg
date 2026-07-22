@@ -11,7 +11,7 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta,
                    WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
 /// (kind, a, b, text)
@@ -29,6 +29,7 @@ pub struct WinApp {
     /// coordinates and sizes are reported to Python in logical px.
     pub scale: f64,
     mouse: (f64, f64),
+    modifiers: ModifiersState,
 }
 
 impl WinApp {
@@ -42,6 +43,7 @@ impl WinApp {
             size: (width, height),
             scale: 1.0,
             mouse: (0.0, 0.0),
+            modifiers: ModifiersState::default(),
         }
     }
 
@@ -190,26 +192,15 @@ impl ApplicationHandler for WinApp {
                 };
                 self.push("wheel", dx, dy, "");
             }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {
                     return;
                 }
-                let named = match &event.logical_key {
-                    Key::Named(NamedKey::Enter) => Some("Enter"),
-                    Key::Named(NamedKey::Backspace) => Some("Backspace"),
-                    Key::Named(NamedKey::Delete) => Some("Delete"),
-                    Key::Named(NamedKey::ArrowLeft) => Some("ArrowLeft"),
-                    Key::Named(NamedKey::ArrowRight) => Some("ArrowRight"),
-                    Key::Named(NamedKey::ArrowUp) => Some("ArrowUp"),
-                    Key::Named(NamedKey::ArrowDown) => Some("ArrowDown"),
-                    Key::Named(NamedKey::Home) => Some("Home"),
-                    Key::Named(NamedKey::End) => Some("End"),
-                    Key::Named(NamedKey::PageUp) => Some("PageUp"),
-                    Key::Named(NamedKey::PageDown) => Some("PageDown"),
-                    Key::Named(NamedKey::Escape) => Some("Escape"),
-                    Key::Named(NamedKey::Tab) => Some("Tab"),
-                    _ => None,
-                };
+                let named = key_name(
+                    &event.logical_key, self.modifiers.shift_key());
                 if let Some(name) = named {
                     self.push("key", 0.0, 0.0, name);
                 } else if let Some(text) = &event.text {
@@ -228,6 +219,26 @@ impl ApplicationHandler for WinApp {
             }
             _ => {}
         }
+    }
+}
+
+fn key_name(key: &Key, shift: bool) -> Option<&'static str> {
+    match key {
+        Key::Named(NamedKey::Enter) => Some("Enter"),
+        Key::Named(NamedKey::Backspace) => Some("Backspace"),
+        Key::Named(NamedKey::Delete) => Some("Delete"),
+        Key::Named(NamedKey::ArrowLeft) => Some("ArrowLeft"),
+        Key::Named(NamedKey::ArrowRight) => Some("ArrowRight"),
+        Key::Named(NamedKey::ArrowUp) => Some("ArrowUp"),
+        Key::Named(NamedKey::ArrowDown) => Some("ArrowDown"),
+        Key::Named(NamedKey::Home) => Some("Home"),
+        Key::Named(NamedKey::End) => Some("End"),
+        Key::Named(NamedKey::PageUp) => Some("PageUp"),
+        Key::Named(NamedKey::PageDown) => Some("PageDown"),
+        Key::Named(NamedKey::Escape) => Some("Escape"),
+        Key::Named(NamedKey::Tab) if shift => Some("ShiftTab"),
+        Key::Named(NamedKey::Tab) => Some("Tab"),
+        _ => None,
     }
 }
 
@@ -324,5 +335,12 @@ mod tests {
         app.scale = 1.5;
         assert_eq!(app.to_logical(300.0), 200.0);
         assert_eq!(app.to_logical(0.0), 0.0);
+    }
+
+    #[test]
+    fn shifted_tab_has_a_distinct_event_name() {
+        let tab = Key::Named(NamedKey::Tab);
+        assert_eq!(key_name(&tab, false), Some("Tab"));
+        assert_eq!(key_name(&tab, true), Some("ShiftTab"));
     }
 }

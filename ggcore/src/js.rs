@@ -37,23 +37,34 @@ function __dispatch(idx, type) {
     var key = idx + ":" + type;
     var l = __listeners[key];
     if (!l) return 0;
-    for (var i = 0; i < l.length; i++) { l[i](window.event); }
+    window.event.currentTarget = __wrappers[idx] || null;
+    for (var i = 0; i < l.length; i++) {
+        l[i].call(__wrappers[idx] || null, window.event);
+    }
     return l.length;
 }
-function __mkevent(type) {
+function __mkevent(type, target, bubbles, cancelable, submitter) {
     window.event = {
         type: type,
+        target: target,
+        currentTarget: target,
+        bubbles: bubbles,
+        cancelable: cancelable,
+        submitter: submitter,
         defaultPrevented: false,
-        preventDefault: function () { this.defaultPrevented = true; },
+        preventDefault: function () {
+            if (this.cancelable) this.defaultPrevented = true;
+        },
         stopPropagation: function () {},
+        stopImmediatePropagation: function () {},
     };
     return window.event;
 }
-function __runinline(code) {
+function __runinline(code, current) {
     // onclick attributes run as a function body: `event` is in scope
     // and `return false` prevents the default action (per browsers).
     var f = new Function("event", code);
-    return f.call(undefined, window.event) === false;
+    return f.call(current, window.event) === false;
 }
 "#;
 
@@ -752,6 +763,20 @@ pub fn dispatch_click(
     doc: Rc<RefCell<Document>>,
     idx: usize,
 ) -> (Vec<String>, bool, bool) {
+    dispatch_event(ctx, doc, idx, "click", true, true, None)
+}
+
+pub fn dispatch_event(
+    ctx: &mut Context,
+    doc: Rc<RefCell<Document>>,
+    idx: usize,
+    event_type: &str,
+    bubbles: bool,
+    cancelable: bool,
+    submitter: Option<usize>,
+) -> (Vec<String>, bool, bool) {
+    let event_type = event_type.to_ascii_lowercase();
+    let inline_name = format!("on{event_type}");
     let chain: Vec<(usize, Option<String>)> = {
         let d = doc.borrow();
         if idx >= d.nodes.len() {
@@ -762,7 +787,13 @@ pub fn dispatch_click(
         while let Some(i) = cur {
             let node = &d.nodes[i];
             if node.is_element() {
-                chain.push((i, node.attr("onclick").map(str::to_string)));
+                chain.push((
+                    i,
+                    node.attr(&inline_name).map(str::to_string),
+                ));
+            }
+            if !bubbles {
+                break;
             }
             cur = node.parent;
         }
@@ -771,11 +802,30 @@ pub fn dispatch_click(
 
     ACTIVE.with(|a| *a.borrow_mut() = Some(doc));
     LOG.with(|l| l.borrow_mut().clear());
-    ctx.eval(Source::from_bytes(b"__mkevent('click')")).ok();
+    let global = ctx.global_object();
+    if let Ok(make_event) = global.get(js_string!("__mkevent"), ctx) {
+        if let Some(func) = make_event.as_callable() {
+            let target: JsValue = wrap_element(idx, ctx).into();
+            let submitter_value = submitter
+                .map(|node| wrap_element(node, ctx).into())
+                .unwrap_or(JsValue::null());
+            let _ = func.call(
+                &JsValue::undefined(),
+                &[
+                    js_string!(event_type.as_str()).into(),
+                    target,
+                    JsValue::new(bubbles),
+                    JsValue::new(cancelable),
+                    submitter_value,
+                ],
+                ctx,
+            );
+        }
+    }
     let mut handled = false;
     let mut prevented = false;
-    for (i, onclick) in chain {
-        if let Some(code) = onclick {
+    for (i, inline) in chain {
+        if let Some(code) = inline {
             handled = true;
             let global = ctx.global_object();
             match global.get(js_string!("__runinline"), ctx) {
@@ -783,11 +833,14 @@ pub fn dispatch_click(
                     if let Some(func) = f.as_callable() {
                         match func.call(
                             &JsValue::undefined(),
-                            &[JsString::from(code.as_str()).into()],
+                            &[
+                                JsString::from(code.as_str()).into(),
+                                wrap_element(i, ctx).into(),
+                            ],
                             ctx,
                         ) {
                             Ok(v) => {
-                                if v.to_boolean() {
+                                if cancelable && v.to_boolean() {
                                     prevented = true; // returned false
                                 }
                             }
@@ -805,7 +858,7 @@ pub fn dispatch_click(
                     &JsValue::undefined(),
                     &[
                         JsValue::from(i as f64),
-                        js_string!("click").into(),
+                        js_string!(event_type.as_str()).into(),
                     ],
                     ctx,
                 );
@@ -821,11 +874,13 @@ pub fn dispatch_click(
         }
     }
     // any handler may have called event.preventDefault()
-    if let Ok(prevented_v) = ctx.eval(Source::from_bytes(
-        b"window.event && window.event.defaultPrevented === true",
-    )) {
-        if prevented_v.to_boolean() {
-            prevented = true;
+    if cancelable {
+        if let Ok(prevented_v) = ctx.eval(Source::from_bytes(
+            b"window.event && window.event.defaultPrevented === true",
+        )) {
+            if prevented_v.to_boolean() {
+                prevented = true;
+            }
         }
     }
     ACTIVE.with(|a| *a.borrow_mut() = None);

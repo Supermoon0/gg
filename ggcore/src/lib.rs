@@ -19,7 +19,8 @@ mod svg;
 mod window;
 
 /// (kind, x1, y1, x2, y2, rgb, aux, font_id, text)
-/// kind: 0=rect 1=text(aux=size) 2=line(aux=thickness) 3=oval 4=image
+/// kind: 0=rect 1=text(aux=size) 2=line(aux=thickness) 3=oval 4=image,
+/// 6/7=clip push/pop, 8/9=vertical sticky push/pop
 type Cmd = (u8, f64, f64, f64, f64, (u8, u8, u8), f64, u32, String);
 
 #[pyclass]
@@ -246,6 +247,71 @@ impl TextEngine {
         }
     }
 
+    /// Translate a display command in document space. Image/background
+    /// x2/y2 fields are dimensions; every other drawable uses endpoints.
+    fn translate_cmd(cmd: &Cmd, dx: f64, dy: f64) -> Cmd {
+        let (kind, x1, y1, x2, y2, color, aux, font, text) = cmd;
+        let shifts_wh = !matches!(*kind, 4 | 5);
+        (
+            *kind,
+            *x1 + dx,
+            *y1 + dy,
+            if shifts_wh { *x2 + dx } else { *x2 },
+            if shifts_wh { *y2 + dy } else { *y2 },
+            *color,
+            *aux,
+            *font,
+            text.clone(),
+        )
+    }
+
+    /// Resolve sticky groups and cull the stored document-space list into
+    /// viewport-space commands. Kind 8 stores normal_top in y1, max_top in
+    /// y2, and the top inset in aux; kind 9 closes the group.
+    fn viewport_cmds(
+        list: &[Cmd],
+        dx: f64,
+        dy: f64,
+        width: f64,
+        height: f64,
+    ) -> Vec<Cmd> {
+        let mut out = Vec::with_capacity(list.len() / 4);
+        let mut sticky_stack: Vec<f64> = Vec::new();
+        let mut sticky_dy = 0.0;
+        for cmd in list {
+            match cmd.0 {
+                8 => {
+                    let normal = cmd.2 + sticky_dy;
+                    let maximum = cmd.4 + sticky_dy;
+                    let stuck = (dy + cmd.6).max(normal).min(maximum);
+                    let delta = stuck - normal;
+                    sticky_stack.push(delta);
+                    sticky_dy += delta;
+                }
+                9 => {
+                    if let Some(delta) = sticky_stack.pop() {
+                        sticky_dy -= delta;
+                    }
+                }
+                _ => {
+                    let shifted;
+                    let candidate = if sticky_dy != 0.0 {
+                        shifted = Self::translate_cmd(cmd, 0.0, sticky_dy);
+                        &shifted
+                    } else {
+                        cmd
+                    };
+                    if let Some(c) =
+                        Self::shift_cull(candidate, dx, dy, width, height)
+                    {
+                        out.push(c);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     fn rasterize_at(
         &mut self,
         width: u32,
@@ -256,15 +322,10 @@ impl TextEngine {
         overlay: &[Cmd],
     ) -> raster::Raster {
         let list = std::mem::take(&mut self.display_list);
-        let mut cmds: Vec<Cmd> =
-            Vec::with_capacity(list.len() / 4 + overlay.len());
-        for cmd in &list {
-            if let Some(c) = Self::shift_cull(
-                cmd, dx, dy, width as f64, height as f64,
-            ) {
-                cmds.push(c);
-            }
-        }
+        let mut cmds = Self::viewport_cmds(
+            &list, dx, dy, width as f64, height as f64,
+        );
+        cmds.reserve(overlay.len());
         cmds.extend_from_slice(overlay);
         let r = self.rasterize(width, height, bg, &cmds);
         self.display_list = list;
@@ -511,7 +572,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
-#[pyclass(unsendable)]
+#[pyclass(unsendable, weakref)]
 struct Doc {
     doc: Rc<RefCell<dom::Document>>,
     js: Option<boa_engine::Context>,
@@ -538,6 +599,62 @@ impl Doc {
         }
         self.ggjs.as_mut().unwrap()
     }
+}
+
+type ScriptRecord = (usize, String, String, String);
+
+/// Connected script elements in document order. Keeping this in the native
+/// DOM makes dynamically appended nodes and HTMLScriptElement property writes
+/// visible to the host loader without rebuilding the Python tree.
+fn collect_script_records(doc: &dom::Document) -> Vec<ScriptRecord> {
+    let mut out = Vec::new();
+    let mut stack = vec![doc.root];
+    while let Some(idx) = stack.pop() {
+        let node = &doc.nodes[idx];
+        if node.tag.as_deref() == Some("script") {
+            let stype = node.attr("type").unwrap_or("").trim().to_lowercase();
+            let is_module = stype == "module";
+            let is_javascript = stype.is_empty()
+                || is_module
+                || stype.contains("javascript")
+                || stype.contains("ecmascript");
+            if is_javascript {
+                let (kind, value) = if let Some(src) = node.attr("src") {
+                    ("src".to_string(), src.to_string())
+                } else {
+                    ("inline".to_string(), doc.collect_text(idx))
+                };
+                if kind == "src" || !value.trim().is_empty() {
+                    let mode = if kind == "inline" {
+                        // async/defer do not affect classic inline scripts.
+                        if is_module { "module" } else { "blocking" }
+                    } else if doc.script_async_overrides.get(&idx)
+                        == Some(&false)
+                    {
+                        // Dynamically inserted script with async explicitly
+                        // disabled: preserve insertion order.
+                        if is_module { "ordered-module" } else { "ordered" }
+                    } else if doc.script_created_dynamically.contains(&idx)
+                        || node.attr("async").is_some()
+                        || doc.script_async_overrides.get(&idx) == Some(&true)
+                    {
+                        if is_module { "async-module" } else { "async" }
+                    } else if is_module {
+                        "module"
+                    } else if node.attr("defer").is_some() {
+                        "defer"
+                    } else {
+                        "blocking"
+                    };
+                    out.push((idx, kind, value, mode.to_string()));
+                }
+            }
+        }
+        for &child in node.children.iter().rev() {
+            stack.push(child);
+        }
+    }
+    out
 }
 
 #[pymethods]
@@ -579,12 +696,57 @@ impl Doc {
         out
     }
 
+    /// (node index, kind, source/code, scheduling mode) in document order.
+    fn script_records(&self) -> Vec<ScriptRecord> {
+        collect_script_records(&self.doc.borrow())
+    }
+
+    /// Inline <script type="importmap"> JSON bodies in document order.
+    fn import_map_sources(&self) -> Vec<String> {
+        let doc = self.doc.borrow();
+        let mut out = Vec::new();
+        let mut stack = vec![doc.root];
+        while let Some(idx) = stack.pop() {
+            let node = &doc.nodes[idx];
+            if node.tag.as_deref() == Some("script")
+                && node.attr("type").unwrap_or("").trim()
+                    .eq_ignore_ascii_case("importmap")
+            {
+                let source = doc.collect_text(idx);
+                if !source.trim().is_empty() {
+                    out.push(source);
+                }
+            }
+            for &child in node.children.iter().rev() {
+                stack.push(child);
+            }
+        }
+        out
+    }
+
+    /// Compatibility execution view used by older Python loaders.
+    fn script_entries(&self) -> Vec<(String, String)> {
+        let doc = self.doc.borrow();
+        let mut immediate = Vec::new();
+        let mut deferred = Vec::new();
+        for (_, kind, value, mode) in collect_script_records(&doc) {
+            let entry = (kind, value);
+            if mode == "defer" || mode == "module" {
+                deferred.push(entry);
+            } else {
+                immediate.push(entry);
+            }
+        }
+        immediate.extend(deferred);
+        immediate
+    }
+
     /// ("inline", code) and ("src", url) entries in EXECUTION order:
     /// parser-order scripts first, then `defer` scripts (and modules,
     /// which defer per spec) in document order — Naver's app bundles
     /// are all defer and read inline-defined globals (EAGER-DATA.GV)
     /// that appear later in the document.
-    fn script_entries(&self) -> Vec<(String, String)> {
+    fn script_entries_legacy(&self) -> Vec<(String, String)> {
         let doc = self.doc.borrow();
         let mut out = Vec::new();
         let mut deferred = Vec::new();
@@ -727,6 +889,14 @@ impl Doc {
         }
     }
 
+    /// Shell-side attribute removal (form reset and boolean state).
+    fn remove_attr(&mut self, node_idx: usize, name: String) {
+        let mut d = self.doc.borrow_mut();
+        if node_idx < d.nodes.len() {
+            d.remove_attr(node_idx, &name);
+        }
+    }
+
     /// Tell the JS engine the page URL so `location.*` is real.
     /// Call before run_scripts. No-op on the Boa path.
     fn set_page_url(&mut self, url: String) {
@@ -742,11 +912,20 @@ impl Doc {
         }
     }
 
-    /// Read document.cookie back (JS writes) to fold into the network jar.
+    /// Read the current document.cookie-visible string.
     fn read_cookies(&self) -> String {
         self.ggjs
             .as_ref()
             .map(|vm| vm.cookies_string())
+            .unwrap_or_default()
+    }
+
+    /// Drain original document.cookie setter strings so the Python network
+    /// jar can validate attributes and apply them with the page URL context.
+    fn take_cookie_writes(&mut self) -> Vec<String> {
+        self.ggjs
+            .as_mut()
+            .map(|vm| vm.take_cookie_writes())
             .unwrap_or_default()
     }
 
@@ -762,6 +941,16 @@ impl Doc {
         }
     }
 
+    fn tick_requests(&mut self, dt_ms: f64) -> (Vec<String>, Vec<(
+        u32, String, String, String, Vec<(String, String)>, String, String,
+    )>) {
+        if self.use_ggjs {
+            self.ggvm().tick_requests(dt_ms)
+        } else {
+            (Vec::new(), Vec::new())
+        }
+    }
+
     /// DOM mutation counter — re-style/re-layout only when it changes.
     fn dom_version(&self) -> u64 {
         self.doc.borrow().version
@@ -772,6 +961,26 @@ impl Doc {
     fn fire_lifecycle(&mut self) -> Vec<String> {
         if self.use_ggjs {
             self.ggvm().fire_lifecycle()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Complete parsing and dispatch DOMContentLoaded without waiting for
+    /// outstanding async or dynamically inserted external scripts.
+    fn fire_dom_content_loaded(&mut self) -> Vec<String> {
+        if self.use_ggjs {
+            self.ggvm().fire_dom_content_loaded()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Mark the document complete and dispatch the window/document load
+    /// events after the host loader has settled all load-blocking scripts.
+    fn fire_load(&mut self) -> Vec<String> {
+        if self.use_ggjs {
+            self.ggvm().fire_load()
         } else {
             Vec::new()
         }
@@ -818,6 +1027,45 @@ impl Doc {
         )
     }
 
+    /// Dispatch a host-initiated DOM event and report cancellation.
+    #[pyo3(signature = (
+        node_idx,
+        event_type,
+        bubbles=true,
+        cancelable=true,
+        submitter_idx=None
+    ))]
+    fn dispatch_event(
+        &mut self,
+        node_idx: usize,
+        event_type: String,
+        bubbles: bool,
+        cancelable: bool,
+        submitter_idx: Option<usize>,
+    ) -> (Vec<String>, bool, bool) {
+        if self.use_ggjs {
+            return self.ggvm().dispatch_event(
+                node_idx,
+                &event_type,
+                bubbles,
+                cancelable,
+                submitter_idx,
+            );
+        }
+        if self.js.is_none() {
+            self.js = Some(js::new_context());
+        }
+        js::dispatch_event(
+            self.js.as_mut().unwrap(),
+            self.doc.clone(),
+            node_idx,
+            &event_type,
+            bubbles,
+            cancelable,
+            submitter_idx,
+        )
+    }
+
     /// Async runtime (P3, gg-js only): run the event loop to a fixed
     /// point. Returns (console output, [(fetch_id, url)] to service).
     /// No-op on the Boa path (Boa has its own loop).
@@ -828,10 +1076,58 @@ impl Doc {
         self.ggvm().pump()
     }
 
+    fn pump_requests(&mut self) -> (Vec<String>, Vec<(
+        u32, String, String, String, Vec<(String, String)>, String, String,
+    )>) {
+        if !self.use_ggjs {
+            return (Vec::new(), Vec::new());
+        }
+        self.ggvm().pump_requests()
+    }
+
+    /// Drain a Promise microtask checkpoint without advancing timers.
+    fn pump_microtasks_requests(&mut self) -> (Vec<String>, Vec<(
+        u32, String, String, String, Vec<(String, String)>, String, String,
+    )>) {
+        if !self.use_ggjs {
+            return (Vec::new(), Vec::new());
+        }
+        self.ggvm().pump_microtasks_requests()
+    }
+
+    /// Opt-in GG_JS_PROFILE samples since the previous call.
+    fn take_js_profile(&mut self) -> Vec<(String, u32, u32, u64)> {
+        if !self.use_ggjs {
+            return Vec::new();
+        }
+        self.ggvm().take_profile()
+    }
+
+    /// Read a numeric script global without evaluating another program.
+    fn global_number(&mut self, name: String) -> Option<f64> {
+        if !self.use_ggjs {
+            return None;
+        }
+        self.ggvm().global_number(&name)
+    }
+
     /// Host settles a fetch the driver performed (gg-js only).
     fn resolve_fetch(&mut self, fetch_id: u32, status: u16, body: String) {
         if self.use_ggjs {
             self.ggvm().resolve_fetch(fetch_id, status, body);
+        }
+    }
+
+
+    fn resolve_fetch_full(
+        &mut self,
+        fetch_id: u32,
+        status: u16,
+        url: String,
+        body: String,
+    ) {
+        if self.use_ggjs {
+            self.ggvm().resolve_fetch_full(fetch_id, status, url, body);
         }
     }
 
@@ -995,6 +1291,40 @@ fn jsvm_run(src: &str) -> PyResult<Vec<String>> {
     match jsvm::eval(src) {
         Ok((_, logs)) => Ok(logs),
         Err(e) => Err(pyo3::exceptions::PyValueError::new_err(e)),
+    }
+}
+
+#[cfg(test)]
+mod display_list_tests {
+    use super::{Cmd, TextEngine};
+
+    fn marker(kind: u8, normal: f64, maximum: f64, inset: f64) -> Cmd {
+        (kind, 0.0, normal, 0.0, maximum, (0, 0, 0), inset, 0, String::new())
+    }
+
+    fn rect(top: f64, bottom: f64) -> Cmd {
+        (0, 0.0, top, 20.0, bottom, (1, 2, 3), 0.0, 0, String::new())
+    }
+
+    #[test]
+    fn sticky_groups_resolve_from_scroll_without_rebuilding_the_list() {
+        let list = vec![
+            marker(8, 100.0, 300.0, 10.0),
+            rect(100.0, 200.0),
+            marker(9, 0.0, 0.0, 0.0),
+        ];
+        let before = TextEngine::viewport_cmds(&list, 0.0, 0.0, 500.0, 200.0);
+        assert_eq!(before.len(), 1);
+        assert_eq!((before[0].2, before[0].4), (100.0, 200.0));
+
+        let stuck = TextEngine::viewport_cmds(&list, 0.0, 150.0, 500.0, 200.0);
+        assert_eq!((stuck[0].2, stuck[0].4), (10.0, 110.0));
+
+        // Once the containing-block boundary is reached, the item scrolls
+        // away instead of remaining pinned beyond its parent.
+        let bounded =
+            TextEngine::viewport_cmds(&list, 0.0, 350.0, 500.0, 200.0);
+        assert_eq!((bounded[0].2, bounded[0].4), (-50.0, 50.0));
     }
 }
 

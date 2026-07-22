@@ -24,7 +24,8 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 
-from . import native, net
+from . import forms, native, net
+from .html_parser import tree_to_list
 
 _MARKER = "data-gg-hit"
 _VAL_TAG = "\x01GGVAL\x01"
@@ -104,26 +105,50 @@ class Page:
         self._console = []
         self._styles_dirty = False   # a handler mutated the DOM
         self._export_cache = None     # (version, flat); invalidated on mutation
+        self._form_defaults = {}
         self._ver = 0
+        self._navigation_token = None
 
     # ---------- navigation ----------
 
-    def goto(self, url_or_str, settle=True):
+    def goto(self, url_or_str, settle=True, *, method="GET", body=None,
+             headers=None):
         """Fetch, parse, run page scripts, compute styles. When `settle`
         (default), also run the event loop to a fixed point so async
         content (fetch/setTimeout) is present before you read the page.
         Returns self."""
         url = url_or_str if isinstance(url_or_str, net.URL) \
             else net.URL(url_or_str)
-        _headers, body, final_url = net.request_text(url, no_cache=True)
+        self.cancel()
+        token = net.CancellationToken()
+        self._navigation_token = token
+        initiator = self.url
+        if initiator is not None and not getattr(initiator, "host", None):
+            initiator = None
+        try:
+            _headers, body, final_url = net.request_text(
+                url, no_cache=True, method=method, body=body,
+                headers=headers, site_for_cookies=initiator,
+                top_level_navigation=True, timeout=self.timeout,
+                cancel_token=token)
+        except Exception:
+            if self._navigation_token is token:
+                self._navigation_token = None
+            raise
+        token.check()
         self.url = final_url
 
         fetch_js = self._fetch_scripts if self.run_scripts else None
         prev = os.environ.get("GGJS")
         os.environ["GGJS"] = "1" if self.engine == "ggjs" else "0"
         try:
-            _root, doc, css_sources, logs = native.load_document(
-                body, self._fetch_stylesheets, fetch_js)
+            root, doc, css_sources, logs = native.load_document(
+                body, self._fetch_stylesheets, fetch_js,
+                page_url=self.url)
+        except Exception:
+            if self._navigation_token is token:
+                self._navigation_token = None
+            raise
         finally:
             if prev is None:
                 os.environ.pop("GGJS", None)
@@ -133,13 +158,24 @@ class Page:
         self._doc = doc
         self._css_sources = css_sources
         self._console = list(logs)
+        self._form_defaults = forms.capture_defaults(root)
         self._ver += 1
         self._export_cache = None
         self._styles_dirty = False
         if settle:
             self.settle()
         self.title = self._compute_title()
+        if self._navigation_token is token:
+            self._navigation_token = None
         return self
+
+    def cancel(self):
+        """Cancel the current goto/resource load from another thread."""
+        token = self._navigation_token
+        if token is None:
+            return False
+        self._navigation_token = None
+        return token.cancel()
 
     # ---------- async event loop ----------
 
@@ -153,34 +189,38 @@ class Page:
             return
         import time
         deadline = time.monotonic() + self.timeout
-        mutated = False
+        version_before = self._doc.dom_version() \
+            if hasattr(self._doc, "dom_version") else None
+        activity = False
         for _ in range(_SETTLE_MAX_ROUNDS):
-            logs, fetches = self._doc.pump()
+            logs, fetches = native.pump_script_requests(self._doc)
+            native.sync_cookie_writes(self._doc, self.url)
             if logs:
                 self._console.extend(logs)
-                mutated = True
+                activity = True
             if fetches:
-                mutated = True
-                for fetch_id, url in fetches:
-                    self._service_fetch(fetch_id, url)
+                activity = True
+                for request in fetches:
+                    self._service_fetch(request)
                 continue  # resolves queued more microtasks; keep draining
             if not self._doc.has_pending_work():
                 break
             if time.monotonic() > deadline:
                 self._console.append("[driver] settle timed out")
                 break
+        native.sync_cookie_writes(self._doc, self.url)
+        mutated = (self._doc.dom_version() != version_before
+                   if version_before is not None else activity)
         if mutated:
             # a handler/timer may have changed the DOM; restyle + refresh
             self._doc.compute_styles(self._css_sources)
             self._ver += 1
             self._export_cache = None
 
-    def _service_fetch(self, fetch_id, url):
-        try:
-            _h, body, _final = net.request_text(self.url.resolve(url))
-            self._doc.resolve_fetch(fetch_id, 200, body)
-        except Exception as e:
-            self._doc.reject_fetch(fetch_id, f"{type(e).__name__}: {e}")
+    def _service_fetch(self, request):
+        native.service_script_fetch(
+            self._doc, self.url, request, network_timeout=self.timeout,
+            cancel_token=self._navigation_token)
 
     def wait_for(self, target, timeout=None):
         """Settle the event loop, then test `target` (a selector string or
@@ -208,6 +248,7 @@ class Page:
     def _run(self, sources):
         """Run scripts and invalidate the export cache (they may mutate)."""
         logs = self._doc.run_scripts(sources)
+        native.sync_cookie_writes(self._doc, self.url)
         self._console.extend(logs)
         self._ver += 1
         return logs
@@ -225,7 +266,12 @@ class Page:
 
         def fetch(u):
             try:
-                return net.request(self.url.resolve(u))[1]
+                return net.request(
+                    self.url.resolve(u), site_for_cookies=self.url,
+                    top_level_navigation=False, timeout=self.timeout,
+                    cancel_token=self._navigation_token)[1]
+            except net.RequestCancelled:
+                raise
             except Exception:
                 return ""
 
@@ -329,6 +375,7 @@ class Page:
             self.settle()
             self._doc.compute_styles(self._css_sources)
         href = el.href  # already resolved on the Element — no extra export
+        activated = None
         # navigate if it was a link and nothing prevented the default
         if not prevented and href \
                 and not href.startswith(("javascript:", "mailto:", "#")):
@@ -336,7 +383,43 @@ class Page:
                 self.goto(self.url.resolve(href))
             except Exception:
                 pass
-        return handled or bool(href)
+        elif not prevented:
+            activated = self._form_activation(el._ridx)
+            if activated is not None:
+                self._console.extend(activated.logs)
+            if activated is not None and (
+                    activated.changed
+                    or (activated.handled
+                        and activated.submission is None)):
+                self.settle()
+                self._doc.compute_styles(self._css_sources)
+                self._ver += 1
+                self._export_cache = None
+            submission = activated.submission if activated else None
+            if submission is not None:
+                try:
+                    self.goto(
+                        self.url.resolve(submission.target),
+                        method=submission.method, body=submission.body,
+                        headers=submission.headers)
+                except Exception:
+                    pass
+        return handled or bool(href) or activated is not None
+
+    def _form_activation(self, ridx):
+        root = native.build_tree(self._doc.export())
+        target = next((node for node in tree_to_list(root, [])
+                       if getattr(node, "_ridx", None) == ridx), None)
+        if target is None:
+            return None
+        return forms.activate_control(
+            target, self.url, self._form_defaults,
+            dispatch_event=lambda *args: native.dispatch_dom_event(
+                self._doc, *args),
+            refresh_tree=lambda: native.build_tree(self._doc.export()),
+            set_attr=self._doc.set_attr,
+            remove_attr=(self._doc.remove_attr
+                         if hasattr(self._doc, "remove_attr") else None))
 
     # ---------- scripting ----------
 

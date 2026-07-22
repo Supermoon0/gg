@@ -1,6 +1,6 @@
 //! Flat-arena DOM: nodes live in one Vec, linked by indices.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct Node {
     pub parent: Option<usize>,
@@ -41,6 +41,13 @@ pub struct Document {
     pub hover_chain: Vec<usize>,
     /// :focus state — the focused element, if any
     pub focused: Option<usize>,
+    /// Explicit HTMLScriptElement.async property writes. A dynamically
+    /// created script defaults to async, so `script.async = false` must be
+    /// distinguishable from an untouched element with no async attribute.
+    pub script_async_overrides: HashMap<usize, bool>,
+    /// Script elements created through the DOM API. Unlike parser-created
+    /// scripts, their force-async flag defaults to true.
+    pub script_created_dynamically: HashSet<usize>,
 }
 
 impl Document {
@@ -52,6 +59,8 @@ impl Document {
             version: 0,
             hover_chain: Vec::new(),
             focused: None,
+            script_async_overrides: HashMap::new(),
+            script_created_dynamically: HashSet::new(),
         }
     }
 

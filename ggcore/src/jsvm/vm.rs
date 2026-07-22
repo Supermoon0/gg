@@ -15,7 +15,7 @@
 //! re-enter the interpreter through `call_value`.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use super::bytecode::{CapSrc, Instr, Module};
@@ -216,6 +216,9 @@ pub(super) enum ClosureRec {
         this_val: Value,
         bound: Vec<Value>,
     },
+    /// Callable Proxy wrapper.  Object Proxies use `St::object_proxies`;
+    /// both point at the same ProxyRec arena so revocation is shared.
+    Proxy(u32),
 }
 
 #[derive(Clone, Copy)]
@@ -305,6 +308,28 @@ pub(super) enum Native {
     /// resolve/reject bound to a `new Promise(executor)` — settles the
     /// promise when called. Rides the ordinary Native call path (P3b).
     Resolve { pid: u32, reject: bool },
+    /// The real Proxy constructor and Proxy.revocable helper.
+    ProxyCtor,
+    ProxyRevocable,
+    ProxyRevoke { proxy: u32 },
+    /// One of the Reflect.* internal-operation entry points.
+    Reflect(u8),
+}
+
+pub(super) mod reflect {
+    pub const APPLY: u8 = 0;
+    pub const CONSTRUCT: u8 = 1;
+    pub const DEFINE_PROPERTY: u8 = 2;
+    pub const DELETE_PROPERTY: u8 = 3;
+    pub const GET: u8 = 4;
+    pub const GET_OWN_PROPERTY_DESCRIPTOR: u8 = 5;
+    pub const GET_PROTOTYPE_OF: u8 = 6;
+    pub const HAS: u8 = 7;
+    pub const IS_EXTENSIBLE: u8 = 8;
+    pub const OWN_KEYS: u8 = 9;
+    pub const PREVENT_EXTENSIONS: u8 = 10;
+    pub const SET: u8 = 11;
+    pub const SET_PROTOTYPE_OF: u8 = 12;
 }
 
 /// host function ids (Native::HostFn payload)
@@ -382,6 +407,13 @@ pub(super) struct Obj {
     /// this object has entries in St.accessors (checked before the
     /// side-table lookup so plain objects pay nothing)
     has_accessors: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ProxyRec {
+    target: Value,
+    handler: Value,
+    revoked: bool,
 }
 
 /// Sentinel: an Obj that is not a Promise.
@@ -647,6 +679,13 @@ pub(super) struct St {
     cells: Vec<Value>,
     shapes: Vec<Shape>,
     pub(super) objects: Vec<Obj>,
+    /// Proxy records are separate from object storage because callable
+    /// targets must remain function-tagged. Object wrappers map their
+    /// object index to the same arena used by ClosureRec::Proxy.
+    proxies: Vec<ProxyRec>,
+    object_proxies: HashMap<u32, u32>,
+    non_extensible_objects: HashSet<u32>,
+    non_extensible_functions: HashSet<u32>,
     pub(super) strs: Vec<Str>,
     pub(super) ics: Vec<IcEntry>,
     pub(super) regs: Vec<Value>,
@@ -670,9 +709,13 @@ pub(super) struct St {
     /// Web Storage backing maps (in-memory; not persisted to disk)
     pub(super) local_storage: HashMap<String, String>,
     pub(super) session_storage: HashMap<String, String>,
-    /// document.cookie pairs in insertion order (in-memory; not yet
-    /// wired to the network layer)
+    /// document.cookie pairs in insertion order (the Python network jar
+    /// seeds the visible values before scripts run).
     pub(super) cookies: Vec<(String, String)>,
+    /// Original document.cookie setter strings awaiting host validation.
+    /// Keeping the attributes is essential: Path/Domain/Secure/expiry
+    /// cannot be reconstructed from the visible `k=v` string.
+    pub(super) cookie_writes: Vec<String>,
     /// node index -> (x, y, w, h) in document coordinates, pushed by
     /// the shell after each layout so getBoundingClientRect answers
     /// real geometry (document-origin approximation: scroll offset is
@@ -723,6 +766,12 @@ pub(super) struct St {
     /// dispatch loop decrements it and aborts at 0, so a hostile
     /// `while(true){}` can never wedge the worker (fleet-safety, P4).
     pub(super) fuel: u64,
+    /// Opt-in low-overhead instruction sampler.  Naver's initial React
+    /// commit is a single long callback, so timer/microtask timings alone
+    /// cannot identify the JavaScript function responsible.  Sampling is
+    /// completely disabled unless GG_JS_PROFILE is set.
+    profile_enabled: bool,
+    profile_samples: HashMap<(u32, u32), u64>,
 }
 
 /// Default per-turn instruction budget (~a few hundred ms of hot loop).
@@ -768,6 +817,10 @@ impl St {
                 transitions: HashMap::new(),
             }],
             objects: Vec::new(),
+            proxies: Vec::new(),
+            object_proxies: HashMap::new(),
+            non_extensible_objects: HashSet::new(),
+            non_extensible_functions: HashSet::new(),
             strs: Vec::new(),
             ics: Vec::new(),
             regs: Vec::new(),
@@ -783,6 +836,7 @@ impl St {
             local_storage: HashMap::new(),
             session_storage: HashMap::new(),
             cookies: Vec::new(),
+            cookie_writes: Vec::new(),
             layout_rects: HashMap::new(),
             map_data: HashMap::new(),
             set_data: HashMap::new(),
@@ -806,6 +860,8 @@ impl St {
             json_atom: u32::MAX,
             rng_state: 0x2545_F491_4F6C_DD1D,
             fuel: DEFAULT_FUEL,
+            profile_enabled: std::env::var_os("GG_JS_PROFILE").is_some(),
+            profile_samples: HashMap::new(),
         };
         for (i, name) in ["undefined", "boolean", "number", "string",
                           "object", "function"]
@@ -819,6 +875,12 @@ impl St {
         st.text_atom = st.intern_name("text");
         st.json_atom = st.intern_name("json");
         st
+    }
+
+    pub(super) fn take_profile_samples(
+        &mut self,
+    ) -> HashMap<(u32, u32), u64> {
+        std::mem::take(&mut self.profile_samples)
     }
 
     /// Intern a property/global name into a stable id. Every name id is
@@ -1195,12 +1257,18 @@ pub(super) struct Timer {
     due_ms: f64,
     seq: u64,
     interval: Option<f64>,
+    is_raf: bool,
 }
 
 pub(super) struct PendingFetch {
     pub(super) fetch_id: u32,
     promise: u32,
     pub(super) url: String,
+    pub(super) method: String,
+    pub(super) body: String,
+    pub(super) headers: Vec<(String, String)>,
+    pub(super) mode: String,
+    pub(super) credentials: String,
 }
 
 fn new_promise(st: &mut St) -> (Value, u32) {
@@ -1360,6 +1428,26 @@ fn drain_microtasks(st: &mut St, mods: &ModStore, budget: &mut usize) {
     }
 }
 
+/// Drain only the microtask checkpoint and hand newly-issued fetches to the
+/// host. Module evaluation uses this before the full timer-aware pump so an
+/// unrelated setTimeout cannot run ahead of DOMContentLoaded.
+pub(super) fn pump_microtasks(
+    st: &mut St,
+    mods: &ModStore,
+    budget_max: usize,
+) -> Vec<PendingFetch> {
+    let mut budget = budget_max;
+    drain_microtasks(st, mods, &mut budget);
+    if budget == 0 && !st.microtasks.is_empty() {
+        st.logs.push("[gg-js] microtask budget exceeded".to_string());
+    }
+    let issued = std::mem::take(&mut st.pending_fetches);
+    for request in &issued {
+        st.awaiting.insert(request.fetch_id, request.promise);
+    }
+    issued
+}
+
 fn next_due_timer(st: &St) -> Option<usize> {
     let mut best: Option<usize> = None;
     for (i, t) in st.timers.iter().enumerate() {
@@ -1390,7 +1478,7 @@ pub(super) fn pump(
     st: &mut St,
     mods: &ModStore,
     budget_max: usize,
-) -> Vec<(u32, String)> {
+) -> Vec<PendingFetch> {
     let mut budget = budget_max;
     // Load-settle horizon: a self-rescheduling `setTimeout` (naver's
     // AutoRolling headline ticker re-arms a fresh timer every few seconds,
@@ -1411,6 +1499,9 @@ pub(super) fn pump(
     // ignores intervals so the settle loop can reach quiescence.
     let mut fired_intervals: std::collections::HashSet<u32> =
         std::collections::HashSet::new();
+    // A callback normally schedules the next rAF. Load settling captures
+    // one initial animation frame instead of fast-forwarding the loop.
+    let mut fired_raf = false;
     loop {
         drain_microtasks(st, mods, &mut budget);
         if budget == 0 {
@@ -1424,6 +1515,9 @@ pub(super) fn pump(
                 continue;
             }
             if t.interval.is_some() && fired_intervals.contains(&t.id) {
+                continue;
+            }
+            if t.is_raf && fired_raf {
                 continue;
             }
             match best {
@@ -1455,6 +1549,7 @@ pub(super) fn pump(
             }
         } else {
             let t = st.timers.remove(i);
+            fired_raf |= t.is_raf;
             st.now_ms = st.now_ms.max(t.due_ms);
             if let Err(e) = call_value(st, mods, t.callback, &t.args) {
                 st.logs.push(format!("[gg-js error] {}", e.msg));
@@ -1465,7 +1560,7 @@ pub(super) fn pump(
     for p in &issued {
         st.awaiting.insert(p.fetch_id, p.promise);
     }
-    issued.into_iter().map(|p| (p.fetch_id, p.url)).collect()
+    issued
 }
 
 /// Real-time slice of the event loop: fire only work due within the
@@ -1478,7 +1573,7 @@ pub(super) fn pump_bounded(
     mods: &ModStore,
     budget_max: usize,
     dt_ms: f64,
-) -> Vec<(u32, String)> {
+) -> Vec<PendingFetch> {
     let until = st.now_ms + dt_ms.max(0.0);
     let mut budget = budget_max;
     loop {
@@ -1499,6 +1594,7 @@ pub(super) fn pump_bounded(
                         due_ms: st.now_ms + iv.max(0.0),
                         seq: st.timer_seq,
                         interval: Some(iv),
+                        is_raf: false,
                     });
                 }
                 budget -= 1;
@@ -1516,14 +1612,23 @@ pub(super) fn pump_bounded(
     for p in &issued {
         st.awaiting.insert(p.fetch_id, p.promise);
     }
-    issued.into_iter().map(|p| (p.fetch_id, p.url)).collect()
+    issued
 }
 
 /// Host (driver) settles a fetch: fulfill its promise with a Response.
 pub(super) fn resolve_fetch(st: &mut St, fetch_id: u32, status: u16, body: String) {
+    resolve_fetch_full(st, fetch_id, status, String::new(), body);
+}
+
+pub(super) fn resolve_fetch_full(
+    st: &mut St,
+    fetch_id: u32,
+    status: u16,
+    url: String,
+    body: String,
+) {
     if let Some(pid) = st.awaiting.remove(&fetch_id) {
-        // find the url of this fetch for the Response (best-effort)
-        let resp = new_response(st, status, "", body);
+        let resp = new_response(st, status, &url, body);
         promise_settle(st, pid, resp, false);
     }
 }
@@ -1544,7 +1649,8 @@ pub(super) fn has_pending_work(st: &St) -> bool {
     // microtasks, and in-flight fetches are real pending work.
     !st.microtasks.is_empty()
         || st.timers.iter().any(|t| {
-            t.interval.is_none() && t.due_ms <= st.now_ms + SETTLE_HORIZON_MS
+            t.interval.is_none() && !t.is_raf
+                && t.due_ms <= st.now_ms + SETTLE_HORIZON_MS
         })
         || !st.pending_fetches.is_empty()
         || !st.awaiting.is_empty()
@@ -1584,7 +1690,11 @@ fn str_ref(st: &mut St, i: u32) -> &str {
     }
 }
 
-fn raw_get_prop(st: &St, oi: usize, key: u32) -> Option<Value> {
+pub(super) fn raw_get_prop(
+    st: &St,
+    oi: usize,
+    key: u32,
+) -> Option<Value> {
     let mut oi = oi;
     for _ in 0..16 {
         let o = &st.objects[oi];
@@ -1668,7 +1778,7 @@ pub(super) fn to_primitive(
     v: Value,
     number_hint: bool,
 ) -> Result<Value, VmError> {
-    if !v.is_object() {
+    if !v.is_object() && proxy_id_of(st, v).is_none() {
         return Ok(v);
     }
     let order = if number_hint {
@@ -1678,12 +1788,16 @@ pub(super) fn to_primitive(
     };
     for name in order {
         let key = st.intern_name(name);
-        let m = match lookup_prop(st, v.index() as usize, key) {
-            PropHit::Data(f) => f,
-            PropHit::Getter(g) => {
-                call_value_this(st, mods, g, Some(v), &[])?
+        let m = if proxy_id_of(st, v).is_some() {
+            internal_get(st, mods, v, key, v)?
+        } else {
+            match lookup_prop(st, v.index() as usize, key) {
+                PropHit::Data(f) => f,
+                PropHit::Getter(g) => {
+                    call_value_this(st, mods, g, Some(v), &[])?
+                }
+                PropHit::Missing => continue,
             }
-            PropHit::Missing => continue,
         };
         if !m.is_function() {
             continue;
@@ -2482,8 +2596,13 @@ fn method_ref_dispatch(
         }
         "propertyIsEnumerable" => {
             let k = args.first().copied().unwrap_or(Value::UNDEFINED);
+            if !is_js_object(recv) {
+                return Ok(Value::boolean(false));
+            }
+            let (key, _) = property_key(st, mods, k)?;
             Ok(Value::boolean(
-                recv.is_object() && has_own_property(st, mods, recv, k)?,
+                !internal_get_own_descriptor(st, mods, recv, key)?
+                    .is_undefined(),
             ))
         }
         "isPrototypeOf" => {
@@ -2505,8 +2624,13 @@ fn method_ref_dispatch(
         }
         "hasOwnProperty" => {
             let k = args.first().copied().unwrap_or(Value::UNDEFINED);
+            if !is_js_object(recv) {
+                return Ok(Value::boolean(false));
+            }
+            let (key, _) = property_key(st, mods, k)?;
             Ok(Value::boolean(
-                recv.is_object() && has_own_property(st, mods, recv, k)?,
+                !internal_get_own_descriptor(st, mods, recv, key)?
+                    .is_undefined(),
             ))
         }
         // array-iterator protocol (see make_array_iter)
@@ -2783,6 +2907,13 @@ fn fn_static_lookup(st: &St, fidx: u32, key: u32) -> Option<Value> {
 /// rest-args array, and crashed naver's search-autocomplete boot on
 /// `.length of undefined`. Native/bound functions report 0 (unknown arity).
 fn fn_arity(st: &St, mods: &ModStore, func: Value) -> i32 {
+    if let ClosureRec::Proxy(id) = st.closures[func.index() as usize] {
+        if let Some(rec) = st.proxies.get(id as usize) {
+            if rec.target.is_function() {
+                return fn_arity(st, mods, rec.target);
+            }
+        }
+    }
     if let ClosureRec::User { module, proto, .. } =
         &st.closures[func.index() as usize]
     {
@@ -2794,6 +2925,13 @@ fn fn_arity(st: &St, mods: &ModStore, func: Value) -> i32 {
 
 /// A function's `.name` (empty for native/bound functions).
 fn fn_name(st: &St, mods: &ModStore, func: Value) -> String {
+    if let ClosureRec::Proxy(id) = st.closures[func.index() as usize] {
+        if let Some(rec) = st.proxies.get(id as usize) {
+            if rec.target.is_function() {
+                return fn_name(st, mods, rec.target);
+            }
+        }
+    }
     if let ClosureRec::User { module, proto, .. } =
         &st.closures[func.index() as usize]
     {
@@ -3120,6 +3258,15 @@ fn primitive_prop_read(st: &mut St, recv: Value, key: u32) -> Value {
 
 /// Object.prototype.toString brand of a value ("[object Array]" ...).
 fn brand_string(st: &St, v: Value) -> String {
+    let mut v = v;
+    for _ in 0..16 {
+        let Some(id) = proxy_id_of(st, v) else { break };
+        let Some(rec) = st.proxies.get(id as usize) else { break };
+        if rec.revoked {
+            break;
+        }
+        v = rec.target;
+    }
     let tag = if v.is_object() {
         let o = &st.objects[v.index() as usize];
         if o.is_array {
@@ -3269,6 +3416,9 @@ fn delete_property(st: &mut St, obj: Value, key: Value) -> bool {
     let Some(&key_id) = st.name_ids.get(&name) else {
         return true;
     };
+    st.accessors.remove(&(oi as u32, key_id));
+    st.objects[oi].has_accessors = st.accessors.keys()
+        .any(|&(owner, _)| owner == oi as u32);
     let shape = st.objects[oi].shape as usize;
     if !st.shapes[shape].props.contains_key(&key_id) {
         return true;
@@ -3292,10 +3442,854 @@ fn delete_property(st: &mut St, obj: Value, key: Value) -> bool {
     true
 }
 
+fn proxy_id_of(st: &St, value: Value) -> Option<u32> {
+    if value.is_object() {
+        return st.object_proxies.get(&value.index()).copied();
+    }
+    if value.is_function() {
+        if let ClosureRec::Proxy(id) = st.closures[value.index() as usize] {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn proxy_rec(st: &St, id: u32) -> Result<ProxyRec, VmError> {
+    let rec = st.proxies.get(id as usize).copied()
+        .ok_or_else(|| VmError {
+            msg: "invalid Proxy record".to_string(),
+            value: None,
+            kind: "TypeError",
+        })?;
+    if rec.revoked {
+        return type_err("Cannot perform operation on a revoked Proxy");
+    }
+    Ok(rec)
+}
+
+fn is_js_object(value: Value) -> bool {
+    value.is_object() || value.is_function() || value.is_dom_node()
+}
+
+fn new_proxy(
+    st: &mut St,
+    target: Value,
+    handler: Value,
+) -> Result<Value, VmError> {
+    if !is_js_object(target) {
+        return type_err("Proxy target must be an object");
+    }
+    if !is_js_object(handler) {
+        return type_err("Proxy handler must be an object");
+    }
+    let id = st.proxies.len() as u32;
+    st.proxies.push(ProxyRec { target, handler, revoked: false });
+    if target.is_function() {
+        st.closures.push(ClosureRec::Proxy(id));
+        Ok(Value::function((st.closures.len() - 1) as u32))
+    } else {
+        let out = new_plain_object(st);
+        st.object_proxies.insert(out.index(), id);
+        Ok(out)
+    }
+}
+
+fn key_value(st: &mut St, key: u32) -> Value {
+    let name = st.names[key as usize].clone();
+    intern(st, &name)
+}
+
+fn property_key(
+    st: &mut St,
+    mods: &ModStore,
+    key: Value,
+) -> Result<(u32, Value), VmError> {
+    let primitive = if key.is_object() {
+        to_primitive(st, mods, key, false)?
+    } else {
+        key
+    };
+    let text = to_display(st, primitive);
+    let id = st.intern_name(&text);
+    Ok((id, intern(st, &text)))
+}
+
+/// Ordinary [[Get]] plus the Proxy dispatch shared by bytecode property
+/// reads and Reflect.get. `receiver` is the value passed to accessors.
+fn internal_get(
+    st: &mut St,
+    mods: &ModStore,
+    target: Value,
+    key: u32,
+    receiver: Value,
+) -> Result<Value, VmError> {
+    if let Some(id) = proxy_id_of(st, target) {
+        let rec = proxy_rec(st, id)?;
+        let trap_key = st.intern_name("get");
+        let trap = internal_get(st, mods, rec.handler, trap_key, rec.handler)?;
+        if trap.is_undefined() {
+            return internal_get(st, mods, rec.target, key, receiver);
+        }
+        if !trap.is_function() {
+            return type_err("Proxy get trap is not callable");
+        }
+        let prop = key_value(st, key);
+        return call_value_this(
+            st, mods, trap, Some(rec.handler),
+            &[rec.target, prop, receiver],
+        );
+    }
+    if target.is_object() {
+        let oi = target.index() as usize;
+        let name = st.names[key as usize].clone();
+        if let Some(&node) = st.style_nodes.get(&target.index()) {
+            let doc = need_doc(st)?;
+            let cur = doc.borrow().nodes[node as usize]
+                .attr("style").unwrap_or("").to_string();
+            let out = if name == "cssText" {
+                cur
+            } else {
+                style_attr_get(&cur, &camel_to_kebab(&name))
+            };
+            return Ok(push_str(st, out));
+        }
+        if let Some(&node) = st.dataset_nodes.get(&target.index()) {
+            let attr = format!("data-{}", camel_to_kebab(&name));
+            let doc = need_doc(st)?;
+            let out = doc.borrow().nodes[node as usize]
+                .attr(&attr).map(str::to_string);
+            return Ok(match out {
+                Some(s) => push_str(st, s),
+                None => Value::UNDEFINED,
+            });
+        }
+        if name == "length" && st.objects[oi].is_array {
+            return Ok(Value::int(st.objects[oi].elems.len() as i32));
+        }
+        if let Ok(index) = name.parse::<usize>() {
+            if let Some(&value) = st.objects[oi].elems.get(index) {
+                if !value.is_undefined() {
+                    return Ok(value);
+                }
+            }
+        }
+        match lookup_prop(st, oi, key) {
+            PropHit::Data(value) => return Ok(value),
+            PropHit::Getter(getter) if getter.is_function() => {
+                return call_value_this(
+                    st, mods, getter, Some(receiver), &[],
+                );
+            }
+            PropHit::Getter(_) => return Ok(Value::UNDEFINED),
+            PropHit::Missing => {}
+        }
+        if st.objects[oi].is_array {
+            if let PropHit::Data(value) = array_proto_hit(st, key) {
+                return Ok(value);
+            }
+            if matches!(
+                name.as_str(),
+                "slice" | "concat" | "join" | "indexOf" | "push"
+                    | "pop" | "map" | "filter" | "forEach" | "sort"
+                    | "splice" | "shift" | "unshift" | "reverse"
+                    | "some" | "every" | "reduce" | "lastIndexOf"
+                    | "at" | "flat" | "flatMap" | "findLast"
+                    | "findLastIndex" | "keys" | "values" | "entries"
+            ) {
+                return Ok(make_native(st, Native::MethodRef(key)));
+            }
+        }
+        if st.objects[oi].regex != REGEX_NONE
+            && matches!(name.as_str(), "exec" | "test")
+        {
+            return Ok(make_native(st, Native::MethodRef(key)));
+        }
+        if matches!(
+            name.as_str(),
+            "hasOwnProperty" | "valueOf" | "propertyIsEnumerable"
+                | "isPrototypeOf"
+        ) {
+            return Ok(make_native(st, Native::MethodRef(key)));
+        }
+        if name == "toString" {
+            return Ok(if st.objects[oi].is_array {
+                make_native(st, Native::MethodRef(key))
+            } else {
+                make_native(st, Native::BrandToString)
+            });
+        }
+        if target == st.known.window && st.gdef[key as usize] {
+            return Ok(st.globals[key as usize]);
+        }
+        return Ok(Value::UNDEFINED);
+    }
+    if target.is_function() {
+        let name = st.names[key as usize].clone();
+        return Ok(if key == st.ids.prototype {
+            fn_prototype(st, target)
+        } else if let Some(value) = fn_static_lookup(st, target.index(), key) {
+            value
+        } else if key == st.ids.length {
+            Value::int(fn_arity(st, mods, target))
+        } else if name == "name" {
+            let name = fn_name(st, mods, target);
+            make_string(st, name)
+        } else if matches!(
+            name.as_str(), "call" | "apply" | "bind" | "toString" | "valueOf"
+        ) {
+            make_native(st, Native::MethodRef(key))
+        } else {
+            Value::UNDEFINED
+        });
+    }
+    if target.is_dom_node() {
+        return dom_get_prop(st, key, target.index());
+    }
+    type_err("Reflect target must be an object")
+}
+
+fn internal_set(
+    st: &mut St,
+    mods: &ModStore,
+    target: Value,
+    key: u32,
+    value: Value,
+    receiver: Value,
+) -> Result<bool, VmError> {
+    if let Some(id) = proxy_id_of(st, target) {
+        let rec = proxy_rec(st, id)?;
+        let trap_key = st.intern_name("set");
+        let trap = internal_get(st, mods, rec.handler, trap_key, rec.handler)?;
+        if trap.is_undefined() {
+            return internal_set(st, mods, rec.target, key, value, receiver);
+        }
+        if !trap.is_function() {
+            return type_err("Proxy set trap is not callable");
+        }
+        let prop = key_value(st, key);
+        let result = call_value_this(
+            st, mods, trap, Some(rec.handler),
+            &[rec.target, prop, value, receiver],
+        )?;
+        return Ok(truthy(st, result));
+    }
+    if target.is_dom_node() {
+        dom_set_prop(st, key, target.index(), value)?;
+        return Ok(true);
+    }
+    if target.is_function() {
+        if key == st.ids.prototype {
+            st.fn_protos.insert(target.index(), value);
+            return Ok(true);
+        }
+        let exists = st.fn_props.contains_key(&(target.index(), key));
+        if !exists && st.non_extensible_functions.contains(&target.index()) {
+            return Ok(false);
+        }
+        st.fn_props.insert((target.index(), key), value);
+        return Ok(true);
+    }
+    if !target.is_object() {
+        return type_err("Reflect target must be an object");
+    }
+    let oi = target.index() as usize;
+    let name = st.names[key as usize].clone();
+    if let Some(&node) = st.style_nodes.get(&target.index()) {
+        let val = to_display(st, value);
+        let doc = need_doc(st)?;
+        if name == "cssText" {
+            doc.borrow_mut().set_attr(node as usize, "style", &val);
+        } else {
+            let prop = camel_to_kebab(&name);
+            let cur = doc.borrow().nodes[node as usize]
+                .attr("style").unwrap_or("").to_string();
+            let next = style_attr_set(&cur, &prop, &val);
+            doc.borrow_mut().set_attr(node as usize, "style", &next);
+        }
+        return Ok(true);
+    }
+    if let Some(&node) = st.dataset_nodes.get(&target.index()) {
+        let val = to_display(st, value);
+        let attr = format!("data-{}", camel_to_kebab(&name));
+        need_doc(st)?.borrow_mut().set_attr(node as usize, &attr, &val);
+        return Ok(true);
+    }
+    if st.objects[oi].is_array && name == "length" {
+        let len = to_number(st, mods, value)?;
+        if len < 0.0 || len.fract() != 0.0 {
+            return err("invalid array length");
+        }
+        st.objects[oi].elems.resize(len as usize, Value::UNDEFINED);
+        return Ok(true);
+    }
+    if let Ok(index) = name.parse::<usize>() {
+        if index >= st.objects[oi].elems.len()
+            && st.non_extensible_objects.contains(&target.index())
+        {
+            return Ok(false);
+        }
+        let elems = &mut st.objects[oi].elems;
+        if index >= elems.len() {
+            elems.resize(index, Value::UNDEFINED);
+            elems.push(value);
+        } else {
+            elems[index] = value;
+        }
+        return Ok(true);
+    }
+    if let Some(setter) = lookup_setter(st, oi, key) {
+        call_value_this(st, mods, setter, Some(receiver), &[value])?;
+        return Ok(true);
+    }
+    let own = st.shapes[st.objects[oi].shape as usize]
+        .props.contains_key(&key);
+    if !own && st.non_extensible_objects.contains(&target.index()) {
+        return Ok(false);
+    }
+    if target == st.known.window {
+        st.globals[key as usize] = value;
+        st.gdef[key as usize] = true;
+    }
+    raw_set_prop(st, oi, key, value);
+    Ok(true)
+}
+
+fn internal_has(
+    st: &mut St,
+    mods: &ModStore,
+    target: Value,
+    key: u32,
+) -> Result<bool, VmError> {
+    if let Some(id) = proxy_id_of(st, target) {
+        let rec = proxy_rec(st, id)?;
+        let trap_key = st.intern_name("has");
+        let trap = internal_get(st, mods, rec.handler, trap_key, rec.handler)?;
+        if trap.is_undefined() {
+            return internal_has(st, mods, rec.target, key);
+        }
+        if !trap.is_function() {
+            return type_err("Proxy has trap is not callable");
+        }
+        let prop = key_value(st, key);
+        let result = call_value_this(
+            st, mods, trap, Some(rec.handler), &[rec.target, prop],
+        )?;
+        let reported = truthy(st, result);
+        if !reported {
+            let actual = ordinary_get_own_descriptor(st, rec.target, key)?;
+            if !actual.is_undefined()
+                && (!internal_is_extensible(st, rec.target)
+                    || !descriptor_flag(st, actual, "configurable"))
+            {
+                return type_err("Proxy has trap cannot hide a required target property");
+            }
+        }
+        return Ok(reported);
+    }
+    if target.is_function() {
+        let name = st.names[key as usize].as_str();
+        return Ok(matches!(name, "prototype" | "call" | "apply" | "bind"
+            | "length" | "name")
+            || fn_static_lookup(st, target.index(), key).is_some());
+    }
+    if target.is_dom_node() {
+        return Ok(!dom_get_prop(st, key, target.index())?.is_undefined());
+    }
+    if !target.is_object() {
+        return type_err("'in' right-hand side is not an object");
+    }
+    let oi = target.index() as usize;
+    let name = st.names[key as usize].clone();
+    if st.style_nodes.contains_key(&target.index()) {
+        return Ok(name.chars().next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic()));
+    }
+    if st.objects[oi].is_array && name == "length" {
+        return Ok(true);
+    }
+    if let Ok(index) = name.parse::<usize>() {
+        return Ok(st.objects[oi].elems.get(index)
+            .is_some_and(|value| !value.is_undefined()));
+    }
+    Ok(!matches!(lookup_prop(st, oi, key), PropHit::Missing))
+}
+
+fn internal_delete(
+    st: &mut St,
+    mods: &ModStore,
+    target: Value,
+    key: u32,
+) -> Result<bool, VmError> {
+    if let Some(id) = proxy_id_of(st, target) {
+        let rec = proxy_rec(st, id)?;
+        let trap_key = st.intern_name("deleteProperty");
+        let trap = internal_get(st, mods, rec.handler, trap_key, rec.handler)?;
+        if trap.is_undefined() {
+            return internal_delete(st, mods, rec.target, key);
+        }
+        if !trap.is_function() {
+            return type_err("Proxy deleteProperty trap is not callable");
+        }
+        let prop = key_value(st, key);
+        let result = call_value_this(
+            st, mods, trap, Some(rec.handler), &[rec.target, prop],
+        )?;
+        let accepted = truthy(st, result);
+        if accepted {
+            let actual = ordinary_get_own_descriptor(st, rec.target, key)?;
+            if !actual.is_undefined()
+                && !descriptor_flag(st, actual, "configurable")
+            {
+                return type_err("Proxy cannot delete a non-configurable property");
+            }
+        }
+        return Ok(accepted);
+    }
+    if target.is_function() {
+        st.fn_props.remove(&(target.index(), key));
+        return Ok(true);
+    }
+    if !target.is_object() {
+        return Ok(false);
+    }
+    let prop = key_value(st, key);
+    Ok(delete_property(st, target, prop))
+}
+
+fn ordinary_own_keys(st: &mut St, target: Value) -> Result<Vec<Value>, VmError> {
+    if target.is_function() {
+        let mut ids: Vec<u32> = st.fn_props.keys()
+            .filter(|&&(owner, _)| owner == target.index())
+            .map(|&(_, key)| key)
+            .collect();
+        if st.fn_protos.contains_key(&target.index()) {
+            ids.push(st.ids.prototype);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        return Ok(ids.into_iter().map(|key| key_value(st, key)).collect());
+    }
+    if !target.is_object() {
+        return type_err("Reflect target must be an object");
+    }
+    let oi = target.index() as usize;
+    let mut out = Vec::new();
+    for index in 0..st.objects[oi].elems.len() {
+        if !st.objects[oi].elems[index].is_undefined() {
+            out.push(intern(st, &index.to_string()));
+        }
+    }
+    let shape = st.objects[oi].shape;
+    let mut props: Vec<(u16, u32)> = st.shapes[shape as usize].props
+        .iter().map(|(&key, &slot)| (slot, key)).collect();
+    props.sort_by_key(|&(slot, _)| slot);
+    let mut seen = HashSet::new();
+    for (_, key) in props {
+        seen.insert(key);
+        out.push(key_value(st, key));
+    }
+    if st.objects[oi].has_accessors {
+        let mut accessors: Vec<u32> = st.accessors.keys()
+            .filter(|&&(owner, key)| owner == target.index() && !seen.contains(&key))
+            .map(|&(_, key)| key).collect();
+        accessors.sort_unstable();
+        for key in accessors {
+            out.push(key_value(st, key));
+        }
+    }
+    if st.objects[oi].is_array {
+        out.push(intern(st, "length"));
+    }
+    Ok(out)
+}
+
+fn internal_own_keys(
+    st: &mut St,
+    mods: &ModStore,
+    target: Value,
+) -> Result<Vec<Value>, VmError> {
+    let Some(id) = proxy_id_of(st, target) else {
+        return ordinary_own_keys(st, target);
+    };
+    let rec = proxy_rec(st, id)?;
+    let trap_key = st.intern_name("ownKeys");
+    let trap = internal_get(st, mods, rec.handler, trap_key, rec.handler)?;
+    if trap.is_undefined() {
+        return internal_own_keys(st, mods, rec.target);
+    }
+    if !trap.is_function() {
+        return type_err("Proxy ownKeys trap is not callable");
+    }
+    let result = call_value_this(
+        st, mods, trap, Some(rec.handler), &[rec.target],
+    )?;
+    if !result.is_object() || !st.objects[result.index() as usize].is_array {
+        return type_err("Proxy ownKeys trap must return an array");
+    }
+    let keys = st.objects[result.index() as usize].elems.clone();
+    let mut names = HashSet::new();
+    for &key in &keys {
+        if !key.is_string() {
+            return type_err("Proxy ownKeys result contains a non-string key");
+        }
+        let name = to_display(st, key);
+        if !names.insert(name) {
+            return type_err("Proxy ownKeys result contains duplicate keys");
+        }
+    }
+    // This VM currently has one non-configurable ordinary key: array
+    // length. It must be present even while the target is extensible.
+    if rec.target.is_object()
+        && st.objects[rec.target.index() as usize].is_array
+        && !names.contains("length")
+    {
+        return type_err("Proxy ownKeys trap omitted non-configurable 'length'");
+    }
+    if !internal_is_extensible(st, rec.target) {
+        let target_keys = ordinary_own_keys(st, rec.target)?;
+        let target_names: HashSet<String> = target_keys.into_iter()
+            .map(|key| to_display(st, key)).collect();
+        if target_names != names {
+            return type_err(
+                "Proxy ownKeys trap omitted or added keys on a non-extensible target",
+            );
+        }
+    }
+    Ok(keys)
+}
+
+fn descriptor_object(
+    st: &mut St,
+    value: Value,
+    writable: bool,
+    enumerable: bool,
+    configurable: bool,
+) -> Value {
+    let out = new_plain_object(st);
+    let oi = out.index() as usize;
+    for (name, val) in [
+        ("value", value),
+        ("writable", Value::boolean(writable)),
+        ("enumerable", Value::boolean(enumerable)),
+        ("configurable", Value::boolean(configurable)),
+    ] {
+        let key = st.intern_name(name);
+        raw_set_prop(st, oi, key, val);
+    }
+    out
+}
+
+fn descriptor_flag(st: &St, descriptor: Value, name: &str) -> bool {
+    if !descriptor.is_object() {
+        return false;
+    }
+    let Some(&key) = st.name_ids.get(name) else {
+        return false;
+    };
+    raw_get_prop(st, descriptor.index() as usize, key)
+        .is_some_and(|value| truthy(st, value))
+}
+
+fn ordinary_get_own_descriptor(
+    st: &mut St,
+    target: Value,
+    key: u32,
+) -> Result<Value, VmError> {
+    if target.is_function() {
+        let value = if key == st.ids.prototype {
+            st.fn_protos.get(&target.index()).copied()
+        } else {
+            st.fn_props.get(&(target.index(), key)).copied()
+        };
+        return Ok(value.map(|v| descriptor_object(st, v, true, true, true))
+            .unwrap_or(Value::UNDEFINED));
+    }
+    if !target.is_object() {
+        return type_err("Reflect target must be an object");
+    }
+    let oi = target.index() as usize;
+    let name = st.names[key as usize].clone();
+    if st.objects[oi].is_array && name == "length" {
+        return Ok(descriptor_object(
+            st, Value::int(st.objects[oi].elems.len() as i32),
+            true, false, false,
+        ));
+    }
+    if let Ok(index) = name.parse::<usize>() {
+        if let Some(&value) = st.objects[oi].elems.get(index) {
+            if !value.is_undefined() {
+                return Ok(descriptor_object(st, value, true, true, true));
+            }
+        }
+        return Ok(Value::UNDEFINED);
+    }
+    if let Some(&(get, set)) = st.accessors.get(&(target.index(), key)) {
+        let out = new_plain_object(st);
+        let di = out.index() as usize;
+        for (name, value) in [
+            ("get", get), ("set", set),
+            ("enumerable", Value::TRUE),
+            ("configurable", Value::TRUE),
+        ] {
+            let id = st.intern_name(name);
+            raw_set_prop(st, di, id, value);
+        }
+        return Ok(out);
+    }
+    let object = &st.objects[oi];
+    let value = st.shapes[object.shape as usize].props.get(&key)
+        .map(|&slot| object.slots[slot as usize]);
+    Ok(value.map(|v| descriptor_object(st, v, true, true, true))
+        .unwrap_or(Value::UNDEFINED))
+}
+
+fn internal_get_own_descriptor(
+    st: &mut St,
+    mods: &ModStore,
+    target: Value,
+    key: u32,
+) -> Result<Value, VmError> {
+    let Some(id) = proxy_id_of(st, target) else {
+        return ordinary_get_own_descriptor(st, target, key);
+    };
+    let rec = proxy_rec(st, id)?;
+    let trap_key = st.intern_name("getOwnPropertyDescriptor");
+    let trap = internal_get(st, mods, rec.handler, trap_key, rec.handler)?;
+    if trap.is_undefined() {
+        return internal_get_own_descriptor(st, mods, rec.target, key);
+    }
+    if !trap.is_function() {
+        return type_err("Proxy getOwnPropertyDescriptor trap is not callable");
+    }
+    let prop = key_value(st, key);
+    let result = call_value_this(
+        st, mods, trap, Some(rec.handler), &[rec.target, prop],
+    )?;
+    if !result.is_undefined() && !result.is_object() {
+        return type_err("Proxy descriptor trap must return an object or undefined");
+    }
+    if !internal_is_extensible(st, rec.target) {
+        let actual = ordinary_get_own_descriptor(st, rec.target, key)?;
+        if result.is_undefined() != actual.is_undefined() {
+            return type_err("Proxy descriptor trap violated a non-extensible target");
+        }
+    }
+    let actual = ordinary_get_own_descriptor(st, rec.target, key)?;
+    if result.is_undefined() && !actual.is_undefined()
+        && !descriptor_flag(st, actual, "configurable")
+    {
+        return type_err("Proxy descriptor trap hid a non-configurable property");
+    }
+    Ok(result)
+}
+
+fn ordinary_define_property(
+    st: &mut St,
+    target: Value,
+    key: u32,
+    desc: Value,
+) -> Result<bool, VmError> {
+    if !is_js_object(target) || target.is_dom_node() {
+        return type_err("defineProperty needs an object");
+    }
+    let exists = !ordinary_get_own_descriptor(st, target, key)?.is_undefined();
+    if !exists && !internal_is_extensible(st, target) {
+        return Ok(false);
+    }
+    define_one_prop(st, target, key, desc)?;
+    Ok(true)
+}
+
+fn internal_define_property(
+    st: &mut St,
+    mods: &ModStore,
+    target: Value,
+    key: u32,
+    desc: Value,
+) -> Result<bool, VmError> {
+    let Some(id) = proxy_id_of(st, target) else {
+        return ordinary_define_property(st, target, key, desc);
+    };
+    let rec = proxy_rec(st, id)?;
+    let trap_key = st.intern_name("defineProperty");
+    let trap = internal_get(st, mods, rec.handler, trap_key, rec.handler)?;
+    if trap.is_undefined() {
+        return internal_define_property(st, mods, rec.target, key, desc);
+    }
+    if !trap.is_function() {
+        return type_err("Proxy defineProperty trap is not callable");
+    }
+    let prop = key_value(st, key);
+    let result = call_value_this(
+        st, mods, trap, Some(rec.handler), &[rec.target, prop, desc],
+    )?;
+    let accepted = truthy(st, result);
+    if accepted && !internal_is_extensible(st, rec.target)
+        && ordinary_get_own_descriptor(st, rec.target, key)?.is_undefined()
+    {
+        return type_err("Proxy cannot define a new property on a non-extensible target");
+    }
+    Ok(accepted)
+}
+
+fn internal_get_proto(
+    st: &mut St,
+    mods: &ModStore,
+    target: Value,
+) -> Result<Value, VmError> {
+    if let Some(id) = proxy_id_of(st, target) {
+        let rec = proxy_rec(st, id)?;
+        let trap_key = st.intern_name("getPrototypeOf");
+        let trap = internal_get(st, mods, rec.handler, trap_key, rec.handler)?;
+        if trap.is_undefined() {
+            return internal_get_proto(st, mods, rec.target);
+        }
+        if !trap.is_function() {
+            return type_err("Proxy getPrototypeOf trap is not callable");
+        }
+        let result = call_value_this(
+            st, mods, trap, Some(rec.handler), &[rec.target],
+        )?;
+        if !result.is_object() && !result.is_null() {
+            return type_err("Proxy getPrototypeOf trap must return an object or null");
+        }
+        if !internal_is_extensible(st, rec.target) {
+            let actual = internal_get_proto(st, mods, rec.target)?;
+            if result != actual {
+                return type_err("Proxy getPrototypeOf trap violated a non-extensible target");
+            }
+        }
+        return Ok(result);
+    }
+    if target.is_object() {
+        let proto = st.objects[target.index() as usize].proto;
+        if proto.is_object() {
+            return Ok(proto);
+        }
+        if st.known.object.is_function() {
+            let object_proto = fn_prototype(st, st.known.object);
+            return Ok(if target == object_proto { Value::NULL } else { object_proto });
+        }
+        return Ok(Value::NULL);
+    }
+    if target.is_function() {
+        return Ok(st.fn_proto_chain.get(&target.index()).copied()
+            .unwrap_or_else(|| fn_prototype(st, st.known.function)));
+    }
+    type_err("Reflect target must be an object")
+}
+
+fn internal_set_proto(
+    st: &mut St,
+    mods: &ModStore,
+    target: Value,
+    proto: Value,
+) -> Result<bool, VmError> {
+    if !proto.is_object() && !proto.is_null() {
+        return type_err("prototype must be an object or null");
+    }
+    if let Some(id) = proxy_id_of(st, target) {
+        let rec = proxy_rec(st, id)?;
+        let trap_key = st.intern_name("setPrototypeOf");
+        let trap = internal_get(st, mods, rec.handler, trap_key, rec.handler)?;
+        if trap.is_undefined() {
+            return internal_set_proto(st, mods, rec.target, proto);
+        }
+        if !trap.is_function() {
+            return type_err("Proxy setPrototypeOf trap is not callable");
+        }
+        let result = call_value_this(
+            st, mods, trap, Some(rec.handler), &[rec.target, proto],
+        )?;
+        let accepted = truthy(st, result);
+        if accepted && !internal_is_extensible(st, rec.target) {
+            let actual = internal_get_proto(st, mods, rec.target)?;
+            if actual != proto {
+                return type_err("Proxy setPrototypeOf trap violated a non-extensible target");
+            }
+        }
+        return Ok(accepted);
+    }
+    if !internal_is_extensible(st, target) {
+        return Ok(internal_get_proto(st, mods, target)? == proto);
+    }
+    if target.is_object() {
+        st.objects[target.index() as usize].proto =
+            if proto.is_null() { Value::UNDEFINED } else { proto };
+        return Ok(true);
+    }
+    if target.is_function() {
+        st.fn_proto_chain.insert(target.index(), proto);
+        return Ok(true);
+    }
+    type_err("Reflect target must be an object")
+}
+
+fn internal_is_extensible(st: &St, target: Value) -> bool {
+    if let Some(id) = proxy_id_of(st, target) {
+        return st.proxies.get(id as usize)
+            .is_some_and(|rec| !rec.revoked && internal_is_extensible(st, rec.target));
+    }
+    if target.is_object() {
+        !st.non_extensible_objects.contains(&target.index())
+    } else if target.is_function() {
+        !st.non_extensible_functions.contains(&target.index())
+    } else {
+        false
+    }
+}
+
+fn internal_prevent_extensions(
+    st: &mut St,
+    mods: &ModStore,
+    target: Value,
+) -> Result<bool, VmError> {
+    if let Some(id) = proxy_id_of(st, target) {
+        let rec = proxy_rec(st, id)?;
+        let trap_key = st.intern_name("preventExtensions");
+        let trap = internal_get(st, mods, rec.handler, trap_key, rec.handler)?;
+        if trap.is_undefined() {
+            return internal_prevent_extensions(st, mods, rec.target);
+        }
+        if !trap.is_function() {
+            return type_err("Proxy preventExtensions trap is not callable");
+        }
+        let result = call_value_this(
+            st, mods, trap, Some(rec.handler), &[rec.target],
+        )?;
+        let accepted = truthy(st, result);
+        if accepted && internal_is_extensible(st, rec.target) {
+            return type_err("Proxy preventExtensions trap returned true for an extensible target");
+        }
+        return Ok(accepted);
+    }
+    if target.is_object() {
+        st.non_extensible_objects.insert(target.index());
+        return Ok(true);
+    }
+    if target.is_function() {
+        st.non_extensible_functions.insert(target.index());
+        return Ok(true);
+    }
+    type_err("Reflect target must be an object")
+}
+
 /// `x instanceof Ctor` — built-ins matched by constructor identity.
 /// User functions yield false: `new` is lowered to a plain object +
 /// `Ctor.call`, so instances carry no link back to their constructor.
 fn instance_of(st: &St, x: Value, ctor: Value) -> Result<bool, VmError> {
+    let mut ctor = ctor;
+    for _ in 0..16 {
+        let Some(id) = proxy_id_of(st, ctor) else { break };
+        let rec = proxy_rec(st, id)?;
+        ctor = rec.target;
+    }
+    let mut x = x;
+    for _ in 0..16 {
+        let Some(id) = proxy_id_of(st, x) else { break };
+        let rec = proxy_rec(st, id)?;
+        x = rec.target;
+    }
     let k = &st.known;
     if ctor == k.array {
         return Ok(x.is_object()
@@ -3412,6 +4406,212 @@ fn concat(st: &mut St, x: Value, y: Value) -> Value {
     Value::string((st.strs.len() - 1) as u32)
 }
 
+fn proxy_call(
+    st: &mut St,
+    mods: &ModStore,
+    id: u32,
+    this_value: Value,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    let rec = proxy_rec(st, id)?;
+    if !rec.target.is_function() {
+        return type_err("Proxy target is not callable");
+    }
+    let trap_key = st.intern_name("apply");
+    let trap = internal_get(st, mods, rec.handler, trap_key, rec.handler)?;
+    if trap.is_undefined() {
+        return call_value_this(st, mods, rec.target, Some(this_value), args);
+    }
+    if !trap.is_function() {
+        return type_err("Proxy apply trap is not callable");
+    }
+    let list = new_array(st, args.to_vec());
+    call_value_this(
+        st, mods, trap, Some(rec.handler),
+        &[rec.target, this_value, list],
+    )
+}
+
+fn construct_value(
+    st: &mut St,
+    mods: &ModStore,
+    ctor: Value,
+    args: &[Value],
+    new_target: Value,
+) -> Result<Value, VmError> {
+    if !ctor.is_function() {
+        return type_err("value is not a constructor");
+    }
+    let closure_index = ctor.index() as usize;
+    if let ClosureRec::Bound { target, bound, .. } = &st.closures[closure_index] {
+        let target = *target;
+        let mut full = bound.clone();
+        full.extend_from_slice(args);
+        let effective_new_target = if new_target == ctor {
+            target
+        } else {
+            new_target
+        };
+        return construct_value(
+            st, mods, target, &full, effective_new_target,
+        );
+    }
+    if let ClosureRec::Proxy(id) = st.closures[closure_index] {
+        let rec = proxy_rec(st, id)?;
+        if !rec.target.is_function() {
+            return type_err("Proxy target is not a constructor");
+        }
+        let trap_key = st.intern_name("construct");
+        let trap = internal_get(st, mods, rec.handler, trap_key, rec.handler)?;
+        if trap.is_undefined() {
+            return construct_value(st, mods, rec.target, args, new_target);
+        }
+        if !trap.is_function() {
+            return type_err("Proxy construct trap is not callable");
+        }
+        let list = new_array(st, args.to_vec());
+        let result = call_value_this(
+            st, mods, trap, Some(rec.handler),
+            &[rec.target, list, new_target],
+        )?;
+        if !is_js_object(result) {
+            return type_err("Proxy construct trap must return an object");
+        }
+        return Ok(result);
+    }
+
+    let instance = new_plain_object(st);
+    let proto_ctor = if new_target.is_function() { new_target } else { ctor };
+    let proto_key = st.ids.prototype;
+    let proto = internal_get(st, mods, proto_ctor, proto_key, proto_ctor)?;
+    if proto.is_object() {
+        st.objects[instance.index() as usize].proto = proto;
+    } else if st.known.object.is_function() {
+        st.objects[instance.index() as usize].proto =
+            fn_prototype(st, st.known.object);
+    }
+    let result = call_value_this(st, mods, ctor, Some(instance), args)?;
+    Ok(if is_js_object(result) { result } else { instance })
+}
+
+fn reflect_op(
+    st: &mut St,
+    mods: &ModStore,
+    op: u8,
+    args_base: usize,
+    argc: u8,
+) -> Result<Value, VmError> {
+    use reflect::*;
+    let arg = |st: &St, index: usize| {
+        if index < argc as usize {
+            st.regs[args_base + index]
+        } else {
+            Value::UNDEFINED
+        }
+    };
+    let target = arg(st, 0);
+    match op {
+        APPLY => {
+            if !target.is_function() {
+                return type_err("Reflect.apply target is not callable");
+            }
+            let this_value = arg(st, 1);
+            let list = arg(st, 2);
+            if !list.is_object() || !st.objects[list.index() as usize].is_array {
+                return type_err("Reflect.apply argumentsList must be an array");
+            }
+            let args = st.objects[list.index() as usize].elems.clone();
+            call_value_this(st, mods, target, Some(this_value), &args)
+        }
+        CONSTRUCT => {
+            let list = arg(st, 1);
+            if !list.is_object() || !st.objects[list.index() as usize].is_array {
+                return type_err("Reflect.construct argumentsList must be an array");
+            }
+            let args = st.objects[list.index() as usize].elems.clone();
+            let new_target = if argc > 2 { arg(st, 2) } else { target };
+            if !new_target.is_function() {
+                return type_err("Reflect.construct newTarget is not a constructor");
+            }
+            construct_value(st, mods, target, &args, new_target)
+        }
+        DEFINE_PROPERTY => {
+            let key_arg = arg(st, 1);
+            let (key, _) = property_key(st, mods, key_arg)?;
+            let desc = arg(st, 2);
+            Ok(Value::boolean(internal_define_property(
+                st, mods, target, key, desc,
+            )?))
+        }
+        DELETE_PROPERTY => {
+            let key_arg = arg(st, 1);
+            let (key, _) = property_key(st, mods, key_arg)?;
+            Ok(Value::boolean(internal_delete(st, mods, target, key)?))
+        }
+        GET => {
+            let key_arg = arg(st, 1);
+            let receiver = if argc > 2 { arg(st, 2) } else { target };
+            let (key, _) = property_key(st, mods, key_arg)?;
+            internal_get(st, mods, target, key, receiver)
+        }
+        GET_OWN_PROPERTY_DESCRIPTOR => {
+            let key_arg = arg(st, 1);
+            let (key, _) = property_key(st, mods, key_arg)?;
+            internal_get_own_descriptor(st, mods, target, key)
+        }
+        GET_PROTOTYPE_OF => internal_get_proto(st, mods, target),
+        HAS => {
+            let key_arg = arg(st, 1);
+            let (key, _) = property_key(st, mods, key_arg)?;
+            Ok(Value::boolean(internal_has(st, mods, target, key)?))
+        }
+        IS_EXTENSIBLE => {
+            if let Some(id) = proxy_id_of(st, target) {
+                let rec = proxy_rec(st, id)?;
+                let trap_key = st.intern_name("isExtensible");
+                let trap = internal_get(st, mods, rec.handler, trap_key, rec.handler)?;
+                if !trap.is_undefined() {
+                    if !trap.is_function() {
+                        return type_err("Proxy isExtensible trap is not callable");
+                    }
+                    let result = call_value_this(
+                        st, mods, trap, Some(rec.handler), &[rec.target],
+                    )?;
+                    let reported = truthy(st, result);
+                    if reported != internal_is_extensible(st, rec.target) {
+                        return type_err("Proxy isExtensible trap violated its target");
+                    }
+                    return Ok(Value::boolean(reported));
+                }
+            }
+            if !is_js_object(target) {
+                return type_err("Reflect target must be an object");
+            }
+            Ok(Value::boolean(internal_is_extensible(st, target)))
+        }
+        OWN_KEYS => {
+            let keys = internal_own_keys(st, mods, target)?;
+            Ok(new_array(st, keys))
+        }
+        PREVENT_EXTENSIONS => Ok(Value::boolean(
+            internal_prevent_extensions(st, mods, target)?,
+        )),
+        SET => {
+            let key_arg = arg(st, 1);
+            let value = arg(st, 2);
+            let receiver = if argc > 3 { arg(st, 3) } else { target };
+            let (key, _) = property_key(st, mods, key_arg)?;
+            Ok(Value::boolean(internal_set(
+                st, mods, target, key, value, receiver,
+            )?))
+        }
+        SET_PROTOTYPE_OF => Ok(Value::boolean(internal_set_proto(
+            st, mods, target, arg(st, 1),
+        )?)),
+        _ => err("unknown Reflect operation"),
+    }
+}
+
 fn do_native(
     st: &mut St,
     mods: &ModStore,
@@ -3430,6 +4630,50 @@ fn do_native(
             Ok(Value::UNDEFINED)
         }
         Native::Noop => Ok(Value::UNDEFINED),
+        Native::ProxyCtor => {
+            let target = if argc > 0 {
+                st.regs[args_base]
+            } else {
+                Value::UNDEFINED
+            };
+            let handler = if argc > 1 {
+                st.regs[args_base + 1]
+            } else {
+                Value::UNDEFINED
+            };
+            new_proxy(st, target, handler)
+        }
+        Native::ProxyRevocable => {
+            let target = if argc > 0 {
+                st.regs[args_base]
+            } else {
+                Value::UNDEFINED
+            };
+            let handler = if argc > 1 {
+                st.regs[args_base + 1]
+            } else {
+                Value::UNDEFINED
+            };
+            let proxy = new_proxy(st, target, handler)?;
+            let id = proxy_id_of(st, proxy).unwrap();
+            let revoke = make_native(st, Native::ProxyRevoke { proxy: id });
+            let out = new_plain_object(st);
+            let oi = out.index() as usize;
+            let proxy_key = st.intern_name("proxy");
+            let revoke_key = st.intern_name("revoke");
+            raw_set_prop(st, oi, proxy_key, proxy);
+            raw_set_prop(st, oi, revoke_key, revoke);
+            Ok(out)
+        }
+        Native::ProxyRevoke { proxy } => {
+            if let Some(rec) = st.proxies.get_mut(proxy as usize) {
+                rec.revoked = true;
+                rec.target = Value::UNDEFINED;
+                rec.handler = Value::UNDEFINED;
+            }
+            Ok(Value::UNDEFINED)
+        }
+        Native::Reflect(op) => reflect_op(st, mods, op, args_base, argc),
         Native::Storage { session, op } => {
             let arg0 = |st: &mut St| -> String {
                 if argc > 0 {
@@ -3932,6 +5176,7 @@ fn do_native(
                 due_ms: st.now_ms + delay,
                 seq: st.timer_seq,
                 interval,
+                is_raf: false,
             });
             Ok(Value::int(id as i32))
         }
@@ -4056,6 +5301,7 @@ fn do_native(
                 due_ms: due,
                 seq: st.timer_seq,
                 interval: None,
+                is_raf: true,
             });
             Ok(Value::int(id as i32))
         }
@@ -4128,6 +5374,60 @@ fn do_native(
             } else {
                 String::new()
             };
+            let options = if argc > 1 {
+                st.regs[args_base + 1]
+            } else {
+                Value::UNDEFINED
+            };
+            let option_value = |st: &mut St, name: &str| {
+                if !options.is_object() {
+                    return Value::UNDEFINED;
+                }
+                let key = st.intern_name(name);
+                raw_get_prop(st, options.index() as usize, key)
+                    .unwrap_or(Value::UNDEFINED)
+            };
+            let method_v = option_value(st, "method");
+            let method = if method_v.is_undefined() {
+                "GET".to_string()
+            } else {
+                to_display(st, method_v).to_uppercase()
+            };
+            let body_v = option_value(st, "body");
+            let body = if body_v.is_undefined() || body_v.is_null() {
+                String::new()
+            } else {
+                to_display(st, body_v)
+            };
+            let mode_v = option_value(st, "mode");
+            let mode = if mode_v.is_undefined() {
+                "cors".to_string()
+            } else {
+                to_display(st, mode_v).to_lowercase()
+            };
+            let credentials_v = option_value(st, "credentials");
+            let credentials = if credentials_v.is_undefined() {
+                "same-origin".to_string()
+            } else {
+                to_display(st, credentials_v).to_lowercase()
+            };
+            let headers_v = option_value(st, "headers");
+            let mut headers = Vec::new();
+            if headers_v.is_object() {
+                let oi = headers_v.index() as usize;
+                let shape = st.objects[oi].shape as usize;
+                let mut props: Vec<(u32, u16)> = st.shapes[shape]
+                    .props
+                    .iter()
+                    .map(|(&key, &slot)| (key, slot))
+                    .collect();
+                props.sort_by_key(|(_, slot)| *slot);
+                for (key, slot) in props {
+                    let name = st.names[key as usize].clone();
+                    let value = st.objects[oi].slots[slot as usize];
+                    headers.push((name, to_display(st, value)));
+                }
+            }
             let (pval, pid) = new_promise(st);
             st.next_fetch_id += 1;
             let fid = st.next_fetch_id;
@@ -4135,6 +5435,11 @@ fn do_native(
                 fetch_id: fid,
                 promise: pid,
                 url,
+                method,
+                body,
+                headers,
+                mode,
+                credentials,
             });
             Ok(pval)
         }
@@ -4321,6 +5626,28 @@ fn host_fn(
         }
         O_KEYS | O_VALUES | O_ENTRIES => {
             let v = argv!(0);
+            if proxy_id_of(st, v).is_some() {
+                let keys = internal_own_keys(st, mods, v)?;
+                let mut out = Vec::new();
+                for key_value in keys {
+                    let name = to_display(st, key_value);
+                    if name == "length" {
+                        continue;
+                    }
+                    let key = st.intern_name(&name);
+                    let descriptor = internal_get_own_descriptor(
+                        st, mods, v, key,
+                    )?;
+                    if descriptor.is_undefined()
+                        || !descriptor_flag(st, descriptor, "enumerable")
+                    {
+                        continue;
+                    }
+                    let value = internal_get(st, mods, v, key, v)?;
+                    out.push(host_entry(st, id, key_value, value));
+                }
+                return Ok(new_array(st, out));
+            }
             if !v.is_object() {
                 return Ok(new_array(st, Vec::new()));
             }
@@ -4350,23 +5677,25 @@ fn host_fn(
         }
         O_ASSIGN => {
             let target = argv!(0);
-            if !target.is_object() {
+            if !is_js_object(target) {
                 return Ok(target);
             }
-            let ti = target.index() as usize;
             for k in 1..n {
                 let src = argv!(k);
-                if !src.is_object() {
+                if !is_js_object(src) {
                     continue;
                 }
-                let si = src.index() as usize;
-                let shape = st.objects[si].shape;
-                let mut pairs: Vec<(u16, u32)> = st.shapes[shape as usize]
-                    .props.iter().map(|(&a, &s)| (s, a)).collect();
-                pairs.sort_by_key(|&(slot, _)| slot);
-                for (slot, atom) in pairs {
-                    let val = st.objects[si].slots[slot as usize];
-                    raw_set_prop(st, ti, atom, val);
+                let keys = internal_own_keys(st, mods, src)?;
+                for key_value in keys {
+                    let name = to_display(st, key_value);
+                    if name == "length" {
+                        continue;
+                    }
+                    let key = st.intern_name(&name);
+                    let value = internal_get(st, mods, src, key, src)?;
+                    let _ = internal_set(
+                        st, mods, target, key, value, target,
+                    )?;
                 }
             }
             Ok(target)
@@ -4420,7 +5749,13 @@ fn host_fn(
             }
             Ok(out)
         }
-        O_FREEZE => Ok(argv!(0)), // no-op (we don't enforce immutability)
+        O_FREEZE => {
+            let target = argv!(0);
+            if is_js_object(target) {
+                let _ = internal_prevent_extensions(st, mods, target)?;
+            }
+            Ok(target)
+        }
         O_DEFINE_PROP => {
             let obj = argv!(0);
             if !obj.is_object() && !obj.is_function() {
@@ -4436,7 +5771,9 @@ fn host_fn(
             };
             let key_name = to_display(st, kvp);
             let key = st.intern_name(&key_name);
-            define_one_prop(st, obj, key, argv!(2))?;
+            if !internal_define_property(st, mods, obj, key, argv!(2))? {
+                return type_err("Object.defineProperty was rejected");
+            }
             Ok(obj)
         }
         O_DEFINE_PROPS => {
@@ -4455,7 +5792,9 @@ fn host_fn(
             pairs.sort_by_key(|&(slot, _)| slot);
             for (slot, atom) in pairs {
                 let desc = st.objects[di].slots[slot as usize];
-                define_one_prop(st, obj, atom, desc)?;
+                if !internal_define_property(st, mods, obj, atom, desc)? {
+                    return type_err("Object.defineProperties was rejected");
+                }
             }
             Ok(obj)
         }
@@ -4463,6 +5802,10 @@ fn host_fn(
             // own names = index keys + shape props + accessor-only
             // keys (Object.keys skips the accessor side-table)
             let v = argv!(0);
+            if proxy_id_of(st, v).is_some() {
+                let keys = internal_own_keys(st, mods, v)?;
+                return Ok(new_array(st, keys));
+            }
             if v.is_function() {
                 let fidx = v.index();
                 let mut keys: Vec<u32> = st.fn_props.keys()
@@ -4550,6 +5893,11 @@ fn host_fn(
         }
         O_GET_OWN_PD => {
             let obj = argv!(0);
+            if proxy_id_of(st, obj).is_some() {
+                let key_value = argv!(1);
+                let (key, _) = property_key(st, mods, key_value)?;
+                return internal_get_own_descriptor(st, mods, obj, key);
+            }
             if obj.is_function() {
                 // builtin-constructor property copying (core-js):
                 // answer for statics; prototype only on user functions
@@ -4718,6 +6066,9 @@ fn host_fn(
         }
         O_GET_PROTO => {
             let v = argv!(0);
+            if proxy_id_of(st, v).is_some() {
+                return internal_get_proto(st, mods, v);
+            }
             Ok(if v.is_object() {
                 let p = st.objects[v.index() as usize].proto;
                 if !p.is_object() && st.known.object.is_function() {
@@ -4751,6 +6102,12 @@ fn host_fn(
         O_SET_PROTO => {
             let v = argv!(0);
             let p = argv!(1);
+            if proxy_id_of(st, v).is_some() {
+                if !internal_set_proto(st, mods, v, p)? {
+                    return type_err("Object.setPrototypeOf was rejected");
+                }
+                return Ok(v);
+            }
             if v.is_object() {
                 st.objects[v.index() as usize].proto =
                     if p.is_object() { p } else { Value::UNDEFINED };
@@ -4761,10 +6118,13 @@ fn host_fn(
             Ok(v)
         }
         A_ISARRAY => {
-            let v = argv!(0);
-            Ok(Value::boolean(
-                v.is_object() && st.objects[v.index() as usize].is_array,
-            ))
+            let mut v = argv!(0);
+            for _ in 0..16 {
+                let Some(id) = proxy_id_of(st, v) else { break };
+                v = proxy_rec(st, id)?.target;
+            }
+            Ok(Value::boolean(v.is_object()
+                && st.objects[v.index() as usize].is_array))
         }
         A_FROM => {
             let v = argv!(0);
@@ -5237,8 +6597,12 @@ fn dom_method(
         if key == ids.create_element {
             let tag = arg_string(st, args_base, argc, 0)?
                 .to_ascii_lowercase();
-            let idx =
-                doc.borrow_mut().new_element(tag, Vec::new(), None);
+            let mut d = doc.borrow_mut();
+            let is_script = tag == "script";
+            let idx = d.new_element(tag, Vec::new(), None);
+            if is_script {
+                d.script_created_dynamically.insert(idx);
+            }
             return Ok(Value::dom_node(idx as u32));
         }
         // createElementNS(ns, tag): our DOM has no namespaces, so the
@@ -5250,8 +6614,12 @@ fn dom_method(
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             let tag = if tag.is_empty() { "div".to_string() } else { tag };
-            let idx =
-                doc.borrow_mut().new_element(tag, Vec::new(), None);
+            let mut d = doc.borrow_mut();
+            let is_script = tag == "script";
+            let idx = d.new_element(tag, Vec::new(), None);
+            if is_script {
+                d.script_created_dynamically.insert(idx);
+            }
             return Ok(Value::dom_node(idx as u32));
         }
         match st.names[key as usize].as_str() {
@@ -5740,6 +7108,28 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
         return Ok(Value::UNDEFINED);
     }
     let node_us = node as usize;
+    match st.names[key as usize].as_str() {
+        "async" => {
+            let d = doc.borrow();
+            let value = d.script_async_overrides.get(&node_us).copied()
+                .unwrap_or_else(|| {
+                    d.script_created_dynamically.contains(&node_us)
+                        || d.nodes[node_us].attr("async").is_some()
+                });
+            return Ok(Value::boolean(value));
+        }
+        "defer" => {
+            return Ok(Value::boolean(
+                doc.borrow().nodes[node_us].attr("defer").is_some()));
+        }
+        "text" if doc.borrow().nodes[node_us].tag.as_deref()
+            == Some("script") =>
+        {
+            let text = doc.borrow().collect_text(node_us);
+            return Ok(push_str(st, text));
+        }
+        _ => {}
+    }
     if key == ids.text_content {
         let text = doc.borrow().collect_text(node_us);
         return Ok(push_str(st, text));
@@ -6090,14 +7480,24 @@ fn dom_set_prop(
             return Ok(());
         }
         if st.names[key as usize] == "cookie" {
-            // "k=v; Path=/; ..." — the first pair is the cookie,
-            // attributes are accepted and ignored (in-memory store)
+            // Keep a same-turn visible copy, but let the Python cookie jar
+            // validate and apply Path/Domain/Secure/expiry before the value
+            // reaches the network. Invalid control characters and cookie
+            // names are ignored here too, matching a browser setter.
             let text = to_display(st, v);
             let first = text.split(';').next().unwrap_or("");
             if let Some((k, val)) = first.split_once('=') {
                 let (k, val) = (k.trim().to_string(),
                                 val.trim().to_string());
-                if !k.is_empty() {
+                let bad_name = |ch: char| {
+                    ch <= '\u{20}' || ch >= '\u{7f}'
+                        || "()<>@,;:\\\"/[]?={}".contains(ch)
+                };
+                let bad_value = |ch: char| ch < '\u{20}' || ch == '\u{7f}';
+                if !k.is_empty()
+                    && !k.chars().any(bad_name)
+                    && !text.chars().any(bad_value)
+                {
                     if let Some(slot) = st
                         .cookies
                         .iter_mut()
@@ -6107,6 +7507,7 @@ fn dom_set_prop(
                     } else {
                         st.cookies.push((k, val));
                     }
+                    st.cookie_writes.push(text);
                 }
             }
             return Ok(());
@@ -6115,6 +7516,37 @@ fn dom_set_prop(
         return Ok(());
     }
     let node_us = node as usize;
+    let prop_name = st.names[key as usize].clone();
+    if prop_name == "text"
+        && doc.borrow().nodes[node_us].tag.as_deref() == Some("script")
+    {
+        let text = to_display(st, v);
+        let mut d = doc.borrow_mut();
+        d.nodes[node_us].children.clear();
+        d.new_text(text, node_us);
+        return Ok(());
+    }
+    if prop_name == "async" {
+        let enabled = truthy(st, v);
+        let mut d = doc.borrow_mut();
+        d.script_async_overrides.insert(node_us, enabled);
+        if enabled {
+            d.set_attr(node_us, "async", "");
+        } else {
+            d.remove_attr(node_us, "async");
+        }
+        return Ok(());
+    }
+    if prop_name == "defer" {
+        let enabled = truthy(st, v);
+        let mut d = doc.borrow_mut();
+        if enabled {
+            d.set_attr(node_us, "defer", "");
+        } else {
+            d.remove_attr(node_us, "defer");
+        }
+        return Ok(());
+    }
     if key == ids.text_content {
         let text = to_display(st, v);
         let mut d = doc.borrow_mut();
@@ -6159,7 +7591,10 @@ fn dom_set_prop(
             doc.borrow_mut().set_attr(node_us, &attr, &value);
             Ok(())
         }
-        n if n.starts_with("on") => Ok(()), // handler props: accepted
+        n if n.starts_with("on") => {
+            st.dom_expando.insert((node, key), v);
+            Ok(())
+        }
         "nodeValue" | "data" => {
             let value = to_display(st, v);
             let mut d = doc.borrow_mut();
@@ -6171,7 +7606,7 @@ fn dom_set_prop(
         }
         "scrollTop" | "scrollLeft" | "selected" | "checked"
         | "disabled" | "hidden" | "draggable"
-        | "contentEditable" | "async" | "defer" | "crossOrigin"
+        | "contentEditable" | "crossOrigin"
         | "charset" | "referrerPolicy" | "integrity"
         | "loading" | "decoding" => Ok(()),
         _ => {
@@ -6224,8 +7659,18 @@ pub(super) fn call_value_this(
         };
         return call_value_this(st, mods, t, Some(eff), &full);
     }
+    if let ClosureRec::Proxy(id) = st.closures[idx as usize] {
+        return proxy_call(
+            st,
+            mods,
+            id,
+            this_explicit.unwrap_or(Value::UNDEFINED),
+            args,
+        );
+    }
     match &st.closures[idx as usize] {
         ClosureRec::Bound { .. } => unreachable!("handled above"),
+        ClosureRec::Proxy(_) => unreachable!("handled above"),
         ClosureRec::Native(n) => {
             let n = *n;
             if let Native::BrandToString = n {
@@ -6699,6 +8144,12 @@ fn exec_loop(
             return err("script exceeded its instruction budget");
         }
         st.fuel -= 1;
+        // One sample per 16K bytecode instructions keeps the profiler cheap
+        // enough to leave compiled in while still producing hundreds of
+        // samples for a multi-second application callback.
+        if st.profile_enabled && (st.fuel & 0x3fff) == 0 {
+            *st.profile_samples.entry((mi, pi)).or_insert(0) += 1;
+        }
         let instr = cmod.module.protos[pi as usize].code[ip];
         ip += 1;
         match instr {
@@ -6994,14 +8445,25 @@ fn exec_loop(
                     y
                 };
             }
+            Instr::Construct { ctor, argc } => {
+                let constructor = reg!(ctor);
+                let args: Vec<Value> = (0..argc as usize)
+                    .map(|index| st.regs[base + ctor as usize + 1 + index])
+                    .collect();
+                reg!(ctor) = construct_value(
+                    st, mods, constructor, &args, constructor,
+                )?;
+            }
             Instr::Delete { dst, obj, key } => {
                 let (ov, kv) = (reg!(obj), reg!(key));
-                let r = delete_property(st, ov, kv);
+                let (key_id, _) = property_key(st, mods, kv)?;
+                let r = internal_delete(st, mods, ov, key_id)?;
                 reg!(dst) = Value::boolean(r);
             }
             Instr::In { dst, a, b } => {
-                let (key, obj) = (reg!(a), reg!(b));
-                let r = has_own_property(st, mods, obj, key)?;
+                let (key_value, obj) = (reg!(a), reg!(b));
+                let (key, _) = property_key(st, mods, key_value)?;
+                let r = internal_has(st, mods, obj, key)?;
                 reg!(dst) = Value::boolean(r);
             }
             Instr::InstanceOf { dst, a, b } => {
@@ -7055,7 +8517,7 @@ fn exec_loop(
                 }
                 if matches!(
                     st.closures[fv.index() as usize],
-                    ClosureRec::Bound { .. }
+                    ClosureRec::Bound { .. } | ClosureRec::Proxy(_)
                 ) {
                     let args: Vec<Value> = (0..argc as usize)
                         .map(|k| st.regs[base + func as usize + 1 + k])
@@ -7104,6 +8566,7 @@ fn exec_loop(
                     ClosureRec::Bound { .. } => {
                         unreachable!("bound pre-checked")
                     }
+                    ClosureRec::Proxy(_) => unreachable!("proxy pre-checked"),
                 };
                 match kind {
                     Err(n) => {
@@ -7167,6 +8630,7 @@ fn exec_loop(
                 if matches!(
                     st.closures[fv.index() as usize],
                     ClosureRec::Bound { .. }
+                        | ClosureRec::Proxy(_)
                         | ClosureRec::Native(Native::MethodRef(_))
                 ) {
                     let receiver = reg!(recv);
@@ -7192,6 +8656,7 @@ fn exec_loop(
                     ClosureRec::Bound { .. } => {
                         unreachable!("bound pre-checked")
                     }
+                    ClosureRec::Proxy(_) => unreachable!("proxy pre-checked"),
                 };
                 match kind {
                     Err(n) => {
@@ -7250,6 +8715,24 @@ fn exec_loop(
             Instr::CallMethod { obj, atom, argc } => {
                 let ov = reg!(obj);
                 let key = name!(atom);
+                if proxy_id_of(st, ov).is_some() {
+                    let method = internal_get(st, mods, ov, key, ov)?;
+                    if !method.is_function() {
+                        return type_err(format!(
+                            ".{} is not a function on Proxy",
+                            st.names[key as usize],
+                        ));
+                    }
+                    let args: Vec<Value> = (0..argc as usize)
+                        .map(|index| {
+                            st.regs[base + obj as usize + 1 + index]
+                        })
+                        .collect();
+                    reg!(obj) = call_value_this(
+                        st, mods, method, Some(ov), &args,
+                    )?;
+                    continue;
+                }
                 // Function.prototype.call / apply (backs spread calls)
                 if ov.is_function() {
                     // Function.prototype.bind: package this + partials
@@ -7300,6 +8783,86 @@ fn exec_loop(
                                 .map(|k| st.regs[a0 + k])
                                 .collect()
                         };
+                        // Hot path for transpiled bundles:
+                        // `fn.apply(this, arguments)` appears hundreds of
+                        // thousands of times in Naver. Re-entering exec()
+                        // through call_value_this used to allocate a second
+                        // register segment and a native Rust stack frame for
+                        // every wrapper. A plain user function can instead
+                        // use the VM's normal in-loop call-frame transition.
+                        let direct_user = match &st.closures
+                            [ov.index() as usize]
+                        {
+                            ClosureRec::User {
+                                module, proto, this_capture, ..
+                            } => Some((*module, *proto, *this_capture)),
+                            _ => None,
+                        };
+                        if let Some((cm0, cp0, this_cap)) = direct_user {
+                            if st.frames.len() >= MAX_FRAMES {
+                                return err("stack overflow");
+                            }
+                            let cl_idx = ov.index();
+                            let (cm, cp) =
+                                ensure_compiled(st, mods, cm0, cp0)?;
+                            if let ClosureRec::User {
+                                module, proto, ..
+                            } = &mut st.closures[cl_idx as usize]
+                            {
+                                (*module, *proto) = (cm, cp);
+                            }
+                            let callee_rc = mods.rc(cm);
+                            let callee =
+                                &callee_rc.module.protos[cp as usize];
+                            let actual = args.len().min(u8::MAX as usize);
+                            let copied = if callee.uses_arguments {
+                                actual
+                            } else {
+                                actual.min(callee.nparams as usize)
+                            };
+                            let new_base = base + obj as usize + 1;
+                            let need = new_base + (callee.nregs as usize)
+                                .max(copied);
+                            if st.regs.len() < need {
+                                st.regs.resize(need, Value::UNDEFINED);
+                            }
+                            for (index, value) in
+                                args.iter().take(copied).enumerate()
+                            {
+                                st.regs[new_base + index] = *value;
+                            }
+                            let initialized = if callee.uses_arguments {
+                                actual.max(callee.nparams as usize)
+                            } else {
+                                actual.min(callee.nparams as usize)
+                            };
+                            for register in initialized
+                                ..callee.nregs as usize
+                            {
+                                st.regs[new_base + register] =
+                                    Value::UNDEFINED;
+                            }
+                            st.frames.push(Frame {
+                                module: mi,
+                                proto: pi,
+                                ip,
+                                base,
+                                closure: cur_cl,
+                                this_val: this_v,
+                                argc: cur_argc,
+                                with_base: cur_with_base,
+                            });
+                            mi = cm;
+                            pi = cp;
+                            ip = 0;
+                            base = new_base;
+                            cur_cl = cl_idx;
+                            cur_argc = actual as u8;
+                            cur_with_base = st.with_stack.len();
+                            this_v = this_cap.unwrap_or(this_arg);
+                            cmod = mods.rc(mi);
+                            continue;
+                        }
                         let r = call_value_this(
                             st, mods, ov, Some(this_arg), &args,
                         )?;
@@ -7968,7 +9531,17 @@ fn exec_loop(
                                 }
                             }
                         }
-                        let mut m = raw_get_prop(st, oi, key);
+                        let mut m = match lookup_prop(st, oi, key) {
+                            PropHit::Data(value) => Some(value),
+                            PropHit::Getter(getter)
+                                if getter.is_function() =>
+                            {
+                                Some(call_value_this(
+                                    st, mods, getter, Some(ov), &[],
+                                )?)
+                            }
+                            _ => None,
+                        };
                         // window.parseInt(...) — global fns are
                         // reachable as window methods
                         if m.is_none()
@@ -8020,6 +9593,7 @@ fn exec_loop(
                         if matches!(
                             st.closures[m.index() as usize],
                             ClosureRec::Bound { .. }
+                                | ClosureRec::Proxy(_)
                                 | ClosureRec::Native(
                                     Native::MethodRef(_),
                                 )
@@ -8046,6 +9620,9 @@ fn exec_loop(
                             ClosureRec::Native(n) => Err(*n),
                             ClosureRec::Bound { .. } => {
                                 unreachable!("bound pre-checked")
+                            }
+                            ClosureRec::Proxy(_) => {
+                                unreachable!("proxy pre-checked")
                             }
                         };
                         match kind {
@@ -8517,7 +10094,8 @@ fn exec_loop(
                                 ClosureRec::User { upvals, .. } => {
                                     upvals[i as usize]
                                 }
-                                ClosureRec::Native(_) | ClosureRec::Bound { .. } => unreachable!(),
+                                ClosureRec::Native(_) | ClosureRec::Bound { .. }
+                                | ClosureRec::Proxy(_) => unreachable!(),
                             }
                         }
                     });
@@ -8551,14 +10129,16 @@ fn exec_loop(
             Instr::GetUpval { dst, idx } => {
                 let cell = match &st.closures[cur_cl as usize] {
                     ClosureRec::User { upvals, .. } => upvals[idx as usize],
-                    ClosureRec::Native(_) | ClosureRec::Bound { .. } => unreachable!(),
+                    ClosureRec::Native(_) | ClosureRec::Bound { .. }
+                    | ClosureRec::Proxy(_) => unreachable!(),
                 };
                 reg!(dst) = st.cells[cell as usize];
             }
             Instr::SetUpval { idx, src } => {
                 let cell = match &st.closures[cur_cl as usize] {
                     ClosureRec::User { upvals, .. } => upvals[idx as usize],
-                    ClosureRec::Native(_) | ClosureRec::Bound { .. } => unreachable!(),
+                    ClosureRec::Native(_) | ClosureRec::Bound { .. }
+                    | ClosureRec::Proxy(_) => unreachable!(),
                 };
                 st.cells[cell as usize] = reg!(src);
             }
@@ -8603,7 +10183,10 @@ fn exec_loop(
             Instr::ForInKeys { dst, obj } => {
                 let ov = reg!(obj);
                 let mut keys: Vec<Value> = Vec::new();
-                if ov.is_object() {
+                if proxy_id_of(st, ov).is_some() {
+                    keys = internal_own_keys(st, mods, ov)?;
+                    keys.retain(|&key| to_display(st, key) != "length");
+                } else if ov.is_object() {
                     let oi = ov.index() as usize;
                     let (is_array, nelems, shape) = {
                         let o = &st.objects[oi];
@@ -8648,7 +10231,10 @@ fn exec_loop(
             }
             Instr::GetIndex { dst, obj, key } => {
                 let (ov, kv) = (reg!(obj), reg!(key));
-                if ov.is_object() && kv.is_number() {
+                if proxy_id_of(st, ov).is_some() {
+                    let (key_id, _) = property_key(st, mods, kv)?;
+                    reg!(dst) = internal_get(st, mods, ov, key_id, ov)?;
+                } else if ov.is_object() && kv.is_number() {
                     let oi = ov.index() as usize;
                     let k = kv.to_number_raw();
                     let mut hit = Value::UNDEFINED;
@@ -8708,17 +10294,21 @@ fn exec_loop(
                         }
                     }
                     let key_id = st.intern_name(&text);
-                    reg!(dst) = match raw_get_prop(st, oi, key_id) {
-                        Some(v) => v,
+                    reg!(dst) = match lookup_prop(st, oi, key_id) {
+                        PropHit::Data(v) => v,
+                        PropHit::Getter(g) if g.is_function() => {
+                            call_value_this(st, mods, g, Some(ov), &[])?
+                        }
+                        PropHit::Getter(_) => Value::UNDEFINED,
                         // window doubles as the global namespace
-                        None if ov == st.known.window
+                        PropHit::Missing if ov == st.known.window
                             && st.gdef[key_id as usize] =>
                         {
                             st.globals[key_id as usize]
                         }
                         // a plain object's computed `toString` is the
                         // genuine Object.prototype.toString (brands)
-                        None if !st.objects[oi].is_array
+                        PropHit::Missing if !st.objects[oi].is_array
                             && text == "toString" =>
                         {
                             make_native(st, Native::BrandToString)
@@ -8727,7 +10317,7 @@ fn exec_loop(
                         // reads V["valueOf"] as a computed access, so
                         // GetIndex must mirror GetProp's fallback or
                         // ordinaryToPrimitive finds nothing callable
-                        None if matches!(
+                        PropHit::Missing if matches!(
                             text.as_str(),
                             "hasOwnProperty" | "toString" | "valueOf"
                                 | "propertyIsEnumerable"
@@ -8736,12 +10326,12 @@ fn exec_loop(
                         {
                             make_native(st, Native::MethodRef(key_id))
                         }
-                        None if st.objects[oi].regex != REGEX_NONE
+                        PropHit::Missing if st.objects[oi].regex != REGEX_NONE
                             && matches!(text.as_str(), "exec" | "test") =>
                         {
                             make_native(st, Native::MethodRef(key_id))
                         }
-                        None if st.objects[oi].is_array
+                        PropHit::Missing if st.objects[oi].is_array
                             && matches!(
                                 text.as_str(),
                                 "slice" | "concat" | "join" | "indexOf"
@@ -8755,7 +10345,7 @@ fn exec_loop(
                             make_native(st, Native::MethodRef(key_id))
                         }
                         // core-js expandos on Array.prototype
-                        None if st.objects[oi].is_array
+                        PropHit::Missing if st.objects[oi].is_array
                             && !matches!(
                                 array_proto_hit(st, key_id),
                                 PropHit::Missing
@@ -8771,7 +10361,7 @@ fn exec_loop(
                                 _ => Value::UNDEFINED,
                             }
                         }
-                        None => Value::UNDEFINED,
+                        PropHit::Missing => Value::UNDEFINED,
                     };
                 } else if ov.is_function() {
                     // fn["prop"]: same surface as static GetProp
@@ -8918,7 +10508,10 @@ fn exec_loop(
             }
             Instr::SetIndex { obj, key, src } => {
                 let (ov, kv, v) = (reg!(obj), reg!(key), reg!(src));
-                if ov.is_object() && kv.is_number() {
+                if proxy_id_of(st, ov).is_some() {
+                    let (key_id, _) = property_key(st, mods, kv)?;
+                    let _ = internal_set(st, mods, ov, key_id, v, ov)?;
+                } else if ov.is_object() && kv.is_number() {
                     let k = kv.to_number_raw();
                     if k < 0.0 || k.fract() != 0.0 {
                         // JS: not an element — a plain named property
@@ -8989,6 +10582,10 @@ fn exec_loop(
             Instr::GetProp { dst, obj, atom, ic } => {
                 let ov = reg!(obj);
                 let key = name!(atom);
+                if proxy_id_of(st, ov).is_some() {
+                    reg!(dst) = internal_get(st, mods, ov, key, ov)?;
+                    continue;
+                }
                 if ov.is_object() && !st.style_nodes.is_empty()
                     || ov.is_object() && !st.dataset_nodes.is_empty()
                 {
@@ -9293,6 +10890,11 @@ fn exec_loop(
             Instr::SetProp { obj, atom, src, ic } => {
                 let ov = reg!(obj);
                 let key = name!(atom);
+                if proxy_id_of(st, ov).is_some() {
+                    let value = reg!(src);
+                    let _ = internal_set(st, mods, ov, key, value, ov)?;
+                    continue;
+                }
                 if ov.is_dom_node() {
                     let v = reg!(src);
                     dom_set_prop(st, key, ov.index(), v)?;

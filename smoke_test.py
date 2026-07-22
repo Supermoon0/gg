@@ -2,13 +2,14 @@
 
 import tkinter
 
-from browser import net
+from browser import keyboard, net
 from browser.html_parser import Element, HTMLParser, Text, tree_to_list
 from browser.css_parser import CSSParser
 from browser.style import (RuleIndex, cascade_priority, default_rules,
                            style)
 from browser.layout import (HSTEP, VSTEP, BlockLayout, DocumentLayout,
-                            ImageLayout, layout_tree_to_list, paint_tree)
+                            ImageLayout, layout_tree_to_list, paint_tree,
+                            sticky_offset)
 from browser.pages import DEMO_PAGE
 
 passed = 0
@@ -68,6 +69,34 @@ dup = next(n for n in tree_to_list(
     HTMLParser('<div id="a" id="b">x</div>').parse(), [])
     if isinstance(n, Element) and n.tag == "div")
 check("duplicate attr: first wins", dup.attributes["id"] == "a")
+
+# --- sequential focus and keyboard default actions ---
+focus_dom = HTMLParser(
+    '<a id="natural" href="/next">link</a>'
+    '<button id="two" tabindex="2">two</button>'
+    '<input id="one" tabindex="1">'
+    '<button id="zero" tabindex="0">zero</button>'
+    '<button id="negative" tabindex="-1">negative</button>'
+    '<input id="disabled" disabled><input id="hidden" type="hidden">'
+    '<div inert><button id="inert-child">inert</button></div>').parse()
+focus_ids = [node.attributes.get("id")
+             for node in keyboard.focus_order(focus_dom)]
+check("focus order: positive tabindex then document order",
+      focus_ids == ["one", "two", "natural", "zero"],
+      repr(focus_ids))
+focus_order = keyboard.focus_order(focus_dom)
+check("Tab focus wraps in both directions",
+      keyboard.next_focus(focus_dom, focus_order[-1]) is focus_order[0]
+      and keyboard.next_focus(
+          focus_dom, focus_order[0], reverse=True) is focus_order[-1])
+focus_text = focus_order[1].children[0]
+check("click focus resolves from button text to its control",
+      keyboard.focus_target(focus_text) is focus_order[1])
+check("Enter and Space choose native element default actions",
+      keyboard.key_action(focus_order[2], "Enter") == "activate"
+      and keyboard.key_action(focus_order[1], "Space") == "activate"
+      and keyboard.key_action(focus_order[0], "Enter") == "submit"
+      and keyboard.key_action(focus_order[0], "Space") == "text")
 
 # --- CSS parsing ---
 rules = CSSParser(
@@ -443,6 +472,18 @@ check("no z-index keeps document paint order",
 # re-styles the mutated DOM
 import os
 from browser import native
+_load_timings = {}
+native.load_document(
+    '<p>timed load</p>', lambda h: {}, None, timings=_load_timings)
+_timing_keys = {
+    "html_parse", "scripts", "stylesheet_wait", "style_compute",
+    "dom_export", "load_document_total",
+}
+check("native load reports structured stage timings",
+      _timing_keys.issubset(_load_timings)
+      and all(_load_timings[key] >= 0 for key in _timing_keys)
+      and _load_timings["load_document_total"]
+      >= _load_timings["html_parse"], repr(_load_timings))
 if native.async_available():
     os.environ["GGJS"] = "1"
     _live_html = (
@@ -467,6 +508,1015 @@ if native.async_available():
     _ldoc.tick(1.0)
     check("a 1ms tick is quiet (real-time pacing, no fast-forward)",
           _ldoc.dom_version() == _v1)
+
+    # settle_async must report a timer-only DOM mutation even when the
+    # callback emits no console output and performs no fetch.
+    _snodes, _sdoc, _scss, _slogs = native.load_document(
+        '<div id="settled">before</div><script>'
+        'setTimeout(function(){document.getElementById("settled")'
+        '.textContent="after";}, 10);</script>',
+        lambda h: {}, lambda s: {})
+    _sv0 = _sdoc.dom_version()
+    _settled_changed = native.settle_async(
+        _sdoc, _scss, net.URL("about:blank"), max_rounds=20)
+    check("settle detects timer-only DOM mutation",
+          _settled_changed and _sdoc.dom_version() > _sv0)
+    _snodes2 = native.refresh(_sdoc, _scss)
+    _settled_text = [t.text for t in tree_to_list(_snodes2, [])
+                     if isinstance(t, Text)]
+    check("settle refresh exposes timer-only text",
+          "after" in _settled_text, str(_settled_text))
+
+    # P2 script scheduling: blocking scripts preserve parser order, async
+    # scripts run when their fetch completes, and defer/modules finish before
+    # DOMContentLoaded in document order.
+    import time as _script_time
+
+    _schedule_html = (
+        '<script>console.log("setup");'
+        'document.addEventListener("DOMContentLoaded",function(){'
+        'console.log("dcl:"+document.readyState);});'
+        'window.addEventListener("load",function(){'
+        'console.log("load:"+document.readyState);});</script>'
+        '<script async src="/slow.js"></script>'
+        '<script async src="/fast.js"></script>'
+        '<script src="/block.js"></script>'
+        '<script>console.log("after")</script>'
+        '<script defer src="/defer-1.js"></script>'
+        '<script defer src="/defer-2.js"></script>')
+    _schedule_sources = {
+        "/slow.js": (0.20, 'console.log("slow")'),
+        "/fast.js": (0.005, 'console.log("fast")'),
+        "/block.js": (0.08, 'console.log("block")'),
+        "/defer-1.js": (0.005, 'console.log("defer-1")'),
+        "/defer-2.js": (0.0, 'console.log("defer-2")'),
+    }
+
+    def _fetch_scheduled(srcs):
+        src = srcs[0]
+        delay, code = _schedule_sources[src]
+        _script_time.sleep(delay)
+        return {src: code}
+
+    _onodes, _odoc, _ocss, _order_logs = native.load_document(
+        _schedule_html, lambda hrefs: {}, _fetch_scheduled,
+        js_budget=2.0)
+    check("script async/defer/blocking order follows lifecycle phases",
+          _order_logs == [
+              "setup", "fast", "block", "after", "defer-1",
+              "defer-2", "dcl:interactive", "slow", "load:complete"],
+          repr(_order_logs))
+
+    _dynamic_sources = {
+        "/dynamic.js": (0.03, 'console.log("dynamic")'),
+        "/ordered-1.js": (0.04, 'console.log("ordered-1")'),
+        "/ordered-2.js": (0.0, 'console.log("ordered-2")'),
+    }
+
+    def _fetch_dynamic(srcs):
+        src = srcs[0]
+        delay, code = _dynamic_sources[src]
+        _script_time.sleep(delay)
+        return {src: code}
+
+    _dynamic_html = (
+        '<html><body><script>'
+        'document.addEventListener("DOMContentLoaded",function(){'
+        'console.log("dynamic-dcl:"+document.readyState);});'
+        'window.addEventListener("load",function(){'
+        'console.log("dynamic-window-load:"+document.readyState);});'
+        'var s=document.createElement("script");s.src="/dynamic.js";'
+        's.onload=function(){console.log("dynamic-load:"+'
+        'document.readyState);};document.body.appendChild(s);'
+        'console.log("creator");</script></body></html>')
+    _dnodes, _ddoc, _dcss, _dynamic_logs = native.load_document(
+        _dynamic_html, lambda hrefs: {}, _fetch_dynamic,
+        js_budget=2.0)
+    check("dynamic script delays load but not DOMContentLoaded",
+          _dynamic_logs == [
+              "creator", "dynamic-dcl:interactive", "dynamic",
+              "dynamic-load:interactive", "dynamic-window-load:complete"],
+          repr(_dynamic_logs))
+
+    _ordered_html = (
+        '<html><body><script>document.addEventListener('
+        '"DOMContentLoaded",function(){'
+        'console.log("ordered-dcl");});'
+        'var a=document.createElement("script");a.async=false;'
+        'a.src="/ordered-1.js";document.body.appendChild(a);'
+        'var b=document.createElement("script");b.async=false;'
+        'b.src="/ordered-2.js";document.body.appendChild(b);'
+        '</script></body></html>')
+    _qnodes, _qdoc, _qcss, _ordered_logs = native.load_document(
+        _ordered_html, lambda hrefs: {}, _fetch_dynamic,
+        js_budget=2.0)
+    check("dynamic async=false scripts keep insertion order",
+          _ordered_logs == ["ordered-dcl", "ordered-1", "ordered-2"],
+          repr(_ordered_logs))
+
+    _event_html = (
+        '<html><body><script>var bad=document.createElement("script");'
+        'bad.src="/missing.js";'
+        'bad.addEventListener("error",function(){'
+        'console.log("script-error:"+document.readyState);});'
+        'document.body.appendChild(bad);</script></body></html>')
+    _enodes, _edoc, _ecss, _event_logs = native.load_document(
+        _event_html, lambda hrefs: {}, lambda srcs: {}, js_budget=2.0)
+    check("failed dynamic script dispatches error before load",
+          _event_logs == ["script-error:loading"],
+          repr(_event_logs))
+
+    # ES modules: resolve imports against the importing module URL, evaluate
+    # dependencies first, isolate top-level bindings, and cache by URL.
+    _module_url = net.URL("https://modules.test/app/index.html")
+    _module_sources = {
+        "/app/main.js": (
+            'import answer, {double as twice} from "./math.js";'
+            'import "./side.js";'
+            'export const result=twice(answer);'
+            'console.log("module-main:"+result+":"+import.meta.url);'),
+        "https://modules.test/app/math.js": (
+            'export const base=21;'
+            'export function double(x){return x*2}'
+            'export default base;'),
+        "https://modules.test/app/side.js": (
+            'console.log("module-side");export const marker=1;'),
+    }
+    _module_fetches = []
+
+    def _fetch_modules(srcs):
+        src = srcs[0]
+        _module_fetches.append(src)
+        return ({src: _module_sources[src]}
+                if src in _module_sources else {})
+
+    _module_html = (
+        '<html><body><script>'
+        'document.addEventListener("DOMContentLoaded",function(){'
+        'console.log("module-dcl:"+typeof result);});'
+        'window.addEventListener("load",function(){'
+        'console.log("module-load");});</script>'
+        '<script type="module" src="/app/main.js"></script>'
+        '</body></html>')
+    _mnodes, _mdoc, _mcss, _module_logs = native.load_document(
+        _module_html, lambda hrefs: {}, _fetch_modules,
+        page_url=_module_url, js_budget=2.0)
+    check("ES module graph resolves, evaluates dependencies, and isolates",
+          _module_logs == [
+              "module-side",
+              "module-main:42:https://modules.test/app/main.js",
+              "module-dcl:undefined", "module-load"],
+          repr(_module_logs))
+    check("ES module graph fetches each URL once",
+          sorted(_module_fetches) == sorted([
+              "/app/main.js",
+              "https://modules.test/app/math.js",
+              "https://modules.test/app/side.js"]),
+          repr(_module_fetches))
+
+    _shared_sources = {
+        "/one.js": (
+            'import {shared} from "./shared.js";'
+            'console.log("one:"+shared);export const one=1;'),
+        "/two.js": (
+            'import {shared} from "./shared.js";'
+            'console.log("two:"+shared);export const two=2;'),
+        "https://modules.test/shared.js": (
+            'console.log("shared-once");export const shared=7;'),
+    }
+    _shared_fetches = []
+
+    def _fetch_shared(srcs):
+        src = srcs[0]
+        _shared_fetches.append(src)
+        return {src: _shared_sources[src]}
+
+    _shared_html = (
+        '<html><body><script type="module" src="/one.js"></script>'
+        '<script type="module" src="/two.js"></script></body></html>')
+    _xnodes, _xdoc, _xcss, _shared_logs = native.load_document(
+        _shared_html, lambda hrefs: {}, _fetch_shared,
+        page_url=_module_url, js_budget=2.0)
+    check("shared ES module dependency evaluates exactly once",
+          _shared_logs == ["shared-once", "one:7", "two:7"],
+          repr(_shared_logs))
+    check("shared ES module dependency fetches exactly once",
+          _shared_fetches.count("https://modules.test/shared.js") == 1,
+          repr(_shared_fetches))
+
+    _live_module_sources = {
+        "/live-main.js": (
+            'import * as state from "./live-state.js";'
+            'setTimeout(function(){console.log("module-live:"+'
+            'state.count);},10);'),
+        "https://modules.test/live-state.js": (
+            'export let count=1;'
+            'setTimeout(function(){count=2;},5);'),
+    }
+
+    def _fetch_live_module(srcs):
+        src = srcs[0]
+        return {src: _live_module_sources[src]}
+
+    _vnodes, _vdoc, _vcss, _live_module_logs = native.load_document(
+        '<html><body><script type="module" src="/live-main.js">'
+        '</script></body></html>', lambda hrefs: {}, _fetch_live_module,
+        page_url=_module_url, js_budget=2.0)
+    _live_tick_logs, _live_tick_fetches = _vdoc.tick(20.0)
+    check("ES module namespace exposes an updated exported binding",
+          _live_module_logs == []
+          and list(_live_tick_logs) == ["module-live:2"]
+          and not _live_tick_fetches,
+          repr((_live_module_logs, _live_tick_logs,
+                _live_tick_fetches)))
+
+    _named_live_sources = {
+        "/named-live-main.js": (
+            'import {count} from "./named-live-state.js";'
+            'setTimeout(function(){console.log("named-live:"+count);},10);'),
+        "https://modules.test/named-live-state.js": (
+            'export let count=1;'
+            'setTimeout(function(){count=3;},5);'),
+    }
+
+    def _fetch_named_live(srcs):
+        src = srcs[0]
+        return {src: _named_live_sources[src]}
+
+    _nv_nodes, _nv_doc, _nv_css, _named_live_logs = native.load_document(
+        '<html><body><script type="module" '
+        'src="/named-live-main.js"></script></body></html>',
+        lambda hrefs: {}, _fetch_named_live,
+        page_url=_module_url, js_budget=2.0)
+    _named_live_tick_logs, _named_live_tick_fetches = _nv_doc.tick(20.0)
+    check("named ES import reads remain live in later callbacks",
+          _named_live_logs == []
+          and list(_named_live_tick_logs) == ["named-live:3"]
+          and not _named_live_tick_fetches,
+          repr((_named_live_logs, list(_named_live_tick_logs))))
+
+    _lexical_live_sources = {
+        "/lexical-live-main.js": (
+            'import {value} from "./lexical-live-state.js";'
+            'function parameter(value){return value;}'
+            'function destructured({value}){return value;}'
+            'var arrow=(value)=>value+1;'
+            'try{throw 6;}catch(value){'
+            'console.log("lexical-catch:"+value);}'
+            '{let value=4;console.log("lexical-block:"+value);}'
+            '{function value(){return 10;}'
+            'console.log("lexical-function:"+value());}'
+            'for(let value of [7]){console.log("lexical-for:"+value);}'
+            'var shorthand={value};var keyed={value:3};'
+            'var methods={value(value){return value;}};'
+            'class Box{value(value){return value;}}'
+            'var pattern=/value/;'
+            'console.log("lexical-values:"+parameter(2)+":"+'
+            'destructured({value:3})+":"+arrow(4)+":"+'
+            'shorthand.value+":"+keyed.value+":"+'
+            'methods.value(11)+":"+(new Box()).value(12)+":"+'
+            'value+":"+'
+            'pattern.test("value"));'
+            'setTimeout(function(){console.log(`lexical-template:${value}`);'
+            '},10);'),
+        "https://modules.test/lexical-live-state.js": (
+            'export let value=1;'
+            'setTimeout(function(){value=8;},5);'),
+    }
+
+    def _fetch_lexical_live(srcs):
+        src = srcs[0]
+        return {src: _lexical_live_sources[src]}
+
+    _ll_nodes, _ll_doc, _ll_css, _lexical_live_logs = (
+        native.load_document(
+            '<html><body><script type="module" '
+            'src="/lexical-live-main.js"></script></body></html>',
+            lambda hrefs: {}, _fetch_lexical_live,
+            page_url=_module_url, js_budget=2.0))
+    check("import live reads respect parameter, catch, and block shadowing",
+          _lexical_live_logs == [
+              "lexical-catch:6", "lexical-block:4",
+              "lexical-function:10", "lexical-for:7",
+              "lexical-values:2:3:5:1:3:11:12:1:true"],
+          repr(_lexical_live_logs))
+    _lexical_tick_logs, _lexical_tick_fetches = _ll_doc.tick(20.0)
+    check("object shorthand and template expressions keep lexical live reads",
+          list(_lexical_tick_logs) == ["lexical-template:8"]
+          and not _lexical_tick_fetches,
+          repr((list(_lexical_tick_logs), _lexical_tick_fetches)))
+
+    _write_import_sources = {
+        "/write-import-main.js": (
+            'import {value} from "./write-import-state.js";'
+            'value=9;console.log("write-import-wrong");'),
+        "https://modules.test/write-import-state.js": (
+            'export const value=1;'),
+    }
+
+    def _fetch_write_import(srcs):
+        src = srcs[0]
+        return {src: _write_import_sources[src]}
+
+    _write_import_html = (
+        '<html><body><script>var target=document.getElementById("write-import");'
+        'target.addEventListener("error",function(){'
+        'console.log("write-import-error");});</script>'
+        '<script id="write-import" type="module" '
+        'src="/write-import-main.js"></script></body></html>')
+    _wi_nodes, _wi_doc, _wi_css, _write_import_logs = native.load_document(
+        _write_import_html, lambda hrefs: {}, _fetch_write_import,
+        page_url=_module_url, js_budget=2.0)
+    check("assigning to an imported binding fails module evaluation",
+          len(_write_import_logs) == 2
+          and _write_import_logs[0].startswith("[gg-js error]")
+          and _write_import_logs[1] == "write-import-error",
+          repr(_write_import_logs))
+
+    _redeclare_import_sources = {
+        "/redeclare-import-main.js": (
+            'import {value} from "./redeclare-import-state.js";'
+            'const value=2;console.log(value);'),
+        "https://modules.test/redeclare-import-state.js": (
+            'export const value=1;'),
+    }
+
+    def _fetch_redeclare_import(srcs):
+        src = srcs[0]
+        return {src: _redeclare_import_sources[src]}
+
+    _redeclare_import_html = (
+        '<html><body><script>var target=document.getElementById("redeclare");'
+        'target.addEventListener("error",function(){'
+        'console.log("redeclare-import-error");});</script>'
+        '<script id="redeclare" type="module" '
+        'src="/redeclare-import-main.js"></script></body></html>')
+    _ri_nodes, _ri_doc, _ri_css, _redeclare_import_logs = (
+        native.load_document(
+            _redeclare_import_html, lambda hrefs: {},
+            _fetch_redeclare_import,
+            page_url=_module_url, js_budget=2.0))
+    check("module-scope declarations cannot redeclare imports",
+          len(_redeclare_import_logs) == 2
+          and _redeclare_import_logs[0].startswith("[gg module error]")
+          and _redeclare_import_logs[1] == "redeclare-import-error",
+          repr(_redeclare_import_logs))
+
+    _barrel_sources = {
+        "/barrel-main.js": (
+            'import * as api from "./barrel.js";'
+            'console.log("barrel:"+api.value+":"+api.inc(4)+":"+'
+            'api.tag);'),
+        "https://modules.test/barrel.js": (
+            'export {default as value, inc} from "./dep.js";'
+            'export * from "./extra.js";'),
+        "https://modules.test/dep.js": (
+            'const base=4;export default base;'
+            'export function inc(x){return x+1}'),
+        "https://modules.test/extra.js": 'export const tag="ok";',
+    }
+
+    def _fetch_barrel(srcs):
+        src = srcs[0]
+        return {src: _barrel_sources[src]}
+
+    _bnodes, _bdoc, _bcss, _barrel_logs = native.load_document(
+        '<html><body><script type="module" src="/barrel-main.js">'
+        '</script></body></html>', lambda hrefs: {}, _fetch_barrel,
+        page_url=_module_url, js_budget=2.0)
+    check("ES module namespace, default, named, and star re-exports work",
+          _barrel_logs == ["barrel:4:5:ok"], repr(_barrel_logs))
+
+    _module_error_html = (
+        '<html><body><script>window.moduleFailed=false;'
+        'var target=document.getElementById("bad-module");'
+        'target.addEventListener("error",function(){'
+        'console.log("module-error:"+document.readyState);});</script>'
+        '<script id="bad-module" type="module" src="/bad.js"></script>'
+        '</body></html>')
+    _bad_sources = {"/bad.js": 'import x from "bare-package";'}
+    _znodes, _zdoc, _zcss, _module_error_logs = native.load_document(
+        _module_error_html, lambda hrefs: {},
+        lambda srcs: {srcs[0]: _bad_sources[srcs[0]]},
+        page_url=_module_url, js_budget=2.0)
+    check("invalid module graph dispatches script error",
+          len(_module_error_logs) == 2
+          and _module_error_logs[0].startswith("[gg module error]")
+          and _module_error_logs[1] == "module-error:loading",
+          repr(_module_error_logs))
+
+    _inline_sources = {
+        "https://modules.test/app/inline-dep.js": (
+            'console.log("inline-dep");export const value=9;')
+    }
+    _inline_html = (
+        '<html><body><script type="module">'
+        'import {value} from "./inline-dep.js";'
+        'console.log("inline-module:"+value+":"+import.meta.url);'
+        '</script><script>console.log("classic-after-inline")</script>'
+        '<script>document.addEventListener("DOMContentLoaded",function(){'
+        'console.log("inline-dcl");});</script></body></html>')
+    _inodes, _idoc, _icss, _inline_logs = native.load_document(
+        _inline_html, lambda hrefs: {},
+        lambda srcs: {srcs[0]: _inline_sources[srcs[0]]},
+        page_url=_module_url, js_budget=2.0)
+    check("inline module is isolated and deferred before DOMContentLoaded",
+          _inline_logs == [
+              "classic-after-inline", "inline-dep",
+              "inline-module:9:https://modules.test/app/index.html",
+              "inline-dcl"], repr(_inline_logs))
+
+    _cycle_sources = {
+        "/cycle-a.js": (
+            'import "./cycle-b.js";console.log("cycle-a");'
+            'export const a=1;'),
+        "https://modules.test/cycle-b.js": (
+            'import "./cycle-a.js";console.log("cycle-b");'
+            'export const b=2;'),
+    }
+    _cycle_fetches = []
+
+    def _fetch_cycle(srcs):
+        src = srcs[0]
+        _cycle_fetches.append(src)
+        return {src: _cycle_sources[src]}
+
+    _cnodes, _cdoc, _ccss, _cycle_logs = native.load_document(
+        '<html><body><script type="module" src="/cycle-a.js">'
+        '</script></body></html>', lambda hrefs: {}, _fetch_cycle,
+        page_url=_module_url, js_budget=2.0)
+    check("cyclic module graph terminates and evaluates each module once",
+          _cycle_logs == ["cycle-b", "cycle-a"]
+          and _cycle_fetches.count("/cycle-a.js") == 1
+          and _cycle_fetches.count("https://modules.test/cycle-b.js") == 1,
+          repr((_cycle_logs, _cycle_fetches)))
+
+    _dynamic_module_sources = {
+        "/dynamic-module.js": (
+            'console.log("dynamic-module");export const ready=true;')
+    }
+
+    def _fetch_dynamic_module(srcs):
+        src = srcs[0]
+        _script_time.sleep(0.02)
+        return {src: _dynamic_module_sources[src]}
+
+    _dynamic_module_html = (
+        '<html><body><script>'
+        'document.addEventListener("DOMContentLoaded",function(){'
+        'console.log("dynamic-module-dcl");});'
+        'window.addEventListener("load",function(){'
+        'console.log("dynamic-module-window-load");});'
+        'var dm=document.createElement("script");dm.type="module";'
+        'dm.src="/dynamic-module.js";dm.onload=function(){'
+        'console.log("dynamic-module-load");};document.body.appendChild(dm);'
+        'console.log("dynamic-module-created");</script></body></html>')
+    _ynodes, _ydoc, _ycss, _dynamic_module_logs = native.load_document(
+        _dynamic_module_html, lambda hrefs: {}, _fetch_dynamic_module,
+        page_url=net.URL("https://modules.test/index.html"),
+        js_budget=2.0)
+    check("dynamic module is async and delays load, not DOMContentLoaded",
+          _dynamic_module_logs == [
+              "dynamic-module-created", "dynamic-module-dcl",
+              "dynamic-module", "dynamic-module-load",
+              "dynamic-module-window-load"],
+          repr(_dynamic_module_logs))
+
+    _import_sources = {
+        "/import-main.js": (
+            'console.log("import-main");setTimeout(function(){'
+            'console.log("import-before");import("./lazy.js").then('
+            'function(m){console.log("import-value:"+m.value);});},10);'),
+        "https://modules.test/lazy.js": (
+            'console.log("lazy-evaluated");export const value=8;'),
+    }
+    _import_fetches = []
+
+    def _fetch_import(srcs):
+        src = srcs[0]
+        _import_fetches.append(src)
+        return {src: _import_sources[src]}
+
+    _j_nodes, _j_doc, _j_css, _import_logs = native.load_document(
+        '<html><body><script type="module" src="/import-main.js">'
+        '</script></body></html>', lambda hrefs: {}, _fetch_import,
+        page_url=net.URL("https://modules.test/index.html"),
+        js_budget=2.0)
+    _import_tick_logs, _import_tick_fetches = _j_doc.tick(10.0)
+    check("dynamic import defers evaluation and resolves its namespace",
+          _import_logs == ["import-main"]
+          and list(_import_tick_logs) == [
+              "import-before", "lazy-evaluated", "import-value:8"]
+          and not _import_tick_fetches,
+          repr((_import_logs, list(_import_tick_logs))))
+    check("literal dynamic import participates in the URL fetch cache",
+          _import_fetches.count("https://modules.test/lazy.js") == 1,
+          repr(_import_fetches))
+
+    _missing_import_sources = {
+        "/missing-import-main.js": (
+            'console.log("missing-import-main");setTimeout(function(){'
+            'import("./not-found.js").then(function(){'
+            'console.log("missing-import-wrong");},function(error){'
+            'console.log("missing-import:"+error.name);});},1);')
+    }
+
+    def _fetch_missing_import(srcs):
+        src = srcs[0]
+        return ({src: _missing_import_sources[src]}
+                if src in _missing_import_sources else {})
+
+    _mi_nodes, _mi_doc, _mi_css, _missing_import_logs = (
+        native.load_document(
+            '<html><body><script type="module" '
+            'src="/missing-import-main.js"></script></body></html>',
+            lambda hrefs: {}, _fetch_missing_import,
+            page_url=net.URL("https://modules.test/index.html"),
+            js_budget=2.0))
+    _missing_import_tick_logs, _missing_import_tick_fetches = (
+        _mi_doc.tick(1.0))
+    check("failed dynamic import rejects without failing its parent module",
+          _missing_import_logs == ["missing-import-main"]
+          and list(_missing_import_tick_logs) == ["missing-import:TypeError"]
+          and not _missing_import_tick_fetches,
+          repr((_missing_import_logs,
+                list(_missing_import_tick_logs))))
+
+    _computed_import_sources = {
+        "/computed-import-main.js": (
+            'var part="computed-lazy";console.log("computed-main");'
+            'setTimeout(function(){console.log("computed-before");'
+            'import("./"+part+".js").then(function(m){'
+            'console.log("computed-value:"+m.value);});},10);'),
+        "https://modules.test/computed-lazy.js": (
+            'console.log("computed-evaluated");export const value=17;'),
+    }
+    _computed_import_fetches = []
+
+    def _fetch_computed_import(srcs):
+        src = srcs[0]
+        _computed_import_fetches.append(src)
+        return ({src: _computed_import_sources[src]}
+                if src in _computed_import_sources else {})
+
+    _ci_nodes, _ci_doc, _ci_css, _computed_import_logs = (
+        native.load_document(
+            '<html><body><script type="module" '
+            'src="/computed-import-main.js"></script></body></html>',
+            lambda hrefs: {}, _fetch_computed_import,
+            page_url=net.URL("https://modules.test/index.html"),
+            js_budget=2.0))
+    _computed_tick_logs, _computed_requests = native.pump_script_requests(
+        _ci_doc, 10.0)
+    _computed_before_service = list(_computed_import_fetches)
+    for _computed_request in _computed_requests:
+        native.service_script_fetch(
+            _ci_doc, net.URL("https://modules.test/index.html"),
+            _computed_request)
+    _computed_done_logs, _computed_done_requests = (
+        native.pump_script_requests(_ci_doc, microtasks_only=True))
+    check("computed dynamic import fetches only when its expression runs",
+          _computed_import_logs == ["computed-main"]
+          and _computed_tick_logs == ["computed-before"]
+          and _computed_before_service == ["/computed-import-main.js"]
+          and _computed_import_fetches == [
+              "/computed-import-main.js",
+              "https://modules.test/computed-lazy.js"],
+          repr((_computed_import_logs, _computed_tick_logs,
+                _computed_import_fetches)))
+    check("computed dynamic import resolves and evaluates after loader exit",
+          list(_computed_done_logs) == [
+              "computed-evaluated", "computed-value:17"]
+          and not _computed_done_requests,
+          repr((list(_computed_done_logs), _computed_done_requests)))
+
+    _computed_tla_sources = {
+        "/computed-tla-main.js": (
+            'var dependency="./computed-tla-dep.js";'
+            'const loaded=await import(dependency);'
+            'console.log("computed-tla:"+loaded.value);'),
+        "https://modules.test/computed-tla-dep.js": (
+            'console.log("computed-tla-dep");export const value=19;'),
+    }
+
+    def _fetch_computed_tla(srcs):
+        src = srcs[0]
+        return {src: _computed_tla_sources[src]}
+
+    _computed_tla_html = (
+        '<html><body><script>document.addEventListener('
+        '"DOMContentLoaded",function(){console.log("computed-tla-dcl");});'
+        '</script><script type="module" '
+        'src="/computed-tla-main.js"></script></body></html>')
+    _ct_nodes, _ct_doc, _ct_css, _computed_tla_logs = (
+        native.load_document(
+            _computed_tla_html, lambda hrefs: {}, _fetch_computed_tla,
+            page_url=net.URL("https://modules.test/index.html"),
+            js_budget=2.0))
+    check("top-level await waits for a computed dynamic import",
+          _computed_tla_logs == [
+              "computed-tla-dep", "computed-tla:19",
+              "computed-tla-dcl"],
+          repr(_computed_tla_logs))
+
+    _computed_cache_sources = {
+        "/computed-cache-main.js": (
+            'var target="./computed-cache-dep.js";setTimeout(function(){'
+            'Promise.all([import(target),import(target)]).then(function(all){'
+            'console.log("computed-cache:"+(all[0].value+all[1].value));'
+            '});},1);'),
+        "https://modules.test/computed-cache-dep.js": (
+            'console.log("computed-cache-evaluated");'
+            'export const value=5;'),
+    }
+    _computed_cache_fetches = []
+
+    def _fetch_computed_cache(srcs):
+        src = srcs[0]
+        _computed_cache_fetches.append(src)
+        return {src: _computed_cache_sources[src]}
+
+    _cc_nodes, _cc_doc, _cc_css, _computed_cache_logs = (
+        native.load_document(
+            '<html><body><script type="module" '
+            'src="/computed-cache-main.js"></script></body></html>',
+            lambda hrefs: {}, _fetch_computed_cache,
+            page_url=net.URL("https://modules.test/index.html"),
+            js_budget=2.0))
+    _cc_tick_logs, _cc_requests = native.pump_script_requests(
+        _cc_doc, 1.0)
+    for _cc_request in _cc_requests:
+        native.service_script_fetch(
+            _cc_doc, net.URL("https://modules.test/index.html"),
+            _cc_request)
+    _cc_done_logs, _cc_done_requests = native.pump_script_requests(
+        _cc_doc, microtasks_only=True)
+    check("concurrent computed imports share source and evaluation caches",
+          _computed_cache_logs == [] and _cc_tick_logs == []
+          and list(_cc_done_logs) == [
+              "computed-cache-evaluated", "computed-cache:10"]
+          and _computed_cache_fetches.count(
+              "https://modules.test/computed-cache-dep.js") == 1
+          and not _cc_done_requests,
+          repr((list(_cc_done_logs), _computed_cache_fetches)))
+
+    _computed_missing_sources = {
+        "/computed-missing-main.js": (
+            'var missing="not-here.js";setTimeout(function(){'
+            'import("./"+missing).then(function(){console.log("wrong");},'
+            'function(error){console.log("computed-missing:"+'
+            'error.name);});},1);')
+    }
+
+    def _fetch_computed_missing(srcs):
+        src = srcs[0]
+        return ({src: _computed_missing_sources[src]}
+                if src in _computed_missing_sources else {})
+
+    _cm_nodes, _cm_doc, _cm_css, _computed_missing_logs = (
+        native.load_document(
+            '<html><body><script type="module" '
+            'src="/computed-missing-main.js"></script></body></html>',
+            lambda hrefs: {}, _fetch_computed_missing,
+            page_url=net.URL("https://modules.test/index.html"),
+            js_budget=2.0))
+    _cm_tick_logs, _cm_requests = native.pump_script_requests(
+        _cm_doc, 1.0)
+    for _cm_request in _cm_requests:
+        native.service_script_fetch(
+            _cm_doc, net.URL("https://modules.test/index.html"),
+            _cm_request)
+    _cm_done_logs, _cm_done_requests = native.pump_script_requests(
+        _cm_doc, microtasks_only=True)
+    check("failed computed dynamic import rejects with TypeError",
+          _computed_missing_logs == [] and _cm_tick_logs == []
+          and list(_cm_done_logs) == ["computed-missing:TypeError"]
+          and not _cm_done_requests,
+          repr((_computed_missing_logs, _cm_tick_logs,
+                list(_cm_done_logs))))
+
+    _tla_sources = {
+        "/tla-main.js": (
+            'import {value} from "./tla-dep.js";'
+            'console.log("tla-main:"+value);'),
+        "https://modules.test/tla-dep.js": (
+            'export const value=await Promise.resolve(9);'
+            'console.log("tla-dep:"+value);'),
+    }
+
+    def _fetch_tla(srcs):
+        src = srcs[0]
+        return {src: _tla_sources[src]}
+
+    _tla_html = (
+        '<html><body><script>document.addEventListener('
+        '"DOMContentLoaded",function(){console.log("tla-dcl");});'
+        '</script><script type="module" src="/tla-main.js">'
+        '</script></body></html>')
+    _k_nodes, _k_doc, _k_css, _tla_logs = native.load_document(
+        _tla_html, lambda hrefs: {}, _fetch_tla,
+        page_url=net.URL("https://modules.test/index.html"),
+        js_budget=2.0)
+    check("top-level await settles dependencies before importer and DCL",
+          _tla_logs == ["tla-dep:9", "tla-main:9", "tla-dcl"],
+          repr(_tla_logs))
+
+    _timer_tla_html = (
+        '<html><body><script>document.addEventListener('
+        '"DOMContentLoaded",function(){console.log("timer-tla-dcl");});'
+        '</script><script type="module">'
+        'await new Promise(function(resolve){setTimeout(resolve,5);});'
+        'console.log("timer-tla-done");</script></body></html>')
+    _l_nodes, _l_doc, _l_css, _timer_tla_logs = native.load_document(
+        _timer_tla_html, lambda hrefs: {}, lambda srcs: {},
+        page_url=net.URL("https://modules.test/index.html"),
+        js_budget=2.0)
+    check("top-level await can suspend on a timer before DCL",
+          _timer_tla_logs == ["timer-tla-done", "timer-tla-dcl"],
+          repr(_timer_tla_logs))
+
+    _map_sources = {
+        "/map-main.js": (
+            'import {value} from "pkg";'
+            'import {tool} from "lib/tool.js";'
+            'console.log("import-map:"+value+":"+tool);'),
+        "https://modules.test/app/mapped.js": 'export const value=4;',
+        "https://modules.test/app/vendor/tool.js": 'export const tool=5;',
+    }
+
+    def _fetch_map(srcs):
+        src = srcs[0]
+        return {src: _map_sources[src]}
+
+    _map_html = (
+        '<html><head><script type="importmap">'
+        '{"imports":{"pkg":"./mapped.js","lib/":"./vendor/"}}'
+        '</script></head><body><script type="module" '
+        'src="/map-main.js"></script></body></html>')
+    _map_nodes, _map_doc, _map_css, _map_logs = native.load_document(
+        _map_html, lambda hrefs: {}, _fetch_map,
+        page_url=net.URL("https://modules.test/app/index.html"),
+        js_budget=2.0)
+    check("import maps resolve exact and prefix bare specifiers",
+          _map_logs == ["import-map:4:5"], repr(_map_logs))
+
+    _scoped_map_sources = {
+        "/app/feature/main.js": (
+            'import {value} from "pkg";'
+            'console.log("scoped-map:"+value);'),
+        "https://modules.test/app/scoped.js": 'export const value=7;',
+    }
+
+    def _fetch_scoped_map(srcs):
+        src = srcs[0]
+        return {src: _scoped_map_sources[src]}
+
+    _scoped_map_html = (
+        '<html><head><script type="importmap">'
+        '{"imports":{"pkg":"./global.js"},"scopes":{'
+        '"./feature/":{"pkg":"./scoped.js"}}}</script></head><body>'
+        '<script type="module" src="/app/feature/main.js"></script>'
+        '</body></html>')
+    _sm_nodes, _sm_doc, _sm_css, _scoped_map_logs = (
+        native.load_document(
+            _scoped_map_html, lambda hrefs: {}, _fetch_scoped_map,
+            page_url=net.URL("https://modules.test/app/index.html"),
+            js_budget=2.0))
+    check("import map scopes prefer the longest matching referrer prefix",
+          _scoped_map_logs == ["scoped-map:7"],
+          repr(_scoped_map_logs))
+
+    _runtime_map_sources = {
+        "/app/runtime-map-main.js": (
+            'var packageName="runtime-pkg";import(packageName).then('
+            'function(m){console.log("runtime-map:"+m.value);});'),
+        "https://modules.test/app/runtime-mapped.js": (
+            'export const value=12;'),
+    }
+
+    def _fetch_runtime_map(srcs):
+        src = srcs[0]
+        return {src: _runtime_map_sources[src]}
+
+    _runtime_map_html = (
+        '<html><head><script type="importmap">{"imports":{'
+        '"runtime-pkg":"./runtime-mapped.js"}}</script></head><body>'
+        '<script type="module" src="/app/runtime-map-main.js"></script>'
+        '</body></html>')
+    _rm_nodes, _rm_doc, _rm_css, _runtime_map_logs = (
+        native.load_document(
+            _runtime_map_html, lambda hrefs: {}, _fetch_runtime_map,
+            page_url=net.URL("https://modules.test/app/index.html"),
+            js_budget=2.0))
+    _runtime_map_pump_logs, _runtime_map_requests = (
+        native.pump_script_requests(_rm_doc, microtasks_only=True))
+    for _runtime_map_request in _runtime_map_requests:
+        native.service_script_fetch(
+            _rm_doc, net.URL("https://modules.test/app/index.html"),
+            _runtime_map_request)
+    _runtime_map_done_logs, _runtime_map_done_requests = (
+        native.pump_script_requests(_rm_doc, microtasks_only=True))
+    check("computed dynamic import resolves through import maps",
+          _runtime_map_logs == []
+          and (list(_runtime_map_pump_logs)
+               + list(_runtime_map_done_logs)) == ["runtime-map:12"]
+          and not _runtime_map_done_requests,
+          repr((_runtime_map_logs, _runtime_map_pump_logs,
+                list(_runtime_map_done_logs))))
+
+    _json_module_sources = {
+        "/json-main.js": (
+            'import config from "./config.json" with {type:"json"};'
+            'import {config as forwarded} from "./json-forward.js";'
+            'console.log("json-static:"+config.answer+":"+'
+            'forwarded.name);'),
+        "https://modules.test/config.json": (
+            '{"answer":42,"name":"gg","__proto__":{"safe":true}}'),
+        "https://modules.test/json-forward.js": (
+            'export {default as config} from "./config.json" '
+            'with {"type":"json"};'),
+    }
+    _json_module_fetches = []
+
+    def _fetch_json_modules(srcs):
+        src = srcs[0]
+        _json_module_fetches.append(src)
+        return ({src: _json_module_sources[src]}
+                if src in _json_module_sources else {})
+
+    _jm_nodes, _jm_doc, _jm_css, _json_module_logs = native.load_document(
+        '<html><body><script type="module" src="/json-main.js">'
+        '</script></body></html>', lambda hrefs: {}, _fetch_json_modules,
+        page_url=net.URL("https://modules.test/index.html"),
+        js_budget=2.0)
+    check("static import attributes load JSON default exports and re-exports",
+          _json_module_logs == ["json-static:42:gg"],
+          repr(_json_module_logs))
+    check("JSON modules share the URL fetch and evaluation cache",
+          _json_module_fetches.count(
+              "https://modules.test/config.json") == 1,
+          repr(_json_module_fetches))
+
+    _dynamic_json_sources = {
+        "/dynamic-json-main.js": (
+            'var target="./dynamic-data.json";setTimeout(function(){'
+            'import(target,{with:{type:"json"}}).then(function(module){'
+            'console.log("json-dynamic:"+module.default.value);});},1);'),
+        "https://modules.test/dynamic-data.json": '{"value":17}',
+    }
+    _dynamic_json_fetches = []
+
+    def _fetch_dynamic_json(srcs):
+        src = srcs[0]
+        _dynamic_json_fetches.append(src)
+        return ({src: _dynamic_json_sources[src]}
+                if src in _dynamic_json_sources else {})
+
+    _dj_nodes, _dj_doc, _dj_css, _dynamic_json_logs = (
+        native.load_document(
+            '<html><body><script type="module" '
+            'src="/dynamic-json-main.js"></script></body></html>',
+            lambda hrefs: {}, _fetch_dynamic_json,
+            page_url=net.URL("https://modules.test/index.html"),
+            js_budget=2.0))
+    check("dynamic import attributes defer JSON fetch until execution",
+          _dynamic_json_logs == []
+          and "https://modules.test/dynamic-data.json"
+          not in _dynamic_json_fetches,
+          repr((_dynamic_json_logs, _dynamic_json_fetches)))
+    _dj_tick_logs, _dj_requests = native.pump_script_requests(
+        _dj_doc, 1.0)
+    for _dj_request in _dj_requests:
+        native.service_script_fetch(
+            _dj_doc, net.URL("https://modules.test/index.html"),
+            _dj_request)
+    _dj_done_logs, _dj_done_requests = native.pump_script_requests(
+        _dj_doc, microtasks_only=True)
+    check("dynamic import options resolve a JSON module namespace",
+          _dj_tick_logs == []
+          and list(_dj_done_logs) == ["json-dynamic:17"]
+          and _dynamic_json_fetches.count(
+              "https://modules.test/dynamic-data.json") == 1
+          and not _dj_done_requests,
+          repr((list(_dj_tick_logs), list(_dj_done_logs),
+                _dynamic_json_fetches)))
+
+    _bad_dynamic_attribute_sources = {
+        "/bad-dynamic-attribute.js": (
+            'setTimeout(function(){import("./never.css",'
+            '{with:{type:"css"}}).then(function(){console.log("wrong");},'
+            'function(error){console.log("bad-attribute:"+error.name);});'
+            '},1);'),
+    }
+    _bad_dynamic_attribute_fetches = []
+
+    def _fetch_bad_dynamic_attribute(srcs):
+        src = srcs[0]
+        _bad_dynamic_attribute_fetches.append(src)
+        return ({src: _bad_dynamic_attribute_sources[src]}
+                if src in _bad_dynamic_attribute_sources else {})
+
+    _bda_nodes, _bda_doc, _bda_css, _bda_logs = native.load_document(
+        '<html><body><script type="module" '
+        'src="/bad-dynamic-attribute.js"></script></body></html>',
+        lambda hrefs: {}, _fetch_bad_dynamic_attribute,
+        page_url=net.URL("https://modules.test/index.html"),
+        js_budget=2.0)
+    _bda_tick_logs, _bda_requests = native.pump_script_requests(
+        _bda_doc, 1.0)
+    for _bda_request in _bda_requests:
+        native.service_script_fetch(
+            _bda_doc, net.URL("https://modules.test/index.html"),
+            _bda_request)
+    _bda_done_logs, _bda_done_requests = native.pump_script_requests(
+        _bda_doc, microtasks_only=True)
+    check("unsupported dynamic import attributes reject with TypeError",
+          _bda_logs == [] and _bda_tick_logs == []
+          and list(_bda_done_logs) == ["bad-attribute:TypeError"]
+          and "https://modules.test/never.css"
+          not in _bad_dynamic_attribute_fetches
+          and not _bda_done_requests,
+          repr((list(_bda_done_logs), _bad_dynamic_attribute_fetches)))
+
+    _invalid_json_sources = {
+        "/invalid-json-main.js": (
+            'setTimeout(function(){import("./invalid.json",'
+            '{with:{type:"json"}}).then(function(){console.log("wrong");},'
+            'function(error){console.log("invalid-json:"+error.name);});'
+            '},1);'),
+        "https://modules.test/invalid.json": '{not valid JSON}',
+    }
+
+    def _fetch_invalid_json(srcs):
+        src = srcs[0]
+        return ({src: _invalid_json_sources[src]}
+                if src in _invalid_json_sources else {})
+
+    _ij_nodes, _ij_doc, _ij_css, _invalid_json_logs = native.load_document(
+        '<html><body><script type="module" '
+        'src="/invalid-json-main.js"></script></body></html>',
+        lambda hrefs: {}, _fetch_invalid_json,
+        page_url=net.URL("https://modules.test/index.html"),
+        js_budget=2.0)
+    _ij_tick_logs, _ij_requests = native.pump_script_requests(_ij_doc, 1.0)
+    for _ij_request in _ij_requests:
+        native.service_script_fetch(
+            _ij_doc, net.URL("https://modules.test/index.html"),
+            _ij_request)
+    _ij_done_logs, _ij_done_requests = native.pump_script_requests(
+        _ij_doc, microtasks_only=True)
+    check("invalid JSON modules reject dynamic import with TypeError",
+          _invalid_json_logs == [] and _ij_tick_logs == []
+          and list(_ij_done_logs) == ["invalid-json:TypeError"]
+          and not _ij_done_requests,
+          repr((list(_ij_tick_logs), list(_ij_done_logs))))
+
+    _bad_static_attribute_sources = {
+        "/bad-static-attribute.js": (
+            'import data from "./data.json" with {type:"css"};'
+            'console.log(data);'),
+    }
+
+    def _fetch_bad_static_attribute(srcs):
+        src = srcs[0]
+        return ({src: _bad_static_attribute_sources[src]}
+                if src in _bad_static_attribute_sources else {})
+
+    _bad_static_attribute_html = (
+        '<html><body><script>var target=document.getElementById("bad-attr");'
+        'target.addEventListener("error",function(){'
+        'console.log("bad-static-attribute-error");});</script>'
+        '<script id="bad-attr" type="module" '
+        'src="/bad-static-attribute.js"></script></body></html>')
+    _bsa_nodes, _bsa_doc, _bsa_css, _bad_static_attribute_logs = (
+        native.load_document(
+            _bad_static_attribute_html, lambda hrefs: {},
+            _fetch_bad_static_attribute,
+            page_url=net.URL("https://modules.test/index.html"),
+            js_budget=2.0))
+    check("unsupported static import attributes fail module loading",
+          len(_bad_static_attribute_logs) == 2
+          and _bad_static_attribute_logs[0].startswith("[gg module error]")
+          and _bad_static_attribute_logs[1]
+          == "bad-static-attribute-error",
+          repr(_bad_static_attribute_logs))
+
+    _bad_map_html = (
+        '<html><body><script>var badMap=document.getElementById("bad-map");'
+        'badMap.addEventListener("error",function(){'
+        'console.log("bad-map-error");});</script>'
+        '<script type="importmap">{bad json</script>'
+        '<script id="bad-map" type="module">console.log("wrong");'
+        '</script></body></html>')
+    _bm_nodes, _bm_doc, _bm_css, _bad_map_logs = native.load_document(
+        _bad_map_html, lambda hrefs: {}, lambda srcs: {},
+        page_url=net.URL("https://modules.test/app/index.html"),
+        js_budget=2.0)
+    check("invalid import map fails module loading and dispatches error",
+          len(_bad_map_logs) == 2
+          and _bad_map_logs[0].startswith("[gg module error]")
+          and _bad_map_logs[1] == "bad-map-error",
+          repr(_bad_map_logs))
 
 # reader mode: EAGER-DATA JSON -> injected readable section
 from browser import reader as _reader
@@ -595,7 +1645,222 @@ _inp = next(n for n in tree_to_list(form_dom, [])
 check("find_form walks up from an input",
       _forms.find_form(_inp) is _form)
 _form.attributes["method"] = "post"
-check("POST form yields no GET href", _forms.submit_href(_form) is None)
+_post = _forms.prepare_submission(_form, net.URL(
+    "https://origin.example/current?keep=no"))
+check("POST form builds a URL-encoded body",
+      _post.method == "POST"
+      and _post.target == "https://search.example/search?old=1"
+      and _post.content_type == "application/x-www-form-urlencoded"
+      and _post.body == (
+          "query=%ED%95%9C%EA%B8%80+%EA%B2%80%EC%83%89"
+          "&where=nexearch&checked=y").encode("ascii"),
+      repr(_post))
+check("POST form has no GET-only href", _forms.submit_href(_form) is None)
+
+_controls_dom = HTMLParser(
+    '<form method="post" enctype="text/plain">'
+    '<textarea name="memo">hello world</textarea>'
+    '<select name="choice"><option value="a">A</option>'
+    '<option value="b" selected>B</option></select>'
+    '<input name="skip" value="x" disabled>'
+    '<button name="go" value="yes">send</button>'
+    '</form>').parse()
+_controls_form = next(n for n in tree_to_list(_controls_dom, [])
+                      if isinstance(n, Element) and n.tag == "form")
+_submitter = next(n for n in tree_to_list(_controls_dom, [])
+                  if isinstance(n, Element) and n.tag == "button")
+_plain = _forms.prepare_submission(
+    _controls_form, "https://origin.example/current",
+    submitter=_submitter)
+check("textarea/select/clicked submitter serialize in order",
+      _plain.body == b"memo=hello world\r\nchoice=b\r\ngo=yes\r\n",
+      repr(_plain.body))
+check("find_submitter walks up from button text",
+      _forms.find_submitter(_submitter.children[0]) is _submitter)
+
+_upload_dom = HTMLParser(
+    '<form action="/upload" method="post" enctype="multipart/form-data">'
+    '<input name="title" value="report">'
+    '<input type="file" name="attachment" value="C:/secret.txt">'
+    '</form>').parse()
+_upload_form = next(n for n in tree_to_list(_upload_dom, [])
+                    if isinstance(n, Element) and n.tag == "form")
+_file_input = next(n for n in tree_to_list(_upload_dom, [])
+                   if isinstance(n, Element)
+                   and n.attributes.get("type") == "file")
+_forms.attach_file(
+    _file_input, "notes.txt", b"hello\x00file", "text/plain")
+_multipart = _forms.prepare_submission(
+    _upload_form, "https://origin.example/form", boundary="GGBOUNDARY")
+check("multipart form includes selected filename and exact bytes",
+      _multipart.target == "/upload"
+      and _multipart.content_type ==
+      "multipart/form-data; boundary=GGBOUNDARY"
+      and b'name="title"\r\n\r\nreport' in _multipart.body
+      and b'filename="notes.txt"' in _multipart.body
+      and b"hello\x00file" in _multipart.body
+      and b"C:/secret.txt" not in _multipart.body,
+      repr(_multipart.body))
+
+_external_dom = HTMLParser(
+    '<form id="main" action="/default" method="get">'
+    '<input name="inside" value="1">'
+    '<input name="other" value="skip" form="other-form">'
+    '</form><form id="other-form"></form>'
+    '<input name="outside" value="2" form="main">'
+    '<button id="external-send" name="go" value="yes" form="main" '
+    'formaction="/override" formmethod="post">send</button>').parse()
+_external_form = next(n for n in tree_to_list(_external_dom, [])
+                      if isinstance(n, Element)
+                      and n.attributes.get("id") == "main")
+_external_button = next(n for n in tree_to_list(_external_dom, [])
+                        if isinstance(n, Element)
+                        and n.attributes.get("id") == "external-send")
+_external_post = _forms.prepare_submission(
+    _external_form, "https://forms.test/start",
+    submitter=_external_button)
+check("external form= controls resolve their owner",
+      _forms.find_form(_external_button.children[0]) is _external_form)
+check("external controls serialize and submitter overrides apply",
+      _external_post.method == "POST"
+      and _external_post.target == "/override"
+      and _external_post.body == b"inside=1&outside=2&go=yes",
+      repr(_external_post))
+
+_valid_dom = HTMLParser(
+    '<form id="valid"><input id="mail" name="mail" type="email" required>'
+    '<input id="code" name="code" pattern="[A-Z]{3}" value="ab">'
+    '<input id="age" name="age" type="number" min="18" value="12">'
+    '<input id="keep" name="keep" type="checkbox" checked>'
+    '<button id="valid-send">send</button><button id="clear" type="reset">'
+    'clear</button></form>').parse()
+_valid_form = next(n for n in tree_to_list(_valid_dom, [])
+                   if isinstance(n, Element) and n.tag == "form")
+_valid_nodes = {n.attributes.get("id"): n
+                for n in tree_to_list(_valid_dom, [])
+                if isinstance(n, Element) and n.attributes.get("id")}
+for _valid_ridx, _valid_node in enumerate(tree_to_list(_valid_dom, [])):
+    if isinstance(_valid_node, Element):
+        _valid_node._ridx = _valid_ridx
+_defaults = _forms.capture_defaults(_valid_dom)
+check("constraint validation reports invalid controls in order",
+      [n.attributes.get("id") for n in
+       _forms.invalid_controls(_valid_form)] == ["mail", "code", "age"])
+_events = []
+_blocked = _forms.activate_control(
+    _valid_nodes["valid-send"], "https://forms.test/start", {},
+    dispatch_event=lambda ridx, event, bubbles, cancelable, submitter:
+        (_events.append(event) or [], False, False))
+check("invalid controls block submit and fire invalid before submit",
+      _blocked.submission is None and _events == ["invalid"] * 3,
+      repr((_blocked, _events)))
+_valid_nodes["mail"].attributes["value"] = "a@example.com"
+_valid_nodes["code"].attributes["value"] = "ABC"
+_valid_nodes["age"].attributes["value"] = "18"
+check("valid required/type/pattern/min constraints allow submit",
+      not _forms.invalid_controls(_valid_form))
+
+_valid_nodes["mail"].attributes["value"] = "changed@example.com"
+_valid_nodes["keep"].attributes.pop("checked", None)
+_reset_events = []
+_reset = _forms.activate_control(
+    _valid_nodes["clear"], "https://forms.test/start", _defaults,
+    dispatch_event=lambda ridx, event, bubbles, cancelable, submitter:
+        (_reset_events.append(event) or [], True, False))
+check("reset event restores captured control defaults",
+      _reset.changed and _reset_events == ["reset"]
+      and _valid_nodes["mail"].attributes.get("value", "") == ""
+      and "checked" in _valid_nodes["keep"].attributes,
+      repr((_reset, _valid_nodes["mail"].attributes)))
+_check_events = []
+_checked = _forms.activate_control(
+    _valid_nodes["keep"], "https://forms.test/start", _defaults,
+    dispatch_event=lambda ridx, event, bubbles, cancelable, submitter:
+        (_check_events.append((event, cancelable)) or [], True, False))
+check("checkbox default action toggles and emits input/change",
+      _checked.changed
+      and "checked" not in _valid_nodes["keep"].attributes
+      and _check_events == [("input", False), ("change", False)],
+      repr((_checked, _check_events)))
+
+# Session-history snapshots restore live form state into a freshly parsed
+# document without retaining the old DOM or file-input contents.
+from browser import navigation as _navigation
+_history_html = (
+    '<form><input id="text" value="before">'
+    '<input id="flag" type="checkbox" checked>'
+    '<input id="file" type="file" value="secret.txt">'
+    '<textarea id="memo">default</textarea>'
+    '<select><option id="one" selected>one</option>'
+    '<option id="two">two</option></select></form>')
+_history_source = HTMLParser(_history_html).parse()
+_history_nodes = {node.attributes.get("id"): node
+                  for node in tree_to_list(_history_source, [])
+                  if isinstance(node, Element) and node.attributes.get("id")}
+_history_nodes["text"].attributes["value"] = "after"
+_history_nodes["flag"].attributes.pop("checked", None)
+_history_nodes["memo"].attributes["value"] = "draft"
+_history_nodes["one"].attributes.pop("selected", None)
+_history_nodes["two"].attributes["selected"] = ""
+_form_state = _navigation.capture_form_state(_history_source)
+_history_fresh = HTMLParser(_history_html).parse()
+_fresh_controls = [node for node in tree_to_list(_history_fresh, [])
+                   if isinstance(node, Element)
+                   and node.tag in ("input", "textarea", "select", "option")]
+for _ridx, _control in enumerate(_fresh_controls, 1):
+    _control._ridx = _ridx
+_state_sets, _state_removes = [], []
+_navigation.restore_form_state(
+    _history_fresh, _form_state,
+    set_attr=lambda ridx, name, value:
+        _state_sets.append((ridx, name, value)),
+    remove_attr=lambda ridx, name: _state_removes.append((ridx, name)))
+_restored_nodes = {node.attributes.get("id"): node
+                   for node in tree_to_list(_history_fresh, [])
+                   if isinstance(node, Element) and node.attributes.get("id")}
+check("history restores form values, checks, and selection",
+      _restored_nodes["text"].attributes.get("value") == "after"
+      and "checked" not in _restored_nodes["flag"].attributes
+      and "value" not in _restored_nodes["file"].attributes
+      and _restored_nodes["memo"].attributes.get("value") == "draft"
+      and "selected" not in _restored_nodes["one"].attributes
+      and "selected" in _restored_nodes["two"].attributes
+      and any(name == "checked" for _ridx, name in _state_removes),
+      repr((_form_state, _state_sets, _state_removes)))
+
+# Starting a newer navigation cancels the superseded worker and only the
+# newest completion can be taken by the UI thread.
+import threading as _threading
+_nav_controller = _navigation.NavigationController()
+_old_started = _threading.Event()
+
+def _old_navigation(token):
+    _old_started.set()
+    while True:
+        token.check()
+        _threading.Event().wait(0.005)
+
+_old_pending = _nav_controller.start(_old_navigation, "old")
+_old_started.wait(1.0)
+_new_pending = _nav_controller.start(lambda token: "new", "new")
+_new_result = _new_pending.future.result(timeout=1.0)
+_ready_navigation = _nav_controller.take_ready()
+_old_cancelled = False
+try:
+    _old_pending.future.result(timeout=1.0)
+except net.RequestCancelled:
+    _old_cancelled = True
+_nav_controller.shutdown()
+_history_entry = _navigation.HistoryEntry(
+    net.URL("https://history.test/a"), _history_html,
+    scroll=321, hscroll=45, form_state=_form_state)
+check("new navigation cancels stale work and history retains viewport",
+      _old_cancelled and _new_result == "new"
+      and _ready_navigation is _new_pending
+      and _ready_navigation.context == "new"
+      and _history_entry.scroll == 321 and _history_entry.hscroll == 45,
+      repr((_old_cancelled, _new_result, _ready_navigation,
+            _history_entry.scroll, _history_entry.hscroll)))
 
 check("background shorthand parses url/pos/repeat",
       parse_background({"background":
@@ -685,6 +1950,162 @@ lbl, nav = boxes["lbl"], boxes["nav"]
 check("flex:1 0 0 grows past a content-sized sibling",
       nav.width > 300 and lbl.width < 100 and lbl.x < nav.x,
       f"lbl.width={lbl.width:.0f} nav.width={nav.width:.0f}")
+
+# --- grid named lines, row spans, and collision-free auto placement ---
+GRID_PAGE = """<html><body style="margin:0">
+<div id=ng style="display:grid; width:400px; gap:10px;
+     grid-template-columns:[side-start] 100px
+                           [side-end content-start] 1fr [content-end];
+     grid-template-rows:[top] 40px [middle] 30px [bottom]">
+  <div id=side style="grid-column:side-start / side-end;
+       grid-row:top / middle">side</div>
+  <div id=main style="grid-column:content-start / content-end;
+       grid-row:top / bottom">main</div>
+  <div id=foot style="grid-column:side-start / content-end;
+       grid-row:middle / bottom">foot</div>
+</div>
+<div id=cg style="display:grid; width:300px;
+     grid-template-columns:repeat(3, [slot] 100px);
+     grid-template-rows:20px 20px">
+  <div id=auto-first>auto</div>
+  <div id=reserved style="grid-column:1 / span 2;
+       grid-row:1 / span 2">reserved</div>
+  <div id=auto-second>auto2</div>
+</div>
+</body></html>"""
+grid_dom = HTMLParser(GRID_PAGE).parse()
+style(grid_dom, sorted(ua, key=cascade_priority))
+grid_doc = DocumentLayout(grid_dom)
+grid_doc.layout(800)
+grid_boxes = {
+    b.node.attributes.get("id"): b
+    for b in layout_tree_to_list(grid_doc, [])
+    if isinstance(b, BlockLayout) and isinstance(b.node, Element)
+    and b.node.attributes.get("id")
+}
+ng = grid_boxes["ng"]
+check("grid named column lines place sidebar and content",
+      abs(grid_boxes["side"].x - ng.x) < 1
+      and abs(grid_boxes["main"].x - (ng.x + 110)) < 1
+      and abs(grid_boxes["main"].width - 290) < 1,
+      f"side.x={grid_boxes['side'].x - ng.x:.0f} "
+      f"main=({grid_boxes['main'].x - ng.x:.0f},"
+      f"{grid_boxes['main'].width:.0f})")
+check("grid named row lines and spans resolve fixed tracks",
+      abs(grid_boxes["foot"].y - (ng.y + 50)) < 1
+      and abs(grid_boxes["foot"].width - 400) < 1,
+      f"foot=({grid_boxes['foot'].x - ng.x:.0f},"
+      f"{grid_boxes['foot'].y - ng.y:.0f},"
+      f"{grid_boxes['foot'].width:.0f})")
+cg = grid_boxes["cg"]
+check("grid auto placement reserves later explicit spans",
+      abs(grid_boxes["reserved"].x - cg.x) < 1
+      and abs(grid_boxes["auto-first"].x - (cg.x + 200)) < 1
+      and abs(grid_boxes["auto-second"].x - (cg.x + 200)) < 1
+      and grid_boxes["auto-second"].y > grid_boxes["auto-first"].y,
+      f"auto1=({grid_boxes['auto-first'].x - cg.x:.0f},"
+      f"{grid_boxes['auto-first'].y - cg.y:.0f}) "
+      f"auto2=({grid_boxes['auto-second'].x - cg.x:.0f},"
+      f"{grid_boxes['auto-second'].y - cg.y:.0f})")
+
+STICKY_PAGE = """<html><body style="margin:0">
+<div id=stick-wrap style="height:300px">
+  <div id=stick style="position:sticky; top:10px; height:30px">
+    <span id=stick-child>sticky</span>
+  </div>
+  <div style="height:500px">long content</div>
+</div>
+</body></html>"""
+sticky_dom = HTMLParser(STICKY_PAGE).parse()
+style(sticky_dom, sorted(ua, key=cascade_priority))
+sticky_doc = DocumentLayout(sticky_dom)
+sticky_doc.layout(800, 120)
+sticky_boxes = {
+    b.node.attributes.get("id"): b
+    for b in layout_tree_to_list(sticky_doc, [])
+    if isinstance(b, BlockLayout) and isinstance(b.node, Element)
+    and b.node.attributes.get("id")
+}
+stick = sticky_boxes["stick"]
+normal_top = stick.y - stick.pt - stick.bw - stick.margin_top
+check("sticky top follows scroll and keeps its inset",
+      abs(sticky_offset(stick, normal_top + 50) - 60) < 1,
+      f"offset={sticky_offset(stick, normal_top + 50):.0f}")
+check("sticky movement stops at the containing-block boundary",
+      abs(sticky_offset(stick, normal_top + 500) - 270) < 1,
+      f"offset={sticky_offset(stick, normal_top + 500):.0f}")
+sticky_cmds = paint_tree(sticky_doc, [])
+check("sticky paint emits native push/pop markers",
+      sum(type(c).__name__ == "DrawStickyPush" for c in sticky_cmds) == 1
+      and sum(type(c).__name__ == "DrawStickyPop" for c in sticky_cmds) == 1)
+
+# --- vertical margin collapsing: parent edges, nesting, empty blocks ---
+MARGIN_PAGE = """<html><body style="margin:0">
+<div id=top-parent style="margin-top:10px">
+  <div id=top-child style="margin-top:30px;height:20px"></div>
+</div>
+<div id=border-parent style="border-width:1px;margin-top:5px">
+  <div id=border-child style="margin-top:25px;height:10px"></div>
+</div>
+<div id=bottom-parent style="margin-bottom:10px">
+  <div id=bottom-child style="height:20px;margin-bottom:40px"></div>
+</div>
+<div id=bottom-next style="height:10px;margin-top:5px"></div>
+<div id=before-empty style="height:10px;margin-bottom:10px"></div>
+<div id=empty style="margin-top:30px;margin-bottom:20px"></div>
+<div id=after-empty style="height:10px;margin-top:15px"></div>
+<div id=neg-before style="height:10px;margin-bottom:20px"></div>
+<div id=neg-empty style="margin-top:-10px;margin-bottom:30px"></div>
+<div id=neg-after style="height:10px;margin-top:-5px"></div>
+<div id=nested style="margin-top:5px">
+  <div id=nested-mid style="margin-top:20px">
+    <div id=nested-leaf style="margin-top:30px;height:10px"></div>
+  </div>
+</div>
+</body></html>"""
+margin_dom = HTMLParser(MARGIN_PAGE).parse()
+style(margin_dom, sorted(ua, key=cascade_priority))
+margin_doc = DocumentLayout(margin_dom)
+margin_doc.layout(800)
+margin_boxes = {
+    b.node.attributes.get("id"): b
+    for b in layout_tree_to_list(margin_doc, [])
+    if isinstance(b, BlockLayout) and isinstance(b.node, Element)
+    and b.node.attributes.get("id")
+}
+check("parent and first-child top margins collapse",
+      abs(margin_boxes["top-parent"].margin_top - 30) < 1
+      and abs(margin_boxes["top-child"].y
+              - margin_boxes["top-parent"].y) < 1,
+      f"parent.mt={margin_boxes['top-parent'].margin_top:.0f} "
+      f"delta={margin_boxes['top-child'].y - margin_boxes['top-parent'].y:.0f}")
+check("parent border prevents top margin collapse",
+      abs(margin_boxes["border-child"].y
+              - margin_boxes["border-parent"].y - 25) < 1,
+      f"delta={margin_boxes['border-child'].y - margin_boxes['border-parent'].y:.0f}")
+bp, bc, bn = (margin_boxes["bottom-parent"],
+              margin_boxes["bottom-child"], margin_boxes["bottom-next"])
+check("last-child bottom margin collapses through an auto-height parent",
+      abs(bp.height - bc.height) < 1 and abs(bp.margin_bottom - 40) < 1
+      and abs(bn.y - (bp.y + bp.height + 40)) < 1,
+      f"parent.h={bp.height:.0f} mb={bp.margin_bottom:.0f} "
+      f"next-gap={bn.y - bp.y - bp.height:.0f}")
+be, ae = margin_boxes["before-empty"], margin_boxes["after-empty"]
+check("empty block margins collapse across the zero-height box",
+      abs(ae.y - (be.y + be.height) - 30) < 1,
+      f"gap={ae.y - be.y - be.height:.0f}")
+nb, na = margin_boxes["neg-before"], margin_boxes["neg-after"]
+check("mixed positive/negative adjoining margins collapse as one set",
+      abs(na.y - (nb.y + nb.height) - 20) < 1,
+      f"gap={na.y - nb.y - nb.height:.0f}")
+check("nested parent/first-child margins propagate as one set",
+      abs(margin_boxes["nested"].margin_top - 30) < 1
+      and abs(margin_boxes["nested"].y - margin_boxes["nested-mid"].y) < 1
+      and abs(margin_boxes["nested-mid"].y
+              - margin_boxes["nested-leaf"].y) < 1,
+      f"ys={margin_boxes['nested'].y:.0f},"
+      f"{margin_boxes['nested-mid'].y:.0f},"
+      f"{margin_boxes['nested-leaf'].y:.0f}")
 
 # --- float + clear (v1: width-bearing floats, block sidestep) ---
 FLOAT_PAGE = """<html><body style="margin: 0">
@@ -1033,6 +2454,109 @@ check("request path sanitized",
       "\r" not in net._safe_path("/a\r\nX: 1")
       and " " not in net._safe_path("/a b"))
 
+# --- Cookie security/scoping regressions ---
+from browser import psl as _psl
+check("PSL exact rules produce the registrable domain",
+      _psl.public_suffix("a.shop.example.co.uk") == "co.uk"
+      and _psl.registrable_domain("a.shop.example.co.uk")
+      == "example.co.uk", _psl.version())
+check("PSL wildcard and exception rules are applied",
+      _psl.public_suffix("a.b.ck") == "b.ck"
+      and _psl.public_suffix("www.ck") == "ck"
+      and _psl.registrable_domain("a.www.ck") == "www.ck")
+_idn_host = _psl.canonical_host("食狮.公司.cn")
+check("PSL canonicalizes Unicode hosts to IDNA",
+      _idn_host == "xn--85x722f.xn--55qx5d.cn"
+      and _psl.registrable_domain(_idn_host) == _idn_host,
+      _idn_host)
+check("schemeful site uses scheme plus eTLD+1",
+      net._site_key(net.URL("https://a.example.co.uk/"))
+      == ("https", "example.co.uk")
+      and net._site_key(net.URL("https://b.example.co.uk/"))
+      == ("https", "example.co.uk")
+      and net._site_key(net.URL("http://b.example.co.uk/"))
+      != ("https", "example.co.uk"))
+check("PSL site domains preserve localhost and IP literals",
+      _psl.site_domain("localhost") == "localhost"
+      and _psl.site_domain("127.0.0.1") == "127.0.0.1"
+      and _psl.site_domain("::1") == "::1")
+
+net._COOKIE_JAR.clear()
+_cu = net.URL("https://www.example.com/app/page")
+_cu_http = net.URL("http://www.example.com/app/page")
+check("document.cookie rejects header controls",
+      not net.set_cookie_from_js(_cu, "sid=ok\r\nX-Injected: yes")
+      and "X-Injected" not in net._cookie_header(_cu))
+check("cookie names reject HTTP separators",
+      not net.set_cookie_from_js(_cu, "bad:name=value"))
+check("Domain cookies reject ICANN and private public suffixes",
+      net._store_set_cookie(
+          net.URL("https://shop.example.co.uk/"),
+          ["bad=1; Domain=co.uk; Secure"]) == 0
+      and net._store_set_cookie(
+          net.URL("https://tenant.github.io/"),
+          ["bad=1; Domain=github.io; Secure"]) == 0)
+
+_stored = net._store_set_cookie(_cu, [
+    "sid=secret; Path=/app; Secure; HttpOnly; SameSite=Strict",
+    "domainwide=1; Domain=example.com; Path=/",
+    "third=ok; Path=/; Secure; SameSite=None",
+])
+check("cookie attributes accepted", _stored == 3, str(net._COOKIE_JAR))
+_doc_cookie = net.cookies_for(_cu)
+check("HttpOnly hidden from document.cookie",
+      "sid=" not in _doc_cookie and "domainwide=1" in _doc_cookie,
+      _doc_cookie)
+check("HttpOnly cookie still sent on matching HTTPS path",
+      "sid=secret" in net._cookie_header(_cu))
+check("Secure cookie withheld from HTTP",
+      "sid=secret" not in net._cookie_header(_cu_http)
+      and "third=ok" not in net._cookie_header(_cu_http))
+check("cookie Path boundary enforced",
+      "sid=secret" not in net._cookie_header(
+          net.URL("https://www.example.com/application")))
+check("Domain cookie reaches a subdomain",
+      "domainwide=1" in net._cookie_header(
+          net.URL("https://cdn.example.com/asset")))
+_cross = net._cookie_header(
+    _cu, site_for_cookies=net.URL("https://cross-site.test/"),
+    top_level_navigation=False)
+check("SameSite blocks cross-site subresource cookies",
+      "sid=secret" not in _cross and "domainwide=1" not in _cross
+      and "third=ok" in _cross, _cross)
+_cross_navigation = net._cookie_header(
+    _cu, site_for_cookies=net.URL("https://cross-site.test/"),
+    top_level_navigation=True)
+check("SameSite top-level GET allows Lax but withholds Strict",
+      "sid=secret" not in _cross_navigation
+      and "domainwide=1" in _cross_navigation
+      and "third=ok" in _cross_navigation, _cross_navigation)
+check("insecure origins cannot set Secure cookies",
+      net._store_set_cookie(
+          _cu_http, ["bad=1; Secure; Path=/"]) == 0)
+check("document.cookie cannot overwrite HttpOnly",
+      not net.set_cookie_from_js(_cu, "sid=evil; Path=/app")
+      and "sid=secret" in net._cookie_header(_cu))
+net._store_set_cookie(_cu, ["gone=1; Path=/; Max-Age=10"])
+net._store_set_cookie(_cu, ["gone=; Path=/; Max-Age=0"])
+check("Max-Age deletes a cookie", "gone=" not in net._cookie_header(_cu))
+
+from concurrent.futures import ThreadPoolExecutor as _CookiePool
+_cookie_errors = []
+def _cookie_worker(i):
+    try:
+        for n in range(25):
+            net.set_cookie_from_js(_cu, f"t{i}_{n}={n}; Path=/")
+            net.cookies_for(_cu)
+            net._cookie_header(_cu)
+    except Exception as e:
+        _cookie_errors.append(e)
+with _CookiePool(max_workers=8) as _pool:
+    list(_pool.map(_cookie_worker, range(8)))
+check("cookie jar is safe under parallel reads/writes",
+      not _cookie_errors, repr(_cookie_errors))
+net._COOKIE_JAR.clear()
+
 # --- Real network fetch ---
 headers, body = net.request(net.URL("https://example.com"))
 check("HTTPS fetch example.com", "<html" in body.lower()
@@ -1048,6 +2572,251 @@ check("about:home renders", "GG Browser" in body)
 
 # --- Headless automation driver (needs the native wheel + JS) ---
 if native.available():
+    # Both GUI shells commit completed navigation on their UI loop and keep
+    # page body + viewport + form state in each history entry.
+    from browser.browser import Browser as _TkBrowser
+    _ui_page1 = net.URL(
+        "data:text/html,<html><body><input id=remember value=before>"
+        "<div style='width:2200px;height:2200px'>long</div></body></html>")
+    _ui_page2 = net.URL(
+        "data:text/html,<html><body><p>second</p></body></html>")
+    _keyboard_url = net.URL("https://keyboard.test/start")
+    _keyboard_html = (
+        '<html><body><a id="k-link" tabindex="1" href="/target">link</a>'
+        '<button id="k-button" tabindex="2" onclick="document.'
+        "getElementById('k-out').setAttribute('data-hit','yes')\">"
+        'button</button><form action="/submitted" method="post">'
+        '<input id="k-text" name="q" value="ok"><button id="k-submit" '
+        'name="go" value="yes">submit</button></form><input id="k-check" '
+        'type="checkbox"><div id="k-out"></div></body></html>')
+
+    def _finish_tk_navigation(browser, future):
+        future.result(timeout=2.0)
+        if browser._navigation_poll is not None:
+            browser.window.after_cancel(browser._navigation_poll)
+            browser._navigation_poll = None
+        browser._poll_navigation()
+
+    _tk_browser = _TkBrowser()
+    _tk_browser.window.withdraw()
+    _finish_tk_navigation(_tk_browser, _tk_browser.load(_ui_page1))
+    _remember = next(node for node in tree_to_list(_tk_browser.nodes, [])
+                     if isinstance(node, Element)
+                     and node.attributes.get("id") == "remember")
+    _remember.attributes["value"] = "restored"
+    _tk_browser.sync_attr(_remember, "value", "restored")
+    _tk_browser.scroll = 321
+    _finish_tk_navigation(_tk_browser, _tk_browser.load(_ui_page2))
+    _tk_browser.go_back()
+    _remember_back = next(
+        node for node in tree_to_list(_tk_browser.nodes, [])
+        if isinstance(node, Element)
+        and node.attributes.get("id") == "remember")
+    check("tk shell back restores body, form value, and scroll",
+          len(_tk_browser.history) == 2
+          and _remember_back.attributes.get("value") == "restored"
+          and _tk_browser.scroll == 321,
+          repr((len(_tk_browser.history), _remember_back.attributes,
+                _tk_browser.scroll)))
+    _tk_browser.go_forward()
+    check("tk shell forward restores the saved document without fetch",
+          _tk_browser.history_index == 1
+          and str(_tk_browser.url) == str(_ui_page2)
+          and any(isinstance(node, Text) and node.text == "second"
+                  for node in tree_to_list(_tk_browser.nodes, [])),
+          repr((_tk_browser.history_index, _tk_browser.url)))
+
+    class _TkKeyEvent:
+        def __init__(self, keysym, char="", state=0):
+            self.keysym = keysym
+            self.char = char
+            self.state = state
+
+    _tk_browser.render_page(_keyboard_url, _keyboard_html)
+    _tk_browser.on_key(_TkKeyEvent("Tab"))
+    _tk_first = _tk_browser.focus_node.attributes.get("id")
+    _tk_browser.on_key(_TkKeyEvent("Tab"))
+    _tk_second = _tk_browser.focus_node.attributes.get("id")
+    _tk_browser.on_key(_TkKeyEvent("ISO_Left_Tab", state=1))
+    _tk_reverse = _tk_browser.focus_node.attributes.get("id")
+    check("tk shell Tab and Shift+Tab follow sequential focus order",
+          (_tk_first, _tk_second, _tk_reverse)
+          == ("k-link", "k-button", "k-link"),
+          repr((_tk_first, _tk_second, _tk_reverse)))
+    _tk_button = next(
+        node for node in tree_to_list(_tk_browser.nodes, [])
+        if isinstance(node, Element)
+        and node.attributes.get("id") == "k-button")
+    _tk_browser.set_focus(_tk_button)
+    _tk_browser.on_key(_TkKeyEvent("Return"))
+    _tk_out = next(
+        node for node in tree_to_list(_tk_browser.nodes, [])
+        if isinstance(node, Element)
+        and node.attributes.get("id") == "k-out")
+    check("tk shell Enter activates the focused button",
+          _tk_out.attributes.get("data-hit") == "yes",
+          repr(_tk_out.attributes))
+    _tk_check = next(
+        node for node in tree_to_list(_tk_browser.nodes, [])
+        if isinstance(node, Element)
+        and node.attributes.get("id") == "k-check")
+    _tk_browser.set_focus(_tk_check)
+    _tk_browser.on_key(_TkKeyEvent("space", char=" "))
+    _tk_check = next(
+        node for node in tree_to_list(_tk_browser.nodes, [])
+        if isinstance(node, Element)
+        and node.attributes.get("id") == "k-check")
+    check("tk shell Space toggles the focused checkbox",
+          "checked" in _tk_check.attributes, repr(_tk_check.attributes))
+    _tk_link = next(
+        node for node in tree_to_list(_tk_browser.nodes, [])
+        if isinstance(node, Element)
+        and node.attributes.get("id") == "k-link")
+    _tk_link_targets = []
+    _tk_real_load = _tk_browser.load
+    _tk_browser.load = lambda url, *args, **kwargs: \
+        _tk_link_targets.append(str(url))
+    try:
+        _tk_browser.set_focus(_tk_link)
+        _tk_browser.on_key(_TkKeyEvent("Return"))
+    finally:
+        _tk_browser.load = _tk_real_load
+    check("tk shell Enter follows the focused link",
+          _tk_link_targets == ["https://keyboard.test/target"],
+          repr(_tk_link_targets))
+    _tk_text = next(
+        node for node in tree_to_list(_tk_browser.nodes, [])
+        if isinstance(node, Element)
+        and node.attributes.get("id") == "k-text")
+    _tk_submit_calls = []
+    _tk_browser.load = lambda url, *args, **kwargs: \
+        _tk_submit_calls.append((str(url), kwargs))
+    try:
+        _tk_browser.set_focus(_tk_text)
+        _tk_browser.on_key(_TkKeyEvent("Return"))
+    finally:
+        _tk_browser.load = _tk_real_load
+    check("tk shell Enter uses the form's default submit button",
+          _tk_submit_calls
+          and _tk_submit_calls[0][0]
+          == "https://keyboard.test/submitted"
+          and _tk_submit_calls[0][1].get("method") == "POST"
+          and _tk_submit_calls[0][1].get("body") == b"q=ok&go=yes",
+          repr(_tk_submit_calls))
+    _tk_browser._navigation.shutdown()
+    _tk_browser.window.destroy()
+
+    from browser.shell import Shell as _NativeShell
+
+    class _FakeNativeWindow:
+        def size(self):
+            return 1100, 780
+
+        def scale_factor(self):
+            return 1.0
+
+        def set_title(self, title):
+            self.title = title
+
+    _native_shell = _NativeShell(_FakeNativeWindow())
+    _native_shell.load(_ui_page1).result(timeout=2.0)
+    _native_shell.poll_navigation()
+    _shell_remember = next(
+        node for node in tree_to_list(_native_shell.nodes, [])
+        if isinstance(node, Element)
+        and node.attributes.get("id") == "remember")
+    _shell_remember.attributes["value"] = "native-restored"
+    _native_shell._doc.set_attr(
+        _shell_remember._ridx, "value", "native-restored")
+    _native_shell.scroll = 222
+    _native_shell.hscroll = 111
+    _native_shell.load(_ui_page2).result(timeout=2.0)
+    _native_shell.poll_navigation()
+    _native_shell.go_back()
+    _shell_back = next(
+        node for node in tree_to_list(_native_shell.nodes, [])
+        if isinstance(node, Element)
+        and node.attributes.get("id") == "remember")
+    check("native shell history restores both viewport axes and forms",
+          _shell_back.attributes.get("value") == "native-restored"
+          and _native_shell.scroll == 222
+          and _native_shell.hscroll == 111,
+          repr((_shell_back.attributes, _native_shell.scroll,
+                _native_shell.hscroll)))
+    _native_shell.render_page(_keyboard_url, _keyboard_html)
+    _native_shell.on_key("Tab")
+    _native_first = _native_shell.focus_node.attributes.get("id")
+    _native_shell.on_key("Tab")
+    _native_second = _native_shell.focus_node.attributes.get("id")
+    _native_shell.on_key("ShiftTab")
+    _native_reverse = _native_shell.focus_node.attributes.get("id")
+    check("native shell Tab and Shift+Tab follow sequential focus order",
+          (_native_first, _native_second, _native_reverse)
+          == ("k-link", "k-button", "k-link"),
+          repr((_native_first, _native_second, _native_reverse)))
+    _native_button = next(
+        node for node in tree_to_list(_native_shell.nodes, [])
+        if isinstance(node, Element)
+        and node.attributes.get("id") == "k-button")
+    _native_shell.set_focus(_native_button)
+    _native_shell.on_key("Enter")
+    _native_out = next(
+        node for node in tree_to_list(_native_shell.nodes, [])
+        if isinstance(node, Element)
+        and node.attributes.get("id") == "k-out")
+    check("native shell Enter activates the focused button",
+          _native_out.attributes.get("data-hit") == "yes",
+          repr(_native_out.attributes))
+    _native_check = next(
+        node for node in tree_to_list(_native_shell.nodes, [])
+        if isinstance(node, Element)
+        and node.attributes.get("id") == "k-check")
+    _native_shell.set_focus(_native_check)
+    _native_shell.on_text(" ")
+    _native_check = next(
+        node for node in tree_to_list(_native_shell.nodes, [])
+        if isinstance(node, Element)
+        and node.attributes.get("id") == "k-check")
+    check("native shell Space toggles the focused checkbox",
+          "checked" in _native_check.attributes,
+          repr(_native_check.attributes))
+    _native_link = next(
+        node for node in tree_to_list(_native_shell.nodes, [])
+        if isinstance(node, Element)
+        and node.attributes.get("id") == "k-link")
+    _native_link_targets = []
+    _native_real_load = _native_shell.load
+    _native_shell.load = lambda url, *args, **kwargs: \
+        _native_link_targets.append(str(url))
+    try:
+        _native_shell.set_focus(_native_link)
+        _native_shell.on_key("Enter")
+    finally:
+        _native_shell.load = _native_real_load
+    check("native shell Enter follows the focused link",
+          _native_link_targets == ["https://keyboard.test/target"],
+          repr(_native_link_targets))
+    _native_text = next(
+        node for node in tree_to_list(_native_shell.nodes, [])
+        if isinstance(node, Element)
+        and node.attributes.get("id") == "k-text")
+    _native_submit_calls = []
+    _native_shell.load = lambda url, *args, **kwargs: \
+        _native_submit_calls.append((str(url), kwargs))
+    try:
+        _native_shell.set_focus(_native_text)
+        _native_shell.on_key("Enter")
+    finally:
+        _native_shell.load = _native_real_load
+    check("native shell Enter uses the form's default submit button",
+          _native_submit_calls
+          and _native_submit_calls[0][0]
+          == "https://keyboard.test/submitted"
+          and _native_submit_calls[0][1].get("method") == "POST"
+          and _native_submit_calls[0][1].get("body") == b"q=ok&go=yes",
+          repr(_native_submit_calls))
+    _native_shell._navigation.shutdown()
+
     from browser.driver import Page
 
     dp = Page()
@@ -1074,6 +2843,137 @@ if native.available():
     dp.click("#b")
     check("driver: click runs the handler", dp.text("#o") == "hit",
           repr(dp.text("#o")))
+
+    _real_request_text = net.request_text
+    _form_requests = []
+
+    def _fake_form_request(url, *args, **kwargs):
+        _form_requests.append((str(url), kwargs))
+        if url.host == "form.test" and url.path == "/start":
+            html = (
+                '<html><body><form action="/result" method="post" '
+                'onsubmit="document.getElementById(\'event-value\')'
+                '.setAttribute(\'value\',\'after\')">'
+                '<input name="q" value="hello world">'
+                '<input id="event-value" name="event" value="before">'
+                '<button id="send" name="go" value="yes">send</button>'
+                '</form></body></html>')
+        else:
+            html = '<html><body><div id="result">posted</div></body></html>'
+        return {}, html, url
+
+    try:
+        net.request_text = _fake_form_request
+        dp3 = Page()
+        dp3.goto("https://form.test/start")
+        _submitted = dp3.click("#send")
+    finally:
+        net.request_text = _real_request_text
+    _post_calls = [kwargs for url, kwargs in _form_requests
+                   if url == "https://form.test/result"]
+    check("driver: submit button performs POST navigation",
+          _submitted and dp3.text("#result") == "posted"
+          and len(_post_calls) == 1,
+          repr(_form_requests))
+    check("driver: POST form forwards body and Content-Type",
+          _post_calls
+          and _post_calls[0].get("method") == "POST"
+          and _post_calls[0].get("body") ==
+          b"q=hello+world&event=after&go=yes"
+          and _post_calls[0].get("headers") == {
+              "Content-Type": "application/x-www-form-urlencoded"},
+          repr(_post_calls))
+
+    _form_event_requests = []
+
+    def _fake_form_event_page(url, *args, **kwargs):
+        _form_event_requests.append(str(url))
+        html = (
+            '<html><body><form id="f" action="/sent" method="post">'
+            '<input id="required" name="q" required></form>'
+            '<button id="event-send" form="f">send</button>'
+            '<button id="event-reset" type="reset" form="f">reset</button>'
+            '<div id="event-out">idle</div><script>'
+            "var q=document.getElementById('required');"
+            "var f=document.getElementById('f');"
+            "q.addEventListener('invalid',function(){"
+            "document.getElementById('event-out').textContent='invalid';});"
+            "f.addEventListener('submit',function(e){"
+            "document.getElementById('event-out').textContent="
+            "'submit:'+e.submitter.id;e.preventDefault();});"
+            "f.addEventListener('reset',function(){"
+            "document.getElementById('event-out').textContent='reset';});"
+            '</script></body></html>')
+        return {}, html, url
+
+    try:
+        net.request_text = _fake_form_event_page
+        dp_events = Page(engine="ggjs")
+        dp_events.goto("https://form-events.test/start")
+        dp_events.click("#event-send")
+        _invalid_text = dp_events.text("#event-out")
+        dp_events.evaluate(
+            "(document.getElementById('required').value = 'ok')")
+        dp_events.click("#event-send")
+        _submit_text = dp_events.text("#event-out")
+        dp_events.click("#event-reset")
+        _reset_text = dp_events.text("#event-out")
+        _reset_value = dp_events.query("#required").attr("value")
+    finally:
+        net.request_text = _real_request_text
+    check("driver: invalid event blocks form navigation",
+          _invalid_text == "invalid" and len(_form_event_requests) == 1,
+          repr((_invalid_text, _form_event_requests)))
+    check("driver: submit event exposes submitter and can cancel",
+          _submit_text == "submit:event-send"
+          and len(_form_event_requests) == 1,
+          repr((_submit_text, _form_event_requests)))
+    check("driver: reset event restores initial control value",
+          _reset_text == "reset" and _reset_value in (None, ""),
+          repr((_reset_text, _reset_value)))
+
+    # The gg-js host bridge must preserve fetch options all the way to the
+    # Python security policy, then expose the real response status and URL.
+    from browser import security as _security
+    _real_policy_fetch = _security.perform_script_fetch
+    _script_requests = []
+
+    def _fake_script_policy(base_url, request, **_network_options):
+        _script_requests.append((str(base_url), dict(request)))
+        return _security.ScriptFetchResponse(
+            201, {}, "cors-ok", net.URL("https://api.fetch.test/final"))
+
+    def _fake_script_page(url, *args, **kwargs):
+        html = (
+            '<html><body><div id="out">pending</div><script>'
+            "fetch('/api', {method:'POST', body:'x=1', "
+            "credentials:'include', headers:{'X-Token':'yes'}})"
+            ".then(function(r) { return r.text().then(function(t) {"
+            "document.getElementById('out').textContent = "
+            "r.status + '|' + r.url + '|' + t; }); });"
+            '</script></body></html>')
+        return {}, html, url
+
+    try:
+        net.request_text = _fake_script_page
+        _security.perform_script_fetch = _fake_script_policy
+        dp4 = Page(engine="ggjs")
+        dp4.goto("https://app.fetch.test/start")
+    finally:
+        net.request_text = _real_request_text
+        _security.perform_script_fetch = _real_policy_fetch
+    _bridged = _script_requests[0][1] if _script_requests else {}
+    check("driver: gg-js fetch bridge preserves request options",
+          len(_script_requests) == 1
+          and _bridged.get("method") == "POST"
+          and _bridged.get("body") == "x=1"
+          and _bridged.get("credentials") == "include"
+          and ("X-Token", "yes") in _bridged.get("headers", []),
+          repr(_script_requests))
+    check("driver: fetch exposes response status, URL, and body",
+          dp4.text("#out") ==
+          "201|https://api.fetch.test/final|cors-ok",
+          repr(dp4.text("#out")))
 else:
     print("[SKIP] driver checks - native ggcore not built")
 

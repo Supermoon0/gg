@@ -10,11 +10,12 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from . import native, net, textengine
+from . import forms, keyboard, native, navigation, net, textengine
 from .draw import scale_cmds
 from .html_parser import Element, Text, tree_to_list
 from .layout import (HSTEP, VSTEP, DocumentLayout, get_font,
-                     layout_tree_to_list, measure, paint_tree)
+                     layout_tree_to_list, measure, paint_tree,
+                     sticky_offset)
 from .pages import error_page
 
 TOOLBAR_H = 44
@@ -28,13 +29,22 @@ BORDER = (200, 200, 200)
 INK = (40, 40, 40)
 
 
-def _fetch_many(urls, base, binary=False):
+def _fetch_many(urls, base, binary=False, *, timeout=net.DEFAULT_TIMEOUT,
+                cancel_token=None):
     """Parallel fetch helper: {url: text-or-bytes}."""
     def fetch(u):
         try:
             if binary:
-                return net.request_raw(base.resolve(u))[1]
-            return net.request(base.resolve(u))[1]
+                return net.request_raw(
+                    base.resolve(u), site_for_cookies=base,
+                    top_level_navigation=False, timeout=timeout,
+                    cancel_token=cancel_token)[1]
+            return net.request(
+                base.resolve(u), site_for_cookies=base,
+                top_level_navigation=False, timeout=timeout,
+                cancel_token=cancel_token)[1]
+        except net.RequestCancelled:
+            raise
         except Exception:
             return b"" if binary else ""
 
@@ -63,6 +73,9 @@ class Shell:
         self.url_focused = False
         self.history = []
         self.history_index = -1
+        self.navigation_timeout = net.DEFAULT_TIMEOUT
+        self._navigation = navigation.NavigationController()
+        self._loading_token = None
         self.document = None
         self.layout_list = []
         self.display_list = []
@@ -70,8 +83,16 @@ class Shell:
         self._pushed_scale = None
         self.nodes = None
         self._doc = None
+        self.focus_node = None
+        self._focus_ridx = None
         self._css_sources = []
+        self._form_defaults = {}
         self._img_by_src = {}
+        self._load_timings = {}
+        self._deferred_resources = False
+        self._dom_version = None
+        self._live_last = time.monotonic()
+        self._live_next = 0.0
         self.status = ""
         self.ui_font = get_font(15, "normal", "roman", "default")
         self.ui_small = get_font(12, "normal", "roman", "default")
@@ -93,30 +114,97 @@ class Shell:
             url = net.URL(HOME_URL)
         self.load(url)
 
-    def load(self, url, add_to_history=True, no_cache=False):
+    def load(self, url, add_to_history=True, no_cache=False, *,
+             method="GET", body=None, headers=None, timeout=None):
+        self._snapshot_history_entry()
         self.set_status(f"로딩 중... {url}")
-        self.render_frame()  # immediate feedback before blocking I/O
+        initiator = getattr(self, "url", None)
+        if initiator is not None and not getattr(initiator, "host", None):
+            initiator = None
+        timeout = self.navigation_timeout if timeout is None else timeout
+        context = {"url": url, "add_to_history": add_to_history}
+
+        def fetch(token):
+            return net.request_text(
+                url, no_cache=no_cache, method=method, body=body,
+                headers=headers, site_for_cookies=initiator,
+                top_level_navigation=True, timeout=timeout,
+                cancel_token=token)
+
+        return self._navigation.start(fetch, context).future
+
+    def poll_navigation(self):
+        pending = self._navigation.take_ready()
+        if pending is None:
+            return False
+        context = pending.context
+        url = context["url"]
         try:
-            _headers, body, url = net.request_text(url, no_cache=no_cache)
-            # url is now the post-redirect URL (base for relative links)
-        except Exception as e:
-            body = error_page(str(url), f"{type(e).__name__}: {e}")
+            _headers, page_body, url = pending.future.result()
+        except net.RequestCancelled:
+            self.set_status("탐색 취소됨")
+            return True
+        except Exception as exc:
+            page_body = error_page(
+                str(url), f"{type(exc).__name__}: {exc}")
+        self._loading_token = pending.token
         try:
-            self.render_page(url, body)
+            self.render_page(url, page_body)
         except Exception:
-            self.render_page(url, error_page(
-                str(url), traceback.format_exc(limit=5)))
-        if add_to_history:
+            page_body = error_page(str(url), traceback.format_exc(limit=5))
+            self.render_page(url, page_body)
+        finally:
+            self._loading_token = None
+        if context["add_to_history"]:
             self.history = self.history[:self.history_index + 1]
-            self.history.append(url)
+            self.history.append(navigation.HistoryEntry(url, page_body))
             self.history_index = len(self.history) - 1
-        self.set_status("완료 (native window)")
+        elif 0 <= self.history_index < len(self.history):
+            self.history[self.history_index] = navigation.HistoryEntry(
+                url, page_body)
+        self.set_status(
+            "첫 화면 · 나머지 로딩 중" if self._deferred_resources
+            else "완료 (native window)")
+        return True
+
+    def cancel_navigation(self):
+        if self._navigation.cancel():
+            self.set_status("탐색 취소됨")
+
+    def _snapshot_history_entry(self):
+        if not (0 <= self.history_index < len(self.history)):
+            return
+        entry = self.history[self.history_index]
+        entry.scroll = float(self.scroll)
+        entry.hscroll = float(self.hscroll)
+        entry.form_state = navigation.capture_form_state(self.nodes)
+
+    def _restore_history_entry(self, entry):
+        self.render_page(entry.url, entry.body)
+        changed = navigation.restore_form_state(
+            self.nodes, entry.form_state,
+            set_attr=self._doc.set_attr,
+            remove_attr=(self._doc.remove_attr
+                         if hasattr(self._doc, "remove_attr") else None))
+        if changed:
+            self.nodes = native.refresh(
+                self._doc, self._css_sources, self._styled_width)
+            self.relayout()
+        self.scroll = entry.scroll
+        self.hscroll = entry.hscroll
+        self.clamp_scroll()
+        self.set_status("완료 (history 복원)")
+        self.dirty = True
 
     def render_page(self, url, body):
+        render_started = time.perf_counter()
+        self._load_timings = {}
         self.url = url
         self.url_text = str(url)
         self.caret = len(self.url_text)
         self.url_focused = False
+        self.focus_node = None
+        self._focus_ridx = None
 
         # Use gg-js so the async event loop (fetch/Promise/setTimeout)
         # is available; fall back cleanly if the wheel predates it.
@@ -125,13 +213,19 @@ class Shell:
             os.environ["GGJS"] = "1"
         self._styled_width = self.logical_size()[0]
         try:
+            load_timings = {}
             self.nodes, self._doc, self._css_sources, logs = \
                 native.load_document(
                     body,
-                    lambda hrefs: _fetch_many(hrefs, url),
-                    lambda srcs: _fetch_many(srcs, url),
+                    lambda hrefs: _fetch_many(
+                        hrefs, url, timeout=self.navigation_timeout,
+                        cancel_token=self._loading_token),
+                    lambda srcs: _fetch_many(
+                        srcs, url, timeout=self.navigation_timeout,
+                        cancel_token=self._loading_token),
                     page_url=url,
-                    viewport_width=self._styled_width)
+                    viewport_width=self._styled_width,
+                    timings=load_timings)
         finally:
             if prev is None:
                 os.environ.pop("GGJS", None)
@@ -140,17 +234,71 @@ class Shell:
         for line in logs:
             print(f"[js console] {line}")
 
-        # Drive the event loop so fetch/timer-driven SPA content appears,
-        # then rebuild the tree from the mutated DOM.
-        if native.settle_async(self._doc, self._css_sources, url):
-            self.nodes = native.refresh(
-                self._doc, self._css_sources, self._styled_width)
+        self._load_timings = load_timings
+        self._form_defaults = forms.capture_defaults(self.nodes)
 
         self.apply_title()
-        self.load_images(keep_cache=False)
+        # Paint the DOM committed by parser-time scripts first. Async data,
+        # images and lazy cards continue from tick_live after this frame.
+        self.engine.clear_images()
+        self._img_by_src = {}
+        self._deferred_resources = True
         self.scroll = 0
         self.hscroll = 0
         self.relayout()
+        self._dom_version = (self._doc.dom_version()
+                             if hasattr(self._doc, "dom_version") else None)
+        self._live_last = time.monotonic()
+        self._live_next = self._live_last
+        self._load_timings["first_paint"] = \
+            (time.perf_counter() - render_started) * 1000.0
+        summary = " ".join(
+            f"{name}={value:.1f}ms"
+            for name, value in self._load_timings.items())
+        print(f"[perf] {url} {summary}")
+
+    def tick_live(self):
+        """Advance one page turn after the current frame was presented."""
+        if self._doc is None:
+            return
+        now = time.monotonic()
+        if now < self._live_next:
+            return
+        dt = min((now - self._live_last) * 1000.0, 1000.0)
+        self._live_last = now
+        self._live_next = now + 0.08
+        changed = False
+        try:
+            if hasattr(self._doc, "tick") and native.async_available():
+                logs, fetches = native.pump_script_requests(self._doc, dt)
+                native.sync_cookie_writes(self._doc, self.url)
+                for line in logs:
+                    print(f"[js live] {line}")
+                for request in fetches:
+                    native.service_script_fetch(
+                        self._doc, self.url, request,
+                        network_timeout=self.navigation_timeout)
+                version = (self._doc.dom_version()
+                           if hasattr(self._doc, "dom_version") else None)
+                changed = version != self._dom_version
+                if changed:
+                    self._dom_version = version
+                    self.nodes = native.refresh(
+                        self._doc, self._css_sources, self._styled_width)
+                    self._remap_focus()
+            if changed or self._deferred_resources:
+                first_resources = self._deferred_resources
+                started = time.perf_counter()
+                self._deferred_resources = False
+                self.load_images(keep_cache=True)
+                self.apply_title()
+                self.relayout()
+                if first_resources:
+                    self._load_timings["deferred_resources"] = \
+                        (time.perf_counter() - started) * 1000.0
+                    self.set_status("완료 (native window)")
+        except Exception as exc:
+            print(f"[live] tick error: {exc}")
 
     def apply_title(self):
         title = "GG Browser"
@@ -173,7 +321,10 @@ class Shell:
         srcs = [s for s in {n.attributes["src"] for n in img_nodes}
                 if s not in self._img_by_src]
         if srcs:
-            raw = _fetch_many(srcs, self.url, binary=True)
+            raw = _fetch_many(
+                srcs, self.url, binary=True,
+                timeout=self.navigation_timeout,
+                cancel_token=self._loading_token)
             for src, data in raw.items():
                 try:
                     self._img_by_src[src] = (
@@ -185,7 +336,10 @@ class Shell:
         textengine.load_svgs(self.nodes)
         textengine.load_background_images(
             self.nodes,
-            lambda urls: _fetch_many(urls, self.url, binary=True))
+            lambda urls: _fetch_many(
+                urls, self.url, binary=True,
+                timeout=self.navigation_timeout,
+                cancel_token=self._loading_token))
 
     def logical_size(self):
         """Window size in CSS px. Layout, hit-testing, and the UI all
@@ -204,6 +358,7 @@ class Shell:
             self._styled_width = w
             self.nodes = native.refresh(
                 self._doc, self._css_sources, w)
+            self._remap_focus()
             self.load_images(keep_cache=True)
         viewport_h = h - TOOLBAR_H - STATUS_H
         self.document = DocumentLayout(self.nodes)
@@ -233,6 +388,7 @@ class Shell:
         # a click handler may have scheduled fetch/timers — settle them
         native.settle_async(self._doc, self._css_sources, self.url)
         self.nodes = native.refresh(self._doc, self._css_sources)
+        self._remap_focus()
         self.load_images(keep_cache=True)
         self.apply_title()
         self.relayout()
@@ -243,15 +399,17 @@ class Shell:
 
     def go_back(self):
         if self.history_index > 0:
+            self.cancel_navigation()
+            self._snapshot_history_entry()
             self.history_index -= 1
-            self.load(self.history[self.history_index],
-                      add_to_history=False)
+            self._restore_history_entry(self.history[self.history_index])
 
     def go_forward(self):
         if self.history_index < len(self.history) - 1:
+            self.cancel_navigation()
+            self._snapshot_history_entry()
             self.history_index += 1
-            self.load(self.history[self.history_index],
-                      add_to_history=False)
+            self._restore_history_entry(self.history[self.history_index])
 
     def go_home(self):
         self.load_url_string(HOME_URL)
@@ -278,12 +436,115 @@ class Shell:
                                  + self.url_text[self.caret:])
                 self.caret += len(text)
                 self.dirty = True
+            else:
+                self.on_text(text)
         elif kind == "key":
             self.on_key(text)
 
+    @staticmethod
+    def _ridx_of(node):
+        while node is not None:
+            ridx = getattr(node, "_ridx", None)
+            if ridx is not None:
+                return ridx
+            node = node.parent
+        return None
+
+    def _node_by_ridx(self, ridx):
+        if ridx is None or self.nodes is None:
+            return None
+        return next((node for node in tree_to_list(self.nodes, [])
+                     if getattr(node, "_ridx", None) == ridx), None)
+
+    def _remap_focus(self):
+        self.focus_node = self._node_by_ridx(self._focus_ridx)
+        if self.focus_node is not None:
+            self.focus_node.is_focused = True
+
+    def set_focus(self, node):
+        ridx = self._ridx_of(node)
+        if ridx == self._focus_ridx and self.focus_node is node:
+            return
+        if self.focus_node is not None:
+            self.focus_node.is_focused = False
+        self._focus_ridx = ridx
+        self.focus_node = node
+        if node is not None:
+            node.is_focused = True
+        if self._doc is not None and hasattr(self._doc, "set_focus"):
+            self._doc.set_focus(ridx)
+            self.nodes = native.refresh(
+                self._doc, self._css_sources, self._styled_width)
+            self._remap_focus()
+            self.load_images(keep_cache=True)
+        self.relayout()
+
+    @staticmethod
+    def _is_descendant(node, ancestor):
+        while node is not None:
+            if node is ancestor:
+                return True
+            node = node.parent
+        return False
+
+    def _scroll_focus_into_view(self, node):
+        boxes = [obj for obj in self.layout_list
+                 if self._is_descendant(getattr(obj, "node", None), node)]
+        if not boxes:
+            return
+        top = min(obj.y for obj in boxes)
+        bottom = max(obj.y + obj.height for obj in boxes)
+        _w, height = self.logical_size()
+        viewport = max(height - TOOLBAR_H - STATUS_H, 1)
+        if top < self.scroll:
+            self.scroll = top
+        elif bottom > self.scroll + viewport:
+            self.scroll = bottom - viewport
+        self.clamp_scroll()
+        self.dirty = True
+
+    def focus_next(self, reverse=False):
+        node = keyboard.next_focus(
+            self.nodes, self.focus_node, reverse=reverse)
+        self.set_focus(node)
+        node = self.focus_node
+        if node is not None:
+            self._scroll_focus_into_view(node)
+        return node
+
+    def _edit_focused(self, text=None, backspace=False):
+        node = self.focus_node
+        if not keyboard.is_text_editable(node):
+            return False
+        value = node.attributes.get("value", "")
+        value = value[:-1] if backspace else value + (text or "")
+        node.attributes["value"] = value
+        if self._doc is not None and hasattr(self._doc, "set_attr"):
+            self._doc.set_attr(node._ridx, "value", value)
+        self.relayout()
+        return True
+
+    def on_text(self, text):
+        if text == " ":
+            action = keyboard.key_action(self.focus_node, "Space")
+            if action == "activate":
+                self.activate_node(self.focus_node)
+                return
+            if action == "text":
+                self._edit_focused(text=" ")
+                return
+            self.scroll += 600
+            self.clamp_scroll()
+            self.dirty = True
+            return
+        self._edit_focused(text=text)
+
     def on_key(self, name):
         if self.url_focused:
-            if name == "Enter":
+            if name in ("Tab", "ShiftTab"):
+                self.url_focused = False
+                self.focus_next(reverse=name == "ShiftTab")
+            elif name == "Enter":
                 self.url_focused = False
                 self.load_url_string(self.url_text)
             elif name == "Backspace" and self.caret > 0:
@@ -305,6 +566,23 @@ class Shell:
                 self.url_focused = False
                 self.url_text = str(self.url) if self.url else ""
             self.dirty = True
+            return
+        if name in ("Tab", "ShiftTab"):
+            self.focus_next(reverse=name == "ShiftTab")
+            return
+        if name == "Escape" and self.focus_node is not None:
+            self.set_focus(None)
+            return
+        if name == "Enter" and self.focus_node is not None:
+            action = keyboard.key_action(self.focus_node, "Enter")
+            if action == "activate":
+                self.activate_node(self.focus_node)
+            elif action == "submit":
+                self.submit_form(self.focus_node)
+            elif action == "newline":
+                self._edit_focused(text="\n")
+            return
+        if name == "Backspace" and self._edit_focused(backspace=True):
             return
         if name == "ArrowDown":
             self.scroll += SCROLL_STEP
@@ -329,7 +607,8 @@ class Shell:
     def hit_test(self, x, y):
         objs = [o for o in self.layout_list
                 if o.x <= x < o.x + o.width
-                and o.y <= y < o.y + o.height]
+                and o.y + sticky_offset(o, self.scroll) <= y
+                < o.y + sticky_offset(o, self.scroll) + o.height]
         return objs[-1] if objs else None
 
     def find_link(self, node):
@@ -348,6 +627,7 @@ class Shell:
                     return
             bx1, _by1, bx2, _by2 = self._urlbar
             if bx1 <= x < bx2:
+                self.set_focus(None)
                 self.url_focused = True
                 self.caret = len(self.url_text)
                 self.dirty = True
@@ -357,9 +637,17 @@ class Shell:
             self.dirty = True
         obj = self.hit_test(x + self.hscroll, y - TOOLBAR_H + self.scroll)
         if not obj:
+            self.set_focus(None)
             return
+        clicked_ridx = self._ridx_of(obj.node)
+        self.set_focus(keyboard.focus_target(obj.node))
+        default_node = self._node_by_ridx(clicked_ridx) or obj.node
+        return self.activate_node(default_node)
+
+    def activate_node(self, default_node):
+        """Dispatch click and then run the element's browser default action."""
         if self._doc is not None:
-            target = obj.node
+            target = default_node
             while target is not None and not (
                     isinstance(target, Element)
                     and hasattr(target, "_ridx")):
@@ -375,16 +663,106 @@ class Shell:
                     print(f"[js console] {line}")
                 if handled:
                     self.refresh_after_js()
+                    default_node = next((node for node in
+                                         tree_to_list(self.nodes, [])
+                                         if getattr(node, "_ridx", None)
+                                         == target._ridx), default_node)
                 if prevented:
                     # preventDefault() (or onclick returning false)
                     # suppresses the default navigation
                     return
-        href = self.find_link(obj.node)
+        href = self.find_link(default_node)
         if href and not href.startswith(("javascript:", "mailto:")):
             try:
                 self.load(self.url.resolve(href))
             except Exception as e:
                 self.set_status(f"이동 실패: {e}")
+            return
+        input_node = forms.find_input(default_node)
+        if input_node is not None \
+                and input_node.attributes.get("type", "").lower() == "file":
+            self.set_status("파일 선택은 tkinter 셸에서 지원합니다")
+            return
+        checkable = forms.find_checkable(default_node)
+        resetter = forms.find_resetter(default_node)
+        submitter = forms.find_submitter(default_node)
+        if checkable is not None or resetter is not None \
+                or submitter is not None:
+            self.activate_form_control(checkable or resetter or submitter)
+
+    def submit_form(self, node, submitter=None):
+        form = forms.find_form(node)
+        if form is None:
+            return
+        try:
+            if submitter is None:
+                submitter = next((candidate for candidate in
+                                  tree_to_list(self.nodes, [])
+                                  if forms.find_submitter(candidate)
+                                  is candidate
+                                  and forms.form_owner(candidate) is form),
+                                 None)
+            activation = forms.activate_submission(
+                form, self.url, submitter=submitter,
+                dispatch_event=self._dispatch_form_event,
+                refresh_tree=self._fresh_form_tree)
+            self._finish_form_activation(activation)
+        except Exception as exc:
+            self.set_status(f"폼 제출 실패: {exc}")
+
+    def activate_form_control(self, control):
+        try:
+            activation = forms.activate_control(
+                control, self.url, self._form_defaults,
+                dispatch_event=self._dispatch_form_event,
+                refresh_tree=self._fresh_form_tree,
+                set_attr=self._doc.set_attr,
+                remove_attr=(self._doc.remove_attr
+                             if hasattr(self._doc, "remove_attr") else None))
+            self._finish_form_activation(activation)
+        except Exception as exc:
+            self.set_status(f"폼 동작 실패: {exc}")
+
+    def _dispatch_form_event(self, *args):
+        result = native.dispatch_dom_event(self._doc, *args)
+        for line in result[0]:
+            print(f"[js console] {line}")
+        return result
+
+    def _fresh_form_tree(self):
+        return native.build_tree(self._doc.export())
+
+    def _finish_form_activation(self, activation):
+        if activation is None:
+            return
+        if activation.invalid:
+            token = activation.invalid[0]
+            first = token if isinstance(token, Element) \
+                else self._node_by_ridx(token)
+            message = forms.validation_message(first) if first else ""
+            if first is not None:
+                self.set_focus(first)
+            self.set_status(message or "폼 값을 확인하세요")
+            if activation.handled:
+                self.refresh_after_js()
+            return
+        if activation.prevented:
+            if activation.handled:
+                self.refresh_after_js()
+            return
+        if activation.changed:
+            self.nodes = native.refresh(
+                self._doc, self._css_sources, self._styled_width)
+            self._remap_focus()
+            self.load_images(keep_cache=True)
+            self.relayout()
+            return
+        submission = activation.submission
+        if submission is not None:
+            self.load(
+                self.url.resolve(submission.target),
+                method=submission.method, body=submission.body,
+                headers=submission.headers)
 
     def on_motion(self, x, y):
         now = time.monotonic()
@@ -467,6 +845,7 @@ class Shell:
                 ("←", self.go_back, back_ok),
                 ("→", self.go_forward, fwd_ok),
                 ("⟳", self.reload, True),
+                ("✕", self.cancel_navigation, self._navigation.active),
                 ("⌂", self.go_home, True)):
             color = INK if enabled else (170, 170, 170)
             cmds.append((1, x + 6, 10, 0.0, 0.0, color, 19.0,
@@ -537,11 +916,18 @@ def run(url_string=None):
     pending = url_string or HOME_URL
     loaded = False
 
-    while shell.running:
-        for kind, a, b, text in win.pump(16):
-            shell.handle(kind, a, b, text)
-            if kind == "ready" and not loaded:
-                loaded = True
-                shell.load_url_string(pending)
-        if shell.dirty:
-            shell.render_frame()
+    try:
+        while shell.running:
+            for kind, a, b, text in win.pump(16):
+                shell.handle(kind, a, b, text)
+                if kind == "ready" and not loaded:
+                    loaded = True
+                    shell.load_url_string(pending)
+            shell.poll_navigation()
+            if shell.dirty:
+                shell.render_frame()
+            # Run page work only after a dirty frame has been presented, so
+            # a slow fetch/resource pass cannot suppress the first paint.
+            shell.tick_live()
+    finally:
+        shell._navigation.shutdown()

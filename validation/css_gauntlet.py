@@ -363,15 +363,16 @@ def t_position_abs_fixed():
     abs_ok = (ra is not None and abs(ra.left - ax) < 1 and
               abs(ra.top - ay) < 1 and abs(ra.right - (ax + 120)) < 1 and
               abs(ra.bottom - (ay + 40)) < 1)
-    fix_ok = (rf is not None and abs(rf.left - HSTEP) < 1 and
-              abs(rf.top - VSTEP) < 1)
+    # A fixed box is relative to the viewport, not the document's internal
+    # HSTEP/VSTEP content gutter: left:0;top:0 must paint at (0,0).
+    fix_ok = (rf is not None and abs(rf.left) < 1 and abs(rf.top) < 1)
     report("position-absolute-offsets", abs_ok,
            f"rect=({getattr(ra,'left',None)},{getattr(ra,'top',None)},"
            f"{getattr(ra,'right',None)},{getattr(ra,'bottom',None)}) "
            f"expected=({ax},{ay},{ax+120},{ay+40})")
     report("position-fixed-offsets", fix_ok,
            f"rect=({getattr(rf,'left',None)},{getattr(rf,'top',None)}) "
-           f"expected=({HSTEP},{VSTEP})")
+           "expected=(0,0) viewport origin")
 
 
 def t_position_relative():

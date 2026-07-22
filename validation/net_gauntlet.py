@@ -5,6 +5,7 @@ Run: python3 validation/net_gauntlet.py (repo root auto-detected)
 Prints one PASS/FAIL line per claim, then a JSON summary.
 """
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import gzip as gzmod
 import json
 import os
@@ -14,7 +15,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from browser import net  # noqa: E402
+from browser import net, psl, security  # noqa: E402
 
 GZ_PAYLOAD = b"gzip works: the quick brown fox. " * 64  # 2112 bytes
 GZ_COMP = gzmod.compress(GZ_PAYLOAD)
@@ -37,7 +38,14 @@ class Server(ThreadingHTTPServer):
         self.hits = {}
         self.conn_count = 0
         self.commands = []
+        self.requests = []
         self.lock = threading.Lock()
+        self.slow_started = threading.Event()
+
+    def handle_error(self, request, client_address):
+        # Cancellation intentionally tears a keep-alive socket down while
+        # the handler might be entering its next read.
+        pass
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -59,11 +67,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self):
-        path = self.path.split("?")[0]
+    def _record(self, path, body=b""):
         with self.server.lock:
             self.server.hits[path] = self.server.hits.get(path, 0) + 1
             self.server.commands.append(self.command)
+            self.server.requests.append({
+                "method": self.command,
+                "path": path,
+                "body": body,
+                "content_type": self.headers.get("Content-Type", ""),
+                "cookie": self.headers.get("Cookie", ""),
+                "if_none_match": self.headers.get("If-None-Match", ""),
+                "if_modified_since": self.headers.get(
+                    "If-Modified-Since", ""),
+                "accept_language": self.headers.get("Accept-Language", ""),
+            })
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        self._record(path)
 
         if path == "/plain":
             self._body(200, b"hello plain", [("Content-Type", "text/plain")])
@@ -85,13 +107,104 @@ class Handler(BaseHTTPRequestHandler):
             self._body(302, b"", [("Location", "/redir/final")])
         elif path == "/redir/final":
             self._body(200, b"redirected-final")
+        elif path.startswith("/method-redirect/"):
+            code = int(path.rsplit("/", 1)[1])
+            self._body(code, b"", [("Location", "/method-final")])
+        elif path == "/method-final":
+            self._body(200, self.command.encode() + b":")
         elif path == "/redir/loop":
             self._body(301, b"", [("Location", "/redir/loop")])
         elif path == "/cached":
             self._body(200, b"cacheable-payload",
                        [("Cache-Control", "max-age=3600")])
+        elif path == "/cache/etag":
+            if self.headers.get("If-None-Match") == '"v1"':
+                self.send_response(304)
+                self.send_header("ETag", '"v1"')
+                self.send_header("Cache-Control", "max-age=60")
+                self.send_header("X-Revalidated", "yes")
+                self.end_headers()
+            else:
+                self._body(200, b"etag-body-v1", [
+                    ("Cache-Control", "no-cache"),
+                    ("ETag", '"v1"'),
+                    ("X-Original", "kept"),
+                ])
+        elif path == "/cache/last-modified":
+            stamp = "Mon, 20 Jul 2026 12:00:00 GMT"
+            if self.headers.get("If-Modified-Since") == stamp:
+                self.send_response(304)
+                self.send_header("Last-Modified", stamp)
+                self.send_header("Cache-Control", "max-age=60")
+                self.end_headers()
+            else:
+                self._body(200, b"last-modified-body", [
+                    ("Cache-Control", "no-cache"),
+                    ("Last-Modified", stamp),
+                ])
+        elif path == "/cache/vary":
+            language = self.headers.get("Accept-Language", "none")
+            self._body(200, ("language=" + language).encode(), [
+                ("Cache-Control", "max-age=3600"),
+                ("Vary", "Accept-Language"),
+            ])
+        elif path == "/cache/vary-star":
+            count = self.server.hits.get(path, 0)
+            self._body(200, f"vary-star-{count}".encode(), [
+                ("Cache-Control", "max-age=3600"), ("Vary", "*")])
+        elif path == "/cache/no-store":
+            count = self.server.hits.get(path, 0)
+            self._body(200, f"no-store-{count}".encode(), [
+                ("Cache-Control", "no-store")])
+        elif path == "/cache/private":
+            self._body(200, b"private-cache-body", [
+                ("Cache-Control", "private, max-age=3600")])
+        elif path == "/slow/cancel":
+            self.send_response(200)
+            self.send_header("Content-Length", "4096")
+            self.end_headers()
+            self.wfile.write(b"x")
+            self.wfile.flush()
+            self.server.slow_started.set()
+            time.sleep(1.0)
+            try:
+                self.wfile.write(b"y" * 4095)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        elif path == "/slow/timeout":
+            time.sleep(0.25)
+            try:
+                self._body(200, b"too-late")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         elif path.startswith("/ka/"):
             self._body(200, ("ka:" + path).encode())
+        elif path == "/cookie/set":
+            self.send_response(200)
+            self.send_header(
+                "Set-Cookie",
+                "server=secret; Path=/cookie; HttpOnly; SameSite=Lax")
+            self.send_header("Set-Cookie", "other=no; Path=/other")
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+        elif path == "/cookie/echo":
+            self._body(200, self.headers.get("Cookie", "").encode())
+        elif path == "/cors/public":
+            self._body(200, b"cors-public", [
+                ("Access-Control-Allow-Origin", "*")])
+        elif path == "/cors/credentials":
+            self._body(200, self.headers.get("Cookie", "").encode(), [
+                ("Access-Control-Allow-Origin",
+                 self.headers.get("Origin", "null")),
+                ("Access-Control-Allow-Credentials", "true")])
+        elif path == "/cors/deny":
+            self._body(200, b"secret-without-cors")
+        elif path == "/cors/preflight":
+            self._body(200, self.command.encode(), [
+                ("Access-Control-Allow-Origin",
+                 self.headers.get("Origin", "null")),
+                ("Access-Control-Allow-Credentials", "true")])
         elif path == "/hugehdr":
             # raw write: huge header, a colon-less garbage line, weird-cased
             # content-length -- probes parser robustness
@@ -104,7 +217,44 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._body(404, b"nope")
 
-    do_POST = do_GET
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(length)
+        self._record(path, body)
+        if path == "/post/echo":
+            self._body(200, body, [("X-Request-Method", self.command),
+                                    ("X-Request-Content-Type",
+                                     self.headers.get("Content-Type", ""))])
+        elif path.startswith("/method-redirect/"):
+            code = int(path.rsplit("/", 1)[1])
+            self._body(code, b"", [("Location", "/method-final")])
+        elif path == "/method-final":
+            self._body(200, self.command.encode() + b":" + body)
+        elif path == "/cookie/echo":
+            self._body(200, self.headers.get("Cookie", "").encode())
+        elif path == "/cors/preflight":
+            self._body(200, self.command.encode() + b":" + body, [
+                ("Access-Control-Allow-Origin",
+                 self.headers.get("Origin", "null")),
+                ("Access-Control-Allow-Credentials", "true")])
+        else:
+            self._body(404, b"nope")
+
+    def do_OPTIONS(self):
+        path = self.path.split("?")[0]
+        self._record(path)
+        if path == "/cors/preflight":
+            self._body(204, b"", [
+                ("Access-Control-Allow-Origin",
+                 self.headers.get("Origin", "null")),
+                ("Access-Control-Allow-Credentials", "true"),
+                ("Access-Control-Allow-Methods", "GET, POST, PUT"),
+                ("Access-Control-Allow-Headers", "content-type, x-token"),
+                ("Access-Control-Max-Age", "600"),
+            ])
+        else:
+            self._body(404, b"nope")
 
 
 def start_server():
@@ -114,8 +264,20 @@ def start_server():
 
 
 def main():
+    with net._COOKIE_LOCK:
+        net._COOKIE_JAR.clear()
     srv, base = start_server()
     port = srv.server_address[1]
+
+    def reset_cached_path(path):
+        key = f"http://127.0.0.1:{port}{path}"
+        with net._CACHE_LOCK:
+            net._CACHE.pop(key, None)
+        try:
+            os.remove(net._disk_path(key))
+        except OSError:
+            pass
+        return key
 
     # (1) plain 200 + Content-Length
     h, b, fin = net.request_full(net.URL(base + "/plain"))
@@ -164,7 +326,51 @@ def main():
            f"raised={err!r} in {dt:.2f}s, server hits on /redir/loop={loops} "
            f"(MAX_REDIRECTS={net.MAX_REDIRECTS} -> expected 9)")
 
+    # POST body and request Content-Type reach the wire unchanged.
+    post_payload = "name=한글+검색".encode("utf-8")
+    h, b, fin = net.request_full(
+        net.URL(base + "/post/echo"), no_cache=True, method="POST",
+        body=post_payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    record("post-body-content-type",
+           b == post_payload and h.get("x-request-method") == "POST"
+           and h.get("x-request-content-type") ==
+           "application/x-www-form-urlencoded",
+           f"body={b!r} method={h.get('x-request-method')!r} "
+           f"content-type={h.get('x-request-content-type')!r} final={fin}")
+
+    # Browser redirect compatibility: POST becomes GET for 301/302/303,
+    # while 307/308 preserve both method and body.
+    redirect_methods = {}
+    for code in (301, 302, 303, 307, 308):
+        _h, redirected, _fin = net.request_full(
+            net.URL(base + f"/method-redirect/{code}"), no_cache=True,
+            method="POST", body=b"k=v",
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        redirect_methods[code] = redirected
+    record("redirect-method-body-rules",
+           all(redirect_methods[code] == b"GET:"
+               for code in (301, 302, 303))
+           and all(redirect_methods[code] == b"POST:k=v"
+                   for code in (307, 308)),
+           repr(redirect_methods))
+
+    rejected = []
+    for kwargs in (
+            {"method": "GET", "body": b"not-allowed"},
+            {"headers": {"X-Test": "ok\r\nInjected: yes"}},
+            {"method": "G\r\nET"}):
+        try:
+            net.request_full(net.URL(base + "/plain"), **kwargs)
+        except ValueError:
+            rejected.append(True)
+        else:
+            rejected.append(False)
+    record("request-injection-and-get-body-rejected",
+           all(rejected), f"rejected={rejected}")
+
     # (5) cache: max-age=3600, hit counter
+    reset_cached_path("/cached")
     curl = net.URL(base + "/cached")
     key = f"http://127.0.0.1:{port}/cached"
     dpath = net._disk_path(key)
@@ -199,6 +405,338 @@ def main():
            f"request_text(no_cache=True) -> server hits={c4} (was 1) "
            f"[net.request has no no_cache param; request_full/request_text do]")
 
+    # Stale ETag entries are conditionally revalidated. A 304 is merged with
+    # the stored metadata and exposed to browser callers as the cached 200.
+    etag_key = reset_cached_path("/cache/etag")
+    status1, h1, b1, _ = net.request_full_status(
+        net.URL(base + "/cache/etag"))
+    status2, h2, b2, _ = net.request_full_status(
+        net.URL(base + "/cache/etag"))
+    status3, _h3, b3, _ = net.request_full_status(
+        net.URL(base + "/cache/etag"))
+    etag_requests = [request for request in srv.requests
+                     if request["path"] == "/cache/etag"]
+    record("cache-etag-304-merges-and-refreshes",
+           status1 == status2 == status3 == 200
+           and b1 == b2 == b3 == b"etag-body-v1"
+           and srv.hits.get("/cache/etag") == 2
+           and etag_requests[-1]["if_none_match"] == '"v1"'
+           and h2.get("x-original") == "kept"
+           and h2.get("x-revalidated") == "yes",
+           f"statuses={status1}/{status2}/{status3} "
+           f"hits={srv.hits.get('/cache/etag')} "
+           f"If-None-Match={etag_requests[-1]['if_none_match']!r} "
+           f"merged={h2.get('x-original')!r}/{h2.get('x-revalidated')!r}")
+
+    # A request-side no-cache directive validates even a currently fresh
+    # entry and uses its validator.
+    status4, _h4, b4, _ = net.request_full_status(
+        net.URL(base + "/cache/etag"),
+        headers={"Cache-Control": "no-cache"})
+    etag_requests = [request for request in srv.requests
+                     if request["path"] == "/cache/etag"]
+    record("request-no-cache-forces-validation",
+           status4 == 200 and b4 == b"etag-body-v1"
+           and srv.hits.get("/cache/etag") == 3
+           and etag_requests[-1]["if_none_match"] == '"v1"',
+           f"status={status4} hits={srv.hits.get('/cache/etag')} "
+           f"If-None-Match={etag_requests[-1]['if_none_match']!r}")
+
+    # Stale validators remain useful on disk after the memory layer is gone.
+    modified_key = reset_cached_path("/cache/last-modified")
+    _h, first_modified, _ = net.request_full(
+        net.URL(base + "/cache/last-modified"))
+    disk_before = os.path.exists(net._disk_path(modified_key))
+    with net._CACHE_LOCK:
+        net._CACHE.pop(modified_key, None)
+    status, _h, second_modified, _ = net.request_full_status(
+        net.URL(base + "/cache/last-modified"))
+    _h, third_modified, _ = net.request_full(
+        net.URL(base + "/cache/last-modified"))
+    modified_requests = [request for request in srv.requests
+                         if request["path"] == "/cache/last-modified"]
+    record("cache-disk-last-modified-revalidation",
+           disk_before and status == 200
+           and first_modified == second_modified == third_modified
+           == b"last-modified-body"
+           and srv.hits.get("/cache/last-modified") == 2
+           and bool(modified_requests[-1]["if_modified_since"]),
+           f"disk={disk_before} status={status} "
+           f"hits={srv.hits.get('/cache/last-modified')} "
+           f"If-Modified-Since="
+           f"{modified_requests[-1]['if_modified_since']!r}")
+
+    # Vary request fields select independent representations in memory.
+    vary_key = reset_cached_path("/cache/vary")
+    _h, en1, _ = net.request_full(net.URL(base + "/cache/vary"),
+                                   headers={"Accept-Language": "en"})
+    _h, fr1, _ = net.request_full(net.URL(base + "/cache/vary"),
+                                   headers={"Accept-Language": "fr"})
+    _h, en2, _ = net.request_full(net.URL(base + "/cache/vary"),
+                                   headers={"Accept-Language": "en"})
+    record("cache-vary-keeps-request-variants",
+           en1 == en2 == b"language=en" and fr1 == b"language=fr"
+           and srv.hits.get("/cache/vary") == 2,
+           f"bodies={en1!r}/{fr1!r}/{en2!r} "
+           f"hits={srv.hits.get('/cache/vary')}")
+
+    # The compact disk layer holds the newest variant only. A mismatch must
+    # go to the network, never return that other variant.
+    with net._CACHE_LOCK:
+        net._CACHE.pop(vary_key, None)
+    _h, en_after_clear, _ = net.request_full(
+        net.URL(base + "/cache/vary"),
+        headers={"Accept-Language": "en"})
+    record("cache-disk-vary-mismatch-is-a-miss",
+           en_after_clear == b"language=en"
+           and srv.hits.get("/cache/vary") == 3,
+           f"body={en_after_clear!r} hits={srv.hits.get('/cache/vary')}")
+
+    no_store_key = reset_cached_path("/cache/no-store")
+    _h, no_store1, _ = net.request_full(net.URL(base + "/cache/no-store"))
+    _h, no_store2, _ = net.request_full(net.URL(base + "/cache/no-store"))
+    record("cache-response-no-store-is-never-stored",
+           no_store1 == b"no-store-1" and no_store2 == b"no-store-2"
+           and no_store_key not in net._CACHE
+           and not os.path.exists(net._disk_path(no_store_key)),
+           f"bodies={no_store1!r}/{no_store2!r} "
+           f"memory={no_store_key in net._CACHE} "
+           f"disk={os.path.exists(net._disk_path(no_store_key))}")
+
+    private_key = reset_cached_path("/cache/private")
+    net.request_full(net.URL(base + "/cache/private"))
+    net.request_full(net.URL(base + "/cache/private"))
+    private_hits = srv.hits.get("/cache/private")
+    private_disk = os.path.exists(net._disk_path(private_key))
+    record("cache-private-allowed-in-private-browser-cache",
+           private_hits == 1 and private_key in net._CACHE and private_disk,
+           f"hits={private_hits} memory={private_key in net._CACHE} "
+           f"disk={private_disk}")
+
+    net.request_full(net.URL(base + "/cache/private"),
+                     headers={"Cache-Control": "no-store"})
+    removed_by_request = (private_key not in net._CACHE
+                          and not os.path.exists(net._disk_path(private_key)))
+    net.request_full(net.URL(base + "/cache/private"))
+    record("cache-request-no-store-bypasses-and-removes",
+           removed_by_request and srv.hits.get("/cache/private") == 3,
+           f"removed={removed_by_request} "
+           f"hits={srv.hits.get('/cache/private')}")
+
+    vary_star_key = reset_cached_path("/cache/vary-star")
+    _h, star1, _ = net.request_full(net.URL(base + "/cache/vary-star"))
+    _h, star2, _ = net.request_full(net.URL(base + "/cache/vary-star"))
+    record("cache-vary-star-is-never-reused",
+           star1 == b"vary-star-1" and star2 == b"vary-star-2"
+           and vary_star_key not in net._CACHE,
+           f"bodies={star1!r}/{star2!r} "
+           f"memory={vary_star_key in net._CACHE}")
+
+    # Cancellation closes the registered socket from another thread, so a
+    # stalled body read ends immediately instead of waiting for its timeout.
+    cancel_token = net.CancellationToken()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        cancelled_future = pool.submit(
+            net.request_full, net.URL(base + "/slow/cancel"),
+            net.MAX_REDIRECTS, False, timeout=5,
+            cancel_token=cancel_token)
+        slow_started = srv.slow_started.wait(1.0)
+        cancel_started = time.monotonic()
+        cancel_token.cancel()
+        cancelled_error = None
+        try:
+            cancelled_future.result(timeout=2.0)
+        except Exception as exc:
+            cancelled_error = exc
+        cancel_elapsed = time.monotonic() - cancel_started
+    record("network-cancellation-interrupts-body-read",
+           slow_started and isinstance(
+               cancelled_error, net.RequestCancelled)
+           and cancel_elapsed < 0.5,
+           f"started={slow_started} error={cancelled_error!r} "
+           f"elapsed={cancel_elapsed:.3f}s")
+
+    timeout_started = time.monotonic()
+    timeout_error = None
+    try:
+        net.request_full(
+            net.URL(base + "/slow/timeout"), timeout=0.05)
+    except Exception as exc:
+        timeout_error = exc
+    timeout_elapsed = time.monotonic() - timeout_started
+    record("network-total-timeout-bounds-header-wait",
+           isinstance(timeout_error, net.RequestTimeout)
+           and timeout_elapsed < 0.2,
+           f"error={timeout_error!r} elapsed={timeout_elapsed:.3f}s")
+
+    # Public Suffix List: exact, wildcard, exception, private and IDNA rules.
+    idn = psl.canonical_host("食狮.公司.cn")
+    record("psl-exact-wildcard-exception-private-idna",
+           psl.version() != "fallback"
+           and psl.public_suffix("shop.example.co.uk") == "co.uk"
+           and psl.registrable_domain("shop.example.co.uk")
+           == "example.co.uk"
+           and psl.public_suffix("a.b.ck") == "b.ck"
+           and psl.registrable_domain("www.ck") == "www.ck"
+           and psl.public_suffix("foo.github.io") == "github.io"
+           and psl.registrable_domain(idn) == idn,
+           f"version={psl.version()} idn={idn} "
+           f"a.b.ck={psl.public_suffix('a.b.ck')} "
+           f"www.ck={psl.registrable_domain('www.ck')}")
+
+    net._COOKIE_JAR.clear()
+    uk_origin = net.URL("https://shop.example.co.uk/")
+    blocked_icann = net._store_set_cookie(
+        uk_origin, ["wide=bad; Domain=co.uk; Secure"])
+    blocked_private = net._store_set_cookie(
+        net.URL("https://tenant.github.io/"),
+        ["wide=bad; Domain=github.io; Secure"])
+    accepted_domain = net._store_set_cookie(
+        uk_origin,
+        ["scoped=ok; Domain=example.co.uk; Secure; SameSite=Strict"])
+    record("cookie-domain-rejects-public-and-private-suffixes",
+           blocked_icann == 0 and blocked_private == 0
+           and accepted_domain == 1,
+           f"co.uk={blocked_icann} github.io={blocked_private} "
+           f"example.co.uk={accepted_domain}")
+    same_scheme = net._cookie_header(
+        net.URL("https://cdn.example.co.uk/resource"),
+        site_for_cookies=net.URL("https://app.example.co.uk/"),
+        top_level_navigation=False)
+    cross_scheme = net._cookie_header(
+        net.URL("https://cdn.example.co.uk/resource"),
+        site_for_cookies=net.URL("http://app.example.co.uk/"),
+        top_level_navigation=False)
+    record("schemeful-site-uses-etld-plus-one-and-scheme",
+           "scoped=ok" in same_scheme
+           and "scoped=ok" not in cross_scheme,
+           f"same={same_scheme!r} cross-scheme={cross_scheme!r} "
+           f"keys={net._site_key(net.URL('https://a.example.co.uk/'))}/"
+           f"{net._site_key(net.URL('http://b.example.co.uk/'))}")
+    net._COOKIE_JAR.clear()
+
+    # cookie wire behaviour: HttpOnly is sent but hidden from JS; Path and
+    # SameSite are enforced before a Cookie header is composed.
+    net.request_full(net.URL(base + "/cookie/set"), no_cache=True)
+    _h, cookie_body, _ = net.request_full(
+        net.URL(base + "/cookie/echo"), no_cache=True)
+    visible = net.cookies_for(net.URL(base + "/cookie/echo"))
+    record("cookie-httponly-path-wire-scope",
+           cookie_body == b"server=secret" and visible == "",
+           f"wire={cookie_body!r}; document.cookie={visible!r}; "
+           "Path=/other cookie withheld")
+    _h, cross_body, _ = net.request_full(
+        net.URL(base + "/cookie/echo"), no_cache=True,
+        site_for_cookies=net.URL("https://cross-site.test/"),
+        top_level_navigation=False)
+    record("cookie-samesite-cross-site-block",
+           cross_body == b"",
+           f"cross-site subresource Cookie echo={cross_body!r}")
+    _h, cross_post_body, _ = net.request_full(
+        net.URL(base + "/cookie/echo"), no_cache=True,
+        method="POST", body=b"x=1",
+        site_for_cookies=net.URL("https://cross-site.test/"),
+        top_level_navigation=True)
+    record("cookie-samesite-lax-blocks-cross-site-post",
+           cross_post_body == b"",
+           f"cross-site top-level POST Cookie echo={cross_post_body!r}")
+
+    # Script fetch policy: a second port is a distinct origin while staying
+    # same-site, which lets credentials tests use ordinary local cookies.
+    cors_srv, cors_base = start_server()
+    page_url = net.URL(base + "/page")
+    public = security.perform_script_fetch(page_url, {
+        "url": cors_base + "/cors/public",
+        "method": "GET", "headers": [], "mode": "cors",
+        "credentials": "omit",
+    })
+    record("cors-public-origin-allowed",
+           public.status == 200 and public.body == "cors-public",
+           f"status={public.status} body={public.body!r}")
+
+    denied = None
+    try:
+        security.perform_script_fetch(page_url, {
+            "url": cors_base + "/cors/deny",
+            "method": "GET", "headers": [], "mode": "cors",
+            "credentials": "omit",
+        })
+    except security.FetchPolicyError as exc:
+        denied = exc
+    record("cors-missing-allow-origin-rejected",
+           denied is not None, repr(denied))
+
+    preflight_before = len(cors_srv.requests)
+    preflight = security.perform_script_fetch(page_url, {
+        "url": cors_base + "/cors/preflight",
+        "method": "POST", "body": '{"x":1}',
+        "headers": [("Content-Type", "application/json"),
+                    ("X-Token", "yes")],
+        "mode": "cors", "credentials": "omit",
+    })
+    preflight_requests = cors_srv.requests[preflight_before:]
+    record("cors-preflight-method-and-headers",
+           preflight.body == 'POST:{"x":1}'
+           and [request["method"] for request in preflight_requests]
+           == ["OPTIONS", "POST"]
+           and preflight_requests[0]["path"] == "/cors/preflight",
+           repr(preflight_requests))
+
+    cors_url = net.URL(cors_base + "/cors/credentials")
+    net._store_set_cookie(cors_url, ["corsid=1; Path=/; SameSite=Lax"])
+    included = security.perform_script_fetch(page_url, {
+        "url": str(cors_url), "method": "GET", "headers": [],
+        "mode": "cors", "credentials": "include",
+    })
+    omitted = security.perform_script_fetch(page_url, {
+        "url": str(cors_url), "method": "GET", "headers": [],
+        "mode": "cors", "credentials": "omit",
+    })
+    record("cors-credentials-include-vs-omit",
+           included.body == "corsid=1" and omitted.body == "",
+           f"include={included.body!r} omit={omitted.body!r}")
+
+    wildcard_credentials = None
+    try:
+        security.perform_script_fetch(page_url, {
+            "url": cors_base + "/cors/public",
+            "method": "GET", "headers": [], "mode": "cors",
+            "credentials": "include",
+        })
+    except security.FetchPolicyError as exc:
+        wildcard_credentials = exc
+    record("cors-wildcard-with-credentials-rejected",
+           wildcard_credentials is not None,
+           repr(wildcard_credentials))
+
+    opaque = security.perform_script_fetch(page_url, {
+        "url": cors_base + "/cors/deny",
+        "method": "GET", "headers": [], "mode": "no-cors",
+        "credentials": "omit",
+    })
+    record("no-cors-cross-origin-response-is-opaque",
+           opaque.opaque and opaque.status == 0 and opaque.body == "",
+           repr(opaque))
+
+    policy_blocks = []
+    for base_probe, request in (
+            (page_url, {
+                "url": cors_base + "/cors/public", "method": "GET",
+                "headers": [], "mode": "same-origin",
+                "credentials": "same-origin"}),
+            (net.URL("https://secure.example/page"), {
+                "url": "http://insecure.example/data", "method": "GET",
+                "headers": [], "mode": "cors", "credentials": "omit"})):
+        try:
+            security.perform_script_fetch(base_probe, request)
+        except (security.FetchPolicyError, PermissionError):
+            policy_blocks.append(True)
+        else:
+            policy_blocks.append(False)
+    record("same-origin-mode-and-mixed-content-blocked",
+           policy_blocks == [True, True], repr(policy_blocks))
+    cors_srv.shutdown()
+
     # (6) keep-alive: separate server for a clean connection count
     srv2, base2 = start_server()
     net.request_full(net.URL(base2 + "/ka/1"), no_cache=True)
@@ -223,11 +761,11 @@ def main():
     import inspect
     sig = str(inspect.signature(net.request_full))
     cmds = set(srv.commands) | set(srv2.commands)
-    record("post-unsupported-get-only",
-           "method" not in sig and cmds == {"GET"},
-           f"request_full signature={sig} (no method/body params); "
-           f"_one_request hardcodes 'GET'; wire commands seen={sorted(cmds)}; "
-           f"forms.py:59 returns None for method=post ('GET-only forms')")
+    record("post-api-and-wire-enabled",
+           "method" in sig and "body" in sig and "headers" in sig
+           and cmds == {"GET", "POST"},
+           f"request_full signature={sig}; "
+           f"wire commands seen={sorted(cmds)}")
 
     # file:// scheme
     fpath = os.path.join(os.path.dirname(os.path.abspath(__file__)),

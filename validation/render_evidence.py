@@ -38,15 +38,20 @@ def fetch_many(urls, base, binary=False):
         try:
             resolved = base.resolve(u)
             if binary:
-                out[u] = net.request_raw(resolved)[1]
+                out[u] = net.request_raw(
+                    resolved, site_for_cookies=base,
+                    top_level_navigation=False)[1]
             else:
-                out[u] = net.request_text(resolved)[1]
+                out[u] = net.request_text(
+                    resolved, site_for_cookies=base,
+                    top_level_navigation=False)[1]
         except Exception:
             out[u] = b"" if binary else ""
     return out
 
 
-def render(name, url_str, height=800):
+def render(name, url_str, height=800, expected_text=(), forbidden_text=(),
+           advance_ms=0.0):
     t0 = time.perf_counter()
     url = net.URL(url_str)
     _h, body, url = net.request_text(url)
@@ -57,6 +62,17 @@ def render(name, url_str, height=800):
         page_url=url)
     if native.settle_async(doc, css_sources, url):
         nodes = native.refresh(doc, css_sources)
+    if advance_ms > 0.0 and hasattr(doc, "tick"):
+        version_before = doc.dom_version() if hasattr(doc, "dom_version") else None
+        live_logs, fetches = native.pump_script_requests(doc, advance_ms)
+        logs.extend(live_logs)
+        native.sync_cookie_writes(doc, url)
+        for request in fetches:
+            native.service_script_fetch(doc, url, request)
+        if fetches:
+            native.settle_async(doc, css_sources, url)
+        if version_before is None or doc.dom_version() != version_before:
+            nodes = native.refresh(doc, css_sources)
     engine.clear_images()
     from browser.html_parser import Element, tree_to_list
     img_nodes = [n for n in tree_to_list(nodes, [])
@@ -78,6 +94,13 @@ def render(name, url_str, height=800):
     d = DocumentLayout(nodes)
     d.layout(W, height)
     cmds = paint_tree(d, [])
+    painted_text = " ".join(
+        c.text for c in cmds if hasattr(c, "text") and c.text)
+    missing = [text for text in expected_text if text not in painted_text]
+    stale = [text for text in forbidden_text if text in painted_text]
+    if missing or stale:
+        raise AssertionError(
+            f"{name} dynamic paint mismatch: missing={missing}, stale={stale}")
     page_h = min(max(int(d.height) + 40, 200), height)
     engine.set_display_list(scale_cmds(
         [c.native(0, 0.0) for c in cmds], 1.0))
@@ -100,7 +123,9 @@ if __name__ == "__main__":
     if "home" in targets:
         render("home", "about:home")
     if "demo" in targets:
-        render("demo", "file://" + os.path.join(REPO_ROOT, "demo_live.html"))
+        render("demo", "file://" + os.path.join(REPO_ROOT, "demo_live.html"),
+               expected_text=("✔",), forbidden_text=("3초 후 이 문장",),
+               advance_ms=3100.0)
     if "css" in targets:
         render("css", "file://" + os.path.join(HERE, "fixture_css.html"),
                height=2100)

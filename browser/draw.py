@@ -7,6 +7,7 @@ kind: 0=rect(aux=corner radius) 1=text(aux=font size)
 2=line(aux=thickness) 3=oval 4=image 5=background image
 (font_id=image id, text="off_x off_y tile_w tile_h rep_x rep_y")
 6=clip push (x1,y1,x2,y2 = clip rect) 7=clip pop
+8=vertical sticky push (y1=normal top,y2=max top,aux=top inset) 9=sticky pop
 """
 
 import re
@@ -68,7 +69,7 @@ def scale_cmds(cmds, scale):
         return cmds
     out = []
     for kind, x1, y1, x2, y2, rgb, aux, font_id, text in cmds:
-        if kind in (0, 1, 2):
+        if kind in (0, 1, 2, 8):
             aux *= scale
         if kind == 5:
             p = text.split()
@@ -249,6 +250,48 @@ class DrawClipPop:
 
     def native(self, scroll, hscroll=0.0):
         return (7, 0.0, 0.0, 0.0, 0.0, (0, 0, 0), 0.0, 0, "")
+
+
+class DrawStickyPush:
+    """Begin a vertically sticky subtree.
+
+    The normal and maximum border-box tops stay in document coordinates;
+    the native rasterizer resolves the actual translation from the current
+    scroll offset without rebuilding the display list.
+    """
+
+    def __init__(self, normal_top, max_top, top_inset):
+        self.normal_top = normal_top
+        self.max_top = max(max_top, normal_top)
+        self.top_inset = top_inset
+        self.left = self.right = 0.0
+        self.top = -1e9
+        self.bottom = 1e9
+
+    def offset(self, scroll):
+        stuck = min(max(self.normal_top, scroll + self.top_inset),
+                    self.max_top)
+        return stuck - self.normal_top
+
+    def execute(self, scroll, canvas):
+        pass
+
+    def native(self, scroll, hscroll=0.0):
+        return (8, 0.0, self.normal_top, 0.0, self.max_top,
+                (0, 0, 0), float(self.top_inset), 0, "")
+
+
+class DrawStickyPop:
+    def __init__(self):
+        self.left = self.right = 0.0
+        self.top = -1e9
+        self.bottom = 1e9
+
+    def execute(self, scroll, canvas):
+        pass
+
+    def native(self, scroll, hscroll=0.0):
+        return (9, 0.0, 0.0, 0.0, 0.0, (0, 0, 0), 0.0, 0, "")
 
 
 class DrawOval:

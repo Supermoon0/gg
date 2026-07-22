@@ -29,8 +29,12 @@ def fetch_many(base, urls, binary=False):
     def one(u):
         try:
             if binary:
-                return net.request_raw(base.resolve(u))[1]
-            return net.request_text(base.resolve(u))[1]
+                return net.request_raw(
+                    base.resolve(u), site_for_cookies=base,
+                    top_level_navigation=False)[1]
+            return net.request_text(
+                base.resolve(u), site_for_cookies=base,
+                top_level_navigation=False)[1]
         except Exception:
             return b"" if binary else ""
     with ThreadPoolExecutor(max_workers=6) as pool:

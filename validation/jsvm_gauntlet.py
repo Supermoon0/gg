@@ -43,6 +43,36 @@ console.log([d instanceof Dog, d instanceof Animal, d instanceof Object,
   d.constructor === Dog].map(String).join("|"));
 """, ["true|true|true|rex generic|rex woof|true|true|true"]),
     # ------------------------------------------------------------------
+    ("CLAIM Proxy/Reflect traps+call+construct+revocation", "sync", r"""
+const target = {x: 2};
+const seen = [];
+const p = new Proxy(target, {
+  get(t, k, r){ seen.push("g:" + k); return Reflect.get(t, k, r) + 1; },
+  set(t, k, v, r){ seen.push("s:" + k); return Reflect.set(t, k, v * 2, r); },
+  has(t, k){ seen.push("h:" + k); return k === "virtual" || Reflect.has(t, k); },
+  deleteProperty(t, k){ seen.push("d:" + k); return Reflect.deleteProperty(t, k); }
+});
+p.x = 4;
+const read = p.x;
+const has = "virtual" in p;
+delete p.x;
+function add(a, b){ return a + b; }
+const callable = new Proxy(add, {
+  apply(t, th, args){ return Reflect.apply(t, th, args) + 1; }
+});
+function Box(v){ this.v = v; }
+const Ctor = new Proxy(Box, {
+  construct(t, args, nt){ return {v: args[0] + 2}; }
+});
+const rev = Proxy.revocable({ok: 1}, {});
+const before = rev.proxy.ok;
+rev.revoke();
+let revoked = false;
+try { rev.proxy.ok; } catch (e) { revoked = e instanceof TypeError; }
+console.log([read, target.x, has, callable(20, 21), new Ctor(40).v,
+  before, revoked, seen.join(",")].map(String).join("|"));
+""", ["9|undefined|true|42|42|1|true|s:x,g:x,h:virtual,d:x"]),
+    # ------------------------------------------------------------------
     ("CLAIM class-extends/super/static/fields/accessors/#private", "sync", r"""
 class Base {
   static kind = "base";

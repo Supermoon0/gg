@@ -38,14 +38,19 @@ from browser.layout import (DocumentLayout, BlockLayout, TextLayout,  # noqa: E4
 from browser.html_parser import Element, Text, tree_to_list  # noqa: E402
 
 W = int(sys.argv[2]) if len(sys.argv) > 2 else 1280
+SETTLE_ROUNDS = int(os.environ.get("GG_AUDIT_SETTLE_ROUNDS", "3"))
 
 
 def fetch_many(base, urls, binary=False):
     out = {}
     for u in urls:
         try:
-            out[u] = (net.request_raw(base.resolve(u))[1] if binary
-                      else net.request_text(base.resolve(u))[1])
+            out[u] = (net.request_raw(
+                base.resolve(u), site_for_cookies=base,
+                top_level_navigation=False)[1] if binary
+                else net.request_text(
+                    base.resolve(u), site_for_cookies=base,
+                    top_level_navigation=False)[1])
         except Exception:
             out[u] = b"" if binary else ""
     return out
@@ -62,31 +67,33 @@ def audit(url_str):
     t0 = time.perf_counter()
     base = net.URL(url_str)
     _h, body, base = net.request_text(base, no_cache=True)
+    network_ms = (time.perf_counter() - t0) * 1000.0
+    load_timings = {}
     nodes, doc, css, logs = native.load_document(
         body, lambda h: fetch_many(base, h),
-        lambda s: fetch_many(base, s), js_budget=25.0, page_url=base)
+        lambda s: fetch_many(base, s), js_budget=25.0, page_url=base,
+        timings=load_timings)
+    initial_ms = (time.perf_counter() - t0) * 1000.0
+    settle_started = time.perf_counter()
     # bounded settle so JS apps mount without hanging
-    for rnd in range(3):
+    for rnd in range(SETTLE_ROUNDS):
         try:
             native.settle_async(doc, css, base, timeout=15.0)
         except Exception:
             break
         nodes = native.refresh(doc, css)
         for _ in range(30):
-            _pl, fetches = doc.pump()
+            _pl, fetches = native.pump_script_requests(doc)
             if fetches:
-                for fid, u in fetches:
-                    try:
-                        doc.resolve_fetch(
-                            fid, 200, net.request_text(base.resolve(u))[1])
-                    except Exception as e:
-                        doc.reject_fetch(fid, str(e))
+                for request in fetches:
+                    native.service_script_fetch(doc, base, request)
                 continue
             if not doc.has_pending_work():
                 break
         if rnd >= 1 and not doc.has_pending_work():
             break
     nodes = native.refresh(doc, css)
+    settle_ms = (time.perf_counter() - settle_started) * 1000.0
     flat = tree_to_list(nodes, [])
     d = DocumentLayout(nodes)
     d.layout(W, 6000)
@@ -128,8 +135,10 @@ def audit(url_str):
     imgs = sum(1 for n in flat
                if isinstance(n, Element) and n.tag == "img"
                and n.attributes.get("src"))
-    js_err = sum(1 for l in logs
-                 if "gg-js error" in str(l) or "Uncaught" in str(l))
+    error_logs = [str(line) for line in logs
+                  if "gg-js error" in str(line)
+                  or "uncaught" in str(line).lower()]
+    js_err = len(error_logs)
     return {
         "url": url_str,
         "nodes": len(flat),
@@ -137,11 +146,17 @@ def audit(url_str):
         "text": sum(1 for c in cmds if hasattr(c, "text")),
         "images": imgs,
         "js_errors": js_err,
+        "js_error_samples": error_logs[:5],
         "overlaps": overlaps,
         "collapsed": collapsed,
         "offscreen": offscreen,
         "height": round(d.height),
         "ms": round((time.perf_counter() - t0) * 1000),
+        "network_ms": round(network_ms),
+        "initial_ms": round(initial_ms),
+        "settle_ms": round(settle_ms),
+        "stages_ms": {key: round(value) for key, value in
+                      load_timings.items()},
         "overlap_samples": samples,
     }
 

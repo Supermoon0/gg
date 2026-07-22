@@ -293,8 +293,9 @@ class 2회) 문법 갭이 좁고, `display:grid`·`position:sticky`도 **0회**�
       갭: 인라인 흐름 안의 float, float 아래로 텍스트 재확장,
       margin 있는 float의 스택 x 근사
 - [ ] inline-block 정식 배치 (지금은 근사)
-- [ ] margin collapsing
-- [x] ~~grid~~ (×0), ~~sticky~~ (×0) — 네이버 홈엔 없음, 스킵
+- [x] margin collapsing — 인접 형제·부모 첫/마지막 자식·중첩·empty chain,
+      양수/음수 집합과 border/padding/BFC 차단까지 07-22 완료
+- [x] ~~grid~~ (×0), ~~sticky~~ (×0) — 네이버 홈 사용량은 0이나 엔진 지원 완료
 
 ---
 
@@ -394,7 +395,8 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
       values/entries. size는 변이마다 갱신되는 데이터 prop. 배열 시드·
       체이닝·객체 키 identity. keys/values/entries는 배열 반환(이터레이터
       대신 — for-of 즉시 동작)
-- [ ] `Proxy`(×1), `Reflect.*`(×10)
+- [x] **`Proxy`(×1), `Reflect.*`(×10)** — 07-22: 객체·callable target,
+      trap·revocable·불변조건과 Reflect 13개 메서드 완료
 - [x] **제너레이터 `function*`/`yield`** — 07-16: 파서 자기완결 상태머신
       디슈가(switch 세그먼트 + 로컬을 외부 스코프 호이스팅 = 클로저 셀로
       지속, sent 값은 세그먼트 시작 대입). 문장 레벨 yield·객체/클래스
@@ -615,8 +617,9 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
 이 문서는 네이버 홈 기준이다. 완주해도 웹 전체엔 다음이 남는다
 (네이버 홈 사용량 0이라 뺐지만 다른 곳에선 흔한 것들):
 
-- [ ] `display: grid` / `position: sticky` (GitHub·뉴스 사이트 도배 수준)
-- [ ] **테이블 레이아웃** (옛 사이트·정부 사이트 뼈대)
+- [x] `display: grid` / `position: sticky` — 07-22: named line·양축 span·
+      occupancy auto-placement, scroll-time sticky paint/hit-test 완료
+- [x] **테이블 레이아웃** — auto column sizing·rowspan/colspan 완료
 - [ ] **`overflow: auto` 내부 스크롤 영역** (채팅창·사이드바)
 - [ ] 폼 컨트롤 렌더링 (`<select>`·체크박스·라디오)
 - [x] ~~트랜스파일 안 된 모던 JS~~ — 07-16: 구조 분해(선언·대입·for-of 헤드)·
@@ -861,3 +864,34 @@ PC-FEED-BEAUTY→…)가 매번 달라짐 — **네이버 서버가 요청마다
 네이버 서버 데이터를 충실히 반영한 것이지 렌더 결함이 아니며, "추천 고정"은
 실증(엔진이 사이트를 있는 그대로 구동)을 훼손함.** Math.random도 정상 동작
 (0.677… 반환) — 콘텐츠 매회 변동은 네이버 자신의 랜덤화. 실제 크롬도 동일.
+
+**07-22 — Proxy/Reflect 네이티브 시맨틱 완성**.
+기존에는 반쪽 스텁이 core-js의 피처 디텍션을 오도하지 않도록 두 전역을 의도적으로
+숨겼다. 이제 객체·함수 Proxy를 별도 내부 record로 보관하고 속성 읽기/쓰기,
+`in`, `delete`, own keys, descriptor/prototype/확장성, 함수 호출과 생성 경로에
+trap을 연결했다. `Reflect` 13개 메서드는 동일한 내부 연산을 사용하며
+`Proxy.revocable`, 비확장 target·중복 own key·잘못된 trap 결과 불변조건도
+검사한다. `new`는 `Construct` 바이트코드로 통합해 callable Proxy의 `apply`와
+`construct`를 정확히 구분한다. 신규 Proxy/Reflect 회귀와 기존 React/Naver
+관문을 포함한 Rust 전수 결과는 **197 passed, 2 ignored**다.
+
+**07-22 — 고급 Grid named line과 실제 sticky 스크롤 경로 완성**.
+`grid-template-columns/rows`의 `[name]` line group과 `repeat()` 중복 line을
+track에서 분리해 보존하고, column/row의 숫자·음수·named line·`span N`·
+네 부분 `grid-area`를 공통 배치기로 연결했다. 명시 item을 occupancy에 먼저
+예약하므로 소스상 앞선 auto item도 rowspan/column-span 영역을 침범하지 않는다.
+`position: sticky; top:*` subtree는 display list에 push/pop marker로 기록하고,
+Rust rasterizer가 현재 scroll offset과 containing-block 끝을 이용해 매 프레임
+이동량을 계산한다. tkinter fallback과 클릭/hover hit-test도 같은 offset을 쓴다.
+focused Python 좌표·marker 검증과 Rust 전수 결과는 **198 passed, 2 ignored**다.
+이 시점의 마지막 레이아웃 체크포인트는 부모-자식·빈 블록 margin collapsing이었다.
+
+**07-22 — vertical margin collapsing 완성**.
+기존 인접 형제 두 margin 처리에서 부모–첫 자식, 마지막 자식–부모 bottom,
+다단 중첩과 zero-height empty block을 가로지르는 adjoining 집합으로 확장했다.
+양수는 최댓값, 음수는 최솟값을 한 번만 더하며, border/padding·명시 높이·
+overflow formatting context·float/out-of-flow·clear는 collapse 경계를 끊는다.
+들여쓰기용 공백 text node도 block flow를 방해하지 않는다. 부모 top/bottom,
+border 차단, empty-through, 양수/음수 혼합, 중첩 전파 좌표 회귀를 추가했고
+grid/sticky를 포함한 순수-Python smoke 구간이 전부 통과했다. 다음 P2 항목은
+transition/@keyframes와 렌더 프레임 스케줄링이다.
