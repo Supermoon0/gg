@@ -434,6 +434,21 @@ impl CompiledRe {
             CompiledRe::Never => None,
         }
     }
+    /// capture-group names by index (0 = whole match, always None);
+    /// an unnamed group yields None. Empty when the regex never compiled.
+    fn capture_names(&self) -> Vec<Option<String>> {
+        match self {
+            CompiledRe::Std(r) => r
+                .capture_names()
+                .map(|n| n.map(String::from))
+                .collect(),
+            CompiledRe::Fancy(r) => r
+                .capture_names()
+                .map(|n| n.map(String::from))
+                .collect(),
+            CompiledRe::Never => Vec::new(),
+        }
+    }
     /// byte offset of the first match, for String.search
     fn find_start(&self, s: &str) -> Option<usize> {
         match self {
@@ -1105,6 +1120,37 @@ fn neutralize_surrogates(s: &str) -> String {
 }
 
 /// Build a RegExp value from a JS pattern + flags. JS flags map to the
+/// Build the `.groups` object for a match result: `{ name: capture }` for
+/// each named group. Returns `undefined` when the pattern has no named
+/// groups (matching the spec — `m.groups` is only an object when named
+/// groups exist). `caps` is the positional capture list (index 0 = whole).
+fn match_groups(st: &mut St, ri: usize, caps: &[Option<String>]) -> Value {
+    let names = st.regexes[ri].re.capture_names();
+    if !names.iter().any(|n| n.is_some()) {
+        return Value::UNDEFINED;
+    }
+    let obj = new_plain_object(st);
+    let oi = obj.index() as usize;
+    for (i, name) in names.iter().enumerate() {
+        if let Some(nm) = name {
+            let atom = st.intern_name(nm);
+            let v = match caps.get(i).and_then(|o| o.clone()) {
+                Some(s) => make_string(st, s),
+                None => Value::UNDEFINED,
+            };
+            raw_set_prop(st, oi, atom, v);
+        }
+    }
+    obj
+}
+
+/// Attach `.groups` to a freshly built match-result array.
+fn attach_groups(st: &mut St, arr: Value, ri: usize, caps: &[Option<String>]) {
+    let groups = match_groups(st, ri, caps);
+    let gatom = st.intern_name("groups");
+    raw_set_prop(st, arr.index() as usize, gatom, groups);
+}
+
 /// `regex` crate's inline flags; `g` (global) is tracked separately.
 fn new_regex(
     st: &mut St,
@@ -1204,6 +1250,9 @@ pub(super) enum PromiseState {
 pub(super) struct Reaction {
     handler: Option<Value>,
     derived: u32, // promise id of the derived promise
+    // `.finally(cb)`: run cb for its side effect, then forward the
+    // ORIGINAL settlement to the derived promise (not cb's return value)
+    finally: bool,
 }
 
 pub(super) struct PromiseRec {
@@ -1221,6 +1270,7 @@ pub(super) enum Job {
         value: Value,
         derived: u32,
         is_reject: bool,
+        finally: bool,
     },
 }
 
@@ -1273,13 +1323,13 @@ fn add_reaction(st: &mut St, pid: u32, reject_side: bool, rx: Reaction) {
         PromiseState::Fulfilled(v) if !reject_side => {
             st.microtasks.push_back(Job::React {
                 handler: rx.handler, value: v, derived: rx.derived,
-                is_reject: false,
+                is_reject: false, finally: rx.finally,
             });
         }
         PromiseState::Rejected(v) if reject_side => {
             st.microtasks.push_back(Job::React {
                 handler: rx.handler, value: v, derived: rx.derived,
-                is_reject: true,
+                is_reject: true, finally: rx.finally,
             });
         }
         _ => {}
@@ -1301,8 +1351,10 @@ pub(super) fn promise_settle(st: &mut St, pid: u32, value: Value, is_reject: boo
             return;
         }
         // this promise follows `inner`: passthrough reactions on both sides
-        add_reaction(st, inner, false, Reaction { handler: None, derived: pid });
-        add_reaction(st, inner, true, Reaction { handler: None, derived: pid });
+        add_reaction(st, inner, false,
+            Reaction { handler: None, derived: pid, finally: false });
+        add_reaction(st, inner, true,
+            Reaction { handler: None, derived: pid, finally: false });
         return;
     }
     st.promises[pid as usize].state = if is_reject {
@@ -1319,6 +1371,7 @@ pub(super) fn promise_settle(st: &mut St, pid: u32, value: Value, is_reject: boo
     for rx in reactions {
         st.microtasks.push_back(Job::React {
             handler: rx.handler, value, derived: rx.derived, is_reject,
+            finally: rx.finally,
         });
     }
 }
@@ -1333,8 +1386,22 @@ fn promise_then(
     let (dval, dpid) = new_promise(st);
     let on_f = if on_fulfilled.is_function() { Some(on_fulfilled) } else { None };
     let on_r = if on_rejected.is_function() { Some(on_rejected) } else { None };
-    add_reaction(st, recv_pid, false, Reaction { handler: on_f, derived: dpid });
-    add_reaction(st, recv_pid, true, Reaction { handler: on_r, derived: dpid });
+    add_reaction(st, recv_pid, false,
+        Reaction { handler: on_f, derived: dpid, finally: false });
+    add_reaction(st, recv_pid, true,
+        Reaction { handler: on_r, derived: dpid, finally: false });
+    dval
+}
+
+/// `p.finally(cb)` — cb runs on both settlement paths for its side effect;
+/// the derived promise mirrors p's original settlement (unless cb throws).
+fn promise_finally(st: &mut St, recv_pid: u32, cb: Value) -> Value {
+    let (dval, dpid) = new_promise(st);
+    let h = if cb.is_function() { Some(cb) } else { None };
+    add_reaction(st, recv_pid, false,
+        Reaction { handler: h, derived: dpid, finally: true });
+    add_reaction(st, recv_pid, true,
+        Reaction { handler: h, derived: dpid, finally: true });
     dval
 }
 
@@ -1376,22 +1443,39 @@ fn drain_microtasks(st: &mut St, mods: &ModStore, budget: &mut usize) {
                     st.logs.push(format!("[gg-js error] {}", e.msg));
                 }
             }
-            Job::React { handler, value, derived, is_reject } => match handler {
-                None => promise_settle(st, derived, value, is_reject),
-                Some(h) => match call_value(st, mods, h, &[value]) {
-                    // a handler that returns normally FULFILLS the derived
-                    // promise (even an onRejected handler — the rejection
-                    // is considered handled)
-                    Ok(ret) => promise_settle(st, derived, ret, false),
-                    Err(e) => {
-                        let reason = e.value.unwrap_or_else(|| {
-                            let s = e.msg.clone();
-                            make_string(st, s)
-                        });
-                        promise_settle(st, derived, reason, true);
+            Job::React { handler, value, derived, is_reject, finally } => {
+                match handler {
+                    None => promise_settle(st, derived, value, is_reject),
+                    // .finally(cb): run cb, discard its result, then forward
+                    // the ORIGINAL settlement. A throw in cb overrides it.
+                    Some(h) if finally => {
+                        match call_value(st, mods, h, &[]) {
+                            Ok(_) => promise_settle(
+                                st, derived, value, is_reject),
+                            Err(e) => {
+                                let reason = e.value.unwrap_or_else(|| {
+                                    let s = e.msg.clone();
+                                    make_string(st, s)
+                                });
+                                promise_settle(st, derived, reason, true);
+                            }
+                        }
                     }
-                },
-            },
+                    Some(h) => match call_value(st, mods, h, &[value]) {
+                        // a handler that returns normally FULFILLS the
+                        // derived promise (even an onRejected handler — the
+                        // rejection is considered handled)
+                        Ok(ret) => promise_settle(st, derived, ret, false),
+                        Err(e) => {
+                            let reason = e.value.unwrap_or_else(|| {
+                                let s = e.msg.clone();
+                                make_string(st, s)
+                            });
+                            promise_settle(st, derived, reason, true);
+                        }
+                    },
+                }
+            }
         }
     }
 }
@@ -2946,13 +3030,15 @@ fn method_ref_dispatch(
                 None => Value::NULL,
                 Some(gs) => {
                     let vals: Vec<Value> = gs
-                        .into_iter()
+                        .iter()
                         .map(|g| match g {
-                            Some(s) => push_str(st, s),
+                            Some(s) => push_str(st, s.clone()),
                             None => Value::UNDEFINED,
                         })
                         .collect();
-                    new_array(st, vals)
+                    let arr = new_array(st, vals);
+                    attach_groups(st, arr, ri, &gs);
+                    arr
                 }
             })
         }
@@ -8015,13 +8101,17 @@ fn exec_loop(
                                     None => Value::NULL,
                                     Some(gs) => {
                                         let vals: Vec<Value> = gs
-                                            .into_iter()
+                                            .iter()
                                             .map(|g| match g {
-                                                Some(s) => push_str(st, s),
+                                                Some(s) => {
+                                                    push_str(st, s.clone())
+                                                }
                                                 None => Value::UNDEFINED,
                                             })
                                             .collect();
-                                        new_array(st, vals)
+                                        let arr = new_array(st, vals);
+                                        attach_groups(st, arr, ri, &gs);
+                                        arr
                                     }
                                 }
                             }
@@ -8048,6 +8138,7 @@ fn exec_loop(
                             "catch" => {
                                 promise_then(st, pid, Value::UNDEFINED, arg0)
                             }
+                            "finally" => promise_finally(st, pid, arg0),
                             other => {
                                 return err(format!(
                                     "Promise has no method .{other}() yet"
@@ -8998,12 +9089,16 @@ fn exec_loop(
                                 match groups {
                                     None => Value::NULL,
                                     Some(gs) => {
-                                        let vals: Vec<Value> = gs.into_iter()
+                                        let vals: Vec<Value> = gs.iter()
                                             .map(|g| match g {
-                                                Some(x) => push_str(st, x),
+                                                Some(x) => {
+                                                    push_str(st, x.clone())
+                                                }
                                                 None => Value::UNDEFINED,
                                             }).collect();
-                                        new_array(st, vals)
+                                        let arr = new_array(st, vals);
+                                        attach_groups(st, arr, ri, &gs);
+                                        arr
                                     }
                                 }
                             }

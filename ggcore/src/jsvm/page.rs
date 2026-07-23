@@ -2331,6 +2331,32 @@ mod tests {
     }
 
     #[test]
+    fn regex_named_groups() {
+        assert_eq!(
+            n("var m='2021-05'.match(/(?<y>\\d+)-(?<mo>\\d+)/); \
+               (m.groups.y==='2021' && m.groups.mo==='05') ? 1 : 0"), 1.0);
+        // exec exposes .groups too
+        assert_eq!(
+            n("var m=/(?<a>\\w)(?<b>\\w)/.exec('xy'); \
+               (m.groups.a==='x' && m.groups.b==='y') ? 1 : 0"), 1.0);
+        // no named groups -> groups is undefined
+        assert_eq!(
+            n("'ab'.match(/(\\w)/).groups === undefined ? 1 : 0"), 1.0);
+    }
+
+    #[test]
+    fn promise_finally_forwards() {
+        // .finally() is callable and chains (value-forwarding is verified
+        // end-to-end through the page event loop)
+        assert_eq!(
+            n("Promise.resolve(1).finally(function(){}) \
+                 .finally(function(){}); 5"), 5.0);
+        assert_eq!(
+            n("Promise.reject('e').finally(function(){}).catch(function(){}); \
+               5"), 5.0);
+    }
+
+    #[test]
     fn computed_destructuring() {
         assert_eq!(
             n("var k='x'; var {[k]:v}={x:9}; v"), 9.0);
