@@ -2331,6 +2331,23 @@ mod tests {
     }
 
     #[test]
+    fn string_match_all() {
+        // matchAll yields one array per match, iterable via spread
+        assert_eq!(
+            n("var a=[...'a1b2'.matchAll(/(\\w)(\\d)/g)]; \
+               (a.length===2 && a[0][1]==='a' && a[1][2]==='2') ? 1 : 0"),
+            1.0);
+        // each result carries .index and named .groups
+        assert_eq!(
+            n("var a=[...'x9'.matchAll(/(?<c>\\w)(?<d>\\d)/g)]; \
+               (a[0].index===0 && a[0].groups.c==='x' && a[0].groups.d==='9') \
+               ? 1 : 0"), 1.0);
+        // for-of also works
+        assert_eq!(
+            n("var n=0; for (var m of 'aaa'.matchAll(/a/g)) n++; n"), 3.0);
+    }
+
+    #[test]
     fn regex_named_groups() {
         assert_eq!(
             n("var m='2021-05'.match(/(?<y>\\d+)-(?<mo>\\d+)/); \

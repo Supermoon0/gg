@@ -9069,6 +9069,40 @@ fn exec_loop(
                             };
                             push_str(st, out)
                         }
+                        "matchAll" => {
+                            let Some(ri) = regex_index(st, av0) else {
+                                return err(
+                                    "String.matchAll needs a regex arg");
+                            };
+                            let all = st.regexes[ri].re
+                                .captures_all(&s, true);
+                            let mut results = Vec::with_capacity(all.len());
+                            let idx_atom = st.intern_name("index");
+                            let inp_atom = st.intern_name("input");
+                            for (whole, groups, start) in all {
+                                // char offset of the byte position `start`
+                                let cidx = s[..start].chars().count() as i32;
+                                let full: Vec<Option<String>> =
+                                    std::iter::once(Some(whole.clone()))
+                                        .chain(groups.into_iter())
+                                        .collect();
+                                let vals: Vec<Value> = full.iter()
+                                    .map(|g| match g {
+                                        Some(x) => push_str(st, x.clone()),
+                                        None => Value::UNDEFINED,
+                                    })
+                                    .collect();
+                                let arr = new_array(st, vals);
+                                attach_groups(st, arr, ri, &full);
+                                let ai = arr.index() as usize;
+                                raw_set_prop(st, ai, idx_atom, Value::int(cidx));
+                                let inp = push_str(st, s.clone());
+                                raw_set_prop(st, ai, inp_atom, inp);
+                                results.push(arr);
+                            }
+                            // an array is iterable — satisfies for-of/spread
+                            new_array(st, results)
+                        }
                         "match" => {
                             let Some(ri) = regex_index(st, av0) else {
                                 return err(
