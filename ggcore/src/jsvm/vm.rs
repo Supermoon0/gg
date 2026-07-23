@@ -1122,6 +1122,40 @@ fn neutralize_surrogates(s: &str) -> String {
 }
 
 /// Build a RegExp value from a JS pattern + flags. JS flags map to the
+/// Translate a JS replacement string to the regex crate's syntax:
+/// `$&` -> `${0}` (whole match) and `$<name>` -> `${name}` (named group).
+/// Numbered `$1` / `${1}` already match the crate, so they pass through.
+fn js_repl_to_rust(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() {
+            if chars[i + 1] == '&' {
+                out.push_str("${0}");
+                i += 2;
+                continue;
+            }
+            if chars[i + 1] == '<' {
+                if let Some(rel) =
+                    chars[i + 2..].iter().position(|&c| c == '>')
+                {
+                    let name: String =
+                        chars[i + 2..i + 2 + rel].iter().collect();
+                    out.push_str("${");
+                    out.push_str(&name);
+                    out.push('}');
+                    i = i + 2 + rel + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Build the `.groups` object for a match result: `{ name: capture }` for
 /// each named group. Returns `undefined` when the pattern has no named
 /// groups (matching the spec — `m.groups` is only an object when named
@@ -9284,9 +9318,9 @@ fn exec_loop(
                                 };
                                 push_str(st, out)
                             } else if let Some(ri) = regex_index(st, av0) {
-                                // JS $& (whole match) -> regex crate ${0}
-                                let to = to_display(st, av1)
-                                    .replace("$&", "${0}");
+                                // JS $&/$<name> -> regex crate syntax
+                                let to =
+                                    js_repl_to_rust(&to_display(st, av1));
                                 let out = if st.regexes[ri].global {
                                     st.regexes[ri].re
                                         .replace_all_str(&s, to.as_str())
@@ -9329,8 +9363,8 @@ fn exec_loop(
                                 };
                                 push_str(st, out)
                             } else if let Some(ri) = regex_index(st, av0) {
-                                let to = to_display(st, av1)
-                                    .replace("$&", "${0}");
+                                let to =
+                                    js_repl_to_rust(&to_display(st, av1));
                                 let out = st.regexes[ri].re
                                     .replace_all_str(&s, to.as_str());
                                 push_str(st, out)

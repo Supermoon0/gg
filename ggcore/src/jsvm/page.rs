@@ -2441,6 +2441,20 @@ mod tests {
     }
 
     #[test]
+    fn regex_named_replacement() {
+        // $<name> in a replacement string refers to a named group
+        assert_eq!(
+            n("'2020'.replace(/(?<y>\\d{4})/,'$<y>!')==='2020!' ? 1 : 0"), 1.0);
+        // $& (whole match) still works alongside
+        assert_eq!(
+            n("'abc'.replace(/b/,'[$&]')==='a[b]c' ? 1 : 0"), 1.0);
+        // named replacement over a global regex
+        assert_eq!(
+            n("'a1b2'.replace(/(?<c>[a-z])(?<n>\\d)/g,'$<n>$<c>')==='1a2b' \
+               ? 1 : 0"), 1.0);
+    }
+
+    #[test]
     fn regex_named_groups() {
         assert_eq!(
             n("var m='2021-05'.match(/(?<y>\\d+)-(?<mo>\\d+)/); \
