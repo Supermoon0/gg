@@ -2014,6 +2014,25 @@ mod tests {
                  a: {value: 4}, \
                  b: {get: function() { return this.a * 10; }} }); \
                o.a + o.b"), 44.0);
+        // an accessor redefined OVER an existing data property wins on read
+        // (the shape still carries the old data slot; the getter must be
+        // consulted first — regression: GetProp fast path read the slot)
+        assert_eq!(
+            n("var o = {y: 10}; Object.defineProperty(o, 'y', \
+               {get: function() { return 99; }}); o.y"), 99.0);
+        // assignment to a getter-only accessor is a sloppy no-op, NOT a
+        // clobber back into a data slot (regression: SetProp created a
+        // stray data property that shadowed nothing but leaked the value)
+        assert_eq!(
+            n("var o = {}; Object.defineProperty(o, 'z', \
+               {get: function() { return 7; }}); o.z = 123; o.z"), 7.0);
+        // a setter still intercepts writes when the property already had a
+        // data slot before being redefined as an accessor
+        assert_eq!(
+            n("var o = {w: 1}; Object.defineProperty(o, 'w', \
+               {get: function() { return this._w || 0; }, \
+                set: function(v) { this._w = v * 3; }}); \
+               o.w = 14; o.w"), 42.0);
         // getOwnPropertyNames sees data props AND accessor-only keys
         // (Object.keys skips the accessor side-table)
         assert_eq!(

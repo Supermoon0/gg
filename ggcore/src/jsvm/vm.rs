@@ -9301,6 +9301,26 @@ fn exec_loop(
                         reg!(dst) = Value::int(elen as i32);
                         continue;
                     }
+                    // An own accessor (Object.defineProperty get/set) wins
+                    // over any data slot of the same name — including one
+                    // the shape still carries because the property used to
+                    // be a plain value before it was redefined. The IC/slot
+                    // fast path below reads the raw slot and cannot see the
+                    // getter, so intercept here (cheap: gated on the flag).
+                    if st.objects[oi].has_accessors {
+                        if let Some(&(g, _s)) =
+                            st.accessors.get(&(oi as u32, key))
+                        {
+                            reg!(dst) = if g.is_function() {
+                                call_value_this(
+                                    st, mods, g, Some(ov), &[],
+                                )?
+                            } else {
+                                Value::UNDEFINED
+                            };
+                            continue;
+                        }
+                    }
                     let slot_ic = ic!(ic);
                     let e = st.ics[slot_ic];
                     let hit = if e.shape == shape {
@@ -9632,6 +9652,22 @@ fn exec_loop(
                     let k = key as usize;
                     st.globals[k] = v;
                     st.gdef[k] = true;
+                }
+                // An own accessor takes precedence over the data fast path:
+                // invoke its setter, or drop the write (sloppy mode) when
+                // the property is getter-only. Without this, assigning to a
+                // getter-only property clobbers it into a plain data slot.
+                if st.objects[oi].has_accessors {
+                    if let Some(&(_g, s)) =
+                        st.accessors.get(&(oi as u32, key))
+                    {
+                        if s.is_function() {
+                            call_value_this(
+                                st, mods, s, Some(ov), &[v],
+                            )?;
+                        }
+                        continue;
+                    }
                 }
                 let slot_ic = ic!(ic);
                 let e = st.ics[slot_ic];
