@@ -656,7 +656,7 @@ LAYOUT_PAGE = """<html><body style="margin: 0">
 dom3 = HTMLParser(LAYOUT_PAGE).parse()
 style(dom3, sorted(ua, key=cascade_priority))
 doc3 = DocumentLayout(dom3)
-doc3.layout(800)  # content width 800 - 2*HSTEP = 774
+doc3.layout(800)  # document is the viewport: content width 800 (body{margin:0})
 boxes = {}
 for b in layout_tree_to_list(doc3, []):
     if isinstance(b, BlockLayout) and isinstance(b.node, Element):
@@ -676,7 +676,7 @@ check("flex row placement", fa.y == fb.y == fc.y and fa.x < fb.x < fc.x,
 # the two auto items grow from their content basis and together consume
 # all free space; each gets ~half, up to the b/c glyph-width difference
 check("flex grow shares space",
-      abs((fb.width + fc.width) - (774 - 100)) < 1
+      abs((fb.width + fc.width) - (doc3.width - 100)) < 1
       and abs(fb.width - fc.width) < 4,
       f"fb.width={fb.width:.0f} fc.width={fc.width:.0f}")
 # a `flex:1 0 0` pane fills the row while a `flex:0 0 auto` label keeps
@@ -787,8 +787,8 @@ check("flex shorthand: grow factors split the remainder 1:2",
       f"a={fb2['gra'].width:.0f} b={fb2['grb'].width:.0f} "
       f"c={fb2['grc'].width:.0f}")
 absbox = boxes["abs"]
-check("absolute positioning", abs(absbox.x - (HSTEP + 50)) < 1
-      and abs(absbox.y - (VSTEP + 300)) < 1,
+check("absolute positioning", abs(absbox.x - 50) < 1
+      and abs(absbox.y - 300) < 1,
       f"({absbox.x:.0f}, {absbox.y:.0f})")
 in_flow_h = boxes["flexbox"].y + boxes["flexbox"].height
 check("absolute is out of flow", doc3.height < 300,
@@ -824,15 +824,15 @@ def _boxes(doc):
 dom4 = HTMLParser(REGRESS_PAGE).parse()
 style(dom4, sorted(ua, key=cascade_priority))
 doc4 = DocumentLayout(dom4)
-doc4.layout(800)  # content width 774, no viewport height
+doc4.layout(800)  # content width 800 (body{margin:0}), no viewport height
 boxes4 = _boxes(doc4)
 
 rel, after = boxes4["rel"], boxes4["after"]
 check("relative offset shifts the box",
-      abs(rel.y - (VSTEP + 30)) < 1 and abs(rel.x - (HSTEP + 10)) < 1,
+      abs(rel.y - 30) < 1 and abs(rel.x - 10) < 1,
       f"({rel.x:.0f}, {rel.y:.0f})")
 check("relative offset is visual-only (siblings keep flow position)",
-      abs(after.y - (VSTEP + 40)) < 1, f"after.y={after.y:.0f}")
+      abs(after.y - 40) < 1, f"after.y={after.y:.0f}")
 
 # height:200px parent (padding 10 -> content 180); child 50% = 90
 check("% height resolves against definite parent height",
