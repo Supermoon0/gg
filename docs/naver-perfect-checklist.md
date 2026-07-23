@@ -270,8 +270,12 @@ class 2회) 문법 갭이 좁고, `display:grid`·`position:sticky`도 **0회**�
       space-between/space-around/space-evenly — 행별 잔여 공간 분배,
       auto 마진이 흡수했으면 무동작), `align-items`/`align-self`
       (center/flex-end — 교차축은 배치 후 서브트리 시프트, 재레이아웃
-      없음; stretch 크기 늘림은 미지원), `flex-shrink`(nowrap 단일
-      행 오버플로를 shrink×크기 비례로 반납, min-content 바닥 없음),
+      없음; stretch 크기 늘림은 미지원 → **07-23: align stretch 지원**
+      (auto 높이 항목이 행 교차크기로 늘어남, 8660f7c)), `flex-shrink`
+      (nowrap 단일 행 오버플로를 shrink×크기 비례로 반납, min-content
+      바닥 없음 → **07-23: iterative 해석 + min-content 바닥 + max 클램프**
+      (e81bc4e), **`gap`/`flex-direction:column` grow/justify/align**
+      (dd0322f·4f2d3aa)),
       `flex-basis` + **`flex` 축약형**(1 / 0 0 200px / none — 양 엔진
       미러, `flex:1`은 스펙대로 basis 0). 덤 버그 수정: `"wrap" in
       "nowrap"`이 참이라 **모든 flex 컨테이너가 랩 모드였음** — 이제
@@ -283,8 +287,10 @@ class 2회) 문법 갭이 좁고, `display:grid`·`position:sticky`도 **0회**�
       기준 없음 → 속성/비율 폴백). input은 블록 박스 모델이라 기존에
       이미 적용됨
 - [x] **`float` + `clear` v1** (×25) — 07-18: 블록 모드를 증분 배치로
-      전환(앞선 float가 등록돼야 뒤 형제가 회피 가능). **폭 명시된
-      float만 참여**(auto 폭은 일반 흐름 폴백 — v1 게이트):
+      전환(앞선 float가 등록돼야 뒤 형제가 회피 가능). ~~**폭 명시된
+      float만 참여**(auto 폭은 일반 흐름 폴백 — v1 게이트)~~ → **07-23:
+      auto 폭 float도 shrink-to-fit로 참여, 플로팅 요소는 block-level로
+      승격(`<p><img float>text</p>` 이미지가 실제 float, 45315df)**:
       좌/우 가장자리에 흐름 하단 y로 배치, 같은 y의 기존 float 뒤로
       스택. 자동 폭 in-flow 블록은 상단이 겹치는 float만큼 x 시프트+
       폭 축소(라인박스 단위가 아니라 블록 통째 회피 — 근사).
@@ -293,8 +299,14 @@ class 2회) 문법 갭이 좁고, `display:grid`·`position:sticky`도 **0회**�
       갭: 인라인 흐름 안의 float, float 아래로 텍스트 재확장,
       margin 있는 float의 스택 x 근사
 - [ ] inline-block 정식 배치 (지금은 근사)
-- [ ] margin collapsing
-- [x] ~~grid~~ (×0), ~~sticky~~ (×0) — 네이버 홈엔 없음, 스킵
+- [x] **margin collapsing** — 07-23: 인접 블록 형제의 세로 마진 병합
+      `max(mb,mt,0)+min(mb,mt,0)` (CSS 2.1 §8.3.1). 문단 32px→16px 간격,
+      example.com 높이 587→555 (efc6152)
+- [x] **grid** — 07-23: `display:grid` 전체 구현 — 트랙(fr/minmax/repeat/
+      rem/%), `grid-template-areas` named-area 배치, gap, column/row span.
+      네이버 홈엔 없지만 위키백과 Vector 3열 셸·카드 그리드가 실제 열로
+      배치됨 (0012311). **sticky**는 여전히 흐름 폴백(안전 근사),
+      `position:fixed`는 뷰포트 기준으로 분리 (0603521)
 
 ---
 
@@ -615,16 +627,27 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
 이 문서는 네이버 홈 기준이다. 완주해도 웹 전체엔 다음이 남는다
 (네이버 홈 사용량 0이라 뺐지만 다른 곳에선 흔한 것들):
 
-- [ ] `display: grid` / `position: sticky` (GitHub·뉴스 사이트 도배 수준)
-- [ ] **테이블 레이아웃** (옛 사이트·정부 사이트 뼈대)
-- [ ] **`overflow: auto` 내부 스크롤 영역** (채팅창·사이드바)
-- [ ] 폼 컨트롤 렌더링 (`<select>`·체크박스·라디오)
+- [x] **`display: grid`** — 07-23: named-area·fr/minmax/repeat·gap·span
+      전체 구현(0012311). `position: sticky`는 흐름 폴백(근사),
+      `position:fixed`는 뷰포트 분리(0603521)
+- [x] **테이블 레이아웃** — 07-23: `display:table/-row/-cell`+`<table>`
+      오토 컬럼 알고리즘(min/max-content, colspan/rowspan, 행/셀 배경).
+      HN 겹침 9→0 (f1ca219)
+- [~] **`overflow: auto` 내부 스크롤 영역** — 07-23: 클립 대상에서
+      **의도적으로 제외**(비스크롤 풀페이지 렌더에서 과소계산 높이로
+      클립하면 읽을 내용을 가림). hidden/clip/scroll은 클립
+- [~] 폼 컨트롤 렌더링 — 07-23: `<input>`/`<textarea>` 기본 폭·
+      checkbox/radio 크기, %폭 인라인블록(97ee65a). `<select>`는 잔여
 - [x] ~~트랜스파일 안 된 모던 JS~~ — 07-16: 구조 분해(선언·대입·for-of 헤드)·
       async/await(전 위치)·클래스 상속·spread/rest **완료**. 잔여:
       제너레이터·**ES 모듈**(import/export)
 - [ ] Web Worker / Service Worker / WebAssembly
 - [ ] `<video>`/`<audio>`/WebGL (유튜브·지도류 — 사실상 별개 프로젝트)
-- [ ] iframe 문서 격리, CORS, 쿠키 전체 속성 (로그인·광고·임베드)
+- [~] iframe 문서 격리, CORS, 쿠키 — 07-21: **`document.cookie` ↔
+      네트워크 쿠키 자 브리지**(세션 쿠키 왕복: 응답 Set-Cookie 캡처 →
+      요청 Cookie 헤더 재생 → 스크립트가 읽고 쓴 값 반영, 5f3c8af).
+      호스트별 저장(도메인 간 누출 없음). 잔여: 전체 속성(Path/Domain/
+      Secure/Expires), iframe 격리, CORS
 - [ ] HTML5 오류 복구 알고리즘 완전판, quirks 모드, **EUC-KR 등 레거시 인코딩**,
       RTL/양방향 텍스트
 - [x] 진행 지표: **사이트 바스켓** — 07-16: `E:\gg\basket_test.py` 상설화
@@ -861,3 +884,64 @@ PC-FEED-BEAUTY→…)가 매번 달라짐 — **네이버 서버가 요청마다
 네이버 서버 데이터를 충실히 반영한 것이지 렌더 결함이 아니며, "추천 고정"은
 실증(엔진이 사이트를 있는 그대로 구동)을 훼손함.** Math.random도 정상 동작
 (0.677… 반환) — 콘텐츠 매회 변동은 네이버 자신의 랜덤화. 실제 크롬도 동일.
+
+---
+
+## 07-21~23 — **레이아웃 표준 일반화 ("전체가 돌아가도록") + 쿠키 브리지**
+
+지시: *"레이아웃이 네이버 한정적으로 하지말고 전체가 돌아가도록 해줘."*
+`browser/layout.py`를 네이버 튜닝이 아니라 **CSS 표준을 따르는 범용 엔진**으로
+일반화. 감사 도구 `scripts/render_audit.py`(사이트별 겹침/오프스크린/붕괴/JS오류
+JSON 1줄) + 10개 basket으로 각 변경을 실측 게이트.
+
+### 레이아웃 커밋 20개 (전부 smoke 143 불변 · 회귀 게이트 통과)
+- **테이블/인라인/@media** (f1ca219): CSS 테이블 오토 컬럼(min/max-content,
+  colspan/rowspan, 행·셀 배경); 인라인 자식만 있는 블록은 인라인 포매팅
+  (`<div>a <a>b</a> c</div>` 3줄→1줄); `@media` 멀티라인 조건 파싱(줄바꿈된
+  `screen\nand (max-width:750px)`가 데스크톱에 모바일 스타일 누출하던 것 차단,
+  Rust+Python 양 엔진 + 유닛테스트)
+- **absolute 컨테이닝 블록** (940c4bb): 가장 가까운 positioned 조상 기준으로
+  오프셋/％크기 해석(문서 기준 → 표준). 드롭다운/오버레이가 한 좌표에 뭉치던
+  최대 결함 해소 — tistory 28→0, yna 236→16
+- **마진 병합** (efc6152), **min/max-height + flex gap** (dd0322f),
+  **CJK 줄바꿈 + word-break/overflow-wrap** (d92bb56), **폼 컨트롤 기본폭 +
+  %폭 인라인블록** (97ee65a), **white-space pre-wrap/pre-line** (b233139)
+- **CSS Grid** (0012311): 트랙 fr/minmax/repeat/rem, `grid-template-areas`
+  named-area 배치, gap, span. 위키백과 Vector 3열 셸이 실제 열로 배치
+- **vertical-align** (b0bbc11), **position:fixed 뷰포트 고정** (0603521),
+  **box-sizing:content-box 명시 존중** (a115eeb — 기본 border-box는 유지),
+  **flex align stretch** (8660f7c), **인라인 요소 배경** (27ebba7),
+  **aspect-ratio** (f6efe7c)
+- **z-index 음수 페인트 순서** (ef575ea), **인접 인라인 팬텀스페이스**
+  (f813cf3 — `$<b>5</b>`→"$5"), **object-fit/object-position** (e5bdb37),
+  **iterative flex min/max 클램핑 + min-content 바닥** (e81bc4e),
+  **진짜 flex-direction:column** grow/justify/align (4f2d3aa),
+  **auto-width float + float→block-level** (45315df)
+
+### 실측 (render_audit.py, 10개 basket)
+**8/10 완전 클린**: example·HN·cern·motherfucking·gnu·danluu·rfc2616·tistory
+= 겹침 0. **HN 9→0, tistory 28→0, yna 236→9~12.** 위키백과는 Grid+float로
+사이드바·figure가 구조적으로 올바르게 배치(잔여 겹침은 항상 열린 Vector
+드롭다운 내비 = 인터랙션 상태 한계, 레이아웃 버그 아님). MDN 메가메뉴도
+hover 상태 미모델 — 정적 렌더의 근본 한계.
+
+### 의도적으로 남긴 3가지 (미구현 아님)
+- **per-line float intrusion**: 블록 단위 회피가 smoke로 고정된 설계라 유지
+  (문단이 float 옆으로 이동은 됨; 라인 단위로 바꾸면 float 테스트 회귀)
+- **box-sizing 기본값**: border-box 유지(코드베이스의 의도적 "web reality"
+  + `width is border-box` 테스트). 명시적 content-box는 처리
+- **object-fit:cover 소스-rect 크롭**: 드로우 레이어에 소스 rect 없어 clip으로
+  근사(시각 결과 동일)
+
+### 쿠키 브리지 + JS 엔진 심화 (07-21, 코덱스 5f3c8af — 리뷰·검증 완료)
+- **`document.cookie` ↔ 네트워크 쿠키 자**: 응답 Set-Cookie 캡처 → 요청
+  Cookie 헤더 재생 → 스크립트 시드/폴드 왕복. 호스트별 저장(도메인 간 누출
+  없음). 잔여: 전체 속성(Path/Domain/Secure/Expires)
+- 함께 실린 JS 엔진 기능(lodash `_.template` 실행용, 커밋 메시지엔 미기재):
+  **`with`문**, **`Function` 생성자**, **`String.replace(함수 콜백)`**,
+  정규식 캡처. 전부 유닛테스트 포함
+- **검증**: cargo **189/189**, smoke 143(레이아웃 전수, google redirect만
+  환경 게이트), 레이아웃 basket 불변(공존 확인), 쿠키 왕복 실동작 확인
+
+*상태: 레이아웃이 네이버 전용이 아니라 표준 기반 범용 엔진으로 일반화됨.
+워크플로우 감사 랭킹 1–20 전부 + Grid 구현. 8/10 사이트 클린.*
