@@ -601,6 +601,30 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
       (lex 12.5 + parse 11.5 + 스텁 6). 웜 실행 저하 없음.
       네이버 웜 로드 1,003ms 재실측은 로컬에서 (이 세션은 egress
       제한).
+- [x] **인터프리터 O(n²) 핫패스 제거 (네이버 settle ~57s → ~5s)** —
+      07-23: 네이버 클라이언트 렌더를 페이즈·오퍼코드·수신자별로 격리
+      프로파일(임시 계측 후 제거)한 결과, settle 전체가 **한 pump
+      라운드**에 몰려 있고 그 라운드의 명령/초 처리량이 힙이 커질수록
+      20배 붕괴 = 디스패치 처리량이 아니라 몇 개의 핫패스에 숨은
+      O(n²)였다. 네 곳을 고쳐 제거:
+      (a) `intern()` — 문자열 아레나를 선형 스캔으로 디듑 → `for..in`/
+      Object.keys 키 인터닝이 키당 O(n), 빌드 전체 O(n²). content→index
+      해시맵(flat_index)로 O(1). 인터닝된 Flat은 불변이라 무효화 없음.
+      (b) charAt/charCodeAt — 매 호출(직접형 + core-js uncurried
+      `fn.apply` 형)마다 전체 UTF-16 유닛 벡터를 재구성 → 문자 스캔이
+      O(n²). 문자열당 단일 유닛 메모(units_cache)를 str_char_read로
+      경유해 순차 스캔 O(n) 상각. 40만자 스캔 12.4s → 0.07s(175×).
+      (c) 문자열 `.length` — 읽을 때마다 UTF-16 유닛 O(n) 재카운트 →
+      스캐너의 `while (i<s.length)`가 O(n²). 문자열당 길이 메모
+      (ulen_cache/str_u16_len).
+      (d) method_ref_dispatch 배열 수신자 — 호출마다 수신자 배열 전체를
+      선(先)클론 → `push.apply(acc, chunk)`가 O(n²). 제자리/스캔 연산
+      (push/pop/shift/unshift/reverse/indexOf/lastIndexOf/at) 무(無)클론
+      패스 추가, slice는 요청 범위만 클론.
+      전부 표준 준수 문자열/배열 시맨틱(네이버 전용 아님). cargo 189,
+      smoke 143(네트워크 게이트된 google 리다이렉트만 실패=환경 기준선).
+      → line 619 baseline JIT 항목이 예견한 "실행이 새 병목" 지점에서
+      먼저 알고리즘 병목을 제거한 것. JIT은 여전히 후순위.
 - [x] **스크롤 60fps (native 셸 기준)** — 07-18: 디스플레이 리스트를
       **Rust에 상주**(set_display_list — 페인트 변화 시에만 문서좌표·
       기기픽셀로 1회 직렬화), 스크롤 프레임은 오프셋만 전달
