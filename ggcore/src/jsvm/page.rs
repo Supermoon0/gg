@@ -2213,6 +2213,48 @@ mod tests {
     }
 
     #[test]
+    fn string_pad_codepoint_and_parse_int() {
+        assert_eq!(n("'5'.padStart(3, '0') === '005' ? 1 : 0"), 1.0);
+        assert_eq!(n("'5'.padEnd(3, '.') === '5..' ? 1 : 0"), 1.0);
+        assert_eq!(n("'ab'.padStart(1) === 'ab' ? 1 : 0"), 1.0);
+        assert_eq!(
+            n("String.fromCodePoint(0x1F600).codePointAt(0)"), 0x1F600 as f64);
+        // parseInt honours a 0x prefix when no radix (or radix 16) is given
+        assert_eq!(n("parseInt('0x1f')"), 31.0);
+        assert_eq!(n("parseInt('0xff', 16)"), 255.0);
+        assert_eq!(n("parseInt('ff', 16)"), 255.0);
+        assert_eq!(n("parseInt('42')"), 42.0);
+    }
+
+    #[test]
+    fn json_stringify_space_replacer_tojson() {
+        // array replacer allow-list
+        assert_eq!(
+            n("JSON.stringify({a:1,b:2}, ['a']) === '{\"a\":1}' ? 1 : 0"), 1.0);
+        // function replacer
+        assert_eq!(
+            n("JSON.stringify({a:1,b:2}, function(k,v){ \
+                 return k==='b' ? undefined : v; }) === '{\"a\":1}' ? 1 : 0"),
+            1.0);
+        // indentation
+        assert_eq!(
+            n("JSON.stringify({a:1}, null, 2) === '{\\n  \"a\": 1\\n}' ? 1 : 0"),
+            1.0);
+        // toJSON hook
+        assert_eq!(
+            n("JSON.stringify({toJSON:function(){return 'X';}}) === '\"X\"' \
+               ? 1 : 0"), 1.0);
+        // getters are serialized
+        assert_eq!(
+            n("JSON.stringify({get x(){return 7;}}) === '{\"x\":7}' ? 1 : 0"),
+            1.0);
+        // nested indentation + arrays
+        assert_eq!(
+            n("JSON.stringify([1,2], null, 1) === '[\\n 1,\\n 2\\n]' ? 1 : 0"),
+            1.0);
+    }
+
+    #[test]
     fn error_hierarchy() {
         assert_eq!(
             n("var e = new TypeError('bad'); \

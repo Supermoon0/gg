@@ -4092,23 +4092,33 @@ fn do_native(
                 return Ok(Value::number(f64::NAN));
             }
             let s = to_display(st, st.regs[args_base]);
-            let radix = if argc >= 2 {
-                num_of(st.regs[args_base + 1])? as u32
+            let radix_arg = if argc >= 2 && !st.regs[args_base + 1].is_undefined() {
+                num_of(st.regs[args_base + 1])? as i64
             } else {
-                10
+                0
             };
-            let radix = if radix == 0 { 10 } else { radix };
+            let t = s.trim_matches(|c: char| {
+                c.is_whitespace() || c == '\u{feff}'
+            });
+            let (neg, rest) = match t.strip_prefix('-') {
+                Some(r) => (true, r),
+                None => (false, t.strip_prefix('+').unwrap_or(t)),
+            };
+            // spec: with no/0 radix a `0x`/`0X` prefix forces base 16;
+            // an explicit radix of 16 also tolerates the prefix.
+            let has_hex_prefix =
+                rest.starts_with("0x") || rest.starts_with("0X");
+            let (radix, digits) = if radix_arg == 0 {
+                if has_hex_prefix { (16u32, &rest[2..]) } else { (10u32, rest) }
+            } else if radix_arg == 16 && has_hex_prefix {
+                (16u32, &rest[2..])
+            } else {
+                (radix_arg as u32, rest)
+            };
             if !(2..=36).contains(&radix) {
                 // spec: invalid radix -> NaN (and is_digit(r>36) panics)
                 return Ok(Value::number(f64::NAN));
             }
-            let t = s.trim_matches(|c: char| {
-                c.is_whitespace() || c == '\u{feff}'
-            });
-            let (neg, digits) = match t.strip_prefix('-') {
-                Some(r) => (true, r),
-                None => (false, t.strip_prefix('+').unwrap_or(t)),
-            };
             let end = digits
                 .find(|c: char| !c.is_digit(radix))
                 .unwrap_or(digits.len());
@@ -4142,8 +4152,49 @@ fn do_native(
         }
         Native::JsonStringify => {
             let v = if argc > 0 { st.regs[args_base] } else { Value::UNDEFINED };
-            // `undefined`/function serialize to nothing at the top level.
-            Ok(match json_stringify(st, v, &mut Vec::new())? {
+            let replacer_v = if argc > 1 { st.regs[args_base + 1] } else { Value::UNDEFINED };
+            let space_v = if argc > 2 { st.regs[args_base + 2] } else { Value::UNDEFINED };
+            // space: a number gives that many (<=10) spaces, a string is
+            // used verbatim (first 10 chars); anything else = compact.
+            let gap = if space_v.is_number() {
+                " ".repeat((space_v.to_number_raw() as i64).clamp(0, 10) as usize)
+            } else if space_v.is_string() {
+                str_ref(st, space_v.index()).chars().take(10).collect()
+            } else {
+                String::new()
+            };
+            // replacer: a function transforms each pair; an array is an
+            // allow-list of property names to keep.
+            let (replacer, allow) = if replacer_v.is_function() {
+                (replacer_v, None)
+            } else if replacer_v.is_object()
+                && st.objects[replacer_v.index() as usize].is_array
+            {
+                let elems = st.objects[replacer_v.index() as usize].elems.clone();
+                let mut a = Vec::new();
+                for e in elems {
+                    let ks = if e.is_string() {
+                        str_ref(st, e.index()).to_string()
+                    } else if e.is_number() {
+                        js_num_str(e.to_number_raw())
+                    } else {
+                        continue;
+                    };
+                    a.push(st.intern_name(&ks));
+                }
+                (Value::UNDEFINED, Some(a))
+            } else {
+                (Value::UNDEFINED, None)
+            };
+            let ctx = JsonCtx { gap, replacer, allow };
+            // top-level holder is the wrapper { "": value } the replacer
+            // is invoked against (spec's SerializeJSONProperty).
+            let holder = new_plain_object(st);
+            let empty = st.intern_name("");
+            raw_set_prop(st, holder.index() as usize, empty, v);
+            Ok(match json_serialize(
+                st, mods, holder, "", v, &mut Vec::new(), &ctx, "",
+            )? {
                 Some(s) => push_str(st, s),
                 None => Value::UNDEFINED,
             })
@@ -5090,11 +5141,72 @@ fn json_quote(s: &str) -> String {
 /// `None` means "omit" (undefined / function): dropped from objects,
 /// becomes `null` in arrays, yields `undefined` at the top level.
 /// Errs on cyclic structures like real JSON.stringify.
-fn json_stringify(
+/// Options threaded through a JSON.stringify call: the indent unit
+/// (`gap`, empty for compact output), an optional function replacer, and
+/// an optional array replacer allow-list of atom keys.
+struct JsonCtx {
+    gap: String,
+    replacer: Value,
+    allow: Option<Vec<u32>>,
+}
+
+/// Own string-keyed properties of an object in enumeration order: data
+/// slots by insertion, then accessor-only keys. Used by JSON.stringify so
+/// getters are serialized (real engines call them) and defineProperty
+/// accessors are not silently dropped.
+fn json_own_keys(st: &St, oi: usize) -> Vec<u32> {
+    let shape = st.objects[oi].shape;
+    let mut pairs: Vec<(u16, u32)> = st.shapes[shape as usize]
+        .props.iter().map(|(&a, &s)| (s, a)).collect();
+    pairs.sort_by_key(|&(slot, _)| slot);
+    let mut keys: Vec<u32> = pairs.into_iter().map(|(_, a)| a).collect();
+    if st.objects[oi].has_accessors {
+        for (&(o, k), _) in st.accessors.iter() {
+            if o == oi as u32 && !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+    }
+    keys
+}
+
+/// Full SerializeJSONProperty: applies toJSON, then a function replacer,
+/// then serializes the (possibly replaced) value with `ctx.gap`
+/// indentation. `holder`/`key` provide the receiver and property name the
+/// replacer is invoked with.
+fn json_serialize(
     st: &mut St,
-    v: Value,
+    mods: &ModStore,
+    holder: Value,
+    key: &str,
+    v0: Value,
     seen: &mut Vec<u32>,
+    ctx: &JsonCtx,
+    indent: &str,
 ) -> Result<Option<String>, VmError> {
+    let mut v = v0;
+    // 1. value.toJSON(key) if present
+    if v.is_object() {
+        let oi = v.index() as usize;
+        let tj = st.intern_name("toJSON");
+        let f = match lookup_prop(st, oi, tj) {
+            PropHit::Data(f) => f,
+            PropHit::Getter(g) if g.is_function() => {
+                call_value_this(st, mods, g, Some(v), &[])?
+            }
+            _ => Value::UNDEFINED,
+        };
+        if f.is_function() {
+            let ks = make_string(st, key.to_string());
+            v = call_value_this(st, mods, f, Some(v), &[ks])?;
+        }
+    }
+    // 2. function replacer(holder, key, value)
+    if ctx.replacer.is_function() {
+        let ks = make_string(st, key.to_string());
+        v = call_value_this(st, mods, ctx.replacer, Some(holder), &[ks, v])?;
+    }
+    // 3. serialize
     if v.is_undefined() || v.is_function() {
         return Ok(None);
     }
@@ -5127,28 +5239,60 @@ fn json_stringify(
             return err("structure too deep to JSON.stringify");
         }
         seen.push(oi as u32);
+        let child = format!("{indent}{}", ctx.gap);
+        let pretty = !ctx.gap.is_empty();
         let out = if st.objects[oi].is_array {
             let elems = st.objects[oi].elems.clone();
-            let mut parts = Vec::with_capacity(elems.len());
-            for e in elems {
-                parts.push(json_stringify(st, e, seen)?
-                    .unwrap_or_else(|| "null".to_string()));
-            }
-            format!("[{}]", parts.join(","))
-        } else {
-            let shape = st.objects[oi].shape;
-            let mut pairs: Vec<(u16, u32)> = st.shapes[shape as usize]
-                .props.iter().map(|(&a, &s)| (s, a)).collect();
-            pairs.sort_by_key(|&(slot, _)| slot);
-            let mut parts = Vec::new();
-            for (slot, atom) in pairs {
-                let val = st.objects[oi].slots[slot as usize];
-                if let Some(vs) = json_stringify(st, val, seen)? {
-                    let key = st.names[atom as usize].clone();
-                    parts.push(format!("{}:{}", json_quote(&key), vs));
+            if elems.is_empty() {
+                "[]".to_string()
+            } else {
+                let mut parts = Vec::with_capacity(elems.len());
+                for (i, e) in elems.into_iter().enumerate() {
+                    let ks = i.to_string();
+                    parts.push(
+                        json_serialize(st, mods, v, &ks, e, seen, ctx, &child)?
+                            .unwrap_or_else(|| "null".to_string()),
+                    );
+                }
+                if pretty {
+                    format!("[\n{child}{}\n{indent}]",
+                        parts.join(&format!(",\n{child}")))
+                } else {
+                    format!("[{}]", parts.join(","))
                 }
             }
-            format!("{{{}}}", parts.join(","))
+        } else {
+            let colon = if pretty { ": " } else { ":" };
+            let keys = json_own_keys(st, oi);
+            let mut parts = Vec::new();
+            for atom in keys {
+                if let Some(allow) = &ctx.allow {
+                    if !allow.contains(&atom) {
+                        continue;
+                    }
+                }
+                let pv = match lookup_prop(st, oi, atom) {
+                    PropHit::Data(d) => d,
+                    PropHit::Getter(g) if g.is_function() => {
+                        call_value_this(st, mods, g, Some(v), &[])?
+                    }
+                    _ => Value::UNDEFINED,
+                };
+                let kname = st.names[atom as usize].clone();
+                if let Some(vs) =
+                    json_serialize(st, mods, v, &kname, pv, seen, ctx, &child)?
+                {
+                    parts.push(format!("{}{colon}{vs}", json_quote(&kname)));
+                }
+            }
+            if parts.is_empty() {
+                "{}".to_string()
+            } else if pretty {
+                format!("{{\n{child}{}\n{indent}}}",
+                    parts.join(&format!(",\n{child}")))
+            } else {
+                format!("{{{}}}", parts.join(","))
+            }
         };
         seen.pop();
         return Ok(Some(out));
@@ -8677,6 +8821,52 @@ fn exec_loop(
                                         .map(|i| i < s.chars().count())
                                         .unwrap_or(false),
                             )
+                        }
+                        "padStart" | "padEnd" => {
+                            let target = num_of(av0)? as i64;
+                            let pad = if av1.is_undefined() {
+                                " ".to_string()
+                            } else {
+                                to_display(st, av1)
+                            };
+                            let curlen = s.chars().count() as i64;
+                            if target <= curlen || pad.is_empty() {
+                                push_str(st, s.clone())
+                            } else {
+                                let need = (target - curlen) as usize;
+                                let pc: Vec<char> = pad.chars().collect();
+                                let fill: String =
+                                    (0..need).map(|i| pc[i % pc.len()]).collect();
+                                let out = if method == "padStart" {
+                                    format!("{fill}{s}")
+                                } else {
+                                    format!("{s}{fill}")
+                                };
+                                push_str(st, out)
+                            }
+                        }
+                        "codePointAt" => {
+                            let i = num_of(av0)? as i64;
+                            let ch = if i >= 0 {
+                                s.chars().nth(i as usize)
+                            } else {
+                                None
+                            };
+                            match ch {
+                                Some(c) => Value::int(c as i32),
+                                None => Value::UNDEFINED,
+                            }
+                        }
+                        // no ICU on board: NFC-normalize is a best-effort
+                        // identity (BMP text is already single-form here)
+                        "normalize" => push_str(st, s.clone()),
+                        "localeCompare" => {
+                            let other = to_display(st, av0);
+                            Value::int(match s.cmp(&other) {
+                                std::cmp::Ordering::Less => -1,
+                                std::cmp::Ordering::Equal => 0,
+                                std::cmp::Ordering::Greater => 1,
+                            })
                         }
                         _ => {
                             return type_err(format!(
