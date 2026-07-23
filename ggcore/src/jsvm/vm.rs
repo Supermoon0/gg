@@ -357,6 +357,8 @@ pub(super) mod host {
     pub const N_ISNAN: u16 = 80;
     pub const N_ISFINITE: u16 = 81;
     pub const N_ISINTEGER: u16 = 82;
+    pub const N_ISSAFEINT: u16 = 83;
+    pub const O_HAS_OWN: u16 = 59;
     pub const S_FROMCHARCODE: u16 = 100;
     // canvas-2d stub context (crash prevention; no real rasterizing)
     pub const CV_MEASURE_TEXT: u16 = 120;
@@ -4781,7 +4783,15 @@ fn host_fn(
         M_CEIL => m1!(f64::ceil),
         M_ROUND => m1!(|x: f64| (x + 0.5).floor()), // JS rounds .5 up
         M_TRUNC => m1!(f64::trunc),
-        M_SIGN => m1!(f64::signum),
+        // JS Math.sign: 0/-0/NaN pass through unchanged (f64::signum maps
+        // 0 -> 1 and -0 -> -1, which is wrong)
+        M_SIGN => m1!(|x: f64| if x.is_nan() || x == 0.0 {
+            x
+        } else if x > 0.0 {
+            1.0
+        } else {
+            -1.0
+        }),
         M_SQRT => m1!(f64::sqrt),
         M_CBRT => m1!(f64::cbrt),
         M_EXP => m1!(f64::exp),
@@ -5428,6 +5438,23 @@ fn host_fn(
                     let x = v.to_number_raw();
                     x.is_finite() && x.fract() == 0.0
                 },
+            ))
+        }
+        N_ISSAFEINT => {
+            let v = argv!(0);
+            Ok(Value::boolean(v.is_number() && {
+                let x = v.to_number_raw();
+                x.is_finite()
+                    && x.fract() == 0.0
+                    && x.abs() <= 9_007_199_254_740_991.0
+            }))
+        }
+        O_HAS_OWN => {
+            // Object.hasOwn(o, k) — the static form of hasOwnProperty
+            let o = argv!(0);
+            let k = argv!(1);
+            Ok(Value::boolean(
+                o.is_object() && has_own_property(st, mods, o, k)?,
             ))
         }
         S_FROMCHARCODE => {
@@ -8329,9 +8356,23 @@ fn exec_loop(
                                 "indexOf" => {
                                     let elems =
                                         st.objects[oi].elems.clone();
+                                    // optional fromIndex (negative counts
+                                    // back from the end)
+                                    let start = if argc > 1 {
+                                        let n = arg1.to_number_raw();
+                                        let len = elems.len() as i64;
+                                        let s = if n < 0.0 {
+                                            (len + n as i64).max(0)
+                                        } else {
+                                            n as i64
+                                        };
+                                        s.max(0) as usize
+                                    } else {
+                                        0
+                                    };
                                     let mut idx = -1i32;
-                                    for (i, &e) in elems.iter().enumerate() {
-                                        if strict_eq(st, e, arg0) {
+                                    for i in start..elems.len() {
+                                        if strict_eq(st, elems[i], arg0) {
                                             idx = i as i32;
                                             break;
                                         }
@@ -8683,6 +8724,42 @@ fn exec_loop(
                                             [target as usize + k] = src[k];
                                     }
                                     ov
+                                }
+                                // ES2023 immutable variants return a copy
+                                "toReversed" => {
+                                    let mut e =
+                                        st.objects[oi].elems.clone();
+                                    e.reverse();
+                                    new_array(st, e)
+                                }
+                                "toSorted" => {
+                                    let mut e =
+                                        st.objects[oi].elems.clone();
+                                    let cmp = if argc > 0
+                                        && arg0.is_function()
+                                    {
+                                        Some(arg0)
+                                    } else {
+                                        None
+                                    };
+                                    merge_sort(st, mods, &mut e, cmp)?;
+                                    new_array(st, e)
+                                }
+                                "with" => {
+                                    let mut e =
+                                        st.objects[oi].elems.clone();
+                                    let len = e.len() as i64;
+                                    let mut i = num_of(arg0)? as i64;
+                                    if i < 0 {
+                                        i += len;
+                                    }
+                                    if i < 0 || i >= len {
+                                        return err(
+                                            "Array.with: index out of range",
+                                        );
+                                    }
+                                    e[i as usize] = arg1;
+                                    new_array(st, e)
                                 }
                                 "at" => {
                                     let elems =

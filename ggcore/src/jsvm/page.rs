@@ -48,22 +48,25 @@ Promise.race = function (arr) {
 
 // Error hierarchy in JS itself — real prototype chains (07-12) make
 // `new TypeError(m) instanceof Error` just work.
-function Error(m) { if (m !== undefined) this.message = '' + m; }
+function Error(m, o) {
+  if (m !== undefined) this.message = '' + m;
+  if (o && typeof o === 'object' && 'cause' in o) this.cause = o.cause;
+}
 Error.prototype.name = 'Error';
 Error.prototype.message = '';
 Error.prototype.toString = function () {
   return this.message ? this.name + ': ' + this.message : this.name;
 };
-function TypeError(m) { if (m !== undefined) this.message = '' + m; }
+function TypeError(m, o) { Error.call(this, m, o); }
 TypeError.prototype = new Error();
 TypeError.prototype.name = 'TypeError';
-function RangeError(m) { if (m !== undefined) this.message = '' + m; }
+function RangeError(m, o) { Error.call(this, m, o); }
 RangeError.prototype = new Error();
 RangeError.prototype.name = 'RangeError';
-function SyntaxError(m) { if (m !== undefined) this.message = '' + m; }
+function SyntaxError(m, o) { Error.call(this, m, o); }
 SyntaxError.prototype = new Error();
 SyntaxError.prototype.name = 'SyntaxError';
-function ReferenceError(m) { if (m !== undefined) this.message = '' + m; }
+function ReferenceError(m, o) { Error.call(this, m, o); }
 ReferenceError.prototype = new Error();
 ReferenceError.prototype.name = 'ReferenceError';
 // Symbol: a string-based stand-in. Unique enough for property keys and
@@ -671,6 +674,31 @@ Object.getOwnPropertyDescriptors = function (o) {
   }
   return out;
 };
+var __b64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function btoa(input) {
+  input = '' + input;
+  var out = '', bits = 0, n = 0;
+  for (var i = 0; i < input.length; i++) {
+    bits = (bits << 8) | (input.charCodeAt(i) & 0xFF);
+    n += 8;
+    while (n >= 6) { n -= 6; out += __b64.charAt((bits >> n) & 63); }
+  }
+  if (n > 0) out += __b64.charAt((bits << (6 - n)) & 63);
+  while (out.length % 4) out += '=';
+  return out;
+}
+function atob(input) {
+  input = ('' + input).replace(/=+$/, '');
+  var out = '', bits = 0, n = 0;
+  for (var i = 0; i < input.length; i++) {
+    var idx = __b64.indexOf(input.charAt(i));
+    if (idx < 0) continue;
+    bits = (bits << 6) | idx;
+    n += 6;
+    if (n >= 8) { n -= 8; out += String.fromCharCode((bits >> n) & 0xFF); }
+  }
+  return out;
+}
 "#;
 use crate::dom;
 
@@ -759,6 +787,35 @@ impl PageVm {
             let mv = make_native(&mut vm.st, Native::HostFn(id));
             let sidx = vm.st.known.string.index();
             vm.st.fn_props.insert((sidx, key), mv);
+        }
+        // Number statics ride fn_props on the Number ctor (same as
+        // String.fromCharCode): method values plus numeric constants.
+        for (m, n) in [
+            ("parseInt", Native::ParseInt),
+            ("parseFloat", Native::ParseFloat),
+            ("isNaN", Native::HostFn(host::N_ISNAN)),
+            ("isFinite", Native::HostFn(host::N_ISFINITE)),
+            ("isInteger", Native::HostFn(host::N_ISINTEGER)),
+            ("isSafeInteger", Native::HostFn(host::N_ISSAFEINT)),
+        ] {
+            let key = vm.name_id(m);
+            let mv = make_native(&mut vm.st, n);
+            let nidx = vm.st.known.number.index();
+            vm.st.fn_props.insert((nidx, key), mv);
+        }
+        for (m, val) in [
+            ("MAX_SAFE_INTEGER", 9_007_199_254_740_991.0_f64),
+            ("MIN_SAFE_INTEGER", -9_007_199_254_740_991.0),
+            ("MAX_VALUE", f64::MAX),
+            ("MIN_VALUE", f64::MIN_POSITIVE),
+            ("EPSILON", f64::EPSILON),
+            ("POSITIVE_INFINITY", f64::INFINITY),
+            ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
+            ("NaN", f64::NAN),
+        ] {
+            let key = vm.name_id(m);
+            let nidx = vm.st.known.number.index();
+            vm.st.fn_props.insert((nidx, key), Value::number(val));
         }
         // async runtime (P3): timers, microtasks, fetch, Promise
         for (name, n) in [
@@ -851,6 +908,7 @@ impl PageVm {
                 ("setPrototypeOf", Native::HostFn(host::O_SET_PROTO)),
                 ("is", Native::HostFn(host::O_IS)),
                 ("fromEntries", Native::HostFn(host::O_FROM_ENTRIES)),
+                ("hasOwn", Native::HostFn(host::O_HAS_OWN)),
             ],
         );
         vm.st.known.object = object_ctor;
@@ -2328,6 +2386,41 @@ mod tests {
         assert_eq!(
             n("var a=[9]; (a.hasOwnProperty(0) && !a.hasOwnProperty(5)) ? 1 : 0"),
             1.0);
+    }
+
+    #[test]
+    fn number_math_object_statics() {
+        assert_eq!(n("Number.parseInt('42px')"), 42.0);
+        assert_eq!(n("Number.parseFloat('3.14x')"), 3.14);
+        assert_eq!(n("Number.MAX_SAFE_INTEGER"), 9_007_199_254_740_991.0);
+        assert_eq!(n("Number.isSafeInteger(5) && !Number.isSafeInteger(1.5) \
+                      ? 1 : 0"), 1.0);
+        assert_eq!(n("Number.EPSILON > 0 ? 1 : 0"), 1.0);
+        // Math.sign: 0 stays 0 (not 1)
+        assert_eq!(n("(Math.sign(-5)===-1 && Math.sign(0)===0 \
+                      && Math.sign(3)===1) ? 1 : 0"), 1.0);
+        assert_eq!(n("Object.hasOwn({a:1},'a') && !Object.hasOwn({},'a') \
+                      ? 1 : 0"), 1.0);
+        // Array.indexOf with a fromIndex
+        assert_eq!(n("[1,2,1].indexOf(1,1)"), 2.0);
+        // Error cause option
+        assert_eq!(n("new Error('x',{cause:5}).cause"), 5.0);
+    }
+
+    #[test]
+    fn logical_assignment_and_immutable_arrays() {
+        assert_eq!(n("var x=0; x||=5; x"), 5.0);
+        assert_eq!(n("var x=3; x||=9; x"), 3.0); // truthy: no assign
+        assert_eq!(n("var x=1; x&&=7; x"), 7.0);
+        assert_eq!(n("var x=null; x??=3; x"), 3.0);
+        assert_eq!(n("var y=0; y??=9; y"), 0.0); // 0 is not nullish
+        // ES2023 immutable array methods
+        assert_eq!(n("var a=[3,1,2]; var b=a.toSorted(); \
+                      (b.join()==='1,2,3' && a[0]===3) ? 1 : 0"), 1.0);
+        assert_eq!(n("[1,2,3].toReversed().join()==='3,2,1' ? 1 : 0"), 1.0);
+        assert_eq!(n("[1,2,3].with(1,9).join()==='1,9,3' ? 1 : 0"), 1.0);
+        // btoa/atob round-trip
+        assert_eq!(n("atob(btoa('hi'))==='hi' ? 1 : 0"), 1.0);
     }
 
     #[test]
