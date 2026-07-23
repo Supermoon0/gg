@@ -255,7 +255,7 @@ def settle_async(doc, css_sources, base_url, timeout=8.0, max_rounds=2000):
 
 def settle_lazy(doc, css_sources, base_url, viewport_w=1280.0,
                 viewport_h=3000.0, horizon_ms=8000.0, max_steps=8000,
-                timeout=25.0):
+                timeout=25.0, eager_steps=40, layout_interval=12):
     """Step-driven settle with layout interleave — unlocks viewport-lazy
     content (Naver's shopping/stocks/widgets, batched behind one
     `/nvhaproxy/v2/pc/lazy` request).
@@ -303,8 +303,10 @@ def settle_lazy(doc, css_sources, base_url, viewport_w=1280.0,
     got_lazy = False
     after_lazy = 0
     mutated = False
-    for _ in range(max_steps):
+    last_layout = -(10 ** 9)
+    for step_i in range(max_steps):
         logs, fetches, more = doc.step(horizon)
+        force_layout = False
         if logs:
             for line in logs:
                 print(f"[js console] {line}")
@@ -317,26 +319,36 @@ def settle_lazy(doc, css_sources, base_url, viewport_w=1280.0,
                     doc.resolve_fetch(fetch_id, 200, body)
                     if "lazy" in url:
                         got_lazy = True
+                        force_layout = True  # re-layout for the batch's render
                 except Exception as e:
                     doc.reject_fetch(fetch_id, f"{type(e).__name__}: {e}")
             stable = 0
         ver = doc.dom_version()
-        if ver != last_ver:
+        changed = ver != last_ver
+        if changed:
             last_ver = ver
-            _push_rects()
             stable = 0
             mutated = True
         else:
             stable += 1
-        if got_lazy:
-            after_lazy += 1
+        # Coalesce layouts (a full restyle+layout per mutation is ~90% of
+        # the cost). React commits a little every slice, so lay out eagerly
+        # while sections are first mounting + reading geometry, then throttle
+        # to roughly frame granularity — same content, ~4x faster.
+        interval = 1 if step_i < eager_steps else layout_interval
+        if (changed and step_i - last_layout >= interval) or force_layout:
+            _push_rects()
+            last_layout = step_i
         # terminate once the DOM has settled and (if a lazy batch loaded)
         # its re-render has drained
         if not more and stable > 8 and (not got_lazy or after_lazy > 150):
             break
+        if got_lazy:
+            after_lazy += 1
         if time.monotonic() > deadline:
             print("[js] lazy settle timed out")
             break
+    _push_rects()  # final geometry for the caller's paint
     return mutated
 
 
