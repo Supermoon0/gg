@@ -620,6 +620,40 @@ Date.parse = function (s) {
   P.toUTCString = P.toString;
   P.toGMTString = P.toString;
 })();
+
+// Legacy escape/unescape (still used by older bundles; distinct from
+// encodeURIComponent — %XX / %uXXXX, no UTF-8 transform).
+function unescape(s) {
+  s = '' + s;
+  var out = '', i = 0;
+  while (i < s.length) {
+    var c = s.charAt(i);
+    if (c === '%' && s.charAt(i + 1) === 'u') {
+      out += String.fromCharCode(parseInt(s.substr(i + 2, 4), 16));
+      i += 6;
+    } else if (c === '%') {
+      out += String.fromCharCode(parseInt(s.substr(i + 1, 2), 16));
+      i += 3;
+    } else { out += c; i += 1; }
+  }
+  return out;
+}
+function escape(s) {
+  s = '' + s;
+  var ok = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz' +
+           '0123456789@*_+-./';
+  var out = '';
+  for (var i = 0; i < s.length; i++) {
+    var ch = s.charAt(i), code = s.charCodeAt(i);
+    if (ok.indexOf(ch) >= 0) { out += ch; }
+    else if (code < 256) {
+      out += '%' + ('0' + code.toString(16).toUpperCase()).slice(-2);
+    } else {
+      out += '%u' + ('000' + code.toString(16).toUpperCase()).slice(-4);
+    }
+  }
+  return out;
+}
 "#;
 use crate::dom;
 

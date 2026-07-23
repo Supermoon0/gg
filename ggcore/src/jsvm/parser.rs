@@ -256,8 +256,16 @@ impl Parser {
             if self.eat_punct(P::Semi) {
                 continue;
             }
+            // `static` is the keyword only when a member name follows it;
+            // `static = x`, `static;`, `static }`, `static()` are a field
+            // or method literally named "static".
             let is_static = matches!(self.kind(), Tok::Ident(k) if k == "static")
-                && !matches!(self.kind_at(1), Some(Tok::Punct(P::LParen)));
+                && !matches!(
+                    self.kind_at(1),
+                    Some(Tok::Punct(
+                        P::LParen | P::Assign | P::Semi | P::RBrace
+                    ))
+                );
             if is_static {
                 self.pos += 1;
             }
@@ -277,10 +285,15 @@ impl Parser {
             // get/set accessor (unless it's a method literally named
             // get/set, i.e. followed by `(`)
             let acc = match self.kind() {
+                // `get`/`set` are accessor keywords only when a member
+                // name follows; `get = x`, `get;`, `get }`, `get()` are a
+                // field or method literally named "get"/"set".
                 Tok::Ident(k) if (k == "get" || k == "set")
                     && !matches!(
                         self.kind_at(1),
-                        Some(Tok::Punct(P::LParen))
+                        Some(Tok::Punct(
+                            P::LParen | P::Assign | P::Semi | P::RBrace
+                        ))
                     ) =>
                 {
                     let is_get = k == "get";
@@ -544,8 +557,9 @@ impl Parser {
                 "async" if matches!(self.kind_at(1), Some(Tok::Ident(k))
                     if k == "function") => {
                     self.pos += 2; // async function
+                    let is_gen = self.eat_punct(P::Star); // async function*
                     let name = self.expect_ident()?;
-                    let f = self.func_lit(Some(name), true)?;
+                    let f = self.func_lit_g(Some(name), true, is_gen)?;
                     Ok(Stmt::FuncDecl(Rc::new(f)))
                 }
                 "class" => {
@@ -1089,6 +1103,7 @@ impl Parser {
                 match self.kind_at(1) {
                     Some(Tok::Ident(n)) if n == "function" => {
                         self.pos += 2; // async function
+                        let is_gen = self.eat_punct(P::Star); // async fn*
                         let name = match self.kind() {
                             Tok::Ident(nm) if !self.at_punct(P::LParen) => {
                                 let nm = nm.clone();
@@ -1098,7 +1113,7 @@ impl Parser {
                             _ => None,
                         };
                         return Ok(Expr::Func(Rc::new(
-                            self.func_lit(name, true)?,
+                            self.func_lit_g(name, true, is_gen)?,
                         )));
                     }
                     // async x => ...
@@ -2028,6 +2043,37 @@ impl Parser {
                 };
                 let f =
                     self.func_lit_g(Some(key.clone()), false, true)?;
+                props.push(Prop {
+                    key: PropKey::Ident(key),
+                    value: Expr::Func(Rc::new(f)),
+                });
+                if !self.eat_punct(P::Comma) {
+                    self.expect_punct(P::RBrace)?;
+                    break;
+                }
+                continue;
+            }
+            // async method: { async foo() {...} } and async generator
+            // { async *foo() {...} }. `async` is a prefix only when a
+            // method name (or `*`) follows and leads to `(`; `{async: 1}`,
+            // `{async}`, `{async(){}}` keep `async` as the key.
+            if matches!(self.kind(), Tok::Ident(k) if k == "async")
+                && !self.nl_before_at(1)
+                && (matches!(self.kind_at(1), Some(Tok::Punct(P::Star)))
+                    || (matches!(self.kind_at(1),
+                            Some(Tok::Ident(_)) | Some(Tok::Str(_)))
+                        && matches!(self.kind_at(2),
+                            Some(Tok::Punct(P::LParen)))))
+            {
+                self.pos += 1; // consume `async`
+                let is_gen = self.eat_punct(P::Star);
+                let key = match self.bump() {
+                    Tok::Ident(n) => n,
+                    Tok::Str(s) => s,
+                    _ => unreachable!(),
+                };
+                let f =
+                    self.func_lit_g(Some(key.clone()), true, is_gen)?;
                 props.push(Prop {
                     key: PropKey::Ident(key),
                     value: Expr::Func(Rc::new(f)),
