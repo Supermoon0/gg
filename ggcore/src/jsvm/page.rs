@@ -2313,6 +2313,25 @@ mod tests {
     }
 
     #[test]
+    fn tagged_templates() {
+        // tag receives (cooked-strings, ...substitutions)
+        assert_eq!(
+            n("function t(s, v){ return s[0] + v + s[1]; } \
+               t`a${9}b` === 'a9b' ? 1 : 0"), 1.0);
+        // multiple substitutions and the strings array length
+        assert_eq!(
+            n("function t(s){ return s.length; } t`${1}${2}${3}`"), 4.0);
+        // the strings array carries a `.raw`
+        assert_eq!(
+            n("function t(s){ return s.raw[0]; } t`hi${1}` === 'hi' ? 1 : 0"),
+            1.0);
+        // String.raw builtin pattern (cooked === raw here)
+        assert_eq!(
+            n("function t(s,a){ return s[0]+a+s[1]; } t`x${5}y` === 'x5y' \
+               ? 1 : 0"), 1.0);
+    }
+
+    #[test]
     fn iterable_spread_and_from() {
         // spreading a generator expands element-wise (not [object Object])
         assert_eq!(

@@ -1682,6 +1682,75 @@ impl Parser {
                         };
                     }
                 }
+                // tagged template: tag`a${x}b` -> tag(strings, x) where
+                // `strings` is the cooked-chunk array carrying a `.raw`.
+                Tok::Template(_) => {
+                    let Tok::Template(parts) = self.bump() else {
+                        unreachable!()
+                    };
+                    let mut chunks: Vec<Expr> = Vec::new();
+                    let mut holes: Vec<Expr> = Vec::new();
+                    let mut pending_chunk = false;
+                    for part in parts {
+                        match part {
+                            TplElem::Chunk(s) => {
+                                chunks.push(Expr::Str(s));
+                                pending_chunk = true;
+                            }
+                            TplElem::ExprSrc(src) => {
+                                // a hole with no preceding chunk means an
+                                // empty cooked string sits between them
+                                if !pending_chunk {
+                                    chunks.push(Expr::Str(String::new()));
+                                }
+                                pending_chunk = false;
+                                let mut sub =
+                                    Parser::new(Rc::new(tokenize(&src)?));
+                                holes.push(sub.expr()?);
+                            }
+                        }
+                    }
+                    // n holes need n+1 cooked chunks
+                    if chunks.len() <= holes.len() {
+                        chunks.push(Expr::Str(String::new()));
+                    }
+                    // strings = (function(s){ s.raw = s; return s; })([...])
+                    let strings = Expr::Call {
+                        callee: Box::new(Expr::Func(Rc::new(FuncLit {
+                            name: None,
+                            params: vec!["s".to_string()],
+                            body: vec![
+                                Stmt::Expr(Expr::Assign(
+                                    AssignOp::Plain,
+                                    Box::new(Expr::Member {
+                                        obj: Box::new(Expr::Ident(
+                                            "s".to_string(),
+                                        )),
+                                        prop: MemberProp::Static(
+                                            "raw".to_string(),
+                                        ),
+                                        optional: false,
+                                    }),
+                                    Box::new(Expr::Ident("s".to_string())),
+                                )),
+                                Stmt::Return(Some(Expr::Ident(
+                                    "s".to_string(),
+                                ))),
+                            ],
+                            is_async: false,
+                            lazy_body: None,
+                        }))),
+                        args: vec![Expr::Array(chunks)],
+                        optional: false,
+                    };
+                    let mut args = vec![strings];
+                    args.extend(holes);
+                    e = Expr::Call {
+                        callee: Box::new(e),
+                        args,
+                        optional: false,
+                    };
+                }
                 _ => return Ok(e),
             }
         }
