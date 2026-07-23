@@ -259,10 +259,12 @@ def style(node, rules, parent_style=None):
     """
     if not isinstance(rules, RuleIndex):
         rules = RuleIndex(rules)
-    _style(node, rules, parent_style or INHERITED_PROPERTIES, {})
+    _style(node, rules, parent_style or INHERITED_PROPERTIES, {},
+           16.0, True)
 
 
-def _style(node, index, parent_style, parent_vars):
+def _style(node, index, parent_style, parent_vars, root_px=16.0,
+           is_root=False):
     node.style = {}
     node._font = None  # invalidate the per-node font cache (see layout)
 
@@ -308,9 +310,10 @@ def _style(node, index, parent_style, parent_vars):
     parent_px = parse_px(parent_style.get("font-size", "16px"), 16.0)
     if fs.endswith("rem"):
         # must be checked before "em" (which is its suffix); rem is
-        # relative to the root font-size (16px)
+        # relative to the root element's font-size, not a fixed 16px —
+        # naver sets `html { font-size: 10px }` so 1rem == 10px.
         try:
-            node.style["font-size"] = px_str(16.0 * float(fs[:-3]))
+            node.style["font-size"] = px_str(root_px * float(fs[:-3]))
         except ValueError:
             node.style["font-size"] = px_str(parent_px)
     elif fs.endswith("%"):
@@ -331,8 +334,11 @@ def _style(node, index, parent_style, parent_vars):
         }
         node.style["font-size"] = px_str(keywords.get(fs, parent_px))
 
+    # the root element establishes the `rem` unit for the whole subtree
+    child_root_px = (parse_px(node.style["font-size"], 16.0)
+                     if is_root else root_px)
     for child in node.children:
-        _style(child, index, node.style, vars_map)
+        _style(child, index, node.style, vars_map, child_root_px)
 
 
 def _expand_box(styles, prefix, value):

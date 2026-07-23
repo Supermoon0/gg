@@ -173,7 +173,7 @@ pub fn compute_styles_vw(
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
     style_node(
-        doc, &index, &pseudo_rules, root, &default_style,
+        doc, &index, &pseudo_rules, root, &default_style, 16.0,
         &HashMap::new(),
     );
 }
@@ -195,12 +195,14 @@ fn content_text(raw: &str) -> Option<String> {
     Some(String::new()) // attr()/counters: render an empty box
 }
 
+#[allow(clippy::too_many_arguments)]
 fn style_node(
     doc: &mut Document,
     index: &RuleIndex,
     pseudo_rules: &[Rule],
     idx: usize,
     parent_style: &HashMap<String, String>,
+    root_px: f64,
     parent_vars: &HashMap<String, String>,
 ) {
     // synthesized children keep the style their host computed for
@@ -213,7 +215,8 @@ fn style_node(
         let children = doc.nodes[idx].children.clone();
         for child in children {
             style_node(
-                doc, index, pseudo_rules, child, &my_style, parent_vars,
+                doc, index, pseudo_rules, child, &my_style, root_px,
+                parent_vars,
             );
         }
         return;
@@ -307,8 +310,9 @@ fn style_node(
     let fs = style.get("font-size").cloned().unwrap_or_default();
     let resolved = if let Some(rem) = fs.strip_suffix("rem") {
         // must be checked before "em" (its suffix); rem is relative to
-        // the root font-size (16px)
-        Some(16.0 * rem.trim().parse::<f64>().unwrap_or(1.0))
+        // the root element's font-size, not a fixed 16px — pages like
+        // naver set `html { font-size: 10px }` so 1rem == 10px.
+        Some(root_px * rem.trim().parse::<f64>().unwrap_or(1.0))
     } else if let Some(pct) = fs.strip_suffix('%') {
         Some(parent_px * pct.trim().parse::<f64>().unwrap_or(100.0) / 100.0)
     } else if let Some(em) = fs.strip_suffix("em") {
@@ -335,8 +339,19 @@ fn style_node(
 
     let children = doc.nodes[idx].children.clone();
     let my_style = doc.nodes[idx].style.clone();
+    // the root element establishes the `rem` unit for the whole subtree
+    let child_root_px = if idx == doc.root {
+        parse_px(
+            my_style.get("font-size").map(String::as_str).unwrap_or("16px"),
+            16.0,
+        )
+    } else {
+        root_px
+    };
     for child in children {
-        style_node(doc, index, pseudo_rules, child, &my_style, vars);
+        style_node(
+            doc, index, pseudo_rules, child, &my_style, child_root_px, vars,
+        );
     }
 
     // synthesize ::before/::after children from matching pseudo rules
@@ -713,6 +728,26 @@ mod tests {
         let doc = styled(":root{--fs:2em} p{font-size:var(--fs)}",
                          "<p>x</p>");
         assert_eq!(tag_style(&doc, "p")["font-size"], "32px");
+    }
+
+    #[test]
+    fn rem_resolves_against_root_font_size_not_fixed_16() {
+        // naver sets `html { font-size: 10px }`, so 1.3rem must be 13px
+        // (not 20.8px against a hardcoded 16px root).
+        let doc = styled(
+            "html{font-size:10px} p{font-size:1.3rem} \
+             b{font-size:1.5rem}",
+            "<p>x<b>y</b></p>",
+        );
+        assert_eq!(tag_style(&doc, "p")["font-size"], "13px");
+        assert_eq!(tag_style(&doc, "b")["font-size"], "15px");
+        // em still resolves against the (inherited) parent font-size
+        let doc = styled(
+            "html{font-size:10px} p{font-size:2rem} b{font-size:1.5em}",
+            "<p>x<b>y</b></p>",
+        );
+        assert_eq!(tag_style(&doc, "p")["font-size"], "20px");
+        assert_eq!(tag_style(&doc, "b")["font-size"], "30px");
     }
 
     #[test]
