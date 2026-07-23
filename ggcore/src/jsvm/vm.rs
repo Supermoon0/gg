@@ -21,8 +21,8 @@ use std::rc::Rc;
 use super::bytecode::{CapSrc, Instr, Module};
 use super::value::Value;
 use crate::dom;
+use crate::dom_api::{find_tag, query, serialize_children};
 use crate::html;
-use crate::js::{find_tag, query, serialize_children};
 
 pub struct VmError {
     pub msg: String,

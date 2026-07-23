@@ -5,13 +5,17 @@ name: wheels
 # needed. Wheels are uploaded as downloadable artifacts on each run.
 
 on:
-  workflow_dispatch: {}        # run manually from the Actions tab
+  workflow_dispatch: {}
   push:
-    branches:
-      - claude/daegongsa-haja-9g8xn1
-    paths:
-      - "ggcore/**"
-      - ".github/workflows/wheels.yml"
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wheels-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -34,7 +38,7 @@ jobs:
 
       - name: Build release wheel
         working-directory: ggcore
-        run: maturin build --release --out ../dist
+        run: maturin build --release --locked --out ../dist
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4

@@ -1,9 +1,9 @@
-"""Optional native (Rust) fast path: HTML parse + CSS + style + JS.
+"""Optional native (Rust) fast path: HTML parse + CSS + style + gg-js.
 
 If the compiled ggcore module is importable, the browser routes the
-front half of the pipeline through Rust (including running scripts
-in the embedded Boa JS engine). Otherwise everything falls back to
-the pure-Python implementation transparently (without JS).
+front half of the pipeline through Rust, including running scripts in
+the native gg-js engine. Otherwise everything falls back to the
+pure-Python implementation transparently (without JS).
 """
 
 try:
@@ -29,6 +29,13 @@ from .style import DEFAULT_STYLE_SHEET
 _DYNAMIC_MODULE_PREFIX = "gg-module-import:"
 _MODULE_RUNTIMES = weakref.WeakKeyDictionary()
 _LEGACY_MODULE_RUNTIMES = {}
+
+
+def _resolve_network_backend(network_backend):
+    if network_backend is not None:
+        return network_backend
+    from .network_backend import default_network_backend
+    return default_network_backend()
 
 
 def _register_module_runtime(doc, graph):
@@ -390,7 +397,9 @@ class _ScriptLoader:
     scripts delay load (but not DOMContentLoaded).
     """
 
-    def __init__(self, doc, fetch_js, js_budget, page_url=None):
+    def __init__(self, doc, fetch_js, js_budget, page_url=None,
+                 network_backend=None, network_timeout=15.0,
+                 cancel_token=None, network_context=None):
         import threading
         import time
         from concurrent.futures import ThreadPoolExecutor
@@ -399,7 +408,6 @@ class _ScriptLoader:
         self.fetch_js = fetch_js
         self.deadline = time.perf_counter() + js_budget
         self.js_budget = js_budget
-        self.fuel_safe = os.environ.get("GGJS") == "1"
         self.pool = ThreadPoolExecutor(max_workers=6)
         self.lock = threading.Lock()
         self.completion_serial = 0
@@ -412,6 +420,10 @@ class _ScriptLoader:
         self.logs = []
         self.budget_reported = False
         self.page_url = page_url
+        self.network_backend = _resolve_network_backend(network_backend)
+        self.network_timeout = network_timeout
+        self.cancel_token = cancel_token
+        self.network_context = network_context
         self.module_graph = _ModuleGraph(self, page_url)
 
     def _service_runtime_fetch(self, request):
@@ -421,7 +433,11 @@ class _ScriptLoader:
             return False
         return service_script_fetch(
             self.doc, self.page_url, request,
-            module_graph=self.module_graph)
+            network_timeout=self.network_timeout,
+            cancel_token=self.cancel_token,
+            module_graph=self.module_graph,
+            network_backend=self.network_backend,
+            network_context=self.network_context)
 
     @staticmethod
     def _normalize(raw):
@@ -467,10 +483,6 @@ class _ScriptLoader:
                     f"[gg] JS budget ({self.js_budget:.0f}s) exceeded - "
                     "remaining script execution skipped")
                 self.budget_reported = True
-        elif not self.fuel_safe and len(code) > 400_000:
-            self.logs.append(
-                f"[gg] skipped a {len(code)//1024} KB script "
-                "(too large for the JS budget)")
         elif self.module_graph.is_module(record):
             try:
                 module_logs, succeeded = self.module_graph.evaluate(
@@ -628,7 +640,9 @@ class _ScriptLoader:
 
 
 def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
-                  page_url=None, viewport_width=1280.0, timings=None):
+                  page_url=None, viewport_width=1280.0, timings=None,
+                  network_backend=None, network_timeout=15.0,
+                  cancel_token=None, network_context=None):
     """Full native front half: parse -> scripts -> styles -> tree.
 
     fetch_css(hrefs) / fetch_js(srcs) -> {url: text} keep networking
@@ -643,6 +657,7 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
     import threading
     import time
 
+    network_backend = _resolve_network_backend(network_backend)
     load_started = time.perf_counter()
 
     def record(name, started):
@@ -689,17 +704,24 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
             except Exception:
                 pass
             try:
-                from . import net as _net
                 host = getattr(page_url, "host", None)
                 if host and hasattr(doc, "seed_cookies"):
-                    jar = _net.cookies_for(page_url)
+                    jar = network_backend.cookies_for(
+                        page_url, context=network_context)
                     if jar:
                         doc.seed_cookies(jar)
             except Exception:
                 pass
-        loader = _ScriptLoader(doc, fetch_js, js_budget, page_url)
+        loader = _ScriptLoader(
+            doc, fetch_js, js_budget, page_url,
+            network_backend=network_backend,
+            network_timeout=network_timeout,
+            cancel_token=cancel_token,
+            network_context=network_context)
         logs.extend(loader.run(doc.script_records()))
-        sync_cookie_writes(doc, page_url)
+        sync_cookie_writes(
+            doc, page_url, network_backend=network_backend,
+            network_context=network_context)
     elif fetch_js is not None:
         import time
         entries = doc.script_entries()
@@ -710,10 +732,6 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
             code = value if kind == "inline" else fetched.get(value, "")
             if code:
                 sources.append(code)
-        # gg-js has execution fuel (a runaway script is killed at its
-        # instruction budget), so it may run scripts of any size. Boa
-        # has no interrupt — keep the size guard there.
-        fuel_safe = os.environ.get("GGJS") == "1"
         if page_url:
             try:
                 doc.set_page_url(str(page_url))
@@ -722,22 +740,16 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
             # seed document.cookie from the network jar so page scripts
             # see the server session before they run
             try:
-                from . import net as _net
                 host = getattr(page_url, "host", None)
                 if host and hasattr(doc, "seed_cookies"):
-                    jar = _net.cookies_for(page_url)
+                    jar = network_backend.cookies_for(
+                        page_url, context=network_context)
                     if jar:
                         doc.seed_cookies(jar)
             except Exception:
                 pass
         deadline = time.perf_counter() + js_budget
         for i, code in enumerate(sources):
-            if not fuel_safe and len(code) > 400_000:
-                # a mega-bundle can burn minutes inside one Boa call
-                # (no engine interrupt) — skip it, keep the page
-                logs.append(f"[gg] skipped a {len(code)//1024} KB script "
-                            "(too large for the JS budget)")
-                continue
             logs.extend(doc.run_scripts([code]))
             if time.perf_counter() > deadline:
                 skipped = len(sources) - i - 1
@@ -756,7 +768,9 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
         # Fold only actual JS setter writes back into the network jar. The
         # native bridge preserves their attributes; seeded HttpOnly-filtered
         # values are not mistaken for new writes.
-        sync_cookie_writes(doc, page_url)
+        sync_cookie_writes(
+            doc, page_url, network_backend=network_backend,
+            network_context=network_context)
     record("scripts", stage_started)
 
     entries = doc.stylesheet_entries()
@@ -902,17 +916,18 @@ def _service_dynamic_module_fetch(doc, request, graph=None):
 
 
 def service_script_fetch(doc, base_url, request, *, network_timeout=15.0,
-                         cancel_token=None, module_graph=None):
+                         cancel_token=None, module_graph=None,
+                         network_backend=None, network_context=None):
     """Apply origin/CORS/credentials policy and settle one JS request."""
     if request["url"].startswith(_DYNAMIC_MODULE_PREFIX):
         return _service_dynamic_module_fetch(
             doc, request, graph=module_graph)
-    from .security import perform_script_fetch
+    network_backend = _resolve_network_backend(network_backend)
     fetch_id = request["fetch_id"]
     try:
-        response = perform_script_fetch(
+        response = network_backend.perform_script_fetch(
             base_url, request, timeout=network_timeout,
-            cancel_token=cancel_token)
+            cancel_token=cancel_token, context=network_context)
         if hasattr(doc, "resolve_fetch_full"):
             doc.resolve_fetch_full(
                 fetch_id, response.status, str(response.final_url),
@@ -928,7 +943,8 @@ def service_script_fetch(doc, base_url, request, *, network_timeout=15.0,
         return False
 
 
-def sync_cookie_writes(doc, page_url):
+def sync_cookie_writes(doc, page_url, *, network_backend=None,
+                       network_context=None):
     """Drain document.cookie setter strings into the scoped network jar."""
     if doc is None or page_url is None or not getattr(page_url, "host", None):
         return 0
@@ -942,14 +958,18 @@ def sync_cookie_writes(doc, page_url):
             writes = [p.strip() for p in value.split(";") if p.strip()]
         else:
             return 0
-        from . import net
-        return sum(net.set_cookie_from_js(page_url, value) for value in writes)
+        network_backend = _resolve_network_backend(network_backend)
+        return sum(
+            network_backend.set_cookie_from_js(
+                page_url, value, context=network_context)
+            for value in writes)
     except Exception:
         return 0
 
 
 def settle_async(doc, css_sources, base_url, timeout=8.0, max_rounds=2000,
-                 *, network_timeout=15.0, cancel_token=None):
+                 *, network_timeout=15.0, cancel_token=None,
+                 network_backend=None, network_context=None):
     """Drive the gg-js event loop to quiescence: drain microtasks, fire
     virtual-clock timers, and service fetch() over the real network,
     looping until no work remains or the timeout. This is what makes
@@ -964,7 +984,9 @@ def settle_async(doc, css_sources, base_url, timeout=8.0, max_rounds=2000,
     activity = False
     for _ in range(max_rounds):
         logs, fetches = pump_script_requests(doc)
-        sync_cookie_writes(doc, base_url)
+        sync_cookie_writes(
+            doc, base_url, network_backend=network_backend,
+            network_context=network_context)
         if logs:
             for line in logs:
                 print(f"[js console] {line}")
@@ -975,14 +997,18 @@ def settle_async(doc, css_sources, base_url, timeout=8.0, max_rounds=2000,
                 service_script_fetch(
                     doc, base_url, request,
                     network_timeout=network_timeout,
-                    cancel_token=cancel_token)
+                    cancel_token=cancel_token,
+                    network_backend=network_backend,
+                    network_context=network_context)
             continue  # resolving fetches queues more microtasks
         if not doc.has_pending_work():
             break
         if time.monotonic() > deadline:
             print("[js] event loop settle timed out")
             break
-    sync_cookie_writes(doc, base_url)
+    sync_cookie_writes(
+        doc, base_url, network_backend=network_backend,
+        network_context=network_context)
     if version_before is not None:
         return doc.dom_version() != version_before
     return activity

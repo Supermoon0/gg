@@ -40,7 +40,7 @@ from-scratch라는 약점이 이 포지션에서는 강점이 된다: 에이전�
 | 보안 + 라이선스 | 32 |
 
 라이선스가 밝은 지점: 의존성 전부 관용 라이선스(MIT/Apache)이고, gg-js는
-Boa를 은퇴시키는 클린룸 소유 가능 IP다.
+클린룸 소유 가능 IP다. Boa 런타임과 의존성은 2026-07-23 제거됐다.
 
 (점수는 P1–P4 진행 이전의 스냅샷. 시맨틱 추출·자동화 API·JS 커버리지는 이후
 작업으로 실질 상승 — §6.)
@@ -53,7 +53,7 @@ Boa를 은퇴시키는 클린룸 소유 가능 IP다.
   setTimeout/fetch + 가상 시계. SPA가 실체화되도록.
 - **P4** (8–14주): 플릿 안전성 — 실행 연료(fuel), mark-sweep GC, 메모리 상한,
   쿠키/스토리지
-- **P5** (6–12주): C ABI + headless Linux 빌드 + Boa 제거
+- **P5** (6–12주): C ABI + headless Linux 빌드. Boa 제거는 2026-07-23 완료.
 
 ## 5. GO/NO-GO 게이트 — **통과** (2026-07-09)
 
@@ -85,8 +85,8 @@ bench/agent_bench.py — 2026-07-13 확인, 둘 다 존재):
 (goto/query/query_all/text/attr/click/evaluate/run/snapshot/links), 현재 휠
 위의 순수 Python, Rust 변경 없음. 셀렉터 해석은 **엔진의 진짜**
 querySelectorAll을 재사용(두 번째 셀렉터 구현이 표류할 일 없음). evaluate()는
-console.log(TOKEN + JSON.stringify(expr))로 구조화 읽기. 두 엔진 모두 동작
-(engine="boa"|"ggjs"); live example.com 추출, JS 렌더 콘텐츠 실체화,
+console.log(TOKEN + JSON.stringify(expr))로 구조화 읽기. 현재는 gg-js 단일
+엔진으로 live example.com 추출, JS 렌더 콘텐츠 실체화,
 클릭→onclick, 에이전트 스냅샷까지 end-to-end 검증. smoke_test.py에 드라이버
 체크 5개 추가.
 
@@ -134,7 +134,7 @@ JS 프렐류드(page.rs PROMISE_PRELUDE). 미변환 async/await SPA가 end-to-en
 **naver 행 수정 (2026-07-09):** layout.py `_layout_positioned` 무한 루프
 (absolute 박스 레이아웃이 자기 absolute 자손을 순회 중인 리스트에 추가).
 인덱스 드레인 + id-set + 5000 캡으로 수정 → 8초+ 무한 → 1ms. native.py
-load_document에 JS 예산(스크립트 간 3초, 400KB 초과 스킵). 참고: GUI 셸은
+load_document에 스크립트 간 JS 예산 3초를 추가. 참고: GUI 셸은
 로드 시 async 이벤트 루프를 아직 안 돌림(P3는 드라이버 우선) — GUI 창에서도
 SPA가 렌더되게 하는 소규모 후속 필요.
 
@@ -147,15 +147,15 @@ SPA가 렌더되게 하는 소규모 후속 필요.
 스프레드 `f(...a)`는 깔끔히 에러(VM 가변 인자 확장 필요). Rust 테스트 85개
 green (2026-07-10 기준).
 
-**현재 상태 요약 (2026-07-13):** ggjs 경로는 Promise/fetch/타이머/async-await
-SPA를 Math/Object/Array와 함께 돌리고, 폭주 루프에 대해 플릿 안전. 드라이버
-기본 엔진은 아직 `"boa"` (driver.py:91) — ggjs로 뒤집는 것이 유력 후보.
+**현재 상태 요약 (2026-07-23):** gg-js 경로는 Promise/fetch/타이머/async-await
+SPA를 Math/Object/Array와 함께 돌리고, 폭주 루프에 대해 플릿 안전. 브라우저와
+드라이버는 gg-js 단일 런타임이며 Boa 코드와 Cargo 의존성은 제거됐다.
 
 **다음 벽돌:** P4 계속 — mark-sweep GC(arena는 자라기만 함; 긴 에이전트
 세션은 누수), 인스턴스별 메모리 상한, 협조적 cancel 핸들. 그다음 루프 내부
 await(CPS 변환), Map/Set/RegExp, 제네릭 thenable, for-await-of, Number/String
 statics(호출 가능 함수-객체 필요). P2b: css.rs 셀렉터([attr], >/+/~, :nth) +
-폼 .value/.checked + fill()/type(). P5: C ABI + headless Linux + Boa 제거.
+폼 .value/.checked + fill()/type(). P5: C ABI + headless Linux.
 
 ## 7. KILL 기준
 

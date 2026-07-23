@@ -4,8 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import threading
 
-from . import net
 from .html_parser import Element, tree_to_list
+from .network_backend import default_network_backend
 
 
 _STATE_ATTRS = {
@@ -28,7 +28,7 @@ class HistoryEntry:
 @dataclass
 class PendingNavigation:
     generation: int
-    token: net.CancellationToken
+    token: object
     future: object
     context: object = None
 
@@ -36,7 +36,8 @@ class PendingNavigation:
 class NavigationController:
     """Runs network work off the UI thread and discards cancelled jobs."""
 
-    def __init__(self, workers=2):
+    def __init__(self, workers=2, network_backend=None):
+        self._network = network_backend or default_network_backend()
         self._executor = ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="gg-navigation")
         self._lock = threading.Lock()
@@ -50,7 +51,7 @@ class NavigationController:
 
     def start(self, worker, context=None):
         self.cancel()
-        token = net.CancellationToken()
+        token = self._network.new_cancel_token()
         with self._lock:
             self._generation += 1
             generation = self._generation
@@ -68,7 +69,7 @@ class NavigationController:
                 self._generation += 1
         if pending is None:
             return False
-        pending.token.cancel()
+        self._network.cancel(pending.token)
         pending.future.cancel()
         return True
 

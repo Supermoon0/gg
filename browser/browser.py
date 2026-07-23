@@ -16,13 +16,20 @@ from .layout import (VSTEP, BlockLayout, DocumentLayout, ImageLayout,
                      TextLayout, layout_tree_to_list, paint_tree,
                      sticky_offset)
 from .pages import error_page
+from .network_backend import default_network_backend
+from .renderer_session import create_renderer_session
 
 SCROLL_STEP = 90
 HOME_URL = "about:home"
 
 
 class Browser:
-    def __init__(self):
+    def __init__(self, network_backend=None, process_model=None):
+        self.network = network_backend or default_network_backend()
+        model = process_model or os.environ.get("GG_PROCESS_MODEL", "local")
+        self.renderer = (create_renderer_session(
+            self.network, process_model=model, timeout=net.DEFAULT_TIMEOUT)
+            if native.available() else None)
         self.window = tkinter.Tk()
         self.window.title("GG Browser")
         self.window.geometry("1100x780")
@@ -49,7 +56,8 @@ class Browser:
         self.history = []
         self.history_index = -1
         self.navigation_timeout = net.DEFAULT_TIMEOUT
-        self._navigation = navigation.NavigationController()
+        self._navigation = navigation.NavigationController(
+            network_backend=self.network)
         self._navigation_poll = None
         self._loading_token = None
         self.url = None
@@ -140,7 +148,7 @@ class Browser:
         }
 
         def fetch(token):
-            return net.request_text(
+            return self.network.request_text(
                 url, no_cache=no_cache, method=method, body=body,
                 headers=headers, site_for_cookies=initiator,
                 top_level_navigation=True, timeout=timeout,
@@ -208,12 +216,11 @@ class Browser:
         self.render_page(entry.url, entry.body)
         changed = navigation.restore_form_state(
             self.nodes, entry.form_state,
-            set_attr=(self._doc.set_attr if self._doc is not None else None),
-            remove_attr=(self._doc.remove_attr
-                         if self._doc is not None
-                         and hasattr(self._doc, "remove_attr") else None))
+            set_attr=(self.renderer.set_attr if self._doc is not None else None),
+            remove_attr=(self.renderer.remove_attr
+                         if self._doc is not None else None))
         if changed and self._doc is not None:
-            self.nodes = native.refresh(self._doc, self._css_sources)
+            self.nodes = self.renderer.frame()
         if changed:
             self.relayout()
         self.scroll = entry.scroll
@@ -229,24 +236,13 @@ class Browser:
         self._reset_interaction()
 
         if native.available():
-            # Rust fast path: parse + JS + cascade + style in ggcore.
-            # Use gg-js so the async event loop is available.
-            prev = os.environ.get("GGJS")
-            if native.async_available():
-                os.environ["GGJS"] = "1"
-            try:
-                load_timings = {}
-                self.nodes, self._doc, self._css_sources, js_logs = \
-                    native.load_document(
-                        body,
-                        lambda hrefs: self.fetch_stylesheets(hrefs, url),
-                        lambda srcs: self.fetch_scripts(srcs, url),
-                        page_url=url, timings=load_timings)
-            finally:
-                if prev is None:
-                    os.environ.pop("GGJS", None)
-                else:
-                    os.environ["GGJS"] = prev
+            # Rust fast path: parse + gg-js + cascade + style in ggcore.
+            load_timings = {}
+            self.renderer.timeout = self.navigation_timeout
+            self.nodes, self._doc, self._css_sources, js_logs = \
+                self.renderer.commit(
+                    url, body, timings=load_timings,
+                    cancel_token=self._loading_token)
             self._load_timings = load_timings
             self._hover_rules = any(
                 ":hover" in s for s in self._css_sources)
@@ -327,7 +323,7 @@ class Browser:
                 self.window.after(
                     1, lambda: self._finish_deferred_resources(gen))
             return
-        self._dom_version = self._doc.dom_version()
+        self._dom_version = self.renderer.state().dom_version
         self._live_idle = 0
         import time
         self._live_last = time.monotonic()
@@ -359,20 +355,13 @@ class Browser:
             now = time.monotonic()
             dt = min((now - self._live_last) * 1000.0, 1000.0)
             self._live_last = now
-            logs, fetches = native.pump_script_requests(self._doc, dt)
-            native.sync_cookie_writes(self._doc, self.url)
-            for line in logs:
+            update = self.renderer.tick(dt)
+            for line in update.logs:
                 print(f"[js live] {line}")
-            for request in fetches:
-                native.service_script_fetch(
-                    self._doc, self.url, request,
-                    network_timeout=self.navigation_timeout)
-            version = self._doc.dom_version()
-            changed = version != self._dom_version
+            changed = update.dom_changed
             if changed:
-                self._dom_version = version
                 self._live_idle = 0
-                self.nodes = native.refresh(self._doc, self._css_sources)
+                self.nodes = self.renderer.frame()
                 self._remap_marks()
             if changed or self._deferred_resources:
                 first_resources = self._deferred_resources
@@ -412,11 +401,13 @@ class Browser:
 
         def fetch(src):
             try:
-                _, data = net.request_raw(
+                _, data = self.network.request_raw(
                     url.resolve(src), site_for_cookies=url,
                     top_level_navigation=False,
                     timeout=self.navigation_timeout,
-                    cancel_token=self._loading_token)
+                    cancel_token=self._loading_token,
+                    context=(self.renderer.network_context
+                             if self.renderer else None))
                 return data
             except net.RequestCancelled:
                 raise
@@ -451,11 +442,13 @@ class Browser:
             return fetched
         def fetch(src):
             try:
-                _, code = net.request(
+                _, code = self.network.request(
                     url.resolve(src), site_for_cookies=url,
                     top_level_navigation=False,
                     timeout=self.navigation_timeout,
-                    cancel_token=self._loading_token)
+                    cancel_token=self._loading_token,
+                    context=(self.renderer.network_context
+                             if self.renderer else None))
                 return code
             except net.RequestCancelled:
                 raise
@@ -477,11 +470,13 @@ class Browser:
 
         def fetch(href):
             try:
-                _, css = net.request(
+                _, css = self.network.request(
                     url.resolve(href), site_for_cookies=url,
                     top_level_navigation=False,
                     timeout=self.navigation_timeout,
-                    cancel_token=self._loading_token)
+                    cancel_token=self._loading_token,
+                    context=(self.renderer.network_context
+                             if self.renderer else None))
                 return css
             except net.RequestCancelled:
                 raise
@@ -572,11 +567,13 @@ class Browser:
                     css_texts.append(" ".join(
                         c.text for c in n.children if isinstance(c, Text)))
         def fetch(u):
-            _, body = net.request_raw(
+            _, body = self.network.request_raw(
                 url.resolve(u), site_for_cookies=url,
                 top_level_navigation=False,
                 timeout=self.navigation_timeout,
-                cancel_token=self._loading_token)
+                cancel_token=self._loading_token,
+                context=(self.renderer.network_context
+                         if self.renderer else None))
             return body
         try:
             loaded = webfonts.load_web_fonts(css_texts, fetch)
@@ -590,8 +587,7 @@ class Browser:
         """Feed layout geometry back to the JS engine so
         getBoundingClientRect answers real rects (document
         coordinates) from the next event handler on."""
-        doc = getattr(self, "_doc", None)
-        if doc is None or not hasattr(doc, "set_layout_rects"):
+        if self._doc is None:
             return
         # ridx -> [min_x, min_y, max_x, max_y] union of the element's boxes
         boxes = {}
@@ -632,7 +628,7 @@ class Browser:
         rects = [(r, float(b[0]), float(b[1]),
                   float(b[2] - b[0]), float(b[3] - b[1]))
                  for r, b in boxes.items()]
-        doc.set_layout_rects(rects)
+        self.renderer.set_layout_rects(rects)
 
     def _push_display_list(self):
         """Hand the display list to Rust once per paint change, in
@@ -751,8 +747,9 @@ class Browser:
     def refresh_after_js(self):
         """Re-style, re-layout and redraw after JS mutated the DOM."""
         # a click handler may have scheduled fetch/timers — settle them
-        native.settle_async(self._doc, self._css_sources, self.url)
-        self.nodes = native.refresh(self._doc, self._css_sources)
+        self.renderer.settle(
+            timeout=self.navigation_timeout, refresh=False)
+        self.nodes = self.renderer.frame()
         self._remap_marks()
         self.load_images(self.nodes, self.url, keep_cache=True)
         for node in tree_to_list(self.nodes, []):
@@ -790,7 +787,7 @@ class Browser:
                     and hasattr(target, "_ridx")):
                 target = target.parent
             if target is not None:
-                result = self._doc.dispatch_click(target._ridx)
+                result = self.renderer.dispatch_click(target._ridx)
                 if len(result) == 3:
                     logs, handled, prevented = result
                 else:  # pre-preventDefault ggcore wheel
@@ -902,9 +899,8 @@ class Browser:
                 marks.append(cur)
             cur = cur.parent
         self._hover_marks = marks
-        doc = getattr(self, "_doc", None)
-        if doc is not None and hasattr(doc, "set_hover"):
-            doc.set_hover(self._hover_ridx)
+        if self._doc is not None:
+            self.renderer.set_hover(self._hover_ridx)
         if self._hover_rules:
             self.restyle()
 
@@ -923,7 +919,7 @@ class Browser:
                 return
             # geometry or structure changed: re-export (styles are
             # already fresh in Rust) and relayout
-            self.nodes = native.build_tree(self._doc.export())
+            self.nodes = native.build_tree(self.renderer.export())
             self._remap_marks()
             self.load_images(self.nodes, self.url, keep_cache=True)
         elif self._py_rule_index is not None:
@@ -939,9 +935,8 @@ class Browser:
         self._focus_ridx = self._ridx_of(node)
         if node is not None:
             node.is_focused = True
-        doc = getattr(self, "_doc", None)
-        if doc is not None and hasattr(doc, "set_focus"):
-            doc.set_focus(self._focus_ridx)
+        if self._doc is not None:
+            self.renderer.set_focus(self._focus_ridx)
         if self._focus_rules:
             self.restyle()
         else:
@@ -1075,15 +1070,15 @@ class Browser:
                 control, self.url, self._form_defaults,
                 dispatch_event=self._dispatch_form_event,
                 refresh_tree=self._fresh_form_tree,
-                set_attr=(self._doc.set_attr if self._doc else None),
-                remove_attr=(self._doc.remove_attr if self._doc is not None
-                             and hasattr(self._doc, "remove_attr") else None))
+                set_attr=(self.renderer.set_attr if self._doc else None),
+                remove_attr=(self.renderer.remove_attr
+                             if self._doc is not None else None))
             self._finish_form_activation(activation)
         except Exception as exc:
             self.set_status(f"폼 동작 실패: {exc}")
 
     def _dispatch_form_event(self, *args):
-        result = native.dispatch_dom_event(self._doc, *args)
+        result = self.renderer.dispatch_event(*args)
         for line in result[0]:
             print(f"[js console] {line}")
         return result
@@ -1091,7 +1086,7 @@ class Browser:
     def _fresh_form_tree(self):
         if self._doc is None:
             return self.nodes
-        return native.build_tree(self._doc.export())
+        return native.build_tree(self.renderer.export())
 
     def _finish_form_activation(self, activation):
         if activation is None:
@@ -1113,7 +1108,7 @@ class Browser:
             return
         if activation.changed:
             if self._doc is not None:
-                self.nodes = native.refresh(self._doc, self._css_sources)
+                self.nodes = self.renderer.frame()
                 self._remap_marks()
             self.relayout()
             return
@@ -1145,11 +1140,9 @@ class Browser:
     def sync_attr(self, node, name, value):
         """Mirror a Python-side attribute change into the Rust DOM so
         page JS reading the input sees the typed value."""
-        doc = getattr(self, "_doc", None)
         ridx = getattr(node, "_ridx", None)
-        if doc is not None and ridx is not None \
-                and hasattr(doc, "set_attr"):
-            doc.set_attr(ridx, name, value)
+        if self._doc is not None and ridx is not None:
+            self.renderer.set_attr(ridx, name, value)
 
     def on_motion(self, event):
         # Hit-testing walks the layout tree; 30ms throttle keeps
@@ -1184,3 +1177,9 @@ class Browser:
             self.window.mainloop()
         finally:
             self._navigation.shutdown()
+            if self.renderer is not None:
+                shutdown = getattr(self.renderer, "shutdown", None)
+                if shutdown is not None:
+                    shutdown()
+                else:
+                    self.renderer.close()

@@ -17,6 +17,8 @@ from .layout import (HSTEP, VSTEP, DocumentLayout, get_font,
                      layout_tree_to_list, measure, paint_tree,
                      sticky_offset)
 from .pages import error_page
+from .network_backend import default_network_backend
+from .renderer_session import create_renderer_session
 
 TOOLBAR_H = 44
 STATUS_H = 24
@@ -30,19 +32,24 @@ INK = (40, 40, 40)
 
 
 def _fetch_many(urls, base, binary=False, *, timeout=net.DEFAULT_TIMEOUT,
-                cancel_token=None):
+                cancel_token=None, network_backend=None,
+                network_context=None):
     """Parallel fetch helper: {url: text-or-bytes}."""
+    network_backend = network_backend or default_network_backend()
+
     def fetch(u):
         try:
             if binary:
-                return net.request_raw(
+                return network_backend.request_raw(
                     base.resolve(u), site_for_cookies=base,
                     top_level_navigation=False, timeout=timeout,
-                    cancel_token=cancel_token)[1]
-            return net.request(
+                    cancel_token=cancel_token,
+                    context=network_context)[1]
+            return network_backend.request(
                 base.resolve(u), site_for_cookies=base,
                 top_level_navigation=False, timeout=timeout,
-                cancel_token=cancel_token)[1]
+                cancel_token=cancel_token,
+                context=network_context)[1]
         except net.RequestCancelled:
             raise
         except Exception:
@@ -57,8 +64,14 @@ def _fetch_many(urls, base, binary=False, *, timeout=net.DEFAULT_TIMEOUT,
 
 
 class Shell:
-    def __init__(self, win):
+    def __init__(self, win, network_backend=None, process_model=None):
         self.win = win
+        self.network = network_backend or default_network_backend()
+        model = process_model or os.environ.get(
+            "GG_PROCESS_MODEL", "isolated")
+        self.renderer = create_renderer_session(
+            self.network, process_model=model,
+            timeout=net.DEFAULT_TIMEOUT)
         self.engine = textengine.engine()
         self.running = True
         self.dirty = True
@@ -74,7 +87,8 @@ class Shell:
         self.history = []
         self.history_index = -1
         self.navigation_timeout = net.DEFAULT_TIMEOUT
-        self._navigation = navigation.NavigationController()
+        self._navigation = navigation.NavigationController(
+            network_backend=self.network)
         self._loading_token = None
         self.document = None
         self.layout_list = []
@@ -125,7 +139,7 @@ class Shell:
         context = {"url": url, "add_to_history": add_to_history}
 
         def fetch(token):
-            return net.request_text(
+            return self.network.request_text(
                 url, no_cache=no_cache, method=method, body=body,
                 headers=headers, site_for_cookies=initiator,
                 top_level_navigation=True, timeout=timeout,
@@ -183,12 +197,10 @@ class Shell:
         self.render_page(entry.url, entry.body)
         changed = navigation.restore_form_state(
             self.nodes, entry.form_state,
-            set_attr=self._doc.set_attr,
-            remove_attr=(self._doc.remove_attr
-                         if hasattr(self._doc, "remove_attr") else None))
+            set_attr=self.renderer.set_attr,
+            remove_attr=self.renderer.remove_attr)
         if changed:
-            self.nodes = native.refresh(
-                self._doc, self._css_sources, self._styled_width)
+            self.nodes = self.renderer.frame(self._styled_width)
             self.relayout()
         self.scroll = entry.scroll
         self.hscroll = entry.hscroll
@@ -206,31 +218,14 @@ class Shell:
         self.focus_node = None
         self._focus_ridx = None
 
-        # Use gg-js so the async event loop (fetch/Promise/setTimeout)
-        # is available; fall back cleanly if the wheel predates it.
-        prev = os.environ.get("GGJS")
-        if native.async_available():
-            os.environ["GGJS"] = "1"
         self._styled_width = self.logical_size()[0]
-        try:
-            load_timings = {}
-            self.nodes, self._doc, self._css_sources, logs = \
-                native.load_document(
-                    body,
-                    lambda hrefs: _fetch_many(
-                        hrefs, url, timeout=self.navigation_timeout,
-                        cancel_token=self._loading_token),
-                    lambda srcs: _fetch_many(
-                        srcs, url, timeout=self.navigation_timeout,
-                        cancel_token=self._loading_token),
-                    page_url=url,
-                    viewport_width=self._styled_width,
-                    timings=load_timings)
-        finally:
-            if prev is None:
-                os.environ.pop("GGJS", None)
-            else:
-                os.environ["GGJS"] = prev
+        load_timings = {}
+        self.renderer.timeout = self.navigation_timeout
+        self.nodes, self._doc, self._css_sources, logs = \
+            self.renderer.commit(
+                url, body, viewport_width=self._styled_width,
+                timings=load_timings,
+                cancel_token=self._loading_token)
         for line in logs:
             print(f"[js console] {line}")
 
@@ -246,8 +241,7 @@ class Shell:
         self.scroll = 0
         self.hscroll = 0
         self.relayout()
-        self._dom_version = (self._doc.dom_version()
-                             if hasattr(self._doc, "dom_version") else None)
+        self._dom_version = self.renderer.state().dom_version
         self._live_last = time.monotonic()
         self._live_next = self._live_last
         self._load_timings["first_paint"] = \
@@ -270,21 +264,12 @@ class Shell:
         changed = False
         try:
             if hasattr(self._doc, "tick") and native.async_available():
-                logs, fetches = native.pump_script_requests(self._doc, dt)
-                native.sync_cookie_writes(self._doc, self.url)
-                for line in logs:
+                update = self.renderer.tick(dt)
+                for line in update.logs:
                     print(f"[js live] {line}")
-                for request in fetches:
-                    native.service_script_fetch(
-                        self._doc, self.url, request,
-                        network_timeout=self.navigation_timeout)
-                version = (self._doc.dom_version()
-                           if hasattr(self._doc, "dom_version") else None)
-                changed = version != self._dom_version
+                changed = update.dom_changed
                 if changed:
-                    self._dom_version = version
-                    self.nodes = native.refresh(
-                        self._doc, self._css_sources, self._styled_width)
+                    self.nodes = self.renderer.frame(self._styled_width)
                     self._remap_focus()
             if changed or self._deferred_resources:
                 first_resources = self._deferred_resources
@@ -324,7 +309,9 @@ class Shell:
             raw = _fetch_many(
                 srcs, self.url, binary=True,
                 timeout=self.navigation_timeout,
-                cancel_token=self._loading_token)
+                cancel_token=self._loading_token,
+                network_backend=self.network,
+                network_context=self.renderer.network_context)
             for src, data in raw.items():
                 try:
                     self._img_by_src[src] = (
@@ -339,7 +326,9 @@ class Shell:
             lambda urls: _fetch_many(
                 urls, self.url, binary=True,
                 timeout=self.navigation_timeout,
-                cancel_token=self._loading_token))
+                cancel_token=self._loading_token,
+                network_backend=self.network,
+                network_context=self.renderer.network_context))
 
     def logical_size(self):
         """Window size in CSS px. Layout, hit-testing, and the UI all
@@ -356,8 +345,7 @@ class Shell:
         # resized across a breakpoint (styling is otherwise width-agnostic)
         if self._doc is not None and w != getattr(self, "_styled_width", w):
             self._styled_width = w
-            self.nodes = native.refresh(
-                self._doc, self._css_sources, w)
+            self.nodes = self.renderer.frame(w)
             self._remap_focus()
             self.load_images(keep_cache=True)
         viewport_h = h - TOOLBAR_H - STATUS_H
@@ -386,8 +374,8 @@ class Shell:
 
     def refresh_after_js(self):
         # a click handler may have scheduled fetch/timers — settle them
-        native.settle_async(self._doc, self._css_sources, self.url)
-        self.nodes = native.refresh(self._doc, self._css_sources)
+        self.renderer.settle(timeout=self.navigation_timeout, refresh=False)
+        self.nodes = self.renderer.frame(self._styled_width)
         self._remap_focus()
         self.load_images(keep_cache=True)
         self.apply_title()
@@ -471,10 +459,9 @@ class Shell:
         self.focus_node = node
         if node is not None:
             node.is_focused = True
-        if self._doc is not None and hasattr(self._doc, "set_focus"):
-            self._doc.set_focus(ridx)
-            self.nodes = native.refresh(
-                self._doc, self._css_sources, self._styled_width)
+        if self._doc is not None:
+            self.renderer.set_focus(ridx)
+            self.nodes = self.renderer.frame(self._styled_width)
             self._remap_focus()
             self.load_images(keep_cache=True)
         self.relayout()
@@ -519,8 +506,8 @@ class Shell:
         value = node.attributes.get("value", "")
         value = value[:-1] if backspace else value + (text or "")
         node.attributes["value"] = value
-        if self._doc is not None and hasattr(self._doc, "set_attr"):
-            self._doc.set_attr(node._ridx, "value", value)
+        if self._doc is not None:
+            self.renderer.set_attr(node._ridx, "value", value)
         self.relayout()
         return True
 
@@ -653,7 +640,7 @@ class Shell:
                     and hasattr(target, "_ridx")):
                 target = target.parent
             if target is not None:
-                result = self._doc.dispatch_click(target._ridx)
+                result = self.renderer.dispatch_click(target._ridx)
                 if len(result) == 3:
                     logs, handled, prevented = result
                 else:  # pre-preventDefault ggcore wheel
@@ -716,21 +703,20 @@ class Shell:
                 control, self.url, self._form_defaults,
                 dispatch_event=self._dispatch_form_event,
                 refresh_tree=self._fresh_form_tree,
-                set_attr=self._doc.set_attr,
-                remove_attr=(self._doc.remove_attr
-                             if hasattr(self._doc, "remove_attr") else None))
+                set_attr=self.renderer.set_attr,
+                remove_attr=self.renderer.remove_attr)
             self._finish_form_activation(activation)
         except Exception as exc:
             self.set_status(f"폼 동작 실패: {exc}")
 
     def _dispatch_form_event(self, *args):
-        result = native.dispatch_dom_event(self._doc, *args)
+        result = self.renderer.dispatch_event(*args)
         for line in result[0]:
             print(f"[js console] {line}")
         return result
 
     def _fresh_form_tree(self):
-        return native.build_tree(self._doc.export())
+        return native.build_tree(self.renderer.export())
 
     def _finish_form_activation(self, activation):
         if activation is None:
@@ -751,8 +737,7 @@ class Shell:
                 self.refresh_after_js()
             return
         if activation.changed:
-            self.nodes = native.refresh(
-                self._doc, self._css_sources, self._styled_width)
+            self.nodes = self.renderer.frame(self._styled_width)
             self._remap_focus()
             self.load_images(keep_cache=True)
             self.relayout()
@@ -931,3 +916,8 @@ def run(url_string=None):
             shell.tick_live()
     finally:
         shell._navigation.shutdown()
+        shutdown = getattr(shell.renderer, "shutdown", None)
+        if shutdown is not None:
+            shutdown()
+        else:
+            shell.renderer.close()

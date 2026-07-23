@@ -1,0 +1,3 @@
+# Static testharness.js tests relative to a pinned web-platform-tests checkout.
+dom/nodes/Document-createElement.html
+dom/nodes/ParentNode-querySelector-All.html

@@ -12,17 +12,14 @@ each failure is measured evidence of a boundary found while probing.
 
 Modes:
   sync  -> ggcore.jsvm_run(src)      (fresh VM per call, no event loop)
-  async -> GGJS=1 Doc.run_scripts + pump loop (drains microtasks/timers)
+  async -> Doc.run_scripts + pump loop (drains microtasks/timers)
 
 Usage:
   python3 jsvm_gauntlet.py          # run against gg-js
   python3 jsvm_gauntlet.py --node   # run the same snippets under node
 """
-import os
 import sys
 import subprocess
-
-os.environ["GGJS"] = "1"
 
 CASES = [
     # ==================================================================
@@ -410,6 +407,7 @@ def run_node(src):
 def main():
     use_node = "--node" in sys.argv
     passed = failed = errored = 0
+    claim_regressions = 0
     for label, mode, src, expected in CASES:
         raised = None
         try:
@@ -432,17 +430,26 @@ def main():
             print(f"      got: {actual}")
         elif raised is not None:
             errored += 1
+            if label.startswith("CLAIM"):
+                claim_regressions += 1
             print(f"ERROR {label}")
             print(f"      expected: {expected}")
             print(f"      raised:   {raised}")
         else:
             failed += 1
+            if label.startswith("CLAIM"):
+                claim_regressions += 1
             print(f"FAIL  {label}")
             print(f"      expected: {expected}")
             print(f"      actual:   {actual}")
     total = passed + failed + errored
     print(f"\nTALLY: {passed}/{total} pass, {failed} fail, {errored} error")
+    if claim_regressions:
+        print(f"REGRESSION: {claim_regressions} promised CLAIM case(s) failed")
+        return 1
+    print("GATE: all promised CLAIM cases passed; GAP cases are informational")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -6,3 +6,4 @@ ggcore/dist/
 .claude/
 validation/out/
 validation/file_scheme_probe.txt
+upstream/

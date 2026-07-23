@@ -1,0 +1,7 @@
+# Paths or glob patterns relative to a pinned tc39/test262 checkout.
+# Keep this list deliberately small: it is a trend score, not a full run.
+test/language/expressions/addition/*.js
+test/language/expressions/strict-equals/*.js
+test/built-ins/Array/prototype/map/*.js
+test/built-ins/Object/keys/*.js
+test/built-ins/Promise/resolve/*.js

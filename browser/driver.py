@@ -1,5 +1,6 @@
 """Headless automation driver — GG as an embeddable, agent-drivable
-engine (no GUI window, no tkinter).
+engine (no GUI window, no tkinter). It can use either the local renderer or
+the crash-contained renderer process without changing the Page API.
 
 This is the seam that turns the engine into a library: an agent (or a
 test) can navigate, query, read, click, and evaluate against a live
@@ -21,11 +22,11 @@ drift. Requires the native ggcore wheel; raises if it is absent.
 """
 
 import json
-import os
-from concurrent.futures import ThreadPoolExecutor
 
 from . import forms, native, net
 from .html_parser import tree_to_list
+from .network_backend import default_network_backend
+from .renderer_session import create_renderer_session
 
 _MARKER = "data-gg-hit"
 _VAL_TAG = "\x01GGVAL\x01"
@@ -89,15 +90,17 @@ class Element:
 class Page:
     """A single headless page/context over one native Doc handle."""
 
-    def __init__(self, engine="boa", run_scripts=True, timeout=15):
-        # engine: "boa" (broader coverage today) or "ggjs" (clean-room
-        # engine, the strategic target). See docs/jsvm-research.md.
+    def __init__(self, run_scripts=True, timeout=15,
+                 network_backend=None, process_model=None):
         if not native.available():
             raise DriverError(
                 "native ggcore wheel not installed — the driver needs it")
-        self.engine = engine
         self.run_scripts = run_scripts
         self.timeout = timeout
+        self._network = network_backend or default_network_backend()
+        self._renderer = create_renderer_session(
+            self._network, process_model=process_model,
+            run_scripts=run_scripts, timeout=timeout)
         self.url = None
         self.title = None
         self._doc = None
@@ -120,13 +123,14 @@ class Page:
         url = url_or_str if isinstance(url_or_str, net.URL) \
             else net.URL(url_or_str)
         self.cancel()
-        token = net.CancellationToken()
+        self._renderer.close()
+        token = self._network.new_cancel_token()
         self._navigation_token = token
         initiator = self.url
         if initiator is not None and not getattr(initiator, "host", None):
             initiator = None
         try:
-            _headers, body, final_url = net.request_text(
+            _headers, body, final_url = self._network.request_text(
                 url, no_cache=True, method=method, body=body,
                 headers=headers, site_for_cookies=initiator,
                 top_level_navigation=True, timeout=self.timeout,
@@ -138,22 +142,13 @@ class Page:
         token.check()
         self.url = final_url
 
-        fetch_js = self._fetch_scripts if self.run_scripts else None
-        prev = os.environ.get("GGJS")
-        os.environ["GGJS"] = "1" if self.engine == "ggjs" else "0"
         try:
-            root, doc, css_sources, logs = native.load_document(
-                body, self._fetch_stylesheets, fetch_js,
-                page_url=self.url)
+            root, doc, css_sources, logs = self._renderer.commit(
+                self.url, body, cancel_token=token)
         except Exception:
             if self._navigation_token is token:
                 self._navigation_token = None
             raise
-        finally:
-            if prev is None:
-                os.environ.pop("GGJS", None)
-            else:
-                os.environ["GGJS"] = prev
 
         self._doc = doc
         self._css_sources = css_sources
@@ -175,7 +170,7 @@ class Page:
         if token is None:
             return False
         self._navigation_token = None
-        return token.cancel()
+        return self._network.cancel(token)
 
     # ---------- async event loop ----------
 
@@ -185,42 +180,20 @@ class Page:
         real network — looping until no work remains or the timeout. This
         is what makes fetch/setTimeout-driven SPA content materialize.
         No-op unless the gg-js async runtime is present."""
-        if not (_HAS_PUMP and self.engine == "ggjs" and self._doc):
+        if not (_HAS_PUMP and self._doc):
             return
-        import time
-        deadline = time.monotonic() + self.timeout
-        version_before = self._doc.dom_version() \
-            if hasattr(self._doc, "dom_version") else None
-        activity = False
-        for _ in range(_SETTLE_MAX_ROUNDS):
-            logs, fetches = native.pump_script_requests(self._doc)
-            native.sync_cookie_writes(self._doc, self.url)
-            if logs:
-                self._console.extend(logs)
-                activity = True
-            if fetches:
-                activity = True
-                for request in fetches:
-                    self._service_fetch(request)
-                continue  # resolves queued more microtasks; keep draining
-            if not self._doc.has_pending_work():
-                break
-            if time.monotonic() > deadline:
-                self._console.append("[driver] settle timed out")
-                break
-        native.sync_cookie_writes(self._doc, self.url)
-        mutated = (self._doc.dom_version() != version_before
-                   if version_before is not None else activity)
-        if mutated:
+        update = self._renderer.settle(
+            timeout=self.timeout, max_rounds=_SETTLE_MAX_ROUNDS,
+            refresh=False)
+        self._console.extend(update.logs)
+        if update.dom_changed:
             # a handler/timer may have changed the DOM; restyle + refresh
-            self._doc.compute_styles(self._css_sources)
+            self._renderer.refresh()
             self._ver += 1
             self._export_cache = None
 
     def _service_fetch(self, request):
-        native.service_script_fetch(
-            self._doc, self.url, request, network_timeout=self.timeout,
-            cancel_token=self._navigation_token)
+        return self._renderer.service_fetch(request)
 
     def wait_for(self, target, timeout=None):
         """Settle the event loop, then test `target` (a selector string or
@@ -242,43 +215,15 @@ class Page:
         """Cached flat DOM export — full-tree marshal is the driver's
         biggest cost, so reuse it across reads until a mutation."""
         if self._export_cache is None or self._export_cache[0] != self._ver:
-            self._export_cache = (self._ver, self._doc.export())
+            self._export_cache = (self._ver, self._renderer.export())
         return self._export_cache[1]
 
     def _run(self, sources):
         """Run scripts and invalidate the export cache (they may mutate)."""
-        logs = self._doc.run_scripts(sources)
-        native.sync_cookie_writes(self._doc, self.url)
+        logs = self._renderer.run(sources)
         self._console.extend(logs)
         self._ver += 1
         return logs
-
-    def _fetch_stylesheets(self, hrefs):
-        return self._fetch_many(hrefs)
-
-    def _fetch_scripts(self, srcs):
-        return self._fetch_many(srcs)
-
-    def _fetch_many(self, urls):
-        out = {}
-        if not urls:
-            return out
-
-        def fetch(u):
-            try:
-                return net.request(
-                    self.url.resolve(u), site_for_cookies=self.url,
-                    top_level_navigation=False, timeout=self.timeout,
-                    cancel_token=self._navigation_token)[1]
-            except net.RequestCancelled:
-                raise
-            except Exception:
-                return ""
-
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            for u, text in zip(urls, pool.map(fetch, urls)):
-                out.setdefault(u, text)
-        return out
 
     # ---------- queries ----------
 
@@ -324,7 +269,7 @@ class Page:
                  "href": href, "type": itype, "id": nid,
                  "interactive": interactive}
                 for (ridx, role, tag, name, href, itype, nid, interactive)
-                in self._doc.snapshot()
+                in self._renderer.snapshot()
             ]
         flat = self._export()
         out = []
@@ -360,7 +305,7 @@ class Page:
         return self._click_element(el)
 
     def _click_element(self, el):
-        result = self._doc.dispatch_click(el._ridx)
+        result = self._renderer.dispatch_click(el._ridx)
         if len(result) == 3:
             logs, handled, prevented = result
         else:  # older wheel
@@ -373,7 +318,7 @@ class Page:
         if handled:
             # a handler may have scheduled async work (fetch/setTimeout)
             self.settle()
-            self._doc.compute_styles(self._css_sources)
+            self._renderer.frame()
         href = el.href  # already resolved on the Element — no extra export
         activated = None
         # navigate if it was a link and nothing prevented the default
@@ -392,7 +337,7 @@ class Page:
                     or (activated.handled
                         and activated.submission is None)):
                 self.settle()
-                self._doc.compute_styles(self._css_sources)
+                self._renderer.frame()
                 self._ver += 1
                 self._export_cache = None
             submission = activated.submission if activated else None
@@ -407,19 +352,17 @@ class Page:
         return handled or bool(href) or activated is not None
 
     def _form_activation(self, ridx):
-        root = native.build_tree(self._doc.export())
+        root = native.build_tree(self._renderer.export())
         target = next((node for node in tree_to_list(root, [])
                        if getattr(node, "_ridx", None) == ridx), None)
         if target is None:
             return None
         return forms.activate_control(
             target, self.url, self._form_defaults,
-            dispatch_event=lambda *args: native.dispatch_dom_event(
-                self._doc, *args),
-            refresh_tree=lambda: native.build_tree(self._doc.export()),
-            set_attr=self._doc.set_attr,
-            remove_attr=(self._doc.remove_attr
-                         if hasattr(self._doc, "remove_attr") else None))
+            dispatch_event=self._renderer.dispatch_event,
+            refresh_tree=lambda: native.build_tree(self._renderer.export()),
+            set_attr=self._renderer.set_attr,
+            remove_attr=self._renderer.remove_attr)
 
     # ---------- scripting ----------
 
@@ -445,6 +388,13 @@ class Page:
     def console(self):
         return list(self._console)
 
+    def close(self):
+        shutdown = getattr(self._renderer, "shutdown", None)
+        if shutdown is not None:
+            shutdown()
+        else:
+            self._renderer.close()
+
     # ---------- internals ----------
 
     def _resolve(self, selector, first):
@@ -453,7 +403,7 @@ class Page:
         no whole-tree marshal; else a marker-tagging fallback."""
         if _HAS_NATIVE:
             try:
-                rows = self._doc.query(selector, first)
+                rows = self._renderer.query(selector, first)
             except Exception:
                 return []
             return [Element(self, ridx, tag, text, dict(attrs))

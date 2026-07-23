@@ -9,9 +9,9 @@ use pyo3::types::PyBytes;
 
 mod css;
 mod dom;
+mod dom_api;
 mod fonts;
 mod html;
-mod js;
 mod jsvm;
 mod raster;
 mod style;
@@ -575,19 +575,14 @@ fn truncate_chars(s: &str, max: usize) -> String {
 #[pyclass(unsendable, weakref)]
 struct Doc {
     doc: Rc<RefCell<dom::Document>>,
-    js: Option<boa_engine::Context>,
     ggjs: Option<jsvm::page::PageVm>,
-    /// GGJS=1 routes scripts/events to the hand-written gg-js engine
-    use_ggjs: bool,
 }
 
 #[pyfunction]
 fn parse_html(html: &str) -> Doc {
     Doc {
         doc: Rc::new(RefCell::new(html::parse(html))),
-        js: None,
         ggjs: None,
-        use_ggjs: std::env::var("GGJS").ok().as_deref() == Some("1"),
     }
 }
 
@@ -854,9 +849,7 @@ impl Doc {
         &mut self,
         rects: Vec<(u32, f64, f64, f64, f64)>,
     ) {
-        if self.use_ggjs {
-            self.ggvm().set_layout_rects(rects);
-        }
+        self.ggvm().set_layout_rects(rects);
     }
 
     /// Shell-side hover update: mark the element under the pointer
@@ -897,17 +890,15 @@ impl Doc {
         }
     }
 
-    /// Tell the JS engine the page URL so `location.*` is real.
-    /// Call before run_scripts. No-op on the Boa path.
+    /// Tell gg-js the page URL so `location.*` is real.
+    /// Call before run_scripts.
     fn set_page_url(&mut self, url: String) {
-        if self.use_ggjs {
-            self.ggvm().set_page_url(&url);
-        }
+        self.ggvm().set_page_url(&url);
     }
 
     /// Seed document.cookie from the network jar before scripts run.
     fn seed_cookies(&mut self, cookies: String) {
-        if self.use_ggjs && !cookies.is_empty() {
+        if !cookies.is_empty() {
             self.ggvm().seed_cookies(&cookies);
         }
     }
@@ -934,21 +925,13 @@ impl Doc {
     /// output, fetches to service). The render loop calls this
     /// periodically after load.
     fn tick(&mut self, dt_ms: f64) -> (Vec<String>, Vec<(u32, String)>) {
-        if self.use_ggjs {
-            self.ggvm().tick(dt_ms)
-        } else {
-            (Vec::new(), Vec::new())
-        }
+        self.ggvm().tick(dt_ms)
     }
 
     fn tick_requests(&mut self, dt_ms: f64) -> (Vec<String>, Vec<(
         u32, String, String, String, Vec<(String, String)>, String, String,
     )>) {
-        if self.use_ggjs {
-            self.ggvm().tick_requests(dt_ms)
-        } else {
-            (Vec::new(), Vec::new())
-        }
+        self.ggvm().tick_requests(dt_ms)
     }
 
     /// DOM mutation counter — re-style/re-layout only when it changes.
@@ -959,52 +942,30 @@ impl Doc {
     /// Fire DOMContentLoaded / load once all scripts have run — app
     /// bundles bootstrap from these. Returns console output.
     fn fire_lifecycle(&mut self) -> Vec<String> {
-        if self.use_ggjs {
-            self.ggvm().fire_lifecycle()
-        } else {
-            Vec::new()
-        }
+        self.ggvm().fire_lifecycle()
     }
 
     /// Complete parsing and dispatch DOMContentLoaded without waiting for
     /// outstanding async or dynamically inserted external scripts.
     fn fire_dom_content_loaded(&mut self) -> Vec<String> {
-        if self.use_ggjs {
-            self.ggvm().fire_dom_content_loaded()
-        } else {
-            Vec::new()
-        }
+        self.ggvm().fire_dom_content_loaded()
     }
 
     /// Mark the document complete and dispatch the window/document load
     /// events after the host loader has settled all load-blocking scripts.
     fn fire_load(&mut self) -> Vec<String> {
-        if self.use_ggjs {
-            self.ggvm().fire_load()
-        } else {
-            Vec::new()
-        }
+        self.ggvm().fire_load()
     }
 
     /// (listeners, timers, microtasks) for boot diagnosis.
     fn pending_counts(&mut self) -> (usize, usize, usize) {
-        if self.use_ggjs {
-            self.ggvm().pending_counts()
-        } else {
-            (0, 0, 0)
-        }
+        self.ggvm().pending_counts()
     }
 
     /// Run scripts (in order) against the DOM. Returns console output.
     /// The JS context persists, so later events see earlier definitions.
     fn run_scripts(&mut self, sources: Vec<String>) -> Vec<String> {
-        if self.use_ggjs {
-            return self.ggvm().run_scripts(&sources);
-        }
-        if self.js.is_none() {
-            self.js = Some(js::new_context());
-        }
-        js::run(self.js.as_mut().unwrap(), self.doc.clone(), &sources)
+        self.ggvm().run_scripts(&sources)
     }
 
     /// Bubble a click through onclick attributes + addEventListener
@@ -1014,17 +975,7 @@ impl Doc {
         &mut self,
         node_idx: usize,
     ) -> (Vec<String>, bool, bool) {
-        if self.use_ggjs {
-            return self.ggvm().dispatch_click(node_idx);
-        }
-        if self.js.is_none() {
-            self.js = Some(js::new_context());
-        }
-        js::dispatch_click(
-            self.js.as_mut().unwrap(),
-            self.doc.clone(),
-            node_idx,
-        )
+        self.ggvm().dispatch_click(node_idx)
     }
 
     /// Dispatch a host-initiated DOM event and report cancellation.
@@ -1043,21 +994,7 @@ impl Doc {
         cancelable: bool,
         submitter_idx: Option<usize>,
     ) -> (Vec<String>, bool, bool) {
-        if self.use_ggjs {
-            return self.ggvm().dispatch_event(
-                node_idx,
-                &event_type,
-                bubbles,
-                cancelable,
-                submitter_idx,
-            );
-        }
-        if self.js.is_none() {
-            self.js = Some(js::new_context());
-        }
-        js::dispatch_event(
-            self.js.as_mut().unwrap(),
-            self.doc.clone(),
+        self.ggvm().dispatch_event(
             node_idx,
             &event_type,
             bubbles,
@@ -1066,22 +1003,15 @@ impl Doc {
         )
     }
 
-    /// Async runtime (P3, gg-js only): run the event loop to a fixed
-    /// point. Returns (console output, [(fetch_id, url)] to service).
-    /// No-op on the Boa path (Boa has its own loop).
+    /// Run the gg-js event loop to a fixed point. Returns
+    /// (console output, [(fetch_id, url)] to service).
     fn pump(&mut self) -> (Vec<String>, Vec<(u32, String)>) {
-        if !self.use_ggjs {
-            return (Vec::new(), Vec::new());
-        }
         self.ggvm().pump()
     }
 
     fn pump_requests(&mut self) -> (Vec<String>, Vec<(
         u32, String, String, String, Vec<(String, String)>, String, String,
     )>) {
-        if !self.use_ggjs {
-            return (Vec::new(), Vec::new());
-        }
         self.ggvm().pump_requests()
     }
 
@@ -1089,35 +1019,23 @@ impl Doc {
     fn pump_microtasks_requests(&mut self) -> (Vec<String>, Vec<(
         u32, String, String, String, Vec<(String, String)>, String, String,
     )>) {
-        if !self.use_ggjs {
-            return (Vec::new(), Vec::new());
-        }
         self.ggvm().pump_microtasks_requests()
     }
 
     /// Opt-in GG_JS_PROFILE samples since the previous call.
     fn take_js_profile(&mut self) -> Vec<(String, u32, u32, u64)> {
-        if !self.use_ggjs {
-            return Vec::new();
-        }
         self.ggvm().take_profile()
     }
 
     /// Read a numeric script global without evaluating another program.
     fn global_number(&mut self, name: String) -> Option<f64> {
-        if !self.use_ggjs {
-            return None;
-        }
         self.ggvm().global_number(&name)
     }
 
-    /// Host settles a fetch the driver performed (gg-js only).
+    /// Host settles a fetch the driver performed.
     fn resolve_fetch(&mut self, fetch_id: u32, status: u16, body: String) {
-        if self.use_ggjs {
-            self.ggvm().resolve_fetch(fetch_id, status, body);
-        }
+        self.ggvm().resolve_fetch(fetch_id, status, body);
     }
-
 
     fn resolve_fetch_full(
         &mut self,
@@ -1126,15 +1044,11 @@ impl Doc {
         url: String,
         body: String,
     ) {
-        if self.use_ggjs {
-            self.ggvm().resolve_fetch_full(fetch_id, status, url, body);
-        }
+        self.ggvm().resolve_fetch_full(fetch_id, status, url, body);
     }
 
     fn reject_fetch(&mut self, fetch_id: u32, message: String) {
-        if self.use_ggjs {
-            self.ggvm().reject_fetch(fetch_id, message);
-        }
+        self.ggvm().reject_fetch(fetch_id, message);
     }
 
     /// Whether the event loop still has queued microtasks/timers/fetches.

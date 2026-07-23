@@ -17,14 +17,40 @@ python main.py https://naver.com      # tkinter 셸
 python main.py --native               # 러스트(winit) 창 셸
 python smoke_test.py                  # 헤드리스 파이프라인 테스트 (249종)
 python basket_test.py                 # 대표 사이트 렌더 측정 (9곳)
-cd ggcore && cargo test --lib         # 엔진 단위 테스트 (197종 + 진단용 2종 ignored)
+cd ggcore && cargo test --lib --no-default-features  # 198 통과 + 진단용 2종 ignored
+```
+
+native shell은 renderer child process를 기본 사용한다. 디버그/테스트에서 로컬
+renderer를 강제하려면 `GG_PROCESS_MODEL=local`을 설정한다. Headless API는 명시적으로
+선택할 수 있다.
+
+```python
+from browser.driver import Page
+
+page = Page(process_model="isolated")
+page.goto("https://example.com")
+```
+
+## 자동 검증
+
+`.github/workflows/ci.yml`은 모든 push와 pull request에서 Windows/Linux
+Rust 테스트, 네이티브 wheel 빌드, Python smoke, network/CSS/JSVM gauntlet,
+시각 렌더 증거 생성을 실행한다. PR 검증은 재현성을 위해 외부 인터넷 테스트를
+건너뛰며, 실제 사이트 9곳은 `live site basket` workflow가 매주 화·금요일
+오전 3시(KST)와 수동 실행 시 측정한다.
+
+로컬에서 외부 사이트 접속을 제외하고 smoke를 실행하려면:
+
+```powershell
+$env:GG_SKIP_LIVE_NETWORK="1"
+python smoke_test.py
 ```
 
 ## JavaScript — 자체 엔진 gg-js
 
 레지스터 바이트코드 VM + NaN 박싱 + 인라인 캐시. 함수 본문은 **첫 호출까지
-파싱·컴파일을 지연**한다(lazy parse/compile). async 지원 빌드에서는 브라우저가
-자동으로 gg-js 경로를 사용한다(`GGJS=1`, Boa는 폴백).
+파싱·컴파일을 지연**한다(lazy parse/compile). 브라우저와 헤드리스 드라이버는
+모두 gg-js를 유일한 JavaScript 런타임으로 사용한다.
 [연구 노트](docs/jsvm-research.md) · [네이버 완벽 구동 체크리스트](docs/naver-perfect-checklist.md)
 
 **언어**: 프로토타입 체인 실물화(`new`·`instanceof`·상속), 클래스(extends/super/
@@ -133,12 +159,21 @@ collapse하며 border·padding·overflow formatting context에서는 차단한�
 바스켓(9곳: 네이버·위키백과·나무위키·연합뉴스·티스토리·HN·MDN·정부24·example)
 8/9 "읽을만함", 크래시 0.
 
+호환성 추세는 [`validation/conformance.py`](validation/conformance.py)가
+동일한 JSON 형식으로 기록한다. PR CI에서는 gg-js/DOM 내장 계약 probe 9개를
+회귀 gate로 실행하고, 주기 workflow에서는 고정 SHA의 Test262·WPT 정적 하위
+집합을 별도 점수로 측정한다. 내장 probe 통과 수를 공식 suite 통과율로 해석하지
+않는다. 실행 방식과 어댑터 경계는 [conformance scorecard](docs/conformance.md)에
+정리되어 있다. 최초 고정 기준선은 내장 9/9, Test262 37/120, 정적 WPT 0/2다.
+
 ## 아직 없는 것 (다음 단계 후보)
 
 상세 우선순위와 완료 조건은 [개발 로드맵](docs/roadmap.md)에 체크리스트로 관리한다.
 
 - baseline JIT, GC, 레이아웃 러스트 이식 (React 실측 병목을 기준으로 결정)
 - transition/@keyframes, iframe, HTTP/2, `<video>`/WebGL, 로그인 호환성
+- [browser/renderer/network 프로세스 격리와 IPC](docs/process-isolation-ipc.md)
+- process-neutral local seam: `browser/renderer_session.py`, `browser/network_backend.py`
 
 ## 네이티브 코어 빌드
 
@@ -151,5 +186,6 @@ pip install --force-reinstall dist\ggcore-*.whl
 
 검증 체인: `cargo test --lib --no-default-features` → 휠 빌드·설치 →
 `python smoke_test.py` → `python validation/net_gauntlet.py` →
+`python validation/jsvm_gauntlet.py` → `python validation/conformance.py` →
 `python validation/css_gauntlet.py` → `python validation/render_evidence.py` →
 `python basket_test.py`

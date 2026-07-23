@@ -25,7 +25,6 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ["GGJS"] = "1"
 
 try:  # windows consoles default to cp949; page text is utf-8
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")

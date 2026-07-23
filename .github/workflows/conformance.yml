@@ -1,0 +1,87 @@
+name: upstream conformance
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Sunday 04:00 Asia/Seoul (Saturday 19:00 UTC).
+    - cron: "0 19 * * 6"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-conformance
+  cancel-in-progress: false
+
+env:
+  TEST262_REVISION: ac6134b9cbbbbd3f003135e63960bb5853a6d498
+  WPT_REVISION: 1cf8f33e7589520f3d754ed4fbe57dbcfcb82a52
+
+jobs:
+  scorecard:
+    name: Pinned Test262 and WPT subset
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PYTHONUNBUFFERED: "1"
+      GG_BROWSER_CACHE_DIR: ${{ runner.temp }}/gg-browser-cache
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out pinned Test262 subset
+        uses: actions/checkout@v4
+        with:
+          repository: tc39/test262
+          ref: ${{ env.TEST262_REVISION }}
+          path: upstream/test262
+          fetch-depth: 1
+          sparse-checkout: |
+            harness
+            test/language/expressions/addition
+            test/language/expressions/strict-equals
+            test/built-ins/Array/prototype/map
+            test/built-ins/Object/keys
+            test/built-ins/Promise/resolve
+
+      - name: Check out pinned WPT subset
+        uses: actions/checkout@v4
+        with:
+          repository: web-platform-tests/wpt
+          ref: ${{ env.WPT_REVISION }}
+          path: upstream/wpt
+          fetch-depth: 1
+          sparse-checkout: |
+            resources
+            dom/nodes
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install CI dependencies
+        run: python -m pip install --upgrade pip -r requirements-ci.txt
+
+      - name: Build and install native wheel
+        run: |
+          maturin build --release --locked --manifest-path ggcore/Cargo.toml --out dist
+          python -m pip install --no-index --find-links dist ggcore==0.1.0
+
+      - name: Run pinned upstream scorecard
+        run: >-
+          python validation/conformance.py
+          --test262-root upstream/test262
+          --wpt-root upstream/wpt
+          --baseline validation/baselines/official-conformance.json
+          --max-tests 120
+          --case-timeout 15
+
+      - name: Upload upstream scorecard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-conformance-scorecard
+          path: validation/out/conformance.json
+          if-no-files-found: warn

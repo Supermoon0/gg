@@ -53,7 +53,7 @@ HOME_PAGE = """<!doctype html>
       <li><a href="https://motherfuckingwebsite.com">motherfuckingwebsite.com</a> &mdash; 순수 HTML 페이지</li>
       <li><a href="https://text.npr.org">text.npr.org</a> &mdash; 텍스트 뉴스</li>
       <li><a href="about:demo">about:demo</a> &mdash; 이 엔진의 기능 데모</li>
-      <li><a href="about:js">about:js</a> &mdash; JavaScript 데모 (Boa 엔진)</li>
+      <li><a href="about:js">about:js</a> &mdash; JavaScript 데모 (gg-js 엔진)</li>
     </ul>
   </div>
   <div class="card">
@@ -140,7 +140,7 @@ JS_PAGE = """<!doctype html>
 </head>
 <body>
   <h1>JavaScript 데모</h1>
-  <p>이 페이지의 스크립트는 러스트로 만든 Boa JS 엔진이
+  <p>이 페이지의 스크립트는 직접 만든 gg-js 엔진이
      우리 DOM 위에서 직접 실행합니다.</p>
 
   <h2>카운터</h2>

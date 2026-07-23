@@ -1,0 +1,118 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Rust unit tests
+        working-directory: ggcore
+        run: cargo test --lib --no-default-features --locked
+
+  integration:
+    name: Browser integration (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            display: ""
+          - os: ubuntu-latest
+            display: "xvfb-run -a"
+    env:
+      PYTHONUNBUFFERED: "1"
+      GG_SKIP_LIVE_NETWORK: "1"
+      GG_BROWSER_CACHE_DIR: ${{ runner.temp }}/gg-browser-cache
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux display and font packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth python3-tk fonts-dejavu-core fonts-noto-cjk
+
+      - name: Install CI dependencies
+        run: python -m pip install --upgrade pip -r requirements-ci.txt
+
+      - name: Build native wheel
+        working-directory: ggcore
+        run: maturin build --release --locked --out ../dist
+
+      - name: Install native wheel
+        run: python -m pip install --no-index --find-links dist ggcore==0.1.0
+
+      - name: Check Python syntax
+        run: python -m compileall -q browser bench validation scripts smoke_test.py basket_test.py
+
+      - name: Run browser smoke suite
+        run: ${{ matrix.display }} python smoke_test.py
+
+      - name: Run network gauntlet
+        run: python validation/net_gauntlet.py
+
+      - name: Run gg-js compatibility gate
+        run: python validation/jsvm_gauntlet.py
+
+      - name: Test conformance harness utilities
+        run: python -m unittest validation.test_conformance validation.test_process_seams validation.test_renderer_process -v
+
+      - name: Run conformance regression scorecard
+        run: python validation/conformance.py
+
+      - name: Run CSS and layout gauntlet
+        run: ${{ matrix.display }} python validation/css_gauntlet.py
+
+      - name: Render visual evidence
+        run: ${{ matrix.display }} python validation/render_evidence.py
+
+      - name: Upload render evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-evidence-${{ runner.os }}
+          path: validation/out/evidence_*.png
+          if-no-files-found: warn
+
+      - name: Upload conformance scorecard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-scorecard-${{ runner.os }}
+          path: validation/out/conformance.json
+          if-no-files-found: warn

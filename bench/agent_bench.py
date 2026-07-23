@@ -71,7 +71,7 @@ def summarize(label, times_ms):
     return med
 
 
-def bench_gg(file_path, n, engine="ggjs"):
+def bench_gg(file_path, n):
     from browser.driver import Page
 
     url = "file:///" + file_path.replace("\\", "/")
@@ -79,7 +79,7 @@ def bench_gg(file_path, n, engine="ggjs"):
     counts = []
     for _ in range(n):
         t0 = time.perf_counter()
-        page = Page(engine=engine)          # fresh in-process context
+        page = Page()                       # fresh in-process context
         page.goto(url)
         snap = page.snapshot()               # semantic extraction
         page.click(".buy")                   # act
@@ -242,7 +242,7 @@ if __name__ == "__main__" and "--async" in __import__("sys").argv:
     times, counts = [], []
     for _ in range(25):
         t0 = time.perf_counter()
-        p = Page(engine="ggjs")
+        p = Page()
         p.goto(url)                 # settles the fetch+timer SPA
         snap = p.snapshot()
         p.click(".buy")

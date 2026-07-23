@@ -49,25 +49,7 @@ def run_ggjs(js_code):
 
 
 def run_ggjs_dom(js_code):
-    """gg-js + 우리 DOM (GGJS=1로 Doc.run_scripts가 gg-js에 라우팅)."""
-    import ggcore
-
-    os.environ["GGJS"] = "1"
-    try:
-        doc = ggcore.parse_html(SEED_HTML)
-        t0 = time.perf_counter()
-        logs = doc.run_scripts([js_code])
-        wall = (time.perf_counter() - t0) * 1000
-    finally:
-        os.environ.pop("GGJS", None)
-    for line in logs:
-        if line.startswith("[gg-js error]"):
-            print("  [gg-js 오류]", line)
-    return parse_lines(logs), wall
-
-
-def run_ggcore(js_code):
-    """Boa 경로에서 실행. (결과 dict, 컨텍스트 생성+총 실행 wall ms)"""
+    """gg-js + 우리 DOM."""
     import ggcore
 
     doc = ggcore.parse_html(SEED_HTML)
@@ -75,8 +57,8 @@ def run_ggcore(js_code):
     logs = doc.run_scripts([js_code])
     wall = (time.perf_counter() - t0) * 1000
     for line in logs:
-        if line.startswith("ERROR"):
-            print("  [gg 오류]", line)
+        if line.startswith("[gg-js error]"):
+            print("  [gg-js 오류]", line)
     return parse_lines(logs), wall
 
 
@@ -168,12 +150,12 @@ def main():
     do_edge = "--gg" not in args
     v8_flags = ["--jitless"] if "--jitless" in args else None
 
-    gg_ok = ggjs_ok = False
+    gg_ok = False
     if do_gg:
         try:
             import ggcore
-            gg_ok = hasattr(ggcore, "parse_html")
-            ggjs_ok = hasattr(ggcore, "jsvm_run")
+            gg_ok = (hasattr(ggcore, "parse_html")
+                     and hasattr(ggcore, "jsvm_run"))
         except ImportError:
             pass
         if not gg_ok:
@@ -185,15 +167,12 @@ def main():
     ]:
         code = load(fname)
         cols = []
-        if do_gg and ggjs_ok:
+        if do_gg and gg_ok:
             try:
                 r, _ = ggjs_runner(code)
                 cols.append(("gg-js", r))
             except Exception as e:
                 print("  [gg-js 실행 불가] %s" % e)
-        if do_gg and gg_ok:
-            r, _ = run_ggcore(code)
-            cols.append(("Boa", r))
         if do_edge and os.path.exists(EDGE):
             r, _ = run_edge(code, v8_flags)
             cols.append(("V8", r))

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "description": "Statuses accepted by the GG conformance regression gate.",
+  "expected": {
+    "builtin-js/builtins/json-regexp": "pass",
+    "builtin-js/closures/block-loop-binding": "pass",
+    "builtin-js/collections/map-set": "pass",
+    "builtin-js/errors/type-hierarchy": "pass",
+    "builtin-js/objects/proxy-reflect": "pass",
+    "builtin-web/dom/create-append-query": "pass",
+    "builtin-web/event-loop/promise-timer": "pass",
+    "builtin-web/events/click-listener": "pass",
+    "builtin-web/modules/inline-module": "pass"
+  }
+}

@@ -1,4 +1,4 @@
-//! gg-js: the hand-written JavaScript engine that will replace Boa.
+//! gg-js: the browser's hand-written JavaScript engine.
 //!
 //! Research notes and target numbers: docs/jsvm-research.md.
 //! Planned pipeline: lexer -> parser -> bytecode compiler -> register VM

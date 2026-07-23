@@ -3,7 +3,7 @@
 //! Scripts, inline event handlers, and listeners all share globals,
 //! heap, and the DOM — modules come and go, the VM state stays. This
 //! is the engine the browser talks to (Doc.run_scripts routes here
-//! when GGJS=1).
+//! through the native document bridge.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -1291,8 +1291,8 @@ impl PageVm {
 
     /// Bubble a click from a node to the root: run onclick attributes
     /// and addEventListener handlers. Returns (console output, any
-    /// handler ran, default action prevented) — the same contract as
-    /// the Boa path: navigation proceeds unless a handler called
+    /// handler ran, default action prevented). Navigation proceeds unless
+    /// a handler called
     /// event.preventDefault() or an onclick returned false.
     pub fn dispatch_click(&mut self, idx: usize) -> (Vec<String>, bool, bool)
     {
@@ -3605,7 +3605,7 @@ console.log('B typeof it: ' + typeof it);
             }, 50);\n"
             .to_string()]);
         vm.tick(20.0); // 20ms: timer not yet due
-        let t = crate::js::find_tag(&doc.borrow(), "div").unwrap();
+        let t = crate::dom_api::find_tag(&doc.borrow(), "div").unwrap();
         assert_eq!(doc.borrow().collect_text(t), "old");
         vm.tick(40.0); // 60ms total: fires
         assert_eq!(doc.borrow().collect_text(t), "hi");

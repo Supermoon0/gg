@@ -1,5 +1,6 @@
 """Headless smoke test for the GG engine pipeline."""
 
+import os
 import tkinter
 
 from browser import keyboard, net
@@ -470,7 +471,6 @@ check("no z-index keeps document paint order",
 
 # M4 live loop: tick fires timers in real-time slices; refresh
 # re-styles the mutated DOM
-import os
 from browser import native
 _load_timings = {}
 native.load_document(
@@ -485,7 +485,6 @@ check("native load reports structured stage timings",
       and _load_timings["load_document_total"]
       >= _load_timings["html_parse"], repr(_load_timings))
 if native.async_available():
-    os.environ["GGJS"] = "1"
     _live_html = (
         '<div id="live">start</div><script>'
         'var n = 0;'
@@ -2557,15 +2556,18 @@ check("cookie jar is safe under parallel reads/writes",
       not _cookie_errors, repr(_cookie_errors))
 net._COOKIE_JAR.clear()
 
-# --- Real network fetch ---
-headers, body = net.request(net.URL("https://example.com"))
-check("HTTPS fetch example.com", "<html" in body.lower()
-      and "example" in body.lower(), f"{len(body)} bytes")
+# --- Real network fetch (kept out of deterministic PR CI) ---
+if os.environ.get("GG_SKIP_LIVE_NETWORK") == "1":
+    print("[SKIP] live example.com/google.com checks")
+else:
+    headers, body = net.request(net.URL("https://example.com"))
+    check("HTTPS fetch example.com", "<html" in body.lower()
+          and "example" in body.lower(), f"{len(body)} bytes")
 
-# redirect propagates the final URL (http://google.com -> www.google.com)
-_h, _b, final = net.request_text(net.URL("http://google.com/"))
-check("redirect returns final URL", final.host != "google.com"
-      and "google" in final.host, str(final))
+    # redirect propagates the final URL (http://google.com -> www.google.com)
+    _h, _b, final = net.request_text(net.URL("http://google.com/"))
+    check("redirect returns final URL", final.host != "google.com"
+          and "google" in final.host, str(final))
 
 headers, body = net.request(net.URL("about:home"))
 check("about:home renders", "GG Browser" in body)
@@ -2908,7 +2910,7 @@ if native.available():
 
     try:
         net.request_text = _fake_form_event_page
-        dp_events = Page(engine="ggjs")
+        dp_events = Page()
         dp_events.goto("https://form-events.test/start")
         dp_events.click("#event-send")
         _invalid_text = dp_events.text("#event-out")
@@ -2957,7 +2959,7 @@ if native.available():
     try:
         net.request_text = _fake_script_page
         _security.perform_script_fetch = _fake_script_policy
-        dp4 = Page(engine="ggjs")
+        dp4 = Page()
         dp4.goto("https://app.fetch.test/start")
     finally:
         net.request_text = _real_request_text

@@ -5,12 +5,31 @@
 
 ## 현재 진행 요약
 
-- 완료: P0 9/9, P1 8/8, P2 14/17
-- 진행할 핵심: transition/@keyframes → iframe 격리 → 접근성 확대
+- 완료: P0 9/9, P1 8/8, P2 14/17, Boa 제거와 gg-js 단일화
+- 진행할 핵심: renderer crash isolation 완료 → shared frame/network service → transition/@keyframes
 - 제품화: P3 0/6
-- 검증 부채: 현재 소스로 네이티브 wheel을 재빌드한 뒤 전체 async smoke 재실행
+- 검증 부채: 새 GitHub Actions workflow의 Windows/Linux 최초 green run 확인
 
 ## 바로 진행할 작업 큐
+
+### 0. 실사용 전환 검증 기반
+
+- [x] Boa 런타임·소스·Cargo 의존성 제거
+- [x] 브라우저와 헤드리스 드라이버를 gg-js 단일 경로로 통일
+- [x] push/PR용 Windows·Linux Rust 및 브라우저 통합 CI 작성
+- [x] network/CSS/JSVM 검증기를 실패 종료 코드가 있는 gate로 전환
+- [x] 외부 사이트 바스켓을 화·금 정기 및 수동 workflow로 분리
+- [ ] GitHub에서 CI 최초 실행 후 플랫폼별 실패 수정
+- [x] WPT 정적 testharness 하위 집합 실행기와 JSON 점수판 작성
+- [x] test262 하위 집합 실행기와 기능·variant별 실패 분류
+- [x] 내장 9개 계약 probe 기준선을 PR CI 회귀 gate로 연결
+- [x] 고정 upstream SHA에서 공식 하위 집합 최초 기준 점수 확인·저장
+- [x] [브라우저/renderer/network IPC 설계](process-isolation-ipc.md)와 완료 조건 확정
+- [x] `RendererSession`/`NetworkBackend` process-neutral interface 추출
+- [x] renderer child, 검증된 JSON IPC, crash recovery 구현
+- [ ] shared-memory frame triple buffer와 browser chrome composite 구현
+- [ ] cookie/cache/socket을 network service로 이동하고 IPC gauntlet 통과
+- [ ] Windows/Linux renderer sandbox와 CPU/RSS/blob quota 적용
 
 ### 1. Transition과 keyframes — 다음 작업
 
@@ -47,7 +66,9 @@
 
 ### 4. 릴리스 검증 게이트
 
-- [ ] 현재 Rust/Python 소스로 release wheel 재빌드·재설치
+- [x] 현재 Rust/Python 소스로 release wheel 재빌드·재설치
+- [x] PR용 Windows/Linux 자동 검증 workflow 추가
+- [x] 실사이트 바스켓 정기·수동 workflow 추가
 - [ ] Python smoke 전체 실행
 - [ ] network/CSS/JSVM gauntlet 재실행
 - [ ] home/demo/css/js render evidence 재생성
@@ -100,7 +121,7 @@
 
 - [ ] 탭, 다운로드, 북마크, 권한·인증서 오류 UI
 - [ ] 브라우징 데이터 삭제와 프로필별 저장소 분리
-- [ ] 페이지/네트워크 프로세스 격리와 리소스 제한
+- [ ] [페이지/네트워크 프로세스 격리와 리소스 제한](process-isolation-ipc.md)
 - [ ] 크래시 복구 및 세션 복원
 - [ ] 프로파일 기반 GC/JIT/레이아웃 Rust 이식 여부 결정
 - [ ] Windows 패키징과 CI 회귀 실행, 릴리스 서명

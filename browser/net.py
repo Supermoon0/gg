@@ -512,7 +512,7 @@ _CACHE_MAX_BODY = 4 * 1024 * 1024
 _CACHE_DEFAULT_TTL = 300.0
 
 # --- disk cache (survives restarts) ---
-_DISK_DIR = os.path.join(
+_DISK_DIR = os.environ.get("GG_BROWSER_CACHE_DIR") or os.path.join(
     os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
     "gg-browser", "cache")
 _DISK_MAX_BODY = 8 * 1024 * 1024

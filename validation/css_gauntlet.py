@@ -9,7 +9,6 @@ commands. Prints one RESULT| line per claim.
 import os, sys, subprocess, traceback
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-os.environ["GGJS"] = "1"
 os.environ["GG_REPO_ROOT"] = REPO_ROOT
 sys.path.insert(0, REPO_ROOT)
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -227,7 +226,6 @@ def t_var_cycle_guard():
     # run in a subprocess so a hang cannot take down the gauntlet
     code = r'''
 import os, sys
-os.environ["GGJS"] = "1"
 sys.path.insert(0, os.environ["GG_REPO_ROOT"])
 from browser import native
 from browser.html_parser import Element, tree_to_list
@@ -566,3 +564,5 @@ for name, fn in TESTS:
 npass = sum(1 for _, v, _ in RESULTS if v == "PASS")
 print(f"SUMMARY|{npass}/{len(RESULTS)} PASS")
 _tk.destroy()
+if npass != len(RESULTS):
+    raise SystemExit(1)

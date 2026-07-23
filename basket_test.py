@@ -2,7 +2,8 @@
 """Site basket: render representative pages headless and score how far
 the engine gets (network, parse, style, layout, paint, JS errors)."""
 import os, sys, time, traceback
-sys.path.insert(0, r"E:\gg")
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, REPO_ROOT)
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from concurrent.futures import ThreadPoolExecutor
 
@@ -23,7 +24,6 @@ SITES = [
 ]
 
 root = tkinter.Tk(); root.withdraw()
-os.environ["GGJS"] = "1"
 
 def fetch_many(base, urls, binary=False):
     def one(u):
