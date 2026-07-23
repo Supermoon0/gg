@@ -2331,6 +2331,16 @@ mod tests {
     }
 
     #[test]
+    fn computed_destructuring() {
+        assert_eq!(
+            n("var k='x'; var {[k]:v}={x:9}; v"), 9.0);
+        assert_eq!(
+            n("var k='a'; var {[k]:v=7}={}; v"), 7.0);
+        assert_eq!(
+            n("var {['a'+'b']:v}={ab:3}; v"), 3.0);
+    }
+
+    #[test]
     fn more_array_and_string_builtins() {
         // Array statics/methods
         assert_eq!(n("Array.of(1,2,3).join()==='1,2,3' ? 1 : 0"), 1.0);

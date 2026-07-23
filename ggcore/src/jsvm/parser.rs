@@ -769,6 +769,31 @@ impl Parser {
                 }
                 break;
             }
+            // computed key: `{ [expr]: binding }` (always needs a binding)
+            if self.at_punct(P::LBracket) {
+                self.pos += 1;
+                let key_expr = self.assign_expr()?;
+                self.expect_punct(P::RBracket)?;
+                self.expect_punct(P::Colon)?;
+                let member = Expr::Member {
+                    obj: Box::new(Expr::Ident(tmp.to_string())),
+                    prop: MemberProp::Computed(Box::new(key_expr)),
+                    optional: false,
+                };
+                if self.at_punct(P::LBrace) || self.at_punct(P::LBracket) {
+                    let inner = self.fresh_tmp("d");
+                    out.push((inner.clone(), Some(member)));
+                    self.pattern_binds(&inner, out, false)?;
+                } else {
+                    let bind = self.expect_ident()?;
+                    let init = self.maybe_default(member)?;
+                    out.push((bind, Some(init)));
+                }
+                if !self.eat_punct(P::Comma) {
+                    break;
+                }
+                continue;
+            }
             let key = self.expect_ident()?;
             seen.push(key.clone());
             let member = Expr::Member {
