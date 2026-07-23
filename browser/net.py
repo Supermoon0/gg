@@ -20,45 +20,147 @@ import urllib.parse
 USER_AGENT = "GGBrowser/0.1 (educational engine)"
 MAX_REDIRECTS = 8
 
-# --- cookie jar (host -> {name: value}) ---
-# A minimal session cookie store: Set-Cookie response headers are captured
-# here and replayed as a Cookie request header to the same host. Attributes
-# (Path/Domain/Expires/Secure) are ignored — enough for session continuity
-# across a page's requests and for document.cookie round-tripping.
-_COOKIE_JAR = {}
+# --- cookie jar ---
+# A session cookie store honouring the parts of RFC 6265 that matter for
+# real sessions: each cookie carries its Domain/Path/expiry/Secure/HttpOnly
+# so responses set them, requests replay only the matching ones, and
+# document.cookie round-trips (minus HttpOnly). Not persisted to disk —
+# it lives for the process, which is the browsing session.
+_COOKIE_JAR = []  # list of records (name, value, domain, path, expires,
+#                   secure, httponly, host_only)
 
 
-def _cookie_header(host):
-    jar = _COOKIE_JAR.get(host)
-    if not jar:
+def _domain_match(cookie_domain, host):
+    """RFC 6265 §5.1.3: host equals the cookie domain, or is a subdomain."""
+    host = (host or "").lower()
+    cd = (cookie_domain or "").lower().lstrip(".")
+    return bool(cd) and (host == cd or host.endswith("." + cd))
+
+
+def _path_match(cookie_path, req_path):
+    """RFC 6265 §5.1.4."""
+    if not req_path.startswith("/"):
+        req_path = "/" + req_path
+    if cookie_path == req_path:
+        return True
+    return req_path.startswith(cookie_path) and (
+        cookie_path.endswith("/")
+        or req_path[len(cookie_path):len(cookie_path) + 1] == "/")
+
+
+def _default_path(req_path):
+    """The directory of the request path (RFC 6265 §5.1.4)."""
+    if not req_path or not req_path.startswith("/"):
+        return "/"
+    i = req_path.rfind("/")
+    return req_path[:i] if i > 0 else "/"
+
+
+def _parse_cookie_date(v):
+    try:
+        import email.utils
+        dt = email.utils.parsedate_to_datetime(v)
+        return dt.timestamp() if dt else None
+    except Exception:
+        return None
+
+
+def _parse_set_cookie(host, req_path, sc):
+    parts = sc.split(";")
+    first = parts[0].strip()
+    if "=" not in first:
+        return None
+    name, value = first.split("=", 1)
+    name = name.strip()
+    if not name:
+        return None
+    rec = {"name": name, "value": value.strip(),
+           "domain": (host or "").lower(), "path": _default_path(req_path),
+           "expires": None, "secure": False, "httponly": False,
+           "host_only": True}
+    for attr in parts[1:]:
+        if "=" in attr:
+            k, v = attr.split("=", 1)
+            k, v = k.strip().lower(), v.strip()
+        else:
+            k, v = attr.strip().lower(), ""
+        if k == "domain" and v:
+            d = v.lstrip(".").lower()
+            # only a domain the origin host belongs to (no cross-site set)
+            if _domain_match(d, host):
+                rec["domain"], rec["host_only"] = d, False
+        elif k == "path" and v.startswith("/"):
+            rec["path"] = v
+        elif k == "max-age":
+            try:
+                rec["expires"] = time.time() + int(v)
+            except ValueError:
+                pass
+        elif k == "expires" and v and rec["expires"] is None:
+            rec["expires"] = _parse_cookie_date(v)
+        elif k == "secure":
+            rec["secure"] = True
+        elif k == "httponly":
+            rec["httponly"] = True
+    return rec
+
+
+def _store_set_cookie(host, values, req_path="/"):
+    """Store Set-Cookie header values for a response from (host, req_path).
+    A matching name/domain/path replaces the old one; an already-expired
+    cookie deletes it."""
+    for sc in values:
+        rec = _parse_set_cookie(host, req_path, sc)
+        if rec is None:
+            continue
+        _COOKIE_JAR[:] = [
+            c for c in _COOKIE_JAR
+            if not (c["name"] == rec["name"]
+                    and c["domain"] == rec["domain"]
+                    and c["path"] == rec["path"])]
+        if rec["expires"] is not None and rec["expires"] <= time.time():
+            continue  # expired -> deletion
+        _COOKIE_JAR.append(rec)
+
+
+def _matching(host, path, secure):
+    now = time.time()
+    out = []
+    for c in _COOKIE_JAR:
+        if c["expires"] is not None and c["expires"] <= now:
+            continue
+        if c["secure"] and not secure:
+            continue
+        if c["host_only"]:
+            if host.lower() != c["domain"]:
+                continue
+        elif not _domain_match(c["domain"], host):
+            continue
+        if not _path_match(c["path"], path):
+            continue
+        out.append(c)
+    out.sort(key=lambda c: -len(c["path"]))  # longer path first (§5.4)
+    return out
+
+
+def _cookie_header(url):
+    secure = getattr(url, "scheme", "https") == "https"
+    cs = _matching(url.host, getattr(url, "path", "/") or "/", secure)
+    if not cs:
         return ""
-    pairs = "; ".join(f"{k}={v}" for k, v in jar.items())
+    pairs = "; ".join(f'{c["name"]}={c["value"]}' for c in cs)
     return f"Cookie: {pairs}\r\n"
 
 
-def _store_set_cookie(host, values):
-    """Store one or more Set-Cookie header values (name=value; attrs...)."""
-    jar = _COOKIE_JAR.setdefault(host, {})
-    for sc in values:
-        first = sc.split(";", 1)[0].strip()
-        if "=" in first:
-            k, v = first.split("=", 1)
-            k = k.strip()
-            if k:
-                jar[k] = v.strip()
-
-
-def cookies_for(host):
-    """The `document.cookie` string for a host: `k=v; k2=v2`."""
-    jar = _COOKIE_JAR.get(host)
-    if not jar:
-        return ""
-    return "; ".join(f"{k}={v}" for k, v in jar.items())
+def cookies_for(host, secure=True):
+    """The `document.cookie` string for a host (path /, HttpOnly hidden)."""
+    cs = [c for c in _matching(host, "/", secure) if not c["httponly"]]
+    return "; ".join(f'{c["name"]}={c["value"]}' for c in cs)
 
 
 def set_cookie_from_js(host, cookie_str):
     """Apply a `document.cookie = 'k=v; Path=/'` write to the jar."""
-    _store_set_cookie(host, [cookie_str])
+    _store_set_cookie(host, [cookie_str], "/")
 
 # --- connection pool ---
 _POOL = {}
@@ -492,7 +594,7 @@ def _one_request(url, s, pool_key):
         f"User-Agent: {USER_AGENT}\r\n"
         f"Accept: text/html,*/*\r\n"
         f"Accept-Encoding: gzip\r\n"
-        f"{_cookie_header(url.host)}"
+        f"{_cookie_header(url)}"
         f"\r\n"
     )
     s.sendall(req.encode("utf-8"))
@@ -520,7 +622,8 @@ def _one_request(url, s, pool_key):
             set_cookies.append(value.strip())
         headers[lname] = value.strip()
     if set_cookies:
-        _store_set_cookie(url.host, set_cookies)
+        _store_set_cookie(url.host, set_cookies,
+                          getattr(url, "path", "/") or "/")
 
     reusable = "close" not in headers.get("connection", "").casefold() \
         and statusline.startswith("HTTP/1.1")
