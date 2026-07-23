@@ -35,6 +35,40 @@ pub fn parse_program(src: &str) -> Result<Vec<Stmt>, ParseError> {
     Ok(out)
 }
 
+/// A numeric literal used as a property key stringifies like `String(n)`
+/// (`2` -> "2", `0.5` -> "0.5"), not with a trailing `.0`.
+fn num_key(n: f64) -> String {
+    if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e15 {
+        format!("{}", n as i64)
+    } else {
+        format!("{n}")
+    }
+}
+
+/// Debug/name hint for a `FuncLit` built from a class member — only a
+/// static key carries a usable name; a computed key is anonymous.
+fn prop_name_hint(p: &MemberProp) -> Option<String> {
+    match p {
+        MemberProp::Static(s) => Some(s.clone()),
+        MemberProp::Computed(_) => None,
+    }
+}
+
+/// Compare two member keys for accessor get/set pairing. Computed keys
+/// never pair (each becomes its own defineProperty).
+fn prop_key_eq(a: &MemberProp, b: &MemberProp) -> bool {
+    matches!((a, b),
+        (MemberProp::Static(x), MemberProp::Static(y)) if x == y)
+}
+
+/// The key expression for `Object.defineProperty(proto, <key>, ...)`.
+fn prop_to_key_expr(p: MemberProp) -> Expr {
+    match p {
+        MemberProp::Static(s) => Expr::Str(s),
+        MemberProp::Computed(e) => *e,
+    }
+}
+
 /// Parse a lazily-captured function body (first call). The token
 /// stream is the original file's; positions stay absolute so error
 /// lines match the source.
@@ -160,12 +194,12 @@ impl Parser {
                 Box::new(cident()),
             )));
         }
-        for (mname, f) in methods {
+        for (key, f) in methods {
             body.push(Stmt::Expr(Expr::Assign(
                 AssignOp::Plain,
                 Box::new(Expr::Member {
                     obj: Box::new(cproto()),
-                    prop: MemberProp::Static(mname),
+                    prop: key,
                     optional: false,
                 }),
                 Box::new(Expr::Func(Rc::new(f))),
@@ -195,16 +229,20 @@ impl Parser {
                     prop: MemberProp::Static("defineProperty".to_string()),
                     optional: false,
                 }),
-                args: vec![cproto(), Expr::Str(aname), Expr::Object(props)],
+                args: vec![
+                    cproto(),
+                    prop_to_key_expr(aname),
+                    Expr::Object(props),
+                ],
                 optional: false,
             }));
         }
-        for (sname, sval) in statics {
+        for (skey, sval) in statics {
             body.push(Stmt::Expr(Expr::Assign(
                 AssignOp::Plain,
                 Box::new(Expr::Member {
                     obj: Box::new(cident()),
-                    prop: MemberProp::Static(sname),
+                    prop: skey,
                     optional: false,
                 }),
                 Box::new(sval),
@@ -228,6 +266,23 @@ impl Parser {
         })
     }
 
+    /// Parse a class member name into a `MemberProp`: a plain identifier
+    /// (incl. `#private`), a string or numeric literal key, or a computed
+    /// `[expr]` key evaluated at class-definition time.
+    fn member_key(&mut self) -> Result<MemberProp, ParseError> {
+        if self.eat_punct(P::LBracket) {
+            let e = self.assign_expr()?;
+            self.expect_punct(P::RBracket)?;
+            return Ok(MemberProp::Computed(Box::new(e)));
+        }
+        match self.bump() {
+            Tok::Ident(n) => Ok(MemberProp::Static(n)),
+            Tok::Str(s) => Ok(MemberProp::Static(s)),
+            Tok::Num(n) => Ok(MemberProp::Static(num_key(n))),
+            t => Err(self.err(format!("bad class member name: {t:?}"))),
+        }
+    }
+
     /// Parse `{ ...members... }` of a class. Returns (ctor, methods,
     /// accessors (name, get, set), statics). Field declarations become
     /// `this.f = v` statements prepended to the ctor body.
@@ -239,18 +294,18 @@ impl Parser {
     ) -> Result<
         (
             FuncLit,
-            Vec<(String, FuncLit)>,
-            Vec<(String, Option<FuncLit>, Option<FuncLit>)>,
-            Vec<(String, Expr)>,
+            Vec<(MemberProp, FuncLit)>,
+            Vec<(MemberProp, Option<FuncLit>, Option<FuncLit>)>,
+            Vec<(MemberProp, Expr)>,
         ),
         ParseError,
     > {
         self.expect_punct(P::LBrace)?;
         let mut ctor: Option<(Vec<String>, Vec<Stmt>)> = None;
-        let mut methods: Vec<(String, FuncLit)> = Vec::new();
-        let mut accessors: Vec<(String, Option<FuncLit>, Option<FuncLit>)> =
+        let mut methods: Vec<(MemberProp, FuncLit)> = Vec::new();
+        let mut accessors: Vec<(MemberProp, Option<FuncLit>, Option<FuncLit>)> =
             Vec::new();
-        let mut statics: Vec<(String, Expr)> = Vec::new();
+        let mut statics: Vec<(MemberProp, Expr)> = Vec::new();
         let mut field_stmts: Vec<Stmt> = Vec::new();
         while !self.eat_punct(P::RBrace) {
             if self.eat_punct(P::Semi) {
@@ -261,16 +316,15 @@ impl Parser {
             if is_static {
                 self.pos += 1;
             }
-            // generator method: `*gen() {...}`
+            // generator method: `*gen() {...}` (name may be computed)
             if self.at_punct(P::Star) {
                 self.pos += 1;
-                let mname = self.expect_ident()?;
-                let f =
-                    self.func_lit_g(Some(mname.clone()), false, true)?;
+                let key = self.member_key()?;
+                let f = self.func_lit_g(prop_name_hint(&key), false, true)?;
                 if is_static {
-                    statics.push((mname, Expr::Func(Rc::new(f))));
+                    statics.push((key, Expr::Func(Rc::new(f))));
                 } else {
-                    methods.push((mname, f));
+                    methods.push((key, f));
                 }
                 continue;
             }
@@ -289,15 +343,7 @@ impl Parser {
                 }
                 _ => None,
             };
-            let mname = match self.bump() {
-                Tok::Ident(n) => n,
-                Tok::Str(s) => s,
-                t => {
-                    return Err(
-                        self.err(format!("bad class member name: {t:?}"))
-                    )
-                }
-            };
+            let key = self.member_key()?;
             // field: `name = expr;` or bare `name;`
             if acc.is_none() && !self.at_punct(P::LParen) {
                 let value = if self.eat_punct(P::Assign) {
@@ -307,13 +353,13 @@ impl Parser {
                 };
                 self.eat_punct(P::Semi);
                 if is_static {
-                    statics.push((mname, value));
+                    statics.push((key, value));
                 } else {
                     field_stmts.push(Stmt::Expr(Expr::Assign(
                         AssignOp::Plain,
                         Box::new(Expr::Member {
                             obj: Box::new(Expr::This),
-                            prop: MemberProp::Static(mname),
+                            prop: key,
                             optional: false,
                         }),
                         Box::new(value),
@@ -333,7 +379,7 @@ impl Parser {
                 body = full;
             }
             let f = FuncLit {
-                name: Some(mname.clone()),
+                name: prop_name_hint(&key),
                 params,
                 body,
                 is_async: false,
@@ -342,26 +388,27 @@ impl Parser {
             if let Some(is_get) = acc {
                 if is_static {
                     // static accessor: approximate as a plain static
-                    statics.push((mname, Expr::Func(Rc::new(f))));
-                } else if let Some(slot) =
-                    accessors.iter_mut().find(|(n, _, _)| *n == mname)
-                {
+                    statics.push((key, Expr::Func(Rc::new(f))));
+                } else if let Some(slot) = accessors.iter_mut().find(
+                    |(n, _, _)| prop_key_eq(n, &key),
+                ) {
                     if is_get {
                         slot.1 = Some(f);
                     } else {
                         slot.2 = Some(f);
                     }
                 } else if is_get {
-                    accessors.push((mname, Some(f), None));
+                    accessors.push((key, Some(f), None));
                 } else {
-                    accessors.push((mname, None, Some(f)));
+                    accessors.push((key, None, Some(f)));
                 }
             } else if is_static {
-                statics.push((mname, Expr::Func(Rc::new(f))));
-            } else if mname == "constructor" {
+                statics.push((key, Expr::Func(Rc::new(f))));
+            } else if matches!(&key, MemberProp::Static(n) if n == "constructor")
+            {
                 ctor = Some((f.params, f.body));
             } else {
-                methods.push((mname, f));
+                methods.push((key, f));
             }
         }
         let (params, mut cbody) = ctor.unwrap_or_else(|| {

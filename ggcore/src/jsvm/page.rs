@@ -2774,6 +2774,47 @@ mod tests {
     }
 
     #[test]
+    fn class_computed_and_literal_member_names() {
+        // computed method name, evaluated at class-definition time
+        assert_eq!(
+            n("var m = 'go'; \
+               class C { [m]() { return 7; } } \
+               new C().go()"),
+            7.0);
+        // computed field name
+        assert_eq!(
+            n("var k = 'x' + 1; \
+               class C { [k] = 5; } \
+               new C().x1"),
+            5.0);
+        // string- and number-literal member names
+        assert_eq!(
+            n("class C { 'a b'() { return 2; } 3() { return 4; } } \
+               var c = new C(); c['a b']() + c[3]()"),
+            6.0);
+        // computed static + computed getter
+        assert_eq!(
+            n("var s = 'make'; var g = 'v'; \
+               class C { static [s]() { return 9; } \
+                 constructor() { this._v = 6; } \
+                 get [g]() { return this._v; } } \
+               C.make() + new C().v"),
+            15.0);
+        // Symbol.iterator as a computed method makes the class iterable
+        assert_eq!(
+            n("class R { \
+                 constructor(n) { this.n = n; } \
+                 [Symbol.iterator]() { \
+                   var i = 0, n = this.n; \
+                   return { next() { \
+                     return i < n ? { value: i++, done: false } \
+                                  : { value: undefined, done: true }; } }; \
+                 } } \
+               var sum = 0; for (var x of new R(4)) sum += x; sum"),
+            6.0);
+    }
+
+    #[test]
     fn generators_state_machine() {
         // basic yields + done protocol
         assert_eq!(
