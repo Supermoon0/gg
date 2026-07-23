@@ -253,6 +253,93 @@ def settle_async(doc, css_sources, base_url, timeout=8.0, max_rounds=2000):
     return mutated
 
 
+def settle_lazy(doc, css_sources, base_url, viewport_w=1280.0,
+                viewport_h=3000.0, horizon_ms=8000.0, max_steps=8000,
+                timeout=25.0):
+    """Step-driven settle with layout interleave — unlocks viewport-lazy
+    content (Naver's shopping/stocks/widgets, batched behind one
+    `/nvhaproxy/v2/pc/lazy` request).
+
+    Plain `settle_async` fires every due timer in one `pump()`, so the host
+    can never interleave layout between React's commit and its
+    geometry-reading effects. Those effects call getBoundingClientRect to
+    decide "is this section on screen?" — and with no layout they read 0,
+    conclude "off-screen", and never load. Here we fire the event loop one
+    scheduler slice at a time (`doc.step`) and refresh real layout rects
+    (`set_layout_rects`) whenever the DOM changes, so the next slice's
+    effects see true geometry and trigger their loads.
+
+    Requires the `step` primitive (newer wheel); falls back to
+    `settle_async` otherwise. Slower than settle_async (a layout per DOM
+    mutation) — meant for full-page headless capture, not the live loop.
+    Returns True if the DOM mutated."""
+    if not (async_available() and hasattr(doc, "step")):
+        return settle_async(doc, css_sources, base_url, timeout=timeout)
+    from . import net
+    from .layout import DocumentLayout
+    import time
+
+    def _push_rects():
+        nodes = refresh(doc, css_sources, viewport_w)
+        d = DocumentLayout(nodes)
+        d.layout(viewport_w, viewport_h)
+        rects, stack = [], [d]
+        while stack:
+            b = stack.pop()
+            nd = getattr(b, "node", None)
+            r = getattr(nd, "_ridx", None) if nd is not None else None
+            if r is not None:
+                rects.append((int(r), float(getattr(b, "x", 0)),
+                              float(getattr(b, "y", 0)),
+                              float(getattr(b, "width", 0)),
+                              float(getattr(b, "height", 0))))
+            stack.extend(getattr(b, "children", []) or [])
+        doc.set_layout_rects(rects)
+
+    deadline = time.monotonic() + timeout
+    horizon = doc.now_ms() + horizon_ms
+    last_ver = -1
+    stable = 0
+    got_lazy = False
+    after_lazy = 0
+    mutated = False
+    for _ in range(max_steps):
+        logs, fetches, more = doc.step(horizon)
+        if logs:
+            for line in logs:
+                print(f"[js console] {line}")
+            mutated = True
+        if fetches:
+            mutated = True
+            for fetch_id, url in fetches:
+                try:
+                    _h, body, _f = net.request_text(base_url.resolve(url))
+                    doc.resolve_fetch(fetch_id, 200, body)
+                    if "lazy" in url:
+                        got_lazy = True
+                except Exception as e:
+                    doc.reject_fetch(fetch_id, f"{type(e).__name__}: {e}")
+            stable = 0
+        ver = doc.dom_version()
+        if ver != last_ver:
+            last_ver = ver
+            _push_rects()
+            stable = 0
+            mutated = True
+        else:
+            stable += 1
+        if got_lazy:
+            after_lazy += 1
+        # terminate once the DOM has settled and (if a lazy batch loaded)
+        # its re-render has drained
+        if not more and stable > 8 and (not got_lazy or after_lazy > 150):
+            break
+        if time.monotonic() > deadline:
+            print("[js] lazy settle timed out")
+            break
+    return mutated
+
+
 def parse_and_style(html, fetch_stylesheets):
     """Compatibility helper: parse + style without running JS."""
     root, _doc, _css, _logs = load_document(html, fetch_stylesheets)

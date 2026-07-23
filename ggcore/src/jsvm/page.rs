@@ -14,8 +14,8 @@ use super::parser;
 use super::value::Value;
 use super::vm::{
     self, call_value, call_value_this, exec, has_pending_work, host,
-    make_native, new_plain_object, pump, raw_set_prop, reject_fetch,
-    resolve_fetch, Ids, ModStore, Native, St, DOC_NODE,
+    make_native, new_plain_object, pump, pump_step, raw_set_prop,
+    reject_fetch, resolve_fetch, Ids, ModStore, Native, St, DOC_NODE,
 };
 
 /// Event-loop budget per settle turn (total microtasks + timers fired).
@@ -1087,6 +1087,22 @@ impl PageVm {
     pub fn pump(&mut self) -> (Vec<String>, Vec<(u32, String)>) {
         let fetches = pump(&mut self.st, &self.mods, PUMP_BUDGET);
         (std::mem::take(&mut self.st.logs), fetches)
+    }
+
+    /// Current virtual-clock time (ms). The host reads this to fix a
+    /// settle horizon before stepping.
+    pub fn now_ms(&self) -> f64 {
+        self.st.now_ms
+    }
+
+    /// Fire ONE scheduler slice (see vm::pump_step). Returns
+    /// (console output, fetches to service, more-work-remains). The host
+    /// refreshes layout rects (set_layout_rects) between steps so
+    /// geometry-reading effects see real rects.
+    pub fn step(&mut self, horizon_ms: f64) -> (Vec<String>, Vec<(u32, String)>, bool) {
+        let (fetches, more) =
+            pump_step(&mut self.st, &self.mods, PUMP_BUDGET, horizon_ms);
+        (std::mem::take(&mut self.st.logs), fetches, more)
     }
 
     pub fn resolve_fetch(&mut self, fetch_id: u32, status: u16, body: String) {

@@ -1486,6 +1486,76 @@ pub(super) fn pump(
     issued.into_iter().map(|p| (p.fetch_id, p.url)).collect()
 }
 
+/// One scheduler slice: drain microtasks, fire the SINGLE earliest timer
+/// due within `horizon`, drain the microtasks it queued, and return.
+/// `pump` fires every due timer in one call, so the host cannot interleave
+/// layout between React's commit and its geometry-reading effects (both
+/// run through separate `setTimeout(0)` scheduler slices). Stepping one
+/// timer at a time lets the host refresh layout rects between slices, so an
+/// effect that reads getBoundingClientRect sees real geometry — which is
+/// what gates viewport-lazy sections (shopping/weather/stocks) from loading.
+/// Returns (fetches issued, whether more load-time work remains).
+pub(super) fn pump_step(
+    st: &mut St,
+    mods: &ModStore,
+    budget_max: usize,
+    horizon: f64,
+) -> (Vec<(u32, String)>, bool) {
+    let mut budget = budget_max;
+    drain_microtasks(st, mods, &mut budget);
+    // the single earliest timer due within the horizon (intervals included:
+    // firing one advances the clock past its due, re-arming it beyond, so a
+    // polling interval — the IntersectionObserver polyfill — steps forward
+    // instead of spinning, and stops once the clock passes the horizon).
+    let mut best: Option<usize> = None;
+    for (i, t) in st.timers.iter().enumerate() {
+        if t.due_ms > horizon {
+            continue;
+        }
+        match best {
+            None => best = Some(i),
+            Some(b) => {
+                let bt = &st.timers[b];
+                if (t.due_ms, t.seq) < (bt.due_ms, bt.seq) {
+                    best = Some(i);
+                }
+            }
+        }
+    }
+    if let Some(i) = best {
+        st.fuel = DEFAULT_FUEL;
+        if let Some(iv) = st.timers[i].interval {
+            let cb = st.timers[i].callback;
+            let args = st.timers[i].args.clone();
+            st.now_ms = st.now_ms.max(st.timers[i].due_ms);
+            st.timer_seq += 1;
+            st.timers[i].due_ms = st.now_ms + iv.max(0.0);
+            st.timers[i].seq = st.timer_seq;
+            if let Err(e) = call_value(st, mods, cb, &args) {
+                st.logs.push(format!("[gg-js error] {}", e.msg));
+            }
+        } else {
+            let t = st.timers.remove(i);
+            st.now_ms = st.now_ms.max(t.due_ms);
+            if let Err(e) = call_value(st, mods, t.callback, &t.args) {
+                st.logs.push(format!("[gg-js error] {}", e.msg));
+            }
+        }
+        drain_microtasks(st, mods, &mut budget);
+    }
+    let issued = std::mem::take(&mut st.pending_fetches);
+    for p in &issued {
+        st.awaiting.insert(p.fetch_id, p.promise);
+    }
+    let more = !st.microtasks.is_empty()
+        || !st.awaiting.is_empty()
+        || st.timers.iter().any(|t| t.due_ms <= horizon);
+    (
+        issued.into_iter().map(|p| (p.fetch_id, p.url)).collect(),
+        more,
+    )
+}
+
 /// Real-time slice of the event loop: fire only work due within the
 /// next `dt_ms` of virtual time, then advance the clock to that point.
 /// (Plain `pump` fast-forwards to quiescence — right for load-time
