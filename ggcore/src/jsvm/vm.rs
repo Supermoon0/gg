@@ -648,6 +648,12 @@ pub(super) struct St {
     shapes: Vec<Shape>,
     pub(super) objects: Vec<Obj>,
     pub(super) strs: Vec<Str>,
+    /// Flat-string content -> its index in `strs`, so `intern` is O(1)
+    /// instead of a linear scan of the whole arena. Only interned Flats
+    /// are recorded (they are never mutated in place — rope flattening
+    /// only ever rewrites Cat entries), so an entry here always points
+    /// at a Flat whose text equals the key.
+    pub(super) flat_index: HashMap<String, u32>,
     pub(super) ics: Vec<IcEntry>,
     pub(super) regs: Vec<Value>,
     pub(super) logs: Vec<String>,
@@ -723,6 +729,17 @@ pub(super) struct St {
     /// dispatch loop decrements it and aborts at 0, so a hostile
     /// `while(true){}` can never wedge the worker (fleet-safety, P4).
     pub(super) fuel: u64,
+    /// Single-entry memo of a string's UTF-16 units, keyed by its `strs`
+    /// index. Indexed char reads (charAt/charCodeAt) otherwise rebuild the
+    /// whole unit vector per call — O(n) — so a char-by-char scanner over
+    /// a big string is O(n^2). Strings are immutable, so the memo never
+    /// goes stale; it holds only the most-recently-scanned string.
+    pub(super) units_cache: Option<(u32, Vec<u16>)>,
+    /// Memoized UTF-16 code-unit length per `strs` index. `s.length` is
+    /// otherwise recounted O(n) per read, so a scanner's
+    /// `while (i < s.length)` is O(n^2). Strings are immutable, so an
+    /// entry never goes stale.
+    pub(super) ulen_cache: HashMap<u32, u32>,
 }
 
 /// Default per-turn instruction budget (~a few hundred ms of hot loop).
@@ -769,6 +786,7 @@ impl St {
             }],
             objects: Vec::new(),
             strs: Vec::new(),
+            flat_index: HashMap::new(),
             ics: Vec::new(),
             regs: Vec::new(),
             logs: Vec::new(),
@@ -806,6 +824,8 @@ impl St {
             json_atom: u32::MAX,
             rng_state: 0x2545_F491_4F6C_DD1D,
             fuel: DEFAULT_FUEL,
+            units_cache: None,
+            ulen_cache: HashMap::new(),
         };
         for (i, name) in ["undefined", "boolean", "number", "string",
                           "object", "function"]
@@ -839,15 +859,13 @@ impl St {
 }
 
 pub(super) fn intern(st: &mut St, s: &str) -> Value {
-    if let Some(i) = st
-        .strs
-        .iter()
-        .position(|x| matches!(x, Str::Flat(f) if f == s))
-    {
-        return Value::string(i as u32);
+    if let Some(&i) = st.flat_index.get(s) {
+        return Value::string(i);
     }
+    let i = st.strs.len() as u32;
     st.strs.push(Str::Flat(s.to_string()));
-    Value::string((st.strs.len() - 1) as u32)
+    st.flat_index.insert(s.to_string(), i);
+    Value::string(i)
 }
 
 pub(super) fn push_str(st: &mut St, s: String) -> Value {
@@ -1557,6 +1575,48 @@ fn str_len(st: &St, i: u32) -> usize {
     }
 }
 
+/// UTF-16 code-unit length of a string value, memoized. Strings are
+/// immutable, so the cached count never goes stale — this turns a hot
+/// `s.length` (recounted O(n) each read) into O(1) amortized.
+fn str_u16_len(st: &mut St, i: u32) -> usize {
+    if let Some(&n) = st.ulen_cache.get(&i) {
+        return n as usize;
+    }
+    let n = str_ref(st, i).encode_utf16().count();
+    st.ulen_cache.insert(i, n as u32);
+    n
+}
+
+/// Indexed UTF-16 char read backing charAt (`want_code == false`) and
+/// charCodeAt. Reuses the single-entry unit memo so a char-by-char scan
+/// of one big string is O(n) amortized instead of rebuilding the whole
+/// unit vector per call (O(n^2)). Strings are immutable, so the memo is
+/// never stale.
+fn str_char_read(st: &mut St, sidx: u32, i: f64, want_code: bool) -> Value {
+    let hit = matches!(&st.units_cache, Some((c, _)) if *c == sidx);
+    if !hit {
+        let txt = str_ref(st, sidx).to_string();
+        let u: Vec<u16> = txt.encode_utf16().collect();
+        st.units_cache = Some((sidx, u));
+    }
+    let i = if i.is_nan() { 0.0 } else { i };
+    let units = &st.units_cache.as_ref().unwrap().1;
+    let ok = i >= 0.0 && (i as usize) < units.len();
+    if want_code {
+        return if ok {
+            Value::int(units[i as usize] as i32)
+        } else {
+            Value::number(f64::NAN)
+        };
+    }
+    let out = if ok {
+        String::from_utf16_lossy(&units[i as usize..i as usize + 1])
+    } else {
+        String::new()
+    };
+    make_string(st, out)
+}
+
 /// Materialize a rope in place (iterative — chains can be 10k+ deep).
 fn flatten(st: &mut St, i: u32) {
     if matches!(st.strs[i as usize], Str::Flat(_)) {
@@ -1935,7 +1995,107 @@ fn method_ref_dispatch(
     let name = st.names[key as usize].clone();
     // array receivers: real element operations, not string ops
     if recv.is_object() && st.objects[recv.index() as usize].is_array {
-        let elems = st.objects[recv.index() as usize].elems.clone();
+        let oi = recv.index() as usize;
+        // No-snapshot fast paths: mutate / scan the receiver in place so
+        // a hot `push.apply(acc, chunk)` or `indexOf` loop over a GROWING
+        // receiver does not clone the whole array on every call — that
+        // eager clone was O(n) per call, i.e. O(n^2) over a build loop
+        // (the dominant cost of Naver's React settle).
+        match name.as_str() {
+            "push" => {
+                st.objects[oi].elems.extend_from_slice(args);
+                return Ok(Value::int(
+                    st.objects[oi].elems.len() as i32,
+                ));
+            }
+            "pop" => {
+                return Ok(st.objects[oi]
+                    .elems
+                    .pop()
+                    .unwrap_or(Value::UNDEFINED));
+            }
+            "shift" => {
+                return Ok(if st.objects[oi].elems.is_empty() {
+                    Value::UNDEFINED
+                } else {
+                    st.objects[oi].elems.remove(0)
+                });
+            }
+            "unshift" => {
+                for &a in args.iter().rev() {
+                    st.objects[oi].elems.insert(0, a);
+                }
+                return Ok(Value::int(
+                    st.objects[oi].elems.len() as i32,
+                ));
+            }
+            "reverse" => {
+                st.objects[oi].elems.reverse();
+                return Ok(recv);
+            }
+            "indexOf" | "lastIndexOf" => {
+                let needle =
+                    args.first().copied().unwrap_or(Value::UNDEFINED);
+                let n = st.objects[oi].elems.len();
+                let mut found = -1i32;
+                if name == "indexOf" {
+                    for i in 0..n {
+                        let e = st.objects[oi].elems[i];
+                        if strict_eq(st, e, needle) {
+                            found = i as i32;
+                            break;
+                        }
+                    }
+                } else {
+                    for i in (0..n).rev() {
+                        let e = st.objects[oi].elems[i];
+                        if strict_eq(st, e, needle) {
+                            found = i as i32;
+                            break;
+                        }
+                    }
+                }
+                return Ok(Value::int(found));
+            }
+            "at" => {
+                let len = st.objects[oi].elems.len() as i64;
+                let mut i = args
+                    .first()
+                    .map(|v| v.to_number_raw() as i64)
+                    .unwrap_or(0);
+                if i < 0 {
+                    i += len;
+                }
+                return Ok(if i >= 0 && i < len {
+                    st.objects[oi].elems[i as usize]
+                } else {
+                    Value::UNDEFINED
+                });
+            }
+            "slice" => {
+                // clone only the requested range, not the whole array
+                let elen = st.objects[oi].elems.len() as f64;
+                let clamp = |k: usize, default: f64| -> usize {
+                    let v = args
+                        .get(k)
+                        .filter(|v| v.is_number())
+                        .map(|v| v.to_number_raw())
+                        .unwrap_or(default);
+                    let v = if v < 0.0 {
+                        (elen + v).max(0.0)
+                    } else {
+                        v.min(elen)
+                    };
+                    v as usize
+                };
+                let a = clamp(0, 0.0);
+                let b = clamp(1, elen).max(a);
+                let out = st.objects[oi].elems[a..b].to_vec();
+                return Ok(new_array(st, out));
+            }
+            _ => {}
+        }
+        let elems = st.objects[oi].elems.clone();
         let elen = elems.len() as f64;
         let idx = |k: usize, default: f64| -> usize {
             let v = args
@@ -2264,6 +2424,20 @@ fn method_ref_dispatch(
         if has_len {
             return array_like_dispatch(st, mods, recv, &name, args);
         }
+    }
+    // Fast path: indexed single-char reads on a string receiver reuse a
+    // memoized UTF-16 unit vector, so an uncurried charAt/charCodeAt
+    // scanner over a big string is O(n) amortized, not O(n^2).
+    if recv.is_string()
+        && matches!(name.as_str(), "charAt" | "charCodeAt")
+    {
+        let iarg = args
+            .first()
+            .map(|v| v.to_number_raw())
+            .unwrap_or(0.0);
+        return Ok(str_char_read(
+            st, recv.index(), iarg, name == "charCodeAt",
+        ));
     }
     let s = to_display(st, recv);
     let units: Vec<u16> = s.encode_utf16().collect();
@@ -8120,6 +8294,27 @@ fn exec_loop(
                     let s = format!("{:.*}", digits, ov.to_number_raw());
                     reg!(obj) = push_str(st, s);
                 } else if ov.is_string() {
+                    // Fast path: indexed single-char reads reuse a
+                    // memoized UTF-16 unit vector, so a char-by-char scan
+                    // (`for (i;i<s.length;i++) s.charCodeAt(i)`) is O(n)
+                    // amortized, not O(n^2) from rebuilding the string
+                    // every call.
+                    if matches!(
+                        st.names[key as usize].as_str(),
+                        "charAt" | "charCodeAt"
+                    ) {
+                        let a0 = base + obj as usize + 1;
+                        let iv = if argc > 0 {
+                            num_of(st.regs[a0])?
+                        } else {
+                            0.0
+                        };
+                        let code =
+                            st.names[key as usize] == "charCodeAt";
+                        reg!(obj) =
+                            str_char_read(st, ov.index(), iv, code);
+                        continue;
+                    }
                     // String methods. Index semantics use Unicode scalars
                     // (matches ASCII/BMP; astral chars differ from JS's
                     // UTF-16 units — acceptable for now).
@@ -8840,8 +9035,7 @@ fn exec_loop(
                             None => Value::UNDEFINED,
                         }
                     } else if text == "length" {
-                        Value::int(
-                            sref.encode_utf16().count() as i32)
+                        Value::int(str_u16_len(st, ov.index()) as i32)
                     } else {
                         let key_id = st.intern_name(&text);
                         primitive_prop_read(st, ov, key_id)
@@ -9171,7 +9365,7 @@ fn exec_loop(
                         Value::UNDEFINED
                     };
                 } else if ov.is_string() && key == st.ids.length {
-                    let n = str_ref(st, ov.index()).encode_utf16().count();
+                    let n = str_u16_len(st, ov.index());
                     reg!(dst) = Value::int(n as i32);
                 } else if ov.is_string() || ov.is_number()
                     || ov.is_boolean()
