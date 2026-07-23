@@ -346,6 +346,11 @@ pub(super) mod host {
     pub const O_GET_OWN_NAMES: u16 = 51;
     pub const O_IS: u16 = 52;
     pub const O_FROM_ENTRIES: u16 = 53;
+    pub const O_SEAL: u16 = 54;
+    pub const O_IS_FROZEN: u16 = 55;
+    pub const O_IS_SEALED: u16 = 56;
+    pub const O_PREVENT_EXT: u16 = 57;
+    pub const O_IS_EXTENSIBLE: u16 = 58;
     pub const A_ISARRAY: u16 = 60;
     pub const A_FROM: u16 = 61;
     pub const N_ISNAN: u16 = 80;
@@ -673,6 +678,15 @@ pub(super) struct St {
     /// (object index, name id) -> (getter, setter) accessor pair
     /// (Object.defineProperty with get/set; UNDEFINED = absent side)
     pub(super) accessors: HashMap<(u32, u32), (Value, Value)>,
+    /// Property-attribute side-tables, populated only when scripts opt out
+    /// of the defaults (defineProperty / freeze / seal). Hot paths gate on
+    /// `is_empty()` so ordinary objects pay nothing.
+    /// object indices frozen/sealed/preventExtensions'd (no new own props)
+    pub(super) non_extensible: std::collections::HashSet<u32>,
+    /// (object index, name id) whose data slot is read-only (writable:false)
+    pub(super) non_writable: std::collections::HashSet<(u32, u32)>,
+    /// (object index, name id) hidden from keys/for-in/JSON (enumerable:false)
+    pub(super) non_enum: std::collections::HashSet<(u32, u32)>,
     /// Web Storage backing maps (in-memory; not persisted to disk)
     pub(super) local_storage: HashMap<String, String>,
     pub(super) session_storage: HashMap<String, String>,
@@ -798,6 +812,9 @@ impl St {
             fn_props: HashMap::new(),
             dom_expando: HashMap::new(),
             accessors: HashMap::new(),
+            non_extensible: std::collections::HashSet::new(),
+            non_writable: std::collections::HashSet::new(),
+            non_enum: std::collections::HashSet::new(),
             local_storage: HashMap::new(),
             session_storage: HashMap::new(),
             cookies: Vec::new(),
@@ -1974,7 +1991,9 @@ fn has_own_property(
         return Ok(false);
     };
     let shape = st.objects[oi].shape as usize;
-    Ok(st.shapes[shape].props.contains_key(&key_id))
+    Ok(st.shapes[shape].props.contains_key(&key_id)
+        || (st.objects[oi].has_accessors
+            && st.accessors.contains_key(&(oi as u32, key_id))))
 }
 
 /// Invoke an extracted builtin (`var f = ''.slice; f.call(s, 1)`).
@@ -2465,6 +2484,28 @@ fn method_ref_dispatch(
                     Value::UNDEFINED
                 });
             }
+            // Object.prototype staples reach arrays too — React calls
+            // hasOwnProperty on prop arrays during reconciliation, and an
+            // unhandled name here throws and aborts the work slice.
+            "hasOwnProperty" => {
+                let k = args.first().copied().unwrap_or(Value::UNDEFINED);
+                return Ok(Value::boolean(
+                    has_own_property(st, mods, recv, k)?,
+                ));
+            }
+            "isPrototypeOf" => return Ok(Value::boolean(false)),
+            "propertyIsEnumerable" => {
+                let k = args
+                    .first()
+                    .map(|&v| to_display(st, v))
+                    .unwrap_or_default();
+                let is_idx = k
+                    .parse::<usize>()
+                    .map(|i| i < st.objects[oi].elems.len())
+                    .unwrap_or(false);
+                return Ok(Value::boolean(is_idx));
+            }
+            "valueOf" => return Ok(recv),
             _ => {
                 return err(format!(
                     "extracted array builtin .{name}() not yet"
@@ -3283,6 +3324,45 @@ pub(super) fn lookup_prop(st: &St, oi: usize, key: u32) -> PropHit {
         oi = o.proto.index() as usize;
     }
     PropHit::Missing
+}
+
+/// Own string-keyed properties of a non-array object in ECMAScript
+/// enumeration order: array-index keys ascending, then other string keys
+/// in insertion order. Includes accessor-only keys. When `skip_non_enum`
+/// is set, keys marked `enumerable:false` are dropped (Object.keys/for-in/
+/// JSON); getOwnPropertyNames passes false to see them all.
+fn own_keys_ordered(st: &St, oi: usize, skip_non_enum: bool) -> Vec<u32> {
+    let shape = st.objects[oi].shape;
+    let mut data: Vec<(u16, u32)> = st.shapes[shape as usize]
+        .props.iter().map(|(&a, &s)| (s, a)).collect();
+    data.sort_by_key(|&(slot, _)| slot);
+    let mut atoms: Vec<u32> = data.into_iter().map(|(_, a)| a).collect();
+    if st.objects[oi].has_accessors {
+        for (&(o, k), _) in st.accessors.iter() {
+            if o == oi as u32 && !atoms.contains(&k) {
+                atoms.push(k);
+            }
+        }
+    }
+    if skip_non_enum && !st.non_enum.is_empty() {
+        atoms.retain(|&k| !st.non_enum.contains(&(oi as u32, k)));
+    }
+    // partition canonical array indices (ascending) ahead of string keys
+    let mut ints: Vec<(u32, u32)> = Vec::new();
+    let mut strs: Vec<u32> = Vec::new();
+    for a in atoms {
+        let nm = &st.names[a as usize];
+        match nm.parse::<u32>() {
+            Ok(iv) if iv != u32::MAX && iv.to_string() == *nm => {
+                ints.push((iv, a))
+            }
+            _ => strs.push(a),
+        }
+    }
+    ints.sort_by_key(|&(iv, _)| iv);
+    let mut out: Vec<u32> = ints.into_iter().map(|(_, a)| a).collect();
+    out.extend(strs);
+    out
 }
 
 /// Expando lookup on the JS-visible Array.prototype object for array
@@ -4503,12 +4583,31 @@ fn define_one_prop(
     let get_id = st.intern_name("get");
     let set_id = st.intern_name("set");
     let val_id = st.intern_name("value");
-    let g = raw_get_prop(st, di, get_id).unwrap_or(Value::UNDEFINED);
-    let s = raw_get_prop(st, di, set_id).unwrap_or(Value::UNDEFINED);
-    if g.is_function() || s.is_function() {
-        st.accessors.insert((oi as u32, key), (g, s));
+    let writable_id = st.intern_name("writable");
+    let enum_id = st.intern_name("enumerable");
+    let get_p = raw_get_prop(st, di, get_id);
+    let set_p = raw_get_prop(st, di, set_id);
+    let val_p = raw_get_prop(st, di, val_id);
+    // was this property already present (data slot or accessor)?
+    let existed = st.shapes[st.objects[oi].shape as usize]
+        .props.contains_key(&key)
+        || st.accessors.contains_key(&(oi as u32, key));
+    let is_accessor_desc = get_p.is_some() || set_p.is_some();
+    if is_accessor_desc {
+        // Redefining an accessor keeps the side the descriptor omits
+        // (spec: absent get/set inherit the existing attribute).
+        let (og, os) = st
+            .accessors
+            .get(&(oi as u32, key))
+            .copied()
+            .unwrap_or((Value::UNDEFINED, Value::UNDEFINED));
+        let ng = if get_p.is_some() { get_p.unwrap() } else { og };
+        let ns = if set_p.is_some() { set_p.unwrap() } else { os };
+        st.accessors.insert((oi as u32, key), (ng, ns));
         st.objects[oi].has_accessors = true;
-    } else if let Some(v) = raw_get_prop(st, di, val_id) {
+    } else if let Some(v) = val_p {
+        // a data descriptor replaces any prior accessor of the same name
+        st.accessors.remove(&(oi as u32, key));
         // defineProperty(window, ...) must reach bare-name reads too
         // (core-js defineGlobalProperty installs polyfills this way)
         if obj == st.known.window {
@@ -4516,6 +4615,34 @@ fn define_one_prop(
             st.gdef[key as usize] = true;
         }
         raw_set_prop(st, oi, key, v);
+        // writable defaults to false for a newly defined data property;
+        // for an existing one an omitted attribute is left unchanged.
+        match raw_get_prop(st, di, writable_id).map(|w| truthy(st, w)) {
+            Some(true) => {
+                st.non_writable.remove(&(oi as u32, key));
+            }
+            Some(false) => {
+                st.non_writable.insert((oi as u32, key));
+            }
+            None if !existed => {
+                st.non_writable.insert((oi as u32, key));
+            }
+            None => {}
+        }
+    }
+    // enumerable defaults to false for a newly defined property; omitted on
+    // an existing one leaves the current setting alone.
+    match raw_get_prop(st, di, enum_id).map(|e| truthy(st, e)) {
+        Some(true) => {
+            st.non_enum.remove(&(oi as u32, key));
+        }
+        Some(false) => {
+            st.non_enum.insert((oi as u32, key));
+        }
+        None if !existed => {
+            st.non_enum.insert((oi as u32, key));
+        }
+        None => {}
     }
     Ok(())
 }
@@ -4620,27 +4747,27 @@ fn host_fn(
                 return Ok(new_array(st, Vec::new()));
             }
             let oi = v.index() as usize;
-            let (is_array, nelems, shape) = {
-                let o = &st.objects[oi];
-                (o.is_array, o.elems.len(), o.shape)
-            };
-            let mut pairs: Vec<(u16, u32)> = st.shapes[shape as usize]
-                .props.iter().map(|(&a, &s)| (s, a)).collect();
-            pairs.sort_by_key(|&(slot, _)| slot);
+            let nelems = st.objects[oi].elems.len();
             let mut out = Vec::new();
-            // array index keys first (like for-in)
+            // dense array element keys first (like for-in)
             for k in 0..nelems {
                 let key = intern(st, &k.to_string());
                 let val = st.objects[oi].elems[k];
                 out.push(host_entry(st, id, key, val));
             }
-            for (slot, atom) in pairs {
+            for atom in own_keys_ordered(st, oi, true) {
                 let name = st.names[atom as usize].clone();
                 let key = intern(st, &name);
-                let val = st.objects[oi].slots[slot as usize];
+                // read getter-aware so accessor props surface their value
+                let val = match lookup_prop(st, oi, atom) {
+                    PropHit::Data(d) => d,
+                    PropHit::Getter(g) if g.is_function() => {
+                        call_value_this(st, mods, g, Some(v), &[])?
+                    }
+                    _ => Value::UNDEFINED,
+                };
                 out.push(host_entry(st, id, key, val));
             }
-            let _ = is_array;
             Ok(new_array(st, out))
         }
         O_ASSIGN => {
@@ -4655,12 +4782,22 @@ fn host_fn(
                     continue;
                 }
                 let si = src.index() as usize;
-                let shape = st.objects[si].shape;
-                let mut pairs: Vec<(u16, u32)> = st.shapes[shape as usize]
-                    .props.iter().map(|(&a, &s)| (s, a)).collect();
-                pairs.sort_by_key(|&(slot, _)| slot);
-                for (slot, atom) in pairs {
-                    let val = st.objects[si].slots[slot as usize];
+                // copy dense array elements (Object.assign({}, [a,b]))
+                let nelems = st.objects[si].elems.len();
+                for k in 0..nelems {
+                    let val = st.objects[si].elems[k];
+                    let atom = st.intern_name(&k.to_string());
+                    raw_set_prop(st, ti, atom, val);
+                }
+                for atom in own_keys_ordered(st, si, true) {
+                    // [[Get]] on the source invokes its getters
+                    let val = match lookup_prop(st, si, atom) {
+                        PropHit::Data(d) => d,
+                        PropHit::Getter(g) if g.is_function() => {
+                            call_value_this(st, mods, g, Some(src), &[])?
+                        }
+                        _ => Value::UNDEFINED,
+                    };
                     raw_set_prop(st, ti, atom, val);
                 }
             }
@@ -4715,7 +4852,55 @@ fn host_fn(
             }
             Ok(out)
         }
-        O_FREEZE => Ok(argv!(0)), // no-op (we don't enforce immutability)
+        O_FREEZE => {
+            let o = argv!(0);
+            if o.is_object() {
+                let oi = o.index();
+                st.non_extensible.insert(oi);
+                for atom in own_keys_ordered(st, oi as usize, false) {
+                    st.non_writable.insert((oi, atom));
+                }
+            }
+            Ok(o)
+        }
+        O_SEAL | O_PREVENT_EXT => {
+            let o = argv!(0);
+            if o.is_object() {
+                st.non_extensible.insert(o.index());
+            }
+            Ok(o)
+        }
+        O_IS_EXTENSIBLE => {
+            let o = argv!(0);
+            Ok(Value::boolean(
+                o.is_object() && !st.non_extensible.contains(&o.index()),
+            ))
+        }
+        O_IS_SEALED => {
+            // primitives are sealed; objects are sealed once non-extensible
+            // (seal/freeze/preventExtensions are the only routes to that)
+            let o = argv!(0);
+            Ok(Value::boolean(
+                !o.is_object() || st.non_extensible.contains(&o.index()),
+            ))
+        }
+        O_IS_FROZEN => {
+            let o = argv!(0);
+            if !o.is_object() {
+                return Ok(Value::boolean(true));
+            }
+            let oi = o.index();
+            if !st.non_extensible.contains(&oi)
+                || !st.objects[oi as usize].elems.is_empty()
+            {
+                return Ok(Value::boolean(false));
+            }
+            let frozen = own_keys_ordered(st, oi as usize, false).iter().all(|&a| {
+                st.non_writable.contains(&(oi, a))
+                    || st.accessors.contains_key(&(oi, a))
+            });
+            Ok(Value::boolean(frozen))
+        }
         O_DEFINE_PROP => {
             let obj = argv!(0);
             if !obj.is_object() && !obj.is_function() {
@@ -4779,34 +4964,15 @@ fn host_fn(
                 return Ok(new_array(st, Vec::new()));
             }
             let oi = v.index() as usize;
-            let (nelems, shape, has_acc) = {
-                let o = &st.objects[oi];
-                (o.elems.len(), o.shape, o.has_accessors)
-            };
+            let nelems = st.objects[oi].elems.len();
             let mut out = Vec::new();
             for k in 0..nelems {
                 out.push(intern(st, &k.to_string()));
             }
-            let mut pairs: Vec<(u16, u32)> = st.shapes[shape as usize]
-                .props.iter().map(|(&a, &s)| (s, a)).collect();
-            pairs.sort_by_key(|&(slot, _)| slot);
-            let mut seen: Vec<u32> = Vec::new();
-            for (_, atom) in pairs {
-                seen.push(atom);
+            // getOwnPropertyNames sees non-enumerable keys too (false)
+            for atom in own_keys_ordered(st, oi, false) {
                 let name = st.names[atom as usize].clone();
                 out.push(intern(st, &name));
-            }
-            if has_acc {
-                let mut acc: Vec<u32> = st.accessors.keys()
-                    .filter(|&&(o, _)| o == oi as u32)
-                    .map(|&(_, k)| k)
-                    .filter(|k| !seen.contains(k))
-                    .collect();
-                acc.sort_unstable();
-                for k in acc {
-                    let name = st.names[k as usize].clone();
-                    out.push(intern(st, &name));
-                }
             }
             Ok(new_array(st, out))
         }
@@ -4939,24 +5105,27 @@ fn host_fn(
             };
             let out = new_plain_object(st);
             let pi = out.index() as usize;
-            let t = Value::boolean(true);
+            let enumerable =
+                Value::boolean(!st.non_enum.contains(&(oi as u32, key)));
             if let Some((g, s)) = acc {
                 let gid = st.intern_name("get");
                 let sid = st.intern_name("set");
                 raw_set_prop(st, pi, gid, g);
                 raw_set_prop(st, pi, sid, s);
             } else if let Some(v) = own {
+                let writable =
+                    Value::boolean(!st.non_writable.contains(&(oi as u32, key)));
                 let vid = st.intern_name("value");
                 let wid = st.intern_name("writable");
                 raw_set_prop(st, pi, vid, v);
-                raw_set_prop(st, pi, wid, t);
+                raw_set_prop(st, pi, wid, writable);
             } else {
                 return Ok(Value::UNDEFINED);
             }
             let eid = st.intern_name("enumerable");
             let cid = st.intern_name("configurable");
-            raw_set_prop(st, pi, eid, t);
-            raw_set_prop(st, pi, cid, t);
+            raw_set_prop(st, pi, eid, enumerable);
+            raw_set_prop(st, pi, cid, Value::boolean(true));
             Ok(out)
         }
         O_CREATE => {
@@ -5063,16 +5232,63 @@ fn host_fn(
         }
         A_FROM => {
             let v = argv!(0);
-            let items: Vec<Value> = if v.is_object()
-                && st.objects[v.index() as usize].is_array
-            {
-                st.objects[v.index() as usize].elems.clone()
-            } else if v.is_string() {
+            let mapfn = argv!(1);
+            let mut items: Vec<Value> = if v.is_string() {
                 let s = str_ref(st, v.index()).to_string();
                 s.chars().map(|c| push_str(st, c.to_string())).collect()
+            } else if v.is_object() {
+                let oi = v.index();
+                if st.objects[oi as usize].is_array {
+                    st.objects[oi as usize].elems.clone()
+                } else if let Some(vals) = st.set_data.get(&oi).cloned() {
+                    vals
+                } else {
+                    // array-like: consult .length, then index 0..length
+                    let lenv = match lookup_prop(st, oi as usize, st.ids.length) {
+                        PropHit::Data(d) => d,
+                        PropHit::Getter(g) if g.is_function() => {
+                            call_value_this(st, mods, g, Some(v), &[])?
+                        }
+                        _ => Value::UNDEFINED,
+                    };
+                    let len = {
+                        let n = lenv.to_number_raw();
+                        if n.is_finite() && n > 0.0 {
+                            (n as usize).min(1 << 24)
+                        } else {
+                            0
+                        }
+                    };
+                    let mut out = Vec::with_capacity(len.min(1 << 16));
+                    for i in 0..len {
+                        // numeric indices live in dense elems on any object
+                        let val = if i < st.objects[oi as usize].elems.len() {
+                            st.objects[oi as usize].elems[i]
+                        } else {
+                            let ka = st.intern_name(&i.to_string());
+                            match lookup_prop(st, oi as usize, ka) {
+                                PropHit::Data(d) => d,
+                                PropHit::Getter(g) if g.is_function() => {
+                                    call_value_this(st, mods, g, Some(v), &[])?
+                                }
+                                _ => Value::UNDEFINED,
+                            }
+                        };
+                        out.push(val);
+                    }
+                    out
+                }
             } else {
                 Vec::new()
             };
+            if mapfn.is_function() {
+                for i in 0..items.len() {
+                    let it = items[i];
+                    items[i] = call_value_this(
+                        st, mods, mapfn, None, &[it, Value::int(i as i32)],
+                    )?;
+                }
+            }
             Ok(new_array(st, items))
         }
         N_ISNAN => {
@@ -5155,19 +5371,7 @@ struct JsonCtx {
 /// getters are serialized (real engines call them) and defineProperty
 /// accessors are not silently dropped.
 fn json_own_keys(st: &St, oi: usize) -> Vec<u32> {
-    let shape = st.objects[oi].shape;
-    let mut pairs: Vec<(u16, u32)> = st.shapes[shape as usize]
-        .props.iter().map(|(&a, &s)| (s, a)).collect();
-    pairs.sort_by_key(|&(slot, _)| slot);
-    let mut keys: Vec<u32> = pairs.into_iter().map(|(_, a)| a).collect();
-    if st.objects[oi].has_accessors {
-        for (&(o, k), _) in st.accessors.iter() {
-            if o == oi as u32 && !keys.contains(&k) {
-                keys.push(k);
-            }
-        }
-    }
-    keys
+    own_keys_ordered(st, oi, true)
 }
 
 /// Full SerializeJSONProperty: applies toJSON, then a function replacer,
@@ -9081,15 +9285,10 @@ fn exec_loop(
                             }
                         }
                     }
-                    // named props in slot (= insertion) order
-                    let mut pairs: Vec<(u16, u32)> = st.shapes
-                        [shape as usize]
-                        .props
-                        .iter()
-                        .map(|(&a, &s)| (s, a))
-                        .collect();
-                    pairs.sort_by_key(|&(slot, _)| slot);
-                    for (_slot, atom) in pairs {
+                    let _ = shape;
+                    // own enumerable named keys, array-index keys ahead of
+                    // string keys (skips enumerable:false props)
+                    for atom in own_keys_ordered(st, oi, true) {
                         let name = st.names[atom as usize].clone();
                         let sv = intern(st, &name);
                         keys.push(sv);
@@ -9809,6 +10008,22 @@ fn exec_loop(
                             node as usize, &attr, &val);
                         continue;
                     }
+                    // arr.length = n truncates (or grows with holes) the
+                    // dense element storage — length is not a real slot.
+                    let oi0 = ov.index() as usize;
+                    if st.objects[oi0].is_array && key == st.ids.length {
+                        let n = reg!(src).to_number_raw();
+                        if n >= 0.0 && n.fract() == 0.0 && n <= u32::MAX as f64 {
+                            let newlen = n as usize;
+                            let elems = &mut st.objects[oi0].elems;
+                            if newlen < elems.len() {
+                                elems.truncate(newlen);
+                            } else {
+                                elems.resize(newlen, Value::UNDEFINED);
+                            }
+                        }
+                        continue;
+                    }
                 }
                 if ov.is_function() {
                     // F.prototype = {...} replaces the lazy prototype;
@@ -9842,6 +10057,25 @@ fn exec_loop(
                     let k = key as usize;
                     st.globals[k] = v;
                     st.gdef[k] = true;
+                }
+                // Property-attribute enforcement (sloppy mode: a blocked
+                // write is a silent no-op). Gated on the side-tables being
+                // non-empty so unfrozen objects skip the checks entirely.
+                if !st.non_writable.is_empty()
+                    && st.non_writable.contains(&(oi as u32, key))
+                {
+                    continue; // writable:false / frozen
+                }
+                if !st.non_extensible.is_empty()
+                    && st.non_extensible.contains(&(oi as u32))
+                {
+                    let exists = st.shapes[st.objects[oi].shape as usize]
+                        .props.contains_key(&key)
+                        || (st.objects[oi].has_accessors
+                            && st.accessors.contains_key(&(oi as u32, key)));
+                    if !exists {
+                        continue; // can't add new props to a sealed object
+                    }
                 }
                 // An own accessor takes precedence over the data fast path:
                 // invoke its setter, or drop the write (sloppy mode) when

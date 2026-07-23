@@ -817,6 +817,11 @@ impl PageVm {
                 ("entries", Native::HostFn(host::O_ENTRIES)),
                 ("assign", Native::HostFn(host::O_ASSIGN)),
                 ("freeze", Native::HostFn(host::O_FREEZE)),
+                ("seal", Native::HostFn(host::O_SEAL)),
+                ("isFrozen", Native::HostFn(host::O_IS_FROZEN)),
+                ("isSealed", Native::HostFn(host::O_IS_SEALED)),
+                ("preventExtensions", Native::HostFn(host::O_PREVENT_EXT)),
+                ("isExtensible", Native::HostFn(host::O_IS_EXTENSIBLE)),
                 ("defineProperty", Native::HostFn(host::O_DEFINE_PROP)),
                 ("defineProperties",
                  Native::HostFn(host::O_DEFINE_PROPS)),
@@ -2251,6 +2256,59 @@ mod tests {
         // nested indentation + arrays
         assert_eq!(
             n("JSON.stringify([1,2], null, 1) === '[\\n 1,\\n 2\\n]' ? 1 : 0"),
+            1.0);
+    }
+
+    #[test]
+    fn property_attributes_and_extensibility() {
+        // freeze blocks writes and reports frozen; seal blocks new props
+        assert_eq!(
+            n("var o={a:1}; Object.freeze(o); o.a=2; \
+               (o.a===1 && Object.isFrozen(o)) ? 1 : 0"), 1.0);
+        assert_eq!(
+            n("var o={a:1}; Object.seal(o); o.b=2; o.a=5; \
+               (o.b===undefined && o.a===5 && Object.isSealed(o)) ? 1 : 0"),
+            1.0);
+        assert_eq!(
+            n("var o={}; Object.defineProperty(o,'a',{value:1,writable:false}); \
+               o.a=2; o.a"), 1.0);
+        // non-enumerable defineProperty hidden from keys; enumerable stays
+        assert_eq!(
+            n("var o={a:1}; Object.defineProperty(o,'b',{value:2,enumerable:false}); \
+               Object.keys(o).join()==='a' ? 1 : 0"), 1.0);
+        // array-index keys enumerate ahead of string keys, ascending
+        assert_eq!(
+            n("var o={}; o.b=1; o['2']=1; o.a=1; o['1']=1; \
+               Object.keys(o).join()==='1,2,b,a' ? 1 : 0"), 1.0);
+        // hasOwnProperty sees accessor-only keys
+        assert_eq!(
+            n("var o={get x(){return 1;}}; \
+               (o.hasOwnProperty('x') && !o.hasOwnProperty('y')) ? 1 : 0"), 1.0);
+        // object-literal accessors are enumerable (unlike defineProperty)
+        assert_eq!(
+            n("Object.keys({get x(){return 1;}}).join()==='x' ? 1 : 0"), 1.0);
+        // Object.assign reads source getters
+        assert_eq!(
+            n("Object.assign({}, {get x(){return 7;}}).x"), 7.0);
+    }
+
+    #[test]
+    fn array_length_from_and_own_property() {
+        // setting length shorter drops the tail
+        assert_eq!(
+            n("var a=[1,2,3,4]; a.length=2; \
+               (a.join()==='1,2' && a[2]===undefined) ? 1 : 0"), 1.0);
+        // Array.from over an array-like, a Set, and with a map fn
+        assert_eq!(
+            n("Array.from({length:3,0:'x',1:'y',2:'z'}).join()==='x,y,z' ? 1 : 0"),
+            1.0);
+        assert_eq!(n("Array.from(new Set([1,1,2,3,3])).length"), 3.0);
+        assert_eq!(
+            n("Array.from([1,2,3], function(x){return x*2;}).join()==='2,4,6' \
+               ? 1 : 0"), 1.0);
+        // extracted-builtin hasOwnProperty works on arrays (React uses this)
+        assert_eq!(
+            n("var a=[9]; (a.hasOwnProperty(0) && !a.hasOwnProperty(5)) ? 1 : 0"),
             1.0);
     }
 

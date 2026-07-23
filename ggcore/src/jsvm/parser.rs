@@ -2257,10 +2257,19 @@ impl Parser {
             decls: vec![(tmp.clone(), Some(base))],
         }];
         for (key, getter, setter) in accs {
-            let mut dprops = vec![Prop {
-                key: PropKey::Ident("configurable".to_string()),
-                value: Expr::Bool(true),
-            }];
+            let mut dprops = vec![
+                Prop {
+                    key: PropKey::Ident("configurable".to_string()),
+                    value: Expr::Bool(true),
+                },
+                // object-literal accessors are enumerable (unlike the
+                // defineProperty default) — say so explicitly so the
+                // runtime doesn't hide them from keys/for-in/JSON
+                Prop {
+                    key: PropKey::Ident("enumerable".to_string()),
+                    value: Expr::Bool(true),
+                },
+            ];
             if let Some(g) = getter {
                 dprops.push(Prop {
                     key: PropKey::Ident("get".to_string()),
