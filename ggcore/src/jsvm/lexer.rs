@@ -226,20 +226,22 @@ impl<'a> Lexer<'a> {
             };
             self.pos += 2;
             let digits = self.pos;
-            while self.peek(0).is_ascii_alphanumeric() {
+            // ES2021 numeric separators: `_` between digits (0xFF_FF)
+            while self.peek(0).is_ascii_alphanumeric() || self.peek(0) == b'_' {
                 self.pos += 1;
             }
-            let text = &self.src[digits..self.pos];
-            let n = u64::from_str_radix(text, radix)
+            let text = self.src[digits..self.pos].replace('_', "");
+            let n = u64::from_str_radix(&text, radix)
                 .map_err(|_| self.err(format!("bad number literal: {text}")))?;
             return Ok(Tok::Num(n as f64));
         }
-        while self.peek(0).is_ascii_digit() {
+        let digit = |c: u8| c.is_ascii_digit() || c == b'_';
+        while digit(self.peek(0)) {
             self.pos += 1;
         }
         if self.peek(0) == b'.' {
             self.pos += 1;
-            while self.peek(0).is_ascii_digit() {
+            while digit(self.peek(0)) {
                 self.pos += 1;
             }
         }
@@ -250,12 +252,12 @@ impl<'a> Lexer<'a> {
             }
             if self.peek(ahead).is_ascii_digit() {
                 self.pos += ahead;
-                while self.peek(0).is_ascii_digit() {
+                while digit(self.peek(0)) {
                     self.pos += 1;
                 }
             }
         }
-        let text = &self.src[start..self.pos];
+        let text = self.src[start..self.pos].replace('_', "");
         text.parse::<f64>()
             .map(Tok::Num)
             .map_err(|_| self.err(format!("bad number literal: {text}")))

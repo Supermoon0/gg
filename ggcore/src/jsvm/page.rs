@@ -654,6 +654,23 @@ function escape(s) {
   }
   return out;
 }
+String.raw = function (strings) {
+  var raw = (strings && strings.raw) || strings || [];
+  var out = '';
+  for (var i = 0; i < raw.length; i++) {
+    out += raw[i];
+    if (i + 1 < arguments.length) out += arguments[i + 1];
+  }
+  return out;
+};
+Object.getOwnPropertyDescriptors = function (o) {
+  var out = {};
+  var names = Object.getOwnPropertyNames(o);
+  for (var i = 0; i < names.length; i++) {
+    out[names[i]] = Object.getOwnPropertyDescriptor(o, names[i]);
+  }
+  return out;
+};
 "#;
 use crate::dom;
 
@@ -843,6 +860,7 @@ impl PageVm {
             &[
                 ("isArray", Native::HostFn(host::A_ISARRAY)),
                 ("from", Native::HostFn(host::A_FROM)),
+                ("of", Native::HostFn(host::A_OF)),
             ],
         );
         vm.st.known.array = array_ctor;
@@ -2310,6 +2328,31 @@ mod tests {
         assert_eq!(
             n("var a=[9]; (a.hasOwnProperty(0) && !a.hasOwnProperty(5)) ? 1 : 0"),
             1.0);
+    }
+
+    #[test]
+    fn more_array_and_string_builtins() {
+        // Array statics/methods
+        assert_eq!(n("Array.of(1,2,3).join()==='1,2,3' ? 1 : 0"), 1.0);
+        assert_eq!(n("[1,2,3].fill(0,1).join()==='1,0,0' ? 1 : 0"), 1.0);
+        assert_eq!(
+            n("['a','b','c'].reduceRight(function(a,b){return a+b;}) === 'cba' \
+               ? 1 : 0"), 1.0);
+        assert_eq!(
+            n("[1,2,3,4,5].copyWithin(0,3).join()==='4,5,3,4,5' ? 1 : 0"), 1.0);
+        assert_eq!(n("[NaN].includes(NaN) ? 1 : 0"), 1.0);
+        // string split with a limit; replaceAll with a global regex
+        assert_eq!(n("'a,b,c,d'.split(',',2).join()==='a,b' ? 1 : 0"), 1.0);
+        assert_eq!(n("'a1b2'.replaceAll(/\\d/g,'X')==='aXbX' ? 1 : 0"), 1.0);
+        // numeric separators
+        assert_eq!(n("1_000_000"), 1000000.0);
+        assert_eq!(n("0xFF_FF"), 65535.0);
+        // toLocaleString returns a string
+        assert_eq!(n("typeof (1234).toLocaleString()==='string' ? 1 : 0"), 1.0);
+        // getOwnPropertyDescriptors
+        assert_eq!(
+            n("var d=Object.getOwnPropertyDescriptors({a:1}); \
+               (d.a.value===1 && d.a.enumerable===true) ? 1 : 0"), 1.0);
     }
 
     #[test]

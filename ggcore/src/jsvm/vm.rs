@@ -353,6 +353,7 @@ pub(super) mod host {
     pub const O_IS_EXTENSIBLE: u16 = 58;
     pub const A_ISARRAY: u16 = 60;
     pub const A_FROM: u16 = 61;
+    pub const A_OF: u16 = 62;
     pub const N_ISNAN: u16 = 80;
     pub const N_ISFINITE: u16 = 81;
     pub const N_ISINTEGER: u16 = 82;
@@ -2955,6 +2956,12 @@ fn method_ref_dispatch(
                 }
             })
         }
+        // no ICU on board: toLocaleString falls back to the default
+        // string conversion (numbers, dates, arrays all coerce sanely)
+        "toLocaleString" => {
+            let s = to_display(st, recv);
+            Ok(make_string(st, s))
+        }
         // calling any method on nullish is a real TypeError (core-js
         // feature tests rely on catching it)
         other if recv.is_nullish() => type_err(format!(
@@ -5234,6 +5241,12 @@ fn host_fn(
                 st.fn_proto_chain.insert(v.index(), p);
             }
             Ok(v)
+        }
+        A_OF => {
+            // Array.of(...items): the args become the elements verbatim
+            let items: Vec<Value> =
+                (0..n).map(|k| argv!(k)).collect();
+            Ok(new_array(st, items))
         }
         A_ISARRAY => {
             let v = argv!(0);
@@ -8248,9 +8261,17 @@ fn exec_loop(
                                 "includes" => {
                                     let elems =
                                         st.objects[oi].elems.clone();
+                                    // SameValueZero: unlike indexOf, NaN
+                                    // matches NaN
+                                    let want_nan = arg0.is_number()
+                                        && arg0.to_number_raw().is_nan();
                                     let mut found = false;
                                     for &e in elems.iter() {
-                                        if strict_eq(st, e, arg0) {
+                                        if strict_eq(st, e, arg0)
+                                            || (want_nan
+                                                && e.is_number()
+                                                && e.to_number_raw().is_nan())
+                                        {
                                             found = true;
                                             break;
                                         }
@@ -8470,6 +8491,107 @@ fn exec_loop(
                                         )?;
                                     }
                                     acc
+                                }
+                                "reduceRight" => {
+                                    let elems =
+                                        st.objects[oi].elems.clone();
+                                    let n = elems.len() as i64;
+                                    let (mut acc, mut i) = if argc >= 2 {
+                                        (arg1, n - 1)
+                                    } else if !elems.is_empty() {
+                                        (elems[elems.len() - 1], n - 2)
+                                    } else {
+                                        return err(
+                                            "Reduce of empty array with \
+                                             no initial value",
+                                        );
+                                    };
+                                    while i >= 0 {
+                                        acc = call_value(
+                                            st, mods, arg0,
+                                            &[
+                                                acc,
+                                                elems[i as usize],
+                                                Value::int(i as i32),
+                                                ov,
+                                            ],
+                                        )?;
+                                        i -= 1;
+                                    }
+                                    acc
+                                }
+                                "fill" => {
+                                    let len =
+                                        st.objects[oi].elems.len() as i64;
+                                    let clamp = |x: i64| {
+                                        if x < 0 {
+                                            (len + x).max(0)
+                                        } else {
+                                            x.min(len)
+                                        }
+                                    };
+                                    let s = clamp(if argc > 1 {
+                                        num_of(arg1)? as i64
+                                    } else {
+                                        0
+                                    });
+                                    let e_arg = if argc > 2 {
+                                        st.regs[a0 + 2]
+                                    } else {
+                                        Value::UNDEFINED
+                                    };
+                                    let e = if e_arg.is_undefined() {
+                                        len
+                                    } else {
+                                        clamp(num_of(e_arg)? as i64)
+                                    };
+                                    for k in s..e {
+                                        st.objects[oi].elems[k as usize] =
+                                            arg0;
+                                    }
+                                    ov
+                                }
+                                "copyWithin" => {
+                                    let len =
+                                        st.objects[oi].elems.len() as i64;
+                                    let clamp = |x: i64| {
+                                        if x < 0 {
+                                            (len + x).max(0)
+                                        } else {
+                                            x.min(len)
+                                        }
+                                    };
+                                    let target = clamp(if argc > 0 {
+                                        num_of(arg0)? as i64
+                                    } else {
+                                        0
+                                    });
+                                    let start = clamp(if argc > 1 {
+                                        num_of(arg1)? as i64
+                                    } else {
+                                        0
+                                    });
+                                    let e_arg = if argc > 2 {
+                                        st.regs[a0 + 2]
+                                    } else {
+                                        Value::UNDEFINED
+                                    };
+                                    let end = if e_arg.is_undefined() {
+                                        len
+                                    } else {
+                                        clamp(num_of(e_arg)? as i64)
+                                    };
+                                    let count =
+                                        (end - start).min(len - target).max(0);
+                                    let src: Vec<Value> = st.objects[oi]
+                                        .elems[start as usize
+                                            ..(start + count) as usize]
+                                        .to_vec();
+                                    for k in 0..count as usize {
+                                        st.objects[oi].elems
+                                            [target as usize + k] = src[k];
+                                    }
+                                    ov
                                 }
                                 "at" => {
                                     let elems =
@@ -8904,13 +9026,13 @@ fn exec_loop(
                             }
                         }
                         "split" => {
-                            if let Some(ri) = regex_index(st, av0) {
-                                let parts = st.regexes[ri].re.split_vec(&s);
-                                let vals: Vec<Value> = parts.into_iter()
-                                    .map(|p| push_str(st, p)).collect();
-                                new_array(st, vals)
-                            } else {
-                                let parts: Vec<Value> = if argc == 0 {
+                            let mut vals: Vec<Value> =
+                                if let Some(ri) = regex_index(st, av0) {
+                                    let parts =
+                                        st.regexes[ri].re.split_vec(&s);
+                                    parts.into_iter()
+                                        .map(|p| push_str(st, p)).collect()
+                                } else if argc == 0 {
                                     vec![push_str(st, s.clone())]
                                 } else {
                                     let sep = to_display(st, av0);
@@ -8924,8 +9046,14 @@ fn exec_loop(
                                             .collect::<Vec<_>>()
                                     }
                                 };
-                                new_array(st, parts)
+                            // optional limit argument caps the piece count
+                            if argc > 1 && !av1.is_undefined() {
+                                let lim = av1.to_number_raw();
+                                if lim.is_finite() && lim >= 0.0 {
+                                    vals.truncate(lim as usize);
+                                }
                             }
+                            new_array(st, vals)
                         }
                         "replace" => {
                             if av1.is_function() {
@@ -8993,6 +9121,12 @@ fn exec_loop(
                                     }
                                     replace_with_fn(st, mods, &s, &m, av1)?
                                 };
+                                push_str(st, out)
+                            } else if let Some(ri) = regex_index(st, av0) {
+                                let to = to_display(st, av1)
+                                    .replace("$&", "${0}");
+                                let out = st.regexes[ri].re
+                                    .replace_all_str(&s, to.as_str());
                                 push_str(st, out)
                             } else {
                                 let from = to_display(st, av0);
