@@ -423,8 +423,45 @@ def layout_mode(node):
     return "block"
 
 
+_CLIP_RECT_RE = re.compile(r"rect\(([^)]*)\)")
+
+
+def _visually_hidden(node):
+    """The screen-reader-only idiom used across Korean portals (Naver's
+    `.blind`, etc.): a 1x1 box clipped to nothing that keeps text for
+    assistive tech but must not paint. We don't clip sub-pixel boxes
+    precisely, so treat the whole subtree as hidden. Kept deliberately
+    narrow so real content and 1px dividers are never caught."""
+    if not isinstance(node, Element):
+        return False
+    style = node.style
+    clip = (style.get("clip") or "").strip().casefold()
+    m = _CLIP_RECT_RE.search(clip)
+    if m and "auto" not in m.group(1):
+        nums = re.findall(r"-?\d*\.?\d+", m.group(1))
+        # clip:rect(0 0 0 0) collapses the element to an empty region
+        if nums and all(abs(float(v)) <= 1.0 for v in nums):
+            return True
+
+    def _tiny(value):
+        v = (value or "").strip().casefold()
+        if v.endswith("px"):
+            try:
+                return float(v[:-2]) <= 1.0
+            except ValueError:
+                return False
+        return v in ("0",)
+
+    if (style.get("overflow", "visible").strip().casefold() == "hidden"
+            and _tiny(style.get("width")) and _tiny(style.get("height"))):
+        return True
+    return False
+
+
 def is_visible(node):
-    return node.style.get("display", "inline") != "none"
+    if node.style.get("display", "inline") == "none":
+        return False
+    return not _visually_hidden(node)
 
 
 def collapse_margins(*values):
