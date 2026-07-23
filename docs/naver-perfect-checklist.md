@@ -564,7 +564,12 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
       submit/button류 제외, checkbox/radio는 checked만, 한글
       percent-인코딩), action의 기존 쿼리 대체 후 resolve·이동.
       POST는 미지원 안내. file: 스킴이 쿼리를 경로에 섞던 버그 수정
-- [ ] 쿠키 세션 유지 (로그인은 범위 밖 — 별도 대공사)
+- [x] **쿠키 세션 유지** — 07-21 `document.cookie` ↔ 네트워크 자 브리지
+      (코덱스 5f3c8af) + 07-23 **속성 인식 자**(35448e3): Set-Cookie 속성
+      파싱, Domain 서브도메인 공유(.naver.com → nid/www; cross-site Domain
+      거부), Path 스코핑, Expires/Max-Age 만료(=0 삭제), Secure(https 한정),
+      HttpOnly(document.cookie 숨김·요청엔 전송). 12/12 유닛. (로그인 자체는
+      여전히 범위 밖 — 서버 인증 플로우)
 - [ ] iframe (홈 셸엔 0개; 광고·로그인에서 등장 — 후순위)
 
 ---
