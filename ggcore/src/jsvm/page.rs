@@ -2313,6 +2313,26 @@ mod tests {
     }
 
     #[test]
+    fn iterable_spread_and_from() {
+        // spreading a generator expands element-wise (not [object Object])
+        assert_eq!(
+            n("function* g(){yield 1;yield 2;} \
+               [...g()].join()==='1,2' ? 1 : 0"), 1.0);
+        // spreading a Set and a string
+        assert_eq!(
+            n("[...new Set([1,1,2])].join()==='1,2' ? 1 : 0"), 1.0);
+        assert_eq!(n("[...'abc'].length"), 3.0);
+        // Array.from over a generator drains the iterator
+        assert_eq!(
+            n("function* g(){yield 5;yield 6;} \
+               Array.from(g()).join()==='5,6' ? 1 : 0"), 1.0);
+        // spread into a call argument list
+        assert_eq!(
+            n("function* g(){yield 1;yield 2;yield 3;} \
+               Math.max(...g())"), 3.0);
+    }
+
+    #[test]
     fn error_hierarchy() {
         assert_eq!(
             n("var e = new TypeError('bad'); \

@@ -1698,6 +1698,21 @@ impl Parser {
         Ok(args)
     }
 
+    /// Wrap `e` as `Array.from(e)` — the universal "make this iterable a
+    /// real array" step used when desugaring spread. Array.from copies an
+    /// array cheaply and drains any other iterable (Set/Map/generator).
+    fn array_from(e: Expr) -> Expr {
+        Expr::Call {
+            callee: Box::new(Expr::Member {
+                obj: Box::new(Expr::Ident("Array".to_string())),
+                prop: MemberProp::Static("from".to_string()),
+                optional: false,
+            }),
+            args: vec![e],
+            optional: false,
+        }
+    }
+
     /// Parse args; the bool is true when a `...spread` was present, in
     /// which case the returned Vec has a single element: an expression
     /// evaluating to the fully-assembled arguments array.
@@ -1722,7 +1737,8 @@ impl Parser {
         if !parts.iter().any(|(s, _)| *s) {
             return Ok((parts.into_iter().map(|(_, e)| e).collect(), false));
         }
-        // assemble [a, ...b, c] -> [].concat([a], b, [c])
+        // assemble f(a, ...b, c) args -> [].concat([a], Array.from(b), [c])
+        // (Array.from lets a non-array iterable spread element-wise)
         let mut segs: Vec<Expr> = Vec::new();
         let mut buf: Vec<Expr> = Vec::new();
         for (spread, e) in parts {
@@ -1730,7 +1746,7 @@ impl Parser {
                 if !buf.is_empty() {
                     segs.push(Expr::Array(std::mem::take(&mut buf)));
                 }
-                segs.push(e);
+                segs.push(Self::array_from(e));
             } else {
                 buf.push(e);
             }
@@ -1991,7 +2007,10 @@ impl Parser {
                 parts.into_iter().map(|(_, e)| e).collect(),
             ));
         }
-        // [a, ...b, c] -> [].concat([a], b, [c])
+        // [a, ...b, c] -> [].concat([a], Array.from(b), [c]). Array.from
+        // makes the spread operand a real array first, so a Set/Map/
+        // generator/iterator spreads element-wise instead of landing as a
+        // single [object Object] (concat only spreads array arguments).
         let mut segs: Vec<Expr> = Vec::new();
         let mut buf: Vec<Expr> = Vec::new();
         for (spread, e) in parts {
@@ -1999,7 +2018,7 @@ impl Parser {
                 if !buf.is_empty() {
                     segs.push(Expr::Array(std::mem::take(&mut buf)));
                 }
-                segs.push(e);
+                segs.push(Self::array_from(e));
             } else {
                 buf.push(e);
             }

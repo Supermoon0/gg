@@ -3230,11 +3230,22 @@ fn materialize_iterable(
         return Ok(new_array(st, vals));
     }
     let itk = st.intern_name("@@iterator");
-    let f = match lookup_prop(st, oi as usize, itk) {
-        PropHit::Data(f) if f.is_function() => f,
-        _ => return Ok(ov), // no protocol: existing behavior
+    let iter = match lookup_prop(st, oi as usize, itk) {
+        PropHit::Data(f) if f.is_function() => {
+            call_value_this(st, mods, f, Some(ov), &[])?
+        }
+        _ => {
+            // the object may itself be an iterator (a generator object, or
+            // a hand-written { next() } iterator): drive its own next().
+            // @@iterator is often method-dispatched rather than a stored
+            // property, so the data lookup above misses it.
+            let nextk = st.intern_name("next");
+            match lookup_prop(st, oi as usize, nextk) {
+                PropHit::Data(f) if f.is_function() => ov,
+                _ => return Ok(ov), // no protocol: existing behavior
+            }
+        }
     };
-    let iter = call_value_this(st, mods, f, Some(ov), &[])?;
     if !iter.is_object() {
         return type_err("@@iterator did not return an object");
     }
@@ -5240,8 +5251,20 @@ fn host_fn(
                 let oi = v.index();
                 if st.objects[oi as usize].is_array {
                     st.objects[oi as usize].elems.clone()
-                } else if let Some(vals) = st.set_data.get(&oi).cloned() {
-                    vals
+                } else if let Some(m) = {
+                    // iterables (Set, Map, generators, custom { next })
+                    // drain through the shared iterator protocol
+                    let m = materialize_iterable(st, mods, v)?;
+                    if m.index() != oi
+                        && m.is_object()
+                        && st.objects[m.index() as usize].is_array
+                    {
+                        Some(st.objects[m.index() as usize].elems.clone())
+                    } else {
+                        None
+                    }
+                } {
+                    m
                 } else {
                     // array-like: consult .length, then index 0..length
                     let lenv = match lookup_prop(st, oi as usize, st.ids.length) {
