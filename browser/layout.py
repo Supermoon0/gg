@@ -421,6 +421,74 @@ def _child_is_block_level(child):
     return child.tag in BLOCK_ELEMENTS
 
 
+# Inherited text properties an anonymous inline box carries over from
+# its block parent (fonts/line metrics for the words it will lay out).
+_ANON_INHERITED = (
+    "font-size", "font-style", "font-weight", "font-family", "color",
+    "text-align", "white-space", "line-height", "letter-spacing",
+    "word-spacing", "word-break", "overflow-wrap", "direction",
+)
+
+
+def _effective_block_children(node):
+    """CSS 9.2.1.1 anonymous block boxes, narrowly: in a block context,
+    CONSECUTIVE inline-level siblings that include real text are wrapped
+    in one anonymous inline container so they share wrapped lines.
+    Without this, `<div>27.1 ° <div>맑음</div></div>` stacked "27.1",
+    "°" and the status each on its own row (naver's weather card).
+
+    Kept conservative: runs must contain a non-whitespace Text node;
+    lone inline ELEMENTS keep the legacy own-block path (they may carry
+    padding/borders that only the block painter renders), and
+    inline-block children stay in the row-cursor path."""
+    out = []
+    run = []
+
+    def run_qualifies(child):
+        if isinstance(child, Text):
+            return True
+        if not isinstance(child, Element):
+            return False
+        if _child_is_block_level(child) or is_out_of_flow(child):
+            return False
+        if child.style.get("display", "") in (
+                "inline-block", "inline-flex", "inline-table"):
+            return False
+        return True
+
+    def flush():
+        if not run:
+            return
+        live = [c for c in run
+                if not (isinstance(c, Text) and not c.text.strip())]
+        has_text = any(isinstance(c, Text) for c in live)
+        if len(live) >= 2 and has_text:
+            anon = Element("gg-anon", {}, node)
+            anon.style = {p: v for p in _ANON_INHERITED
+                          if (v := node.style.get(p))}
+            anon.children = list(run)
+            anon._font = None
+            out.append(anon)
+        else:
+            out.extend(run)
+        run.clear()
+
+    for child in node.children:
+        if isinstance(child, Element) and not is_visible(child):
+            continue  # no box: does not break the run
+        if run_qualifies(child):
+            if isinstance(child, Text) and not child.text.strip() \
+                    and not run:
+                out.append(child)  # leading formatting whitespace
+                continue
+            run.append(child)
+        else:
+            flush()
+            out.append(child)
+    flush()
+    return out
+
+
 class _FlowMarker:
     """Stand-in 'previous sibling' marking the bottom of an inline-block
     row, so the next in-flow block clears the row. Never painted — only its
@@ -1146,6 +1214,25 @@ class DocumentLayout:
                 else:
                     box.mr = leftover
 
+            # vertical twin: `inset:0; margin:auto` centers a fixed-size
+            # box both ways (naver's paging-arrow sprite)
+            mt_auto = (st.get("margin-top") or "").strip() == "auto"
+            mb_auto = (st.get("margin-bottom") or "").strip() == "auto"
+            if mt_auto or mb_auto:
+                border_box_h = (box.bw * 2 + box.pt + box.height + box.pb)
+                if top is not None and bottom is not None:
+                    leftover_v = max(
+                        cb_h - top - bottom - border_box_h, 0.0)
+                else:
+                    leftover_v = 0.0
+                if mt_auto and mb_auto:
+                    box.margin_top = leftover_v / 2
+                    box.margin_bottom = leftover_v / 2
+                elif mt_auto:
+                    box.margin_top = leftover_v
+                else:
+                    box.margin_bottom = leftover_v
+
             if left is not None:
                 target_x = cb_x + left
             elif right is not None:
@@ -1405,7 +1492,7 @@ class BlockLayout:
             ib_x = None        # inline-block run cursor (None = no run open)
             ib_row_y = self.y
             ib_row_h = 0
-            for child in node.children:
+            for child in _effective_block_children(node):
                 if not is_visible(child):
                     continue
                 # Formatting whitespace between block tags creates no box
@@ -2721,7 +2808,21 @@ class BlockLayout:
         # a leading space only when the source had whitespace here and we
         # are not at the start of a line
         sp = measure(font, " ") if (space_before and line.children) else 0.0
-        if not nowrap and self.cursor_x + sp + w > self.width \
+        # a line may only break at a break OPPORTUNITY: source whitespace,
+        # a CJK boundary (either side), or after a replaced atom. Without
+        # one, adjacent tokens stick — naver's <strong>27.1</strong>°
+        # temperature must not push its degree sign to the next line.
+        can_break = space_before
+        if not can_break and line.children:
+            prev_atom = line.children[-1]
+            prev_word = getattr(prev_atom, "word", None)
+            if prev_word is None:            # image / inline-block atom
+                can_break = True
+            elif prev_word and _is_cjk(prev_word[-1]):
+                can_break = True
+        if not can_break and word and _is_cjk(word[0]):
+            can_break = True
+        if not nowrap and can_break and self.cursor_x + sp + w > self.width \
                 and self.cursor_x > 0:
             self.new_line()
             sp = 0.0
@@ -3355,17 +3456,27 @@ def _attr_px(node, name):
 
 def _z_index(obj):
     """Stacking level of a layout subtree for z-index ordering. Only
-    positioned boxes with an integer z-index leave 0; everything else
-    keeps document order."""
+    positioned boxes carry one; z-index:auto inherits the nearest
+    positioned ancestor's level (the box belongs to that ancestor's
+    stacking context — the abs pass flattens nested absolutes into
+    siblings, and without inheritance a button's own ::before icon
+    sorted BELOW the z-indexed button and vanished under its fill)."""
     node = getattr(obj, "node", None)
     if not isinstance(node, Element):
         return 0
     if node.style.get("position", "static") == "static":
         return 0  # z-index has no effect on static boxes
-    try:
-        return int(node.style.get("z-index", "auto"))
-    except (ValueError, TypeError):
-        return 0
+    cur = node
+    for _ in range(32):
+        if not isinstance(cur, Element):
+            break
+        if cur.style.get("position", "static") != "static":
+            try:
+                return int(cur.style.get("z-index", "auto"))
+            except (ValueError, TypeError):
+                pass  # auto: join the parent stacking context
+        cur = getattr(cur, "parent", None)
+    return 0
 
 
 def parse_transform(value, w, h):
