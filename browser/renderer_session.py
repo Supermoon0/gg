@@ -79,7 +79,7 @@ class LocalRendererSession:
     """One renderer document hosted in the current process."""
 
     def __init__(self, network_backend=None, *, run_scripts=True,
-                 timeout=net.DEFAULT_TIMEOUT, js_budget=3.0):
+                 timeout=net.DEFAULT_TIMEOUT, js_budget=8.0):
         if not native.available():
             raise RuntimeError("native ggcore wheel is required")
         self.network = network_backend or default_network_backend()
@@ -393,7 +393,7 @@ class RemoteRendererSession:
     """RendererSession proxy backed by a crash-contained child process."""
 
     def __init__(self, network_backend=None, *, run_scripts=True,
-                 timeout=net.DEFAULT_TIMEOUT, js_budget=3.0):
+                 timeout=net.DEFAULT_TIMEOUT, js_budget=8.0):
         from .process.browser_host import RendererProcessHost
 
         if not native.available():
@@ -593,7 +593,7 @@ class RemoteRendererSession:
 
 def create_renderer_session(network_backend=None, *, process_model=None,
                             run_scripts=True, timeout=net.DEFAULT_TIMEOUT,
-                            js_budget=3.0):
+                            js_budget=8.0):
     model = (process_model or os.environ.get("GG_PROCESS_MODEL", "local")).casefold()
     if model == "local":
         return LocalRendererSession(

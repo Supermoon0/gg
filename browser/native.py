@@ -321,7 +321,16 @@ class _ModuleGraph:
         if self._has_js_error(current):
             return False
 
-        while time.perf_counter() <= self.loader.deadline:
+        # One module evaluation gets a SLICE of the load's JS budget,
+        # never the whole thing: a module whose top-level await depends
+        # on something we don't provide (naver's gfp-display-sdk ad
+        # module retries on timers forever) would otherwise spin this
+        # pump until loader.deadline and starve every later script —
+        # main.js skipped == a blank page that mounts nothing.
+        slice_deadline = min(
+            self.loader.deadline,
+            time.perf_counter() + max(0.5, self.loader.js_budget / 3.0))
+        while time.perf_counter() <= slice_deadline:
             state = (self.doc.global_number(marker)
                      if hasattr(self.doc, "global_number") else None)
             if state in (1.0, -1.0):
@@ -639,7 +648,7 @@ class _ScriptLoader:
             self.module_graph.close()
 
 
-def load_document(html, fetch_css, fetch_js=None, js_budget=3.0,
+def load_document(html, fetch_css, fetch_js=None, js_budget=8.0,
                   page_url=None, viewport_width=1280.0, timings=None,
                   network_backend=None, network_timeout=15.0,
                   cancel_token=None, network_context=None):

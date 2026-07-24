@@ -294,27 +294,80 @@ def safe_color(value, default="black"):
     return default
 
 
+def _color_alpha(tok):
+    """The alpha a color token carries (1.0 when opaque/unknown)."""
+    t = tok.strip().casefold()
+    if t.startswith("#") and len(t) == 9:        # #rrggbbaa
+        try:
+            return int(t[7:9], 16) / 255.0
+        except ValueError:
+            return 1.0
+    if t.startswith("#") and len(t) == 5:        # #rgba
+        try:
+            return int(t[4], 16) / 15.0
+        except ValueError:
+            return 1.0
+    m = re.match(r"rgba?\([^)]*[,/]\s*(\d*\.?\d+)\s*\)$", t)
+    if m and ("rgba(" in t or "/" in t):
+        try:
+            a = float(m.group(1))
+            return a / 100.0 if t.rstrip(")").endswith("%") else a
+        except ValueError:
+            return 1.0
+    return 1.0
+
+
 def box_shadow(value):
-    """Parse the first box-shadow layer to (dx, dy, color), or None.
-    Blur/spread are ignored (we paint a flat offset rect); `inset` and
-    `none` yield None."""
-    v = (value or "").split(",")[0].strip()
-    if not v or v == "none" or "inset" in v:
-        return None
-    color = ""
-    nums = []
-    for tok in v.split():
-        c = safe_color(tok, default="")
-        if c and not color:
-            color = c
-        elif tok.endswith("px") or _num_re.fullmatch(tok):
-            try:
-                nums.append(float(tok.rstrip("px")))
-            except ValueError:
-                pass
-    if len(nums) < 2:
-        return None
-    return nums[0], nums[1], color or "#000000"
+    """Parse the first paintable box-shadow layer to (dx, dy, color), or
+    None. Blur/spread are ignored (we paint a flat offset rect), so a
+    NEAR-TRANSPARENT layer must not paint at all: we cannot alpha-blend,
+    and naver's card outline `0 0 0 1px #0000001A, 0 1px 2px
+    rgba(0,0,0,.04)` painted as an opaque black slab behind every card —
+    visible as solid black boxes wherever the card had no background
+    (empty ad slots). `inset` and `none` yield None."""
+    layers, depth, start = [], 0, 0
+    s = value or ""
+    for i, ch in enumerate(s):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(depth - 1, 0)
+        elif ch == "," and depth == 0:
+            layers.append(s[start:i])
+            start = i + 1
+    layers.append(s[start:])
+    for layer in layers:
+        v = layer.strip()
+        if not v or v == "none":
+            return None
+        if "inset" in v:
+            continue
+        color = ""
+        alpha = 1.0
+        nums = []
+        for tok in v.split():
+            c = safe_color(tok, default="")
+            # a color-shaped token safe_color rejects (#rrggbbaa) still
+            # decides the layer's alpha — otherwise the translucent
+            # outline paints as the opaque fallback
+            looks_color = tok.startswith("#") \
+                or tok.casefold().startswith(("rgb", "hsl"))
+            if (c or looks_color) and not color:
+                color = c or "#000000"
+                alpha = _color_alpha(tok)
+            elif tok.endswith("px") or _num_re.fullmatch(tok):
+                try:
+                    nums.append(float(tok.rstrip("px")))
+                except ValueError:
+                    pass
+        if len(nums) < 2:
+            continue
+        if alpha < 0.25:
+            # a subtle tinted shadow: closer to invisible than to a
+            # solid fill — skip this layer
+            continue
+        return nums[0], nums[1], color or "#000000"
+    return None
 
 
 _num_re = re.compile(r"-?\d+(?:\.\d+)?")
