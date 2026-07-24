@@ -172,6 +172,9 @@ struct Scope {
     bindings: HashMap<String, Binding>,
     /// locals_end to restore when the scope closes
     prev_locals_end: u8,
+    /// lexicals this scope spilled to the %spillN object (register
+    /// exhaustion); removed from the spill map when the scope closes
+    spilled_here: Vec<String>,
 }
 
 struct FnCtx {
@@ -270,6 +273,7 @@ impl FnCtx {
             scopes: vec![Scope {
                 bindings: HashMap::new(),
                 prev_locals_end: nparams,
+                spilled_here: Vec::new(),
             }],
             captured: HashSet::new(),
             uses_arguments: false,
@@ -309,6 +313,7 @@ impl FnCtx {
         self.scopes.push(Scope {
             bindings: HashMap::new(),
             prev_locals_end: self.locals_end,
+            spilled_here: Vec::new(),
         });
     }
 
@@ -316,6 +321,9 @@ impl FnCtx {
         let s = self.scopes.pop().unwrap();
         self.locals_end = s.prev_locals_end;
         self.tmp_top = self.locals_end;
+        for n in &s.spilled_here {
+            self.spilled.remove(n);
+        }
     }
 
     /// Reserve the next local register for a binding in the innermost
@@ -418,6 +426,14 @@ enum Place {
 /// Collect function-scoped names (`var`, `function`, `var` for-heads)
 /// without descending into nested functions. `let`/`const` are block-
 /// scoped and excluded — the compiler binds them where they appear.
+/// Fresh unique binding name for a function's hidden spill object.
+/// `%` keeps it out of reach of any source-level identifier.
+fn next_spill_name() -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SPILL_SEQ: AtomicUsize = AtomicUsize::new(0);
+    format!("%spill{}", SPILL_SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
 fn hoist(stmts: &[Stmt], out: &mut Vec<String>) {
     for s in stmts {
         match s {
@@ -1878,6 +1894,44 @@ impl Compiler {
             DeclKind::Const => BindKind::Const,
             DeclKind::Var => unreachable!("var is function-scoped"),
         };
+        // Register exhaustion (minified mega-functions with hundreds
+        // of lexicals): spill the binding into the %spillN heap object
+        // instead of failing the whole compile. Trades TDZ/const
+        // re-assignment checks for those bindings — undefined-before-
+        // init instead of a throw — which valid minified code never
+        // observes. The spill object must live in the FUNCTION scope
+        // (its register survives block exits), so a fresh one can only
+        // be created while scopes[0] is innermost. Spill well before
+        // the 250 ceiling: locals and expression temps share the
+        // register file, and mega-functions need deep temp headroom.
+        // A name already spilled by an enclosing block falls through
+        // to a register declaration (inner shadow must not clobber the
+        // outer spill slot).
+        {
+            let f = self.fns.last().unwrap();
+            if f.locals_end >= 160
+                && (f.spill_name.is_some() || f.scopes.len() == 1)
+                && !f.spilled.contains_key(name)
+            {
+                let a = self.atom(name);
+                let f = self.fns.last_mut().unwrap();
+                if f.spill_name.is_none() {
+                    let sn = next_spill_name();
+                    let r = f.declare(&sn, BindKind::Var, true)?;
+                    f.emit(Instr::NewObject { dst: r });
+                    f.emit(Instr::CellWrap { reg: r });
+                    f.lookup_mut(&sn).unwrap().is_cell = true;
+                    f.spill_name = Some(sn);
+                }
+                f.spilled.insert(name.to_string(), a);
+                f.scopes
+                    .last_mut()
+                    .unwrap()
+                    .spilled_here
+                    .push(name.to_string());
+                return Ok(());
+            }
+        }
         let f = self.fns.last_mut().unwrap();
         if f.scopes.last().unwrap().bindings.contains_key(name) {
             return Err(CompileError {
@@ -2168,13 +2222,7 @@ impl Compiler {
                 // locals lean and let overflow vars live on the heap
                 if f.locals_end >= 120 {
                     if f.spill_name.is_none() {
-                        use std::sync::atomic::{AtomicUsize, Ordering};
-                        static SPILL_SEQ: AtomicUsize =
-                            AtomicUsize::new(0);
-                        let sn = format!(
-                            "%spill{}",
-                            SPILL_SEQ.fetch_add(1, Ordering::Relaxed)
-                        );
+                        let sn = next_spill_name();
                         let r = f.declare(&sn, BindKind::Var, true)?;
                         f.emit(Instr::NewObject { dst: r });
                         f.emit(Instr::CellWrap { reg: r });
@@ -2331,12 +2379,27 @@ impl Compiler {
                         .bindings
                         .get(name)
                         .is_none()
+                        && !self.fx().spilled.contains_key(name)
                     {
                         // `if (c) let x` style (not valid JS): tolerate
                         // by binding into the enclosing scope
                         self.declare_lexical_one(name, *kind)?;
                     }
-                    let b = self.fx().lookup(name).unwrap();
+                    let Some(b) = self.fx().lookup(name) else {
+                        // spilled lexical: no register binding — route
+                        // the initializer through the spill object
+                        let rv = match init {
+                            Some(e) => self.expr(e)?,
+                            None => {
+                                let r = self.fx().alloc()?;
+                                self.fx()
+                                    .emit(Instr::LoadUndef { dst: r });
+                                r
+                            }
+                        };
+                        self.store_name(name, rv);
+                        continue;
+                    };
                     let rv = match init {
                         Some(e) => self.expr(e)?,
                         None => {

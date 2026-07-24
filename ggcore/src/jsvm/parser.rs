@@ -930,6 +930,13 @@ impl Parser {
 
     fn for_stmt(&mut self) -> Result<Stmt, ParseError> {
         self.pos += 1;
+        // `for await (const x of asyncIterable)`: accept the syntax,
+        // lower as a plain for-of. Without async iterators each value
+        // arrives un-awaited — the common polyfill/SDK loops still make
+        // progress, and a parse failure would drop the whole module.
+        if matches!(self.kind(), Tok::Ident(k) if k == "await") {
+            self.pos += 1;
+        }
         self.expect_punct(P::LParen)?;
 
         // for (var x in/of obj)
