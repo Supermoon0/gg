@@ -1015,7 +1015,7 @@ class DocumentLayout:
         while i < len(self.abs_queue) and len(processed) < 5000:
             entry = self.abs_queue[i]
             i += 1
-            node, cb, static_x, static_y = entry
+            node, cb, static_x, static_y, abs_clips = entry
             if id(node) in processed:
                 continue
             processed.add(id(node))
@@ -1053,6 +1053,9 @@ class DocumentLayout:
                 continue
 
             box = BlockLayout(node, self, None)
+            # fixed boxes are viewport-anchored: ancestor clips don't cut
+            box._abs_clips = \
+                [] if st.get("position") == "fixed" else abs_clips
             spec_w = parse_size(st.get("width"), cb_w, em)
             if spec_w is not None:
                 box.forced_width = spec_w
@@ -1157,9 +1160,26 @@ class BlockLayout:
         """Queue an out-of-flow child for the positioned-layout pass,
         remembering its containing block (nearest positioned ancestor)
         and its static position (where it would sit in normal flow, used
-        when an offset is auto)."""
+        when an offset is auto).
+
+        Also records the overflow-clipping ancestors at or above the
+        containing block: an absolute box escapes clips BELOW its
+        containing block but is still cut by any that also clip the
+        containing block itself (naver's widget-board carousel keeps
+        page-2's absolutely-positioned card text hidden this way)."""
         cb = _nearest_positioned(self)
-        self._document().abs_queue.append((node, cb, static_x, static_y))
+        clips = []
+        if cb is not None:
+            cur, seen_cb = self, False
+            while cur is not None and not isinstance(cur, DocumentLayout):
+                if cur is cb:
+                    seen_cb = True
+                if seen_cb and isinstance(cur, BlockLayout) \
+                        and cur._clips():
+                    clips.append(cur)
+                cur = getattr(cur, "parent", None)
+        self._document().abs_queue.append(
+            (node, cb, static_x, static_y, clips))
 
     def layout(self):
         # idempotent: inline-block sizing lays a box out once to measure,
@@ -1372,7 +1392,15 @@ class BlockLayout:
                     box.forced_width = max(w, 0.0)
                     box.flex_origin = (self.x + ib_x, ib_row_y)
                     box.layout()
-                    if ib_x > 0 and ib_x + box.outer_width() > self.width:
+                    # white-space:nowrap keeps the run on one line even
+                    # past the container edge (carousel viewports: naver's
+                    # widget board lines up 420px pages inside an
+                    # overflow:hidden 420px wrap — page 2 must overflow
+                    # rightward and be clipped, not stack below)
+                    nowrap = node.style.get("white-space", "") \
+                        .strip().casefold() in ("nowrap", "pre")
+                    if not nowrap and ib_x > 0 \
+                            and ib_x + box.outer_width() > self.width:
                         # wrap: re-anchor on the next row
                         ib_row_y += ib_row_h
                         ib_x = 0
@@ -3340,7 +3368,11 @@ def paint_tree(layout_object, display_list):
         style = getattr(layout_object.node, "style", None)
         tf = style.get("transform") if style else None
         sticky = _sticky_metrics(layout_object)
-        if (tf and tf != "none") or sticky is not None:
+        # absolutely-positioned boxes paint from the document's abs
+        # pass, outside their ancestors' clip brackets — re-apply the
+        # overflow clips recorded at queue time so they can't escape
+        aclips = getattr(layout_object, "_abs_clips", None) or []
+        if (tf and tf != "none") or sticky is not None or aclips:
             sub = _paint_tree_inner(layout_object, [])
             if tf and tf != "none":
                 dx, dy, hidden = parse_transform(
@@ -3349,6 +3381,14 @@ def paint_tree(layout_object, display_list):
                     return display_list
                 if dx or dy:
                     translate_cmds(sub, dx, dy)
+            if aclips:
+                pre = []
+                for cbox in aclips:
+                    pre.append(DrawClipPush(
+                        cbox.x - cbox.pl, cbox.y - cbox.pt,
+                        cbox.x + cbox.width + cbox.pr,
+                        cbox.y + cbox.height + cbox.pb))
+                sub = pre + sub + [DrawClipPop() for _ in aclips]
             if sticky is not None:
                 normal, maximum, inset = sticky
                 display_list.append(DrawStickyPush(

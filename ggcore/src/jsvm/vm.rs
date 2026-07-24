@@ -6981,7 +6981,7 @@ fn dom_method(
             return Ok(rect);
         }
         "scrollIntoView" | "focus" | "blur" | "scrollTo" | "scrollBy"
-        | "setAttributeNS" | "closest" => {
+        | "scroll" | "setAttributeNS" | "closest" => {
             return Ok(Value::UNDEFINED);
         }
         "getContext" => {
@@ -10466,6 +10466,23 @@ fn exec_loop(
                     // dynamic property read: `o[key]`, `o[i]` from for-in
                     let text = str_ref(st, kv.index()).to_string();
                     let oi = ov.index() as usize;
+                    // el.style[name] — computed-key style reads mirror
+                    // the SetIndex write path
+                    if let Some(&node) = st.style_nodes.get(&ov.index())
+                    {
+                        let doc = need_doc(st)?;
+                        let cur = doc.borrow().nodes[node as usize]
+                            .attr("style")
+                            .unwrap_or("")
+                            .to_string();
+                        let out = if text == "cssText" {
+                            cur
+                        } else {
+                            style_attr_get(&cur, &camel_to_kebab(&text))
+                        };
+                        reg!(dst) = push_str(st, out);
+                        continue;
+                    }
                     // integer-string keys hit dense elems on ANY object
                     // (numeric literal keys live there); gaps fall
                     // through to the named lookup below
@@ -10733,6 +10750,41 @@ fn exec_loop(
                     // dynamic property write: `o[key] = v`
                     let text = str_ref(st, kv.index()).to_string();
                     let oi = ov.index() as usize;
+                    // el.style[name] = v — React's setValueForStyles
+                    // writes styles with a COMPUTED key; dropping this
+                    // lost naver's inline overflow:hidden on the
+                    // widget-board carousel viewport
+                    if let Some(&node) = st.style_nodes.get(&ov.index())
+                    {
+                        let val = to_display(st, v);
+                        let doc = need_doc(st)?;
+                        if text == "cssText" {
+                            doc.borrow_mut().set_attr(
+                                node as usize, "style", &val);
+                        } else {
+                            let prop = camel_to_kebab(&text);
+                            let cur = doc.borrow().nodes[node as usize]
+                                .attr("style")
+                                .unwrap_or("")
+                                .to_string();
+                            let next =
+                                style_attr_set(&cur, &prop, &val);
+                            doc.borrow_mut().set_attr(
+                                node as usize, "style", &next);
+                        }
+                        continue;
+                    }
+                    if let Some(&node) =
+                        st.dataset_nodes.get(&ov.index())
+                    {
+                        let val = to_display(st, v);
+                        let attr =
+                            format!("data-{}", camel_to_kebab(&text));
+                        let doc = need_doc(st)?;
+                        doc.borrow_mut().set_attr(
+                            node as usize, &attr, &val);
+                        continue;
+                    }
                     if st.objects[oi].is_array {
                         if let Some(k) = elem_index(&text) {
                             let elems = &mut st.objects[oi].elems;

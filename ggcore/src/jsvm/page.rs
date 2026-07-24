@@ -4082,6 +4082,36 @@ console.log('B typeof it: ' + typeof it);
     }
 
     #[test]
+    fn style_computed_key_writes_reach_the_attribute() {
+        // React's setValueForStyles writes styles with a COMPUTED key
+        // (style[name] = value); it must land in the style attribute
+        // exactly like the constant-key path — naver's widget-board
+        // carousel viewport gets its overflow:hidden this way.
+        let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
+            crate::html::parse("<div id=w></div>"),
+        ))));
+        let logs = vm.run_scripts(&["\
+            var w = document.getElementById('w');\n\
+            var name = 'overflow';\n\
+            w.style[name] = 'hidden';\n\
+            var camel = 'backgroundColor';\n\
+            w.style[camel] = 'blue';\n\
+            console.log(w.getAttribute('style'));\n\
+            console.log(w.style[name]);\n\
+            console.log(w.style['background-color'.replace(/-c/, 'C')]);\n\
+            var ct = 'cssText';\n\
+            w.style[ct] = 'color: red';\n\
+            console.log(w.getAttribute('style'));\n"
+            .to_string()]);
+        assert_eq!(logs, vec![
+            "overflow: hidden; background-color: blue",
+            "hidden",
+            "blue",
+            "color: red",
+        ]);
+    }
+
+    #[test]
     fn classlist_ops() {
         let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
             crate::html::parse("<div id=t class='a b'></div>"),
