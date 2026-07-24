@@ -194,7 +194,13 @@ class LocalRendererSession:
         changed = False
         fetch_count = 0
         pending = False
-        for _ in range(max_rounds):
+        for round_no in range(max_rounds):
+            # Drain due work first (dt=None leaves the virtual clock
+            # alone), then — once the fetch/microtask stream quiets but
+            # timers remain — advance the clock so setTimeout(fn, >0)
+            # eventually fires. Without this a page whose data layer
+            # retries or debounces on a timer never settles: the shell
+            # ticks real dt each frame, headless settle must too.
             update = self.tick()
             all_logs.extend(update.logs)
             changed = changed or update.dom_changed
@@ -203,6 +209,13 @@ class LocalRendererSession:
             if update.fetch_count:
                 continue
             if not pending:
+                break
+            step = self.tick(dt_ms=25.0)
+            all_logs.extend(step.logs)
+            changed = changed or step.dom_changed
+            fetch_count += step.fetch_count
+            pending = step.pending_work
+            if not pending and not step.fetch_count:
                 break
             if time.monotonic() > deadline:
                 timeout_log = "[renderer] settle timed out"
