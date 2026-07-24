@@ -3268,6 +3268,36 @@ mod tests {
     }
 
     #[test]
+    fn await_of_async_function_expression() {
+        // `await async function(){...}()` — an async IIFE in operand
+        // position. The async-fn EXPRESSION form must parse anywhere an
+        // expression can, not just at assignment level (naver's gfp SDK
+        // does `const e = await async function(){ ... await ... }()`).
+        let mut vm = PageVm::new(None);
+        vm.run_scripts(&["\
+            var out = 0;\n\
+            (async function(){\n\
+              var e = await async function(){\n\
+                var t = await Promise.resolve(3); return t * 2; }();\n\
+              return e; })().then(function(v){ out = v; });\n"
+            .to_string()]);
+        let (_l, _) = vm.pump();
+        let (_l, _) = vm.pump();
+        let logs = vm.run_scripts(&[
+            "console.log('out=' + out);\n".to_string(),
+        ]);
+        assert!(
+            format!("{logs:?}").contains("out=6"),
+            "await of async fn expr wrong: {logs:?}"
+        );
+        // typeof of an async fn expression (feature-detection idiom)
+        assert_eq!(
+            n("typeof async function(){} === 'function' ? 1 : 0"),
+            1.0,
+        );
+    }
+
+    #[test]
     fn babel_es5_class_inheritance() {
         // the exact shapes @babel/preset-env emits for `class B
         // extends A` — naver's bundles boot through this

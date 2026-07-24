@@ -1848,6 +1848,31 @@ impl Parser {
                         self.func_lit_g(name, false, is_gen)?,
                     )))
                 }
+                // `async function` / `async function*` EXPRESSION in any
+                // operand position (`await async function(){}()`,
+                // `typeof async function(){}`, a call argument). Arrows
+                // and the statement/assign forms are handled in
+                // assign_expr; here we only claim `async` when a
+                // `function` keyword follows on the same line, else it's
+                // an ordinary identifier named `async`.
+                "async"
+                    if matches!(self.kind(), Tok::Ident(k) if k == "function")
+                        && !self.nl_before() =>
+                {
+                    self.pos += 1; // function
+                    let is_gen = self.eat_punct(P::Star);
+                    let name = match self.kind() {
+                        Tok::Ident(n) if !self.at_punct(P::LParen) => {
+                            let n = n.clone();
+                            self.pos += 1;
+                            Some(n)
+                        }
+                        _ => None,
+                    };
+                    Ok(Expr::Func(Rc::new(
+                        self.func_lit_g(name, true, is_gen)?,
+                    )))
+                }
                 "new" => {
                     let callee = self.member_only_expr()?;
                     let (args, spread) = if self.eat_punct(P::LParen) {
