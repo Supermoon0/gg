@@ -1031,6 +1031,28 @@ class DocumentLayout:
             self.children.append(box)
             box.layout()
 
+            # CSS 2.1 §10.3.7: an absolutely-positioned box's auto
+            # horizontal margins resolve against its CONTAINING BLOCK, not
+            # the document. box.layout() sized them against the document
+            # (self.width), so `margin-left:auto` on an icon inside a
+            # 36px button ballooned to ~1200px and shoved the icon off to
+            # the right. Recompute them here; the translate below is
+            # margin-aware, so fixing box.ml/mr repositions correctly.
+            ml_auto = (st.get("margin-left") or "").strip() == "auto"
+            mr_auto = (st.get("margin-right") or "").strip() == "auto"
+            if ml_auto or mr_auto:
+                border_box_w = (box.bw * 2 + box.pl + box.width + box.pr)
+                if left is not None and right is not None:
+                    leftover = max(cb_w - left - right - border_box_w, 0.0)
+                else:
+                    leftover = 0.0  # under-constrained: auto margins are 0
+                if ml_auto and mr_auto:
+                    box.ml = box.mr = leftover / 2
+                elif ml_auto:
+                    box.ml = leftover
+                else:
+                    box.mr = leftover
+
             if left is not None:
                 target_x = cb_x + left
             elif right is not None:
