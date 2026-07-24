@@ -316,11 +316,25 @@ impl Parser {
             if is_static {
                 self.pos += 1;
             }
+            // async method: `async m() {}` / `async *m() {}`. Not a member
+            // literally named `async` (followed by `(`, `=`, `;`, `}`), and
+            // not `async` split from its name by a newline (ASI makes that a
+            // field `async` plus a separate method).
+            let is_async = matches!(self.kind(), Tok::Ident(k) if k == "async")
+                && !matches!(
+                    self.kind_at(1),
+                    Some(Tok::Punct(P::LParen)) | Some(Tok::Punct(P::Assign))
+                        | Some(Tok::Punct(P::Semi)) | Some(Tok::Punct(P::RBrace))
+                )
+                && !self.nl_before_at(1);
+            if is_async {
+                self.pos += 1;
+            }
             // generator method: `*gen() {...}` (name may be computed)
             if self.at_punct(P::Star) {
                 self.pos += 1;
                 let key = self.member_key()?;
-                let f = self.func_lit_g(prop_name_hint(&key), false, true)?;
+                let f = self.func_lit_g(prop_name_hint(&key), is_async, true)?;
                 if is_static {
                     statics.push((key, Expr::Func(Rc::new(f))));
                 } else {
@@ -369,7 +383,7 @@ impl Parser {
             }
             let (params, prologue) = self.arrow_params()?;
             let saved = self.in_async;
-            self.in_async = false;
+            self.in_async = is_async;
             let body = self.block();
             self.in_async = saved;
             let mut body = body?;
@@ -382,7 +396,7 @@ impl Parser {
                 name: prop_name_hint(&key),
                 params,
                 body,
-                is_async: false,
+                is_async,
                 lazy_body: None,
             };
             if let Some(is_get) = acc {

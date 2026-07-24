@@ -2896,6 +2896,38 @@ mod tests {
     }
 
     #[test]
+    fn class_async_methods_parse_and_run() {
+        // async instance method with await + a following method (the
+        // shape that broke naver's gfp ad SDK: `async m(){...await...}`
+        // followed by another method left the class parser desynced)
+        assert_eq!(
+            n("var log = 0; \
+               class C { \
+                 async load(v) { var x = await v; return x + 1; } \
+                 mark() { log = 5; return log; } } \
+               var c = new C(); c.mark()"),
+            5.0);
+        // the async method actually resolves its awaited value
+        assert_eq!(
+            n("class C { async load(v) { var x = await v; return x * 2; } } \
+               var out = 0; \
+               new C().load(21).then(function (r) { out = r; }); out"),
+            0.0); // resolves on a later microtask; sync read is still 0
+        // static async + a member literally named `async` must not be
+        // mistaken for the async-method prefix
+        assert_eq!(
+            n("class C { static async make() { return 9; } \
+                 async() { return 3; } } \
+               new C().async()"),
+            3.0);
+        // async method wedged between plain methods, minified (no spaces)
+        assert_eq!(
+            n("class C{a(){return 1}async b(t){const{x:e}=await t;return e}c(){return 7}}\
+               new C().c()"),
+            7.0);
+    }
+
+    #[test]
     fn class_computed_and_literal_member_names() {
         // computed method name, evaluated at class-definition time
         assert_eq!(
