@@ -163,8 +163,32 @@ MessageEvent.prototype = new Event('');
 // them here is now safe because reads/writes/calls/construction all
 // route through their actual internal operations.
 function MutationObserver(cb) { this._cb = cb; }
-MutationObserver.prototype.observe = function () {};
-MutationObserver.prototype.disconnect = function () {};
+// core-js's microtask fallback (used when it can't find an own
+// queueMicrotask descriptor on the global) flushes its job queue on a
+// characterData mutation of a bare text node. Make that one idiom
+// actually fire — a silent stub here leaves every core-js Promise
+// reaction queued forever, which reads as "promises never resolve".
+MutationObserver.prototype.observe = function (target, opts) {
+  if (!(opts && opts.characterData && target
+        && typeof target === 'object')) return;
+  var self = this;
+  try {
+    var value = target.data;
+    Object.defineProperty(target, 'data', {
+      configurable: true,
+      get: function () { return value; },
+      set: function (v) {
+        value = v;
+        queueMicrotask(function () {
+          if (self._cb) {
+            self._cb([{ type: 'characterData', target: target }], self);
+          }
+        });
+      },
+    });
+  } catch (e) {}
+};
+MutationObserver.prototype.disconnect = function () { this._cb = null; };
 MutationObserver.prototype.takeRecords = function () { return []; };
 function IntersectionObserver(cb, opts) { this._cb = cb; }
 IntersectionObserver.prototype.observe = function (t) {
@@ -509,6 +533,17 @@ fetch = function (input, init) {
     return r;
   });
 };
+window.fetch = fetch;
+// Globals live outside the window object in this engine; property READS
+// fall through the window alias, but getOwnPropertyDescriptor(window, x)
+// does not. core-js's microtask module resolves queueMicrotask through
+// exactly that descriptor probe — when it comes back empty it falls back
+// to MutationObserver-based flushing. Expose the scheduling natives as
+// real own properties so polyfills take the native path.
+window.queueMicrotask = queueMicrotask;
+window.setTimeout = setTimeout;
+window.clearTimeout = clearTimeout;
+window.Promise = Promise;
 // DOM interface constructors: patch surfaces for polyfills
 // (real DOM nodes are engine values, not instances of these)
 function EventTarget() {}
@@ -3142,6 +3177,54 @@ mod tests {
             .to_string()]);
         let (logs, _) = vm.pump();
         assert!(logs.contains(&"raf number".to_string()), "{logs:?}");
+    }
+
+    #[test]
+    fn promise_adopts_foreign_thenables() {
+        // Fulfilling with a `{then}` object must adopt its eventual
+        // value (Promise Resolution Procedure), not pass the thenable
+        // itself through to reactions. Polyfilled promises (core-js on
+        // naver) and async-over-axios flows depend on this: handing the
+        // foreign promise object onward reads as `response === undefined`.
+        let mut vm = PageVm::new(None);
+        vm.run_scripts(&["\
+            var out = 'none';\n\
+            Promise.resolve({ then: function (res) { res({ z: 9 }); } })\n\
+              .then(function (v) { out = 'z=' + (v && v.z); });\n"
+            .to_string()]);
+        let (logs, _) = vm.pump();
+        assert!(logs.is_empty(), "{logs:?}");
+        let mut vm2 = PageVm::new(None);
+        let logs2 = vm2.run_scripts(&["\
+            var seen = [];\n\
+            // sync-resolving thenable: object value must survive\n\
+            Promise.resolve({ then: function (res) { res({ z: 9 }); } })\n\
+              .then(function (v) { seen.push('sync:' + v.z); });\n\
+            // async-resolving thenable via timer\n\
+            Promise.resolve({ then: function (res) {\n\
+              setTimeout(function () { res({ w: 7 }); }, 0); } })\n\
+              .then(function (v) { seen.push('async:' + v.w); });\n\
+            // rejecting thenable routes to onRejected\n\
+            Promise.resolve({ then: function (_res, rej) { rej('nope'); } })\n\
+              .then(function () { seen.push('BAD'); },\n\
+                    function (e) { seen.push('rej:' + e); });\n"
+            .to_string()]);
+        assert!(logs2.is_empty(), "{logs2:?}");
+        let (_logs, _) = vm2.pump();
+        let (_logs, _) = vm2.pump();
+        vm2.run_scripts(&[
+            "console.log(seen.sort().join('|'));\n".to_string(),
+        ]);
+        let (logs3, _) = vm2.pump();
+        let all: Vec<String> = vm2.run_scripts(&[
+            "console.log('FINAL ' + seen.sort().join('|'));\n".to_string(),
+        ]);
+        let joined = format!("{logs3:?} {all:?}");
+        assert!(
+            joined.contains("async:7") && joined.contains("sync:9")
+                && joined.contains("rej:nope"),
+            "thenable adoption results missing: {joined}"
+        );
     }
 
     #[test]

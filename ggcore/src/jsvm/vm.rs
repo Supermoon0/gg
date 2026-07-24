@@ -1248,6 +1248,17 @@ pub(super) enum Job {
         derived: u32,
         is_reject: bool,
     },
+    /// Promise Resolution Procedure step for a NON-native thenable
+    /// (a foreign promise — core-js's polyfill, a userland library —
+    /// or any `{then(res, rej)}` object): call `then` with the
+    /// adopting promise's resolve/reject natives on a microtask.
+    AdoptThen {
+        thenable: Value,
+        then: Value,
+        resolve_fn: Value,
+        reject_fn: Value,
+        pid: u32,
+    },
 }
 
 pub(super) struct Timer {
@@ -1336,6 +1347,32 @@ pub(super) fn promise_settle(st: &mut St, pid: u32, value: Value, is_reject: boo
         add_reaction(st, inner, false, Reaction { handler: None, derived: pid });
         add_reaction(st, inner, true, Reaction { handler: None, derived: pid });
         return;
+    }
+    // Promise Resolution Procedure for foreign thenables: fulfilling
+    // with a polyfilled promise (core-js) or any `{then}` object must
+    // ADOPT its eventual value, not hand the thenable itself to
+    // reactions. (naver: async/await over axios yields core-js
+    // promises through this exact path.)
+    if !is_reject && value.is_object() {
+        let then_key = st.intern_name("then");
+        if let PropHit::Data(thenv) =
+            lookup_prop(st, value.index() as usize, then_key)
+        {
+            if thenv.is_function() {
+                let resolve_fn =
+                    make_native(st, Native::Resolve { pid, reject: false });
+                let reject_fn =
+                    make_native(st, Native::Resolve { pid, reject: true });
+                st.microtasks.push_back(Job::AdoptThen {
+                    thenable: value,
+                    then: thenv,
+                    resolve_fn,
+                    reject_fn,
+                    pid,
+                });
+                return; // stays pending until the thenable settles it
+            }
+        }
     }
     st.promises[pid as usize].state = if is_reject {
         PromiseState::Rejected(value)
@@ -1441,6 +1478,17 @@ fn drain_microtasks(st: &mut St, mods: &ModStore, budget: &mut usize) {
                     }
                 },
             },
+            Job::AdoptThen { thenable, then, resolve_fn, reject_fn, pid } => {
+                if let Err(e) = call_value_this(
+                    st, mods, then, Some(thenable), &[resolve_fn, reject_fn],
+                ) {
+                    let reason = e.value.unwrap_or_else(|| {
+                        let s = e.msg.clone();
+                        make_string(st, s)
+                    });
+                    promise_settle(st, pid, reason, true);
+                }
+            }
         }
     }
 }
@@ -2065,6 +2113,23 @@ fn method_ref_dispatch(
     args: &[Value],
 ) -> Result<Value, VmError> {
     let name = st.names[key as usize].clone();
+    // promise receivers: `p.then` extracted as a value and invoked via
+    // .call/.apply — core-js's thenable adoption does exactly
+    // `then.call(promise, resolve, reject)` after READING p.then
+    if recv.is_object()
+        && st.objects[recv.index() as usize].promise != PROMISE_NONE
+    {
+        let pid = st.objects[recv.index() as usize].promise;
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+        match name.as_str() {
+            "then" => return Ok(promise_then(st, pid, a0, a1)),
+            "catch" => {
+                return Ok(promise_then(st, pid, Value::UNDEFINED, a0))
+            }
+            _ => {}
+        }
+    }
     // array receivers: real element operations, not string ops
     if recv.is_object() && st.objects[recv.index() as usize].is_array {
         let elems = st.objects[recv.index() as usize].elems.clone();
@@ -10008,6 +10073,18 @@ fn exec_loop(
                                         .unwrap_or(false),
                             )
                         }
+                        // code-point order approximates any locale well
+                        // enough for UI sorts; throwing here kills whole
+                        // React render passes (naver sorts widget rows
+                        // with localeCompare(…, 'ko'))
+                        "localeCompare" => {
+                            let other = to_display(st, av0);
+                            Value::int(match s.as_str().cmp(&other) {
+                                std::cmp::Ordering::Less => -1,
+                                std::cmp::Ordering::Equal => 0,
+                                std::cmp::Ordering::Greater => 1,
+                            })
+                        }
                         _ => {
                             return type_err(format!(
                                 "cannot call .{}() on a string (yet)",
@@ -10724,6 +10801,21 @@ fn exec_loop(
                                 && matches!(
                                     st.names[key as usize].as_str(),
                                     "exec" | "test"
+                                ) =>
+                        {
+                            make_native(st, Native::MethodRef(key))
+                        }
+                        // promises expose then/catch as READABLE values:
+                        // core-js's isThenable check is `var f = x.then`
+                        // followed by `f.call(x, res, rej)` — a magic
+                        // call-only method reads as undefined and makes
+                        // every native promise look like a plain value,
+                        // so adopted promises leak through unwrapped
+                        PropHit::Missing
+                            if st.objects[oi].promise != PROMISE_NONE
+                                && matches!(
+                                    st.names[key as usize].as_str(),
+                                    "then" | "catch"
                                 ) =>
                         {
                             make_native(st, Native::MethodRef(key))
