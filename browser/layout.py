@@ -451,9 +451,9 @@ def _effective_block_children(node):
             return False
         if _child_is_block_level(child) or is_out_of_flow(child):
             return False
-        if child.style.get("display", "") in (
-                "inline-block", "inline-flex", "inline-table"):
-            return False
+        # inline-blocks may join a TEXT-bearing run (a logo <i> beside
+        # a label shares its line); runs without text fall back to the
+        # row-cursor path, so card grids are unaffected
         return True
 
     def flush():
@@ -554,12 +554,15 @@ def layout_mode(node):
     # flow rather than the line-based inline path. Synthesized ::before/
     # ::after boxes don't count: an inline-block pseudo (naver's 1px link
     # dividers, dot separators) must flow on the same line as the text
-    # beside it, not push the text into a stacked block row.
-    if any(isinstance(child, Element)
-           and child.style.get("display", "") in (
-               "inline-block", "inline-flex", "inline-table")
-           and child.tag not in ("img", "svg", "br", "::before", "::after")
-           for child in node.children):
+    # beside it, not push the text into a stacked block row. An anonymous
+    # inline run is by construction inline (its inline-blocks share the
+    # line with the run's text — a logo <i> beside its label).
+    if node.tag != "gg-anon" and any(
+            isinstance(child, Element)
+            and child.style.get("display", "") in (
+                "inline-block", "inline-flex", "inline-table")
+            and child.tag not in ("img", "svg", "br", "::before", "::after")
+            for child in node.children):
         return "block"
     if node.tag in ("svg", "::before", "::after"):
         return "inline"  # replaced/synthesized: inline by nature
@@ -3251,6 +3254,18 @@ class LineLayout:
         cmds = []
         groups = {}          # id(el) -> [el, min_x, max_x]
         block = self.node
+        def _has_own_box(el):
+            # block-level and atomic ancestors paint their own
+            # background in their own box — re-filling it at word
+            # granularity painted naver's white card background OVER
+            # the 로그인 label inside the green login button (the walk
+            # ran past the button up to the card because the line's
+            # block node was a bare Text)
+            if _child_is_block_level(el):
+                return True
+            return el.style.get("display", "") in (
+                "inline-block", "inline-flex", "inline-table")
+
         for child in self.children:
             n = getattr(child, "node", None)
             # atomic inline-block boxes paint their own background via
@@ -3263,7 +3278,8 @@ class LineLayout:
                 anc = n
             x0 = child.x
             x1 = child.x + getattr(child, "width", 0)
-            while isinstance(anc, Element) and anc is not block:
+            while isinstance(anc, Element) and anc is not block \
+                    and not _has_own_box(anc):
                 bg = anc.style.get("background-color", "")
                 if bg and safe_color(bg, default=""):
                     g = groups.get(id(anc))
