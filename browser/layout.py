@@ -1934,6 +1934,12 @@ class BlockLayout:
                 auto = base is None
             if base is None:
                 base = _measure_content_width(child, doc)
+            # min-width floors the base size (a pill with min-width:75px
+            # must reserve that much of the row)
+            minw = parse_size(child.style.get("min-width"),
+                              self.width, em)
+            if minw:
+                base = max(base or 0.0, minw)
             is_auto.append(auto)
             specs.append(max(base or 0.0, 0.0))
 
@@ -1961,8 +1967,26 @@ class BlockLayout:
             eff_grows = grows
             eff_total = total_grow
         else:
-            eff_grows = [1.0 if is_auto[i] else 0.0
-                         for i in range(len(specs))]
+            # ...but the leftover belongs to auto MARGINS when any item
+            # declares one (naver's weather header pushes its location
+            # label right with margin-left:auto), and an EXPLICIT
+            # flex-grow:0 (`flex:none`) must never be overridden by the
+            # equal-share fallback.
+            any_auto_margin = any(
+                (c.style.get("margin-left", "").strip().casefold()
+                 == "auto")
+                or (c.style.get("margin-right", "").strip().casefold()
+                    == "auto")
+                for c in kid_nodes)
+            if any_auto_margin:
+                eff_grows = [0.0] * len(specs)
+            else:
+                eff_grows = [
+                    1.0 if (is_auto[i]
+                            and not (kid_nodes[i].style.get("flex-grow")
+                                     or "").strip())
+                    else 0.0
+                    for i in range(len(specs))]
             eff_total = sum(eff_grows)
 
         gap_total = col_gap * max(len(specs) - 1, 0)
