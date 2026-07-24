@@ -2208,8 +2208,8 @@ check("flex shorthand: grow factors split the remainder 1:2",
       f"a={fb2['gra'].width:.0f} b={fb2['grb'].width:.0f} "
       f"c={fb2['grc'].width:.0f}")
 absbox = boxes["abs"]
-check("absolute positioning", abs(absbox.x - (HSTEP + 50)) < 1
-      and abs(absbox.y - (VSTEP + 300)) < 1,
+check("absolute positioning", abs(absbox.x - 50) < 1
+      and abs(absbox.y - 300) < 1,
       f"({absbox.x:.0f}, {absbox.y:.0f})")
 in_flow_h = boxes["flexbox"].y + boxes["flexbox"].height
 check("absolute is out of flow", doc3.height < 300,
@@ -2245,15 +2245,15 @@ def _boxes(doc):
 dom4 = HTMLParser(REGRESS_PAGE).parse()
 style(dom4, sorted(ua, key=cascade_priority))
 doc4 = DocumentLayout(dom4)
-doc4.layout(800)  # content width 774, no viewport height
+doc4.layout(800)  # content width 800 (body{margin:0}), no viewport height
 boxes4 = _boxes(doc4)
 
 rel, after = boxes4["rel"], boxes4["after"]
 check("relative offset shifts the box",
-      abs(rel.y - (VSTEP + 30)) < 1 and abs(rel.x - (HSTEP + 10)) < 1,
+      abs(rel.y - 30) < 1 and abs(rel.x - 10) < 1,
       f"({rel.x:.0f}, {rel.y:.0f})")
 check("relative offset is visual-only (siblings keep flow position)",
-      abs(after.y - (VSTEP + 40)) < 1, f"after.y={after.y:.0f}")
+      abs(after.y - 40) < 1, f"after.y={after.y:.0f}")
 
 # height:200px parent (padding 10 -> content 180); child 50% = 90
 check("% height resolves against definite parent height",

@@ -372,11 +372,19 @@ pub(super) mod host {
     pub const O_IS: u16 = 52;
     pub const O_FROM_ENTRIES: u16 = 53;
     pub const O_GET_OWN_PDS: u16 = 54;
+    pub const O_SEAL: u16 = 55;
+    pub const O_IS_FROZEN: u16 = 56;
+    pub const O_IS_SEALED: u16 = 57;
+    pub const O_PREVENT_EXT: u16 = 58;
+    pub const O_IS_EXTENSIBLE: u16 = 63;
     pub const A_ISARRAY: u16 = 60;
     pub const A_FROM: u16 = 61;
+    pub const A_OF: u16 = 62;
     pub const N_ISNAN: u16 = 80;
     pub const N_ISFINITE: u16 = 81;
     pub const N_ISINTEGER: u16 = 82;
+    pub const N_ISSAFEINT: u16 = 83;
+    pub const O_HAS_OWN: u16 = 59;
     pub const S_FROMCHARCODE: u16 = 100;
     // canvas-2d stub context (crash prevention; no real rasterizing)
     pub const CV_MEASURE_TEXT: u16 = 120;
@@ -459,6 +467,21 @@ impl CompiledRe {
                 r.captures(s).ok().flatten().map(grab)
             }
             CompiledRe::Never => None,
+        }
+    }
+    /// capture-group names by index (0 = whole match, always None);
+    /// an unnamed group yields None. Empty when the regex never compiled.
+    fn capture_names(&self) -> Vec<Option<String>> {
+        match self {
+            CompiledRe::Std(r) => r
+                .capture_names()
+                .map(|n| n.map(String::from))
+                .collect(),
+            CompiledRe::Fancy(r) => r
+                .capture_names()
+                .map(|n| n.map(String::from))
+                .collect(),
+            CompiledRe::Never => Vec::new(),
         }
     }
     /// byte offset of the first match, for String.search
@@ -688,6 +711,12 @@ pub(super) struct St {
     non_extensible_objects: HashSet<u32>,
     non_extensible_functions: HashSet<u32>,
     pub(super) strs: Vec<Str>,
+    /// Flat-string content -> its index in `strs`, so `intern` is O(1)
+    /// instead of a linear scan of the whole arena. Only interned Flats
+    /// are recorded (they are never mutated in place — rope flattening
+    /// only ever rewrites Cat entries), so an entry here always points
+    /// at a Flat whose text equals the key.
+    pub(super) flat_index: HashMap<String, u32>,
     pub(super) ics: Vec<IcEntry>,
     pub(super) regs: Vec<Value>,
     pub(super) logs: Vec<String>,
@@ -707,6 +736,14 @@ pub(super) struct St {
     /// (object index, name id) -> (getter, setter) accessor pair
     /// (Object.defineProperty with get/set; UNDEFINED = absent side)
     pub(super) accessors: HashMap<(u32, u32), (Value, Value)>,
+    /// Property-attribute side-tables, populated only when scripts opt out
+    /// of the defaults (defineProperty / freeze / seal). Hot paths gate on
+    /// `is_empty()` so ordinary objects pay nothing.
+    /// object indices frozen/sealed/preventExtensions'd (no new own props)
+    /// (object index, name id) whose data slot is read-only (writable:false)
+    pub(super) non_writable: std::collections::HashSet<(u32, u32)>,
+    /// (object index, name id) hidden from keys/for-in/JSON (enumerable:false)
+    pub(super) non_enum: std::collections::HashSet<(u32, u32)>,
     /// Web Storage backing maps (in-memory; not persisted to disk)
     pub(super) local_storage: HashMap<String, String>,
     pub(super) session_storage: HashMap<String, String>,
@@ -773,6 +810,17 @@ pub(super) struct St {
     /// completely disabled unless GG_JS_PROFILE is set.
     profile_enabled: bool,
     profile_samples: HashMap<(u32, u32), u64>,
+    /// Single-entry memo of a string's UTF-16 units, keyed by its `strs`
+    /// index. Indexed char reads (charAt/charCodeAt) otherwise rebuild the
+    /// whole unit vector per call — O(n) — so a char-by-char scanner over
+    /// a big string is O(n^2). Strings are immutable, so the memo never
+    /// goes stale; it holds only the most-recently-scanned string.
+    pub(super) units_cache: Option<(u32, Vec<u16>)>,
+    /// Memoized UTF-16 code-unit length per `strs` index. `s.length` is
+    /// otherwise recounted O(n) per read, so a scanner's
+    /// `while (i < s.length)` is O(n^2). Strings are immutable, so an
+    /// entry never goes stale.
+    pub(super) ulen_cache: HashMap<u32, u32>,
 }
 
 /// Default per-turn instruction budget (~a few hundred ms of hot loop).
@@ -823,6 +871,7 @@ impl St {
             non_extensible_objects: HashSet::new(),
             non_extensible_functions: HashSet::new(),
             strs: Vec::new(),
+            flat_index: HashMap::new(),
             ics: Vec::new(),
             regs: Vec::new(),
             logs: Vec::new(),
@@ -834,6 +883,8 @@ impl St {
             fn_props: HashMap::new(),
             dom_expando: HashMap::new(),
             accessors: HashMap::new(),
+            non_writable: std::collections::HashSet::new(),
+            non_enum: std::collections::HashSet::new(),
             local_storage: HashMap::new(),
             session_storage: HashMap::new(),
             cookies: Vec::new(),
@@ -863,6 +914,8 @@ impl St {
             fuel: DEFAULT_FUEL,
             profile_enabled: std::env::var_os("GG_JS_PROFILE").is_some(),
             profile_samples: HashMap::new(),
+            units_cache: None,
+            ulen_cache: HashMap::new(),
         };
         for (i, name) in ["undefined", "boolean", "number", "string",
                           "object", "function"]
@@ -902,15 +955,13 @@ impl St {
 }
 
 pub(super) fn intern(st: &mut St, s: &str) -> Value {
-    if let Some(i) = st
-        .strs
-        .iter()
-        .position(|x| matches!(x, Str::Flat(f) if f == s))
-    {
-        return Value::string(i as u32);
+    if let Some(&i) = st.flat_index.get(s) {
+        return Value::string(i);
     }
+    let i = st.strs.len() as u32;
     st.strs.push(Str::Flat(s.to_string()));
-    Value::string((st.strs.len() - 1) as u32)
+    st.flat_index.insert(s.to_string(), i);
+    Value::string(i)
 }
 
 pub(super) fn push_str(st: &mut St, s: String) -> Value {
@@ -1132,6 +1183,71 @@ fn neutralize_surrogates(s: &str) -> String {
 }
 
 /// Build a RegExp value from a JS pattern + flags. JS flags map to the
+/// Translate a JS replacement string to the regex crate's syntax:
+/// `$&` -> `${0}` (whole match) and `$<name>` -> `${name}` (named group).
+/// Numbered `$1` / `${1}` already match the crate, so they pass through.
+fn js_repl_to_rust(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() {
+            if chars[i + 1] == '&' {
+                out.push_str("${0}");
+                i += 2;
+                continue;
+            }
+            if chars[i + 1] == '<' {
+                if let Some(rel) =
+                    chars[i + 2..].iter().position(|&c| c == '>')
+                {
+                    let name: String =
+                        chars[i + 2..i + 2 + rel].iter().collect();
+                    out.push_str("${");
+                    out.push_str(&name);
+                    out.push('}');
+                    i = i + 2 + rel + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Build the `.groups` object for a match result: `{ name: capture }` for
+/// each named group. Returns `undefined` when the pattern has no named
+/// groups (matching the spec — `m.groups` is only an object when named
+/// groups exist). `caps` is the positional capture list (index 0 = whole).
+fn match_groups(st: &mut St, ri: usize, caps: &[Option<String>]) -> Value {
+    let names = st.regexes[ri].re.capture_names();
+    if !names.iter().any(|n| n.is_some()) {
+        return Value::UNDEFINED;
+    }
+    let obj = new_plain_object(st);
+    let oi = obj.index() as usize;
+    for (i, name) in names.iter().enumerate() {
+        if let Some(nm) = name {
+            let atom = st.intern_name(nm);
+            let v = match caps.get(i).and_then(|o| o.clone()) {
+                Some(s) => make_string(st, s),
+                None => Value::UNDEFINED,
+            };
+            raw_set_prop(st, oi, atom, v);
+        }
+    }
+    obj
+}
+
+/// Attach `.groups` to a freshly built match-result array.
+fn attach_groups(st: &mut St, arr: Value, ri: usize, caps: &[Option<String>]) {
+    let groups = match_groups(st, ri, caps);
+    let gatom = st.intern_name("groups");
+    raw_set_prop(st, arr.index() as usize, gatom, groups);
+}
+
 /// `regex` crate's inline flags; `g` (global) is tracked separately.
 fn new_regex(
     st: &mut St,
@@ -1231,6 +1347,9 @@ pub(super) enum PromiseState {
 pub(super) struct Reaction {
     handler: Option<Value>,
     derived: u32, // promise id of the derived promise
+    // `.finally(cb)`: run cb for its side effect, then forward the
+    // ORIGINAL settlement to the derived promise (not cb's return value)
+    finally: bool,
 }
 
 pub(super) struct PromiseRec {
@@ -1248,6 +1367,7 @@ pub(super) enum Job {
         value: Value,
         derived: u32,
         is_reject: bool,
+        finally: bool,
     },
     /// Promise Resolution Procedure step for a NON-native thenable
     /// (a foreign promise — core-js's polyfill, a userland library —
@@ -1317,13 +1437,13 @@ fn add_reaction(st: &mut St, pid: u32, reject_side: bool, rx: Reaction) {
         PromiseState::Fulfilled(v) if !reject_side => {
             st.microtasks.push_back(Job::React {
                 handler: rx.handler, value: v, derived: rx.derived,
-                is_reject: false,
+                is_reject: false, finally: rx.finally,
             });
         }
         PromiseState::Rejected(v) if reject_side => {
             st.microtasks.push_back(Job::React {
                 handler: rx.handler, value: v, derived: rx.derived,
-                is_reject: true,
+                is_reject: true, finally: rx.finally,
             });
         }
         _ => {}
@@ -1345,8 +1465,10 @@ pub(super) fn promise_settle(st: &mut St, pid: u32, value: Value, is_reject: boo
             return;
         }
         // this promise follows `inner`: passthrough reactions on both sides
-        add_reaction(st, inner, false, Reaction { handler: None, derived: pid });
-        add_reaction(st, inner, true, Reaction { handler: None, derived: pid });
+        add_reaction(st, inner, false,
+            Reaction { handler: None, derived: pid, finally: false });
+        add_reaction(st, inner, true,
+            Reaction { handler: None, derived: pid, finally: false });
         return;
     }
     // Promise Resolution Procedure for foreign thenables: fulfilling
@@ -1389,6 +1511,7 @@ pub(super) fn promise_settle(st: &mut St, pid: u32, value: Value, is_reject: boo
     for rx in reactions {
         st.microtasks.push_back(Job::React {
             handler: rx.handler, value, derived: rx.derived, is_reject,
+            finally: rx.finally,
         });
     }
 }
@@ -1403,8 +1526,22 @@ fn promise_then(
     let (dval, dpid) = new_promise(st);
     let on_f = if on_fulfilled.is_function() { Some(on_fulfilled) } else { None };
     let on_r = if on_rejected.is_function() { Some(on_rejected) } else { None };
-    add_reaction(st, recv_pid, false, Reaction { handler: on_f, derived: dpid });
-    add_reaction(st, recv_pid, true, Reaction { handler: on_r, derived: dpid });
+    add_reaction(st, recv_pid, false,
+        Reaction { handler: on_f, derived: dpid, finally: false });
+    add_reaction(st, recv_pid, true,
+        Reaction { handler: on_r, derived: dpid, finally: false });
+    dval
+}
+
+/// `p.finally(cb)` — cb runs on both settlement paths for its side effect;
+/// the derived promise mirrors p's original settlement (unless cb throws).
+fn promise_finally(st: &mut St, recv_pid: u32, cb: Value) -> Value {
+    let (dval, dpid) = new_promise(st);
+    let h = if cb.is_function() { Some(cb) } else { None };
+    add_reaction(st, recv_pid, false,
+        Reaction { handler: h, derived: dpid, finally: true });
+    add_reaction(st, recv_pid, true,
+        Reaction { handler: h, derived: dpid, finally: true });
     dval
 }
 
@@ -1463,22 +1600,39 @@ fn drain_microtasks(st: &mut St, mods: &ModStore, budget: &mut usize) {
                     st.logs.push(format!("[gg-js error] {}", e.msg));
                 }
             }
-            Job::React { handler, value, derived, is_reject } => match handler {
-                None => promise_settle(st, derived, value, is_reject),
-                Some(h) => match call_value(st, mods, h, &[value]) {
-                    // a handler that returns normally FULFILLS the derived
-                    // promise (even an onRejected handler — the rejection
-                    // is considered handled)
-                    Ok(ret) => promise_settle(st, derived, ret, false),
-                    Err(e) => {
-                        let reason = e.value.unwrap_or_else(|| {
-                            let s = e.msg.clone();
-                            make_string(st, s)
-                        });
-                        promise_settle(st, derived, reason, true);
+            Job::React { handler, value, derived, is_reject, finally } => {
+                match handler {
+                    None => promise_settle(st, derived, value, is_reject),
+                    // .finally(cb): run cb, discard its result, then forward
+                    // the ORIGINAL settlement. A throw in cb overrides it.
+                    Some(h) if finally => {
+                        match call_value(st, mods, h, &[]) {
+                            Ok(_) => promise_settle(
+                                st, derived, value, is_reject),
+                            Err(e) => {
+                                let reason = e.value.unwrap_or_else(|| {
+                                    let s = e.msg.clone();
+                                    make_string(st, s)
+                                });
+                                promise_settle(st, derived, reason, true);
+                            }
+                        }
                     }
-                },
-            },
+                    Some(h) => match call_value(st, mods, h, &[value]) {
+                        // a handler that returns normally FULFILLS the
+                        // derived promise (even an onRejected handler — the
+                        // rejection is considered handled)
+                        Ok(ret) => promise_settle(st, derived, ret, false),
+                        Err(e) => {
+                            let reason = e.value.unwrap_or_else(|| {
+                                let s = e.msg.clone();
+                                make_string(st, s)
+                            });
+                            promise_settle(st, derived, reason, true);
+                        }
+                    },
+                }
+            }
             Job::AdoptThen { thenable, then, resolve_fn, reject_fn, pid } => {
                 if let Err(e) = call_value_this(
                     st, mods, then, Some(thenable), &[resolve_fn, reject_fn],
@@ -1629,6 +1783,76 @@ pub(super) fn pump(
     issued
 }
 
+/// One scheduler slice: drain microtasks, fire the SINGLE earliest timer
+/// due within `horizon`, drain the microtasks it queued, and return.
+/// `pump` fires every due timer in one call, so the host cannot interleave
+/// layout between React's commit and its geometry-reading effects (both
+/// run through separate `setTimeout(0)` scheduler slices). Stepping one
+/// timer at a time lets the host refresh layout rects between slices, so an
+/// effect that reads getBoundingClientRect sees real geometry — which is
+/// what gates viewport-lazy sections (shopping/weather/stocks) from loading.
+/// Returns (fetches issued, whether more load-time work remains).
+pub(super) fn pump_step(
+    st: &mut St,
+    mods: &ModStore,
+    budget_max: usize,
+    horizon: f64,
+) -> (Vec<(u32, String)>, bool) {
+    let mut budget = budget_max;
+    drain_microtasks(st, mods, &mut budget);
+    // the single earliest timer due within the horizon (intervals included:
+    // firing one advances the clock past its due, re-arming it beyond, so a
+    // polling interval — the IntersectionObserver polyfill — steps forward
+    // instead of spinning, and stops once the clock passes the horizon).
+    let mut best: Option<usize> = None;
+    for (i, t) in st.timers.iter().enumerate() {
+        if t.due_ms > horizon {
+            continue;
+        }
+        match best {
+            None => best = Some(i),
+            Some(b) => {
+                let bt = &st.timers[b];
+                if (t.due_ms, t.seq) < (bt.due_ms, bt.seq) {
+                    best = Some(i);
+                }
+            }
+        }
+    }
+    if let Some(i) = best {
+        st.fuel = DEFAULT_FUEL;
+        if let Some(iv) = st.timers[i].interval {
+            let cb = st.timers[i].callback;
+            let args = st.timers[i].args.clone();
+            st.now_ms = st.now_ms.max(st.timers[i].due_ms);
+            st.timer_seq += 1;
+            st.timers[i].due_ms = st.now_ms + iv.max(0.0);
+            st.timers[i].seq = st.timer_seq;
+            if let Err(e) = call_value(st, mods, cb, &args) {
+                st.logs.push(format!("[gg-js error] {}", e.msg));
+            }
+        } else {
+            let t = st.timers.remove(i);
+            st.now_ms = st.now_ms.max(t.due_ms);
+            if let Err(e) = call_value(st, mods, t.callback, &t.args) {
+                st.logs.push(format!("[gg-js error] {}", e.msg));
+            }
+        }
+        drain_microtasks(st, mods, &mut budget);
+    }
+    let issued = std::mem::take(&mut st.pending_fetches);
+    for p in &issued {
+        st.awaiting.insert(p.fetch_id, p.promise);
+    }
+    let more = !st.microtasks.is_empty()
+        || !st.awaiting.is_empty()
+        || st.timers.iter().any(|t| t.due_ms <= horizon);
+    (
+        issued.into_iter().map(|p| (p.fetch_id, p.url)).collect(),
+        more,
+    )
+}
+
 /// Real-time slice of the event loop: fire only work due within the
 /// next `dt_ms` of virtual time, then advance the clock to that point.
 /// (Plain `pump` fast-forwards to quiescence — right for load-time
@@ -1728,6 +1952,48 @@ fn str_len(st: &St, i: u32) -> usize {
         Str::Flat(s) => s.len(),
         Str::Cat { len, .. } => *len as usize,
     }
+}
+
+/// UTF-16 code-unit length of a string value, memoized. Strings are
+/// immutable, so the cached count never goes stale — this turns a hot
+/// `s.length` (recounted O(n) each read) into O(1) amortized.
+fn str_u16_len(st: &mut St, i: u32) -> usize {
+    if let Some(&n) = st.ulen_cache.get(&i) {
+        return n as usize;
+    }
+    let n = str_ref(st, i).encode_utf16().count();
+    st.ulen_cache.insert(i, n as u32);
+    n
+}
+
+/// Indexed UTF-16 char read backing charAt (`want_code == false`) and
+/// charCodeAt. Reuses the single-entry unit memo so a char-by-char scan
+/// of one big string is O(n) amortized instead of rebuilding the whole
+/// unit vector per call (O(n^2)). Strings are immutable, so the memo is
+/// never stale.
+fn str_char_read(st: &mut St, sidx: u32, i: f64, want_code: bool) -> Value {
+    let hit = matches!(&st.units_cache, Some((c, _)) if *c == sidx);
+    if !hit {
+        let txt = str_ref(st, sidx).to_string();
+        let u: Vec<u16> = txt.encode_utf16().collect();
+        st.units_cache = Some((sidx, u));
+    }
+    let i = if i.is_nan() { 0.0 } else { i };
+    let units = &st.units_cache.as_ref().unwrap().1;
+    let ok = i >= 0.0 && (i as usize) < units.len();
+    if want_code {
+        return if ok {
+            Value::int(units[i as usize] as i32)
+        } else {
+            Value::number(f64::NAN)
+        };
+    }
+    let out = if ok {
+        String::from_utf16_lossy(&units[i as usize..i as usize + 1])
+    } else {
+        String::new()
+    };
+    make_string(st, out)
 }
 
 /// Materialize a rope in place (iterative — chains can be 10k+ deep).
@@ -2045,7 +2311,9 @@ fn has_own_property(
         return Ok(false);
     };
     let shape = st.objects[oi].shape as usize;
-    Ok(st.shapes[shape].props.contains_key(&key_id))
+    Ok(st.shapes[shape].props.contains_key(&key_id)
+        || (st.objects[oi].has_accessors
+            && st.accessors.contains_key(&(oi as u32, key_id))))
 }
 
 /// Invoke an extracted builtin (`var f = ''.slice; f.call(s, 1)`).
@@ -2153,7 +2421,107 @@ fn method_ref_dispatch(
     }
     // array receivers: real element operations, not string ops
     if recv.is_object() && st.objects[recv.index() as usize].is_array {
-        let elems = st.objects[recv.index() as usize].elems.clone();
+        let oi = recv.index() as usize;
+        // No-snapshot fast paths: mutate / scan the receiver in place so
+        // a hot `push.apply(acc, chunk)` or `indexOf` loop over a GROWING
+        // receiver does not clone the whole array on every call — that
+        // eager clone was O(n) per call, i.e. O(n^2) over a build loop
+        // (the dominant cost of Naver's React settle).
+        match name.as_str() {
+            "push" => {
+                st.objects[oi].elems.extend_from_slice(args);
+                return Ok(Value::int(
+                    st.objects[oi].elems.len() as i32,
+                ));
+            }
+            "pop" => {
+                return Ok(st.objects[oi]
+                    .elems
+                    .pop()
+                    .unwrap_or(Value::UNDEFINED));
+            }
+            "shift" => {
+                return Ok(if st.objects[oi].elems.is_empty() {
+                    Value::UNDEFINED
+                } else {
+                    st.objects[oi].elems.remove(0)
+                });
+            }
+            "unshift" => {
+                for &a in args.iter().rev() {
+                    st.objects[oi].elems.insert(0, a);
+                }
+                return Ok(Value::int(
+                    st.objects[oi].elems.len() as i32,
+                ));
+            }
+            "reverse" => {
+                st.objects[oi].elems.reverse();
+                return Ok(recv);
+            }
+            "indexOf" | "lastIndexOf" => {
+                let needle =
+                    args.first().copied().unwrap_or(Value::UNDEFINED);
+                let n = st.objects[oi].elems.len();
+                let mut found = -1i32;
+                if name == "indexOf" {
+                    for i in 0..n {
+                        let e = st.objects[oi].elems[i];
+                        if strict_eq(st, e, needle) {
+                            found = i as i32;
+                            break;
+                        }
+                    }
+                } else {
+                    for i in (0..n).rev() {
+                        let e = st.objects[oi].elems[i];
+                        if strict_eq(st, e, needle) {
+                            found = i as i32;
+                            break;
+                        }
+                    }
+                }
+                return Ok(Value::int(found));
+            }
+            "at" => {
+                let len = st.objects[oi].elems.len() as i64;
+                let mut i = args
+                    .first()
+                    .map(|v| v.to_number_raw() as i64)
+                    .unwrap_or(0);
+                if i < 0 {
+                    i += len;
+                }
+                return Ok(if i >= 0 && i < len {
+                    st.objects[oi].elems[i as usize]
+                } else {
+                    Value::UNDEFINED
+                });
+            }
+            "slice" => {
+                // clone only the requested range, not the whole array
+                let elen = st.objects[oi].elems.len() as f64;
+                let clamp = |k: usize, default: f64| -> usize {
+                    let v = args
+                        .get(k)
+                        .filter(|v| v.is_number())
+                        .map(|v| v.to_number_raw())
+                        .unwrap_or(default);
+                    let v = if v < 0.0 {
+                        (elen + v).max(0.0)
+                    } else {
+                        v.min(elen)
+                    };
+                    v as usize
+                };
+                let a = clamp(0, 0.0);
+                let b = clamp(1, elen).max(a);
+                let out = st.objects[oi].elems[a..b].to_vec();
+                return Ok(new_array(st, out));
+            }
+            _ => {}
+        }
+        let elems = st.objects[oi].elems.clone();
         let elen = elems.len() as f64;
         let idx = |k: usize, default: f64| -> usize {
             let v = args
@@ -2453,6 +2821,28 @@ fn method_ref_dispatch(
                     Value::UNDEFINED
                 });
             }
+            // Object.prototype staples reach arrays too — React calls
+            // hasOwnProperty on prop arrays during reconciliation, and an
+            // unhandled name here throws and aborts the work slice.
+            "hasOwnProperty" => {
+                let k = args.first().copied().unwrap_or(Value::UNDEFINED);
+                return Ok(Value::boolean(
+                    has_own_property(st, mods, recv, k)?,
+                ));
+            }
+            "isPrototypeOf" => return Ok(Value::boolean(false)),
+            "propertyIsEnumerable" => {
+                let k = args
+                    .first()
+                    .map(|&v| to_display(st, v))
+                    .unwrap_or_default();
+                let is_idx = k
+                    .parse::<usize>()
+                    .map(|i| i < st.objects[oi].elems.len())
+                    .unwrap_or(false);
+                return Ok(Value::boolean(is_idx));
+            }
+            "valueOf" => return Ok(recv),
             _ => {
                 return err(format!(
                     "extracted array builtin .{name}() not yet"
@@ -2482,6 +2872,20 @@ fn method_ref_dispatch(
         if has_len {
             return array_like_dispatch(st, mods, recv, &name, args);
         }
+    }
+    // Fast path: indexed single-char reads on a string receiver reuse a
+    // memoized UTF-16 unit vector, so an uncurried charAt/charCodeAt
+    // scanner over a big string is O(n) amortized, not O(n^2).
+    if recv.is_string()
+        && matches!(name.as_str(), "charAt" | "charCodeAt")
+    {
+        let iarg = args
+            .first()
+            .map(|v| v.to_number_raw())
+            .unwrap_or(0.0);
+        return Ok(str_char_read(
+            st, recv.index(), iarg, name == "charCodeAt",
+        ));
     }
     let s = to_display(st, recv);
     let units: Vec<u16> = s.encode_utf16().collect();
@@ -2888,15 +3292,23 @@ fn method_ref_dispatch(
                 None => Value::NULL,
                 Some(gs) => {
                     let vals: Vec<Value> = gs
-                        .into_iter()
+                        .iter()
                         .map(|g| match g {
-                            Some(s) => push_str(st, s),
+                            Some(s) => push_str(st, s.clone()),
                             None => Value::UNDEFINED,
                         })
                         .collect();
-                    new_array(st, vals)
+                    let arr = new_array(st, vals);
+                    attach_groups(st, arr, ri, &gs);
+                    arr
                 }
             })
+        }
+        // no ICU on board: toLocaleString falls back to the default
+        // string conversion (numbers, dates, arrays all coerce sanely)
+        "toLocaleString" => {
+            let s = to_display(st, recv);
+            Ok(make_string(st, s))
         }
         // calling any method on nullish is a real TypeError (core-js
         // feature tests rely on catching it)
@@ -3187,11 +3599,22 @@ fn materialize_iterable(
         return Ok(new_array(st, vals));
     }
     let itk = st.intern_name("@@iterator");
-    let f = match lookup_prop(st, oi as usize, itk) {
-        PropHit::Data(f) if f.is_function() => f,
-        _ => return Ok(ov), // no protocol: existing behavior
+    let iter = match lookup_prop(st, oi as usize, itk) {
+        PropHit::Data(f) if f.is_function() => {
+            call_value_this(st, mods, f, Some(ov), &[])?
+        }
+        _ => {
+            // the object may itself be an iterator (a generator object, or
+            // a hand-written { next() } iterator): drive its own next().
+            // @@iterator is often method-dispatched rather than a stored
+            // property, so the data lookup above misses it.
+            let nextk = st.intern_name("next");
+            match lookup_prop(st, oi as usize, nextk) {
+                PropHit::Data(f) if f.is_function() => ov,
+                _ => return Ok(ov), // no protocol: existing behavior
+            }
+        }
     };
-    let iter = call_value_this(st, mods, f, Some(ov), &[])?;
     if !iter.is_object() {
         return type_err("@@iterator did not return an object");
     }
@@ -3281,6 +3704,45 @@ pub(super) fn lookup_prop(st: &St, oi: usize, key: u32) -> PropHit {
         oi = o.proto.index() as usize;
     }
     PropHit::Missing
+}
+
+/// Own string-keyed properties of a non-array object in ECMAScript
+/// enumeration order: array-index keys ascending, then other string keys
+/// in insertion order. Includes accessor-only keys. When `skip_non_enum`
+/// is set, keys marked `enumerable:false` are dropped (Object.keys/for-in/
+/// JSON); getOwnPropertyNames passes false to see them all.
+fn own_keys_ordered(st: &St, oi: usize, skip_non_enum: bool) -> Vec<u32> {
+    let shape = st.objects[oi].shape;
+    let mut data: Vec<(u16, u32)> = st.shapes[shape as usize]
+        .props.iter().map(|(&a, &s)| (s, a)).collect();
+    data.sort_by_key(|&(slot, _)| slot);
+    let mut atoms: Vec<u32> = data.into_iter().map(|(_, a)| a).collect();
+    if st.objects[oi].has_accessors {
+        for (&(o, k), _) in st.accessors.iter() {
+            if o == oi as u32 && !atoms.contains(&k) {
+                atoms.push(k);
+            }
+        }
+    }
+    if skip_non_enum && !st.non_enum.is_empty() {
+        atoms.retain(|&k| !st.non_enum.contains(&(oi as u32, k)));
+    }
+    // partition canonical array indices (ascending) ahead of string keys
+    let mut ints: Vec<(u32, u32)> = Vec::new();
+    let mut strs: Vec<u32> = Vec::new();
+    for a in atoms {
+        let nm = &st.names[a as usize];
+        match nm.parse::<u32>() {
+            Ok(iv) if iv != u32::MAX && iv.to_string() == *nm => {
+                ints.push((iv, a))
+            }
+            _ => strs.push(a),
+        }
+    }
+    ints.sort_by_key(|&(iv, _)| iv);
+    let mut out: Vec<u32> = ints.into_iter().map(|(_, a)| a).collect();
+    out.extend(strs);
+    out
 }
 
 /// Expando lookup on the JS-visible Array.prototype object for array
@@ -5208,23 +5670,33 @@ fn do_native(
                 return Ok(Value::number(f64::NAN));
             }
             let s = to_display(st, st.regs[args_base]);
-            let radix = if argc >= 2 {
-                num_of(st.regs[args_base + 1])? as u32
+            let radix_arg = if argc >= 2 && !st.regs[args_base + 1].is_undefined() {
+                num_of(st.regs[args_base + 1])? as i64
             } else {
-                10
+                0
             };
-            let radix = if radix == 0 { 10 } else { radix };
+            let t = s.trim_matches(|c: char| {
+                c.is_whitespace() || c == '\u{feff}'
+            });
+            let (neg, rest) = match t.strip_prefix('-') {
+                Some(r) => (true, r),
+                None => (false, t.strip_prefix('+').unwrap_or(t)),
+            };
+            // spec: with no/0 radix a `0x`/`0X` prefix forces base 16;
+            // an explicit radix of 16 also tolerates the prefix.
+            let has_hex_prefix =
+                rest.starts_with("0x") || rest.starts_with("0X");
+            let (radix, digits) = if radix_arg == 0 {
+                if has_hex_prefix { (16u32, &rest[2..]) } else { (10u32, rest) }
+            } else if radix_arg == 16 && has_hex_prefix {
+                (16u32, &rest[2..])
+            } else {
+                (radix_arg as u32, rest)
+            };
             if !(2..=36).contains(&radix) {
                 // spec: invalid radix -> NaN (and is_digit(r>36) panics)
                 return Ok(Value::number(f64::NAN));
             }
-            let t = s.trim_matches(|c: char| {
-                c.is_whitespace() || c == '\u{feff}'
-            });
-            let (neg, digits) = match t.strip_prefix('-') {
-                Some(r) => (true, r),
-                None => (false, t.strip_prefix('+').unwrap_or(t)),
-            };
             let end = digits
                 .find(|c: char| !c.is_digit(radix))
                 .unwrap_or(digits.len());
@@ -5258,8 +5730,49 @@ fn do_native(
         }
         Native::JsonStringify => {
             let v = if argc > 0 { st.regs[args_base] } else { Value::UNDEFINED };
-            // `undefined`/function serialize to nothing at the top level.
-            Ok(match json_stringify(st, v, &mut Vec::new())? {
+            let replacer_v = if argc > 1 { st.regs[args_base + 1] } else { Value::UNDEFINED };
+            let space_v = if argc > 2 { st.regs[args_base + 2] } else { Value::UNDEFINED };
+            // space: a number gives that many (<=10) spaces, a string is
+            // used verbatim (first 10 chars); anything else = compact.
+            let gap = if space_v.is_number() {
+                " ".repeat((space_v.to_number_raw() as i64).clamp(0, 10) as usize)
+            } else if space_v.is_string() {
+                str_ref(st, space_v.index()).chars().take(10).collect()
+            } else {
+                String::new()
+            };
+            // replacer: a function transforms each pair; an array is an
+            // allow-list of property names to keep.
+            let (replacer, allow) = if replacer_v.is_function() {
+                (replacer_v, None)
+            } else if replacer_v.is_object()
+                && st.objects[replacer_v.index() as usize].is_array
+            {
+                let elems = st.objects[replacer_v.index() as usize].elems.clone();
+                let mut a = Vec::new();
+                for e in elems {
+                    let ks = if e.is_string() {
+                        str_ref(st, e.index()).to_string()
+                    } else if e.is_number() {
+                        js_num_str(e.to_number_raw())
+                    } else {
+                        continue;
+                    };
+                    a.push(st.intern_name(&ks));
+                }
+                (Value::UNDEFINED, Some(a))
+            } else {
+                (Value::UNDEFINED, None)
+            };
+            let ctx = JsonCtx { gap, replacer, allow };
+            // top-level holder is the wrapper { "": value } the replacer
+            // is invoked against (spec's SerializeJSONProperty).
+            let holder = new_plain_object(st);
+            let empty = st.intern_name("");
+            raw_set_prop(st, holder.index() as usize, empty, v);
+            Ok(match json_serialize(
+                st, mods, holder, "", v, &mut Vec::new(), &ctx, "",
+            )? {
                 Some(s) => push_str(st, s),
                 None => Value::UNDEFINED,
             })
@@ -5629,12 +6142,31 @@ fn define_one_prop(
     let get_id = st.intern_name("get");
     let set_id = st.intern_name("set");
     let val_id = st.intern_name("value");
-    let g = raw_get_prop(st, di, get_id).unwrap_or(Value::UNDEFINED);
-    let s = raw_get_prop(st, di, set_id).unwrap_or(Value::UNDEFINED);
-    if g.is_function() || s.is_function() {
-        st.accessors.insert((oi as u32, key), (g, s));
+    let writable_id = st.intern_name("writable");
+    let enum_id = st.intern_name("enumerable");
+    let get_p = raw_get_prop(st, di, get_id);
+    let set_p = raw_get_prop(st, di, set_id);
+    let val_p = raw_get_prop(st, di, val_id);
+    // was this property already present (data slot or accessor)?
+    let existed = st.shapes[st.objects[oi].shape as usize]
+        .props.contains_key(&key)
+        || st.accessors.contains_key(&(oi as u32, key));
+    let is_accessor_desc = get_p.is_some() || set_p.is_some();
+    if is_accessor_desc {
+        // Redefining an accessor keeps the side the descriptor omits
+        // (spec: absent get/set inherit the existing attribute).
+        let (og, os) = st
+            .accessors
+            .get(&(oi as u32, key))
+            .copied()
+            .unwrap_or((Value::UNDEFINED, Value::UNDEFINED));
+        let ng = if get_p.is_some() { get_p.unwrap() } else { og };
+        let ns = if set_p.is_some() { set_p.unwrap() } else { os };
+        st.accessors.insert((oi as u32, key), (ng, ns));
         st.objects[oi].has_accessors = true;
-    } else if let Some(v) = raw_get_prop(st, di, val_id) {
+    } else if let Some(v) = val_p {
+        // a data descriptor replaces any prior accessor of the same name
+        st.accessors.remove(&(oi as u32, key));
         // defineProperty(window, ...) must reach bare-name reads too
         // (core-js defineGlobalProperty installs polyfills this way)
         if obj == st.known.window {
@@ -5656,6 +6188,34 @@ fn define_one_prop(
         } else {
             raw_set_prop(st, oi, key, v);
         }
+        // writable defaults to false for a newly defined data property;
+        // for an existing one an omitted attribute is left unchanged.
+        match raw_get_prop(st, di, writable_id).map(|w| truthy(st, w)) {
+            Some(true) => {
+                st.non_writable.remove(&(oi as u32, key));
+            }
+            Some(false) => {
+                st.non_writable.insert((oi as u32, key));
+            }
+            None if !existed => {
+                st.non_writable.insert((oi as u32, key));
+            }
+            None => {}
+        }
+    }
+    // enumerable defaults to false for a newly defined property; omitted on
+    // an existing one leaves the current setting alone.
+    match raw_get_prop(st, di, enum_id).map(|e| truthy(st, e)) {
+        Some(true) => {
+            st.non_enum.remove(&(oi as u32, key));
+        }
+        Some(false) => {
+            st.non_enum.insert((oi as u32, key));
+        }
+        None if !existed => {
+            st.non_enum.insert((oi as u32, key));
+        }
+        None => {}
     }
     Ok(())
 }
@@ -5690,7 +6250,15 @@ fn host_fn(
         M_CEIL => m1!(f64::ceil),
         M_ROUND => m1!(|x: f64| (x + 0.5).floor()), // JS rounds .5 up
         M_TRUNC => m1!(f64::trunc),
-        M_SIGN => m1!(f64::signum),
+        // JS Math.sign: 0/-0/NaN pass through unchanged (f64::signum maps
+        // 0 -> 1 and -0 -> -1, which is wrong)
+        M_SIGN => m1!(|x: f64| if x.is_nan() || x == 0.0 {
+            x
+        } else if x > 0.0 {
+            1.0
+        } else {
+            -1.0
+        }),
         M_SQRT => m1!(f64::sqrt),
         M_CBRT => m1!(f64::cbrt),
         M_EXP => m1!(f64::exp),
@@ -5782,13 +6350,8 @@ fn host_fn(
                 return Ok(new_array(st, Vec::new()));
             }
             let oi = v.index() as usize;
-            let (is_array, nelems, shape) = {
-                let o = &st.objects[oi];
-                (o.is_array, o.elems.len(), o.shape)
-            };
-            let mut pairs: Vec<(u16, u32)> = st.shapes[shape as usize]
-                .props.iter().map(|(&a, &s)| (s, a)).collect();
-            pairs.sort_by_key(|&(slot, _)| slot);
+            let nelems = st.objects[oi].elems.len();
+            let v_is_array = st.objects[oi].is_array;
             let mut out = Vec::new();
             // array index keys first (like for-in). Plain objects store
             // numeric keys sparsely in elems (o["907"]=x pads 0..906
@@ -5796,16 +6359,23 @@ fn host_fn(
             // hundreds of phantom undefined keys, so skip holes.
             for k in 0..nelems {
                 let val = st.objects[oi].elems[k];
-                if !is_array && val.is_undefined() {
+                if !v_is_array && val.is_undefined() {
                     continue;
                 }
                 let key = intern(st, &k.to_string());
                 out.push(host_entry(st, id, key, val));
             }
-            for (slot, atom) in pairs {
+            for atom in own_keys_ordered(st, oi, true) {
                 let name = st.names[atom as usize].clone();
                 let key = intern(st, &name);
-                let val = st.objects[oi].slots[slot as usize];
+                // read getter-aware so accessor props surface their value
+                let val = match lookup_prop(st, oi, atom) {
+                    PropHit::Data(d) => d,
+                    PropHit::Getter(g) if g.is_function() => {
+                        call_value_this(st, mods, g, Some(v), &[])?
+                    }
+                    _ => Value::UNDEFINED,
+                };
                 out.push(host_entry(st, id, key, val));
             }
             Ok(new_array(st, out))
@@ -5885,11 +6455,58 @@ fn host_fn(
             Ok(out)
         }
         O_FREEZE => {
-            let target = argv!(0);
-            if is_js_object(target) {
-                let _ = internal_prevent_extensions(st, mods, target)?;
+            // freeze = prevent extensions (proxy-aware, marks the
+            // shared non_extensible_objects registry) + every current
+            // own key becomes non-writable
+            let o = argv!(0);
+            if is_js_object(o) {
+                let _ = internal_prevent_extensions(st, mods, o)?;
+                if o.is_object() {
+                    let oi = o.index();
+                    for atom in own_keys_ordered(st, oi as usize, false) {
+                        st.non_writable.insert((oi, atom));
+                    }
+                }
             }
-            Ok(target)
+            Ok(o)
+        }
+        O_SEAL | O_PREVENT_EXT => {
+            let o = argv!(0);
+            if is_js_object(o) {
+                let _ = internal_prevent_extensions(st, mods, o)?;
+            }
+            Ok(o)
+        }
+        O_IS_EXTENSIBLE => {
+            let o = argv!(0);
+            Ok(Value::boolean(
+                is_js_object(o) && internal_is_extensible(st, o),
+            ))
+        }
+        O_IS_SEALED => {
+            // primitives are sealed; objects are sealed once non-extensible
+            // (seal/freeze/preventExtensions are the only routes to that)
+            let o = argv!(0);
+            Ok(Value::boolean(
+                !is_js_object(o) || !internal_is_extensible(st, o),
+            ))
+        }
+        O_IS_FROZEN => {
+            let o = argv!(0);
+            if !o.is_object() {
+                return Ok(Value::boolean(!o.is_function()));
+            }
+            let oi = o.index();
+            if internal_is_extensible(st, o)
+                || !st.objects[oi as usize].elems.is_empty()
+            {
+                return Ok(Value::boolean(false));
+            }
+            let frozen = own_keys_ordered(st, oi as usize, false).iter().all(|&a| {
+                st.non_writable.contains(&(oi, a))
+                    || st.accessors.contains_key(&(oi, a))
+            });
+            Ok(Value::boolean(frozen))
         }
         O_DEFINE_PROP => {
             let obj = argv!(0);
@@ -5988,26 +6605,10 @@ fn host_fn(
                 }
                 out.push(intern(st, &k.to_string()));
             }
-            let mut pairs: Vec<(u16, u32)> = st.shapes[shape as usize]
-                .props.iter().map(|(&a, &s)| (s, a)).collect();
-            pairs.sort_by_key(|&(slot, _)| slot);
-            let mut seen: Vec<u32> = Vec::new();
-            for (_, atom) in pairs {
-                seen.push(atom);
+            // getOwnPropertyNames sees non-enumerable keys too (false)
+            for atom in own_keys_ordered(st, oi, false) {
                 let name = st.names[atom as usize].clone();
                 out.push(intern(st, &name));
-            }
-            if has_acc {
-                let mut acc: Vec<u32> = st.accessors.keys()
-                    .filter(|&&(o, _)| o == oi as u32)
-                    .map(|&(_, k)| k)
-                    .filter(|k| !seen.contains(k))
-                    .collect();
-                acc.sort_unstable();
-                for k in acc {
-                    let name = st.names[k as usize].clone();
-                    out.push(intern(st, &name));
-                }
             }
             Ok(new_array(st, out))
         }
@@ -6142,24 +6743,27 @@ fn host_fn(
             };
             let out = new_plain_object(st);
             let pi = out.index() as usize;
-            let t = Value::boolean(true);
+            let enumerable =
+                Value::boolean(!st.non_enum.contains(&(oi as u32, key)));
             if let Some((g, s)) = acc {
                 let gid = st.intern_name("get");
                 let sid = st.intern_name("set");
                 raw_set_prop(st, pi, gid, g);
                 raw_set_prop(st, pi, sid, s);
             } else if let Some(v) = own {
+                let writable =
+                    Value::boolean(!st.non_writable.contains(&(oi as u32, key)));
                 let vid = st.intern_name("value");
                 let wid = st.intern_name("writable");
                 raw_set_prop(st, pi, vid, v);
-                raw_set_prop(st, pi, wid, t);
+                raw_set_prop(st, pi, wid, writable);
             } else {
                 return Ok(Value::UNDEFINED);
             }
             let eid = st.intern_name("enumerable");
             let cid = st.intern_name("configurable");
-            raw_set_prop(st, pi, eid, t);
-            raw_set_prop(st, pi, cid, t);
+            raw_set_prop(st, pi, eid, enumerable);
+            raw_set_prop(st, pi, cid, Value::boolean(true));
             Ok(out)
         }
         O_GET_OWN_PDS => {
@@ -6306,6 +6910,12 @@ fn host_fn(
             }
             Ok(v)
         }
+        A_OF => {
+            // Array.of(...items): the args become the elements verbatim
+            let items: Vec<Value> =
+                (0..n).map(|k| argv!(k)).collect();
+            Ok(new_array(st, items))
+        }
         A_ISARRAY => {
             let mut v = argv!(0);
             for _ in 0..16 {
@@ -6317,16 +6927,75 @@ fn host_fn(
         }
         A_FROM => {
             let v = argv!(0);
-            let items: Vec<Value> = if v.is_object()
-                && st.objects[v.index() as usize].is_array
-            {
-                st.objects[v.index() as usize].elems.clone()
-            } else if v.is_string() {
+            let mapfn = argv!(1);
+            let mut items: Vec<Value> = if v.is_string() {
                 let s = str_ref(st, v.index()).to_string();
                 s.chars().map(|c| push_str(st, c.to_string())).collect()
+            } else if v.is_object() {
+                let oi = v.index();
+                if st.objects[oi as usize].is_array {
+                    st.objects[oi as usize].elems.clone()
+                } else if let Some(m) = {
+                    // iterables (Set, Map, generators, custom { next })
+                    // drain through the shared iterator protocol
+                    let m = materialize_iterable(st, mods, v)?;
+                    if m.index() != oi
+                        && m.is_object()
+                        && st.objects[m.index() as usize].is_array
+                    {
+                        Some(st.objects[m.index() as usize].elems.clone())
+                    } else {
+                        None
+                    }
+                } {
+                    m
+                } else {
+                    // array-like: consult .length, then index 0..length
+                    let lenv = match lookup_prop(st, oi as usize, st.ids.length) {
+                        PropHit::Data(d) => d,
+                        PropHit::Getter(g) if g.is_function() => {
+                            call_value_this(st, mods, g, Some(v), &[])?
+                        }
+                        _ => Value::UNDEFINED,
+                    };
+                    let len = {
+                        let n = lenv.to_number_raw();
+                        if n.is_finite() && n > 0.0 {
+                            (n as usize).min(1 << 24)
+                        } else {
+                            0
+                        }
+                    };
+                    let mut out = Vec::with_capacity(len.min(1 << 16));
+                    for i in 0..len {
+                        // numeric indices live in dense elems on any object
+                        let val = if i < st.objects[oi as usize].elems.len() {
+                            st.objects[oi as usize].elems[i]
+                        } else {
+                            let ka = st.intern_name(&i.to_string());
+                            match lookup_prop(st, oi as usize, ka) {
+                                PropHit::Data(d) => d,
+                                PropHit::Getter(g) if g.is_function() => {
+                                    call_value_this(st, mods, g, Some(v), &[])?
+                                }
+                                _ => Value::UNDEFINED,
+                            }
+                        };
+                        out.push(val);
+                    }
+                    out
+                }
             } else {
                 Vec::new()
             };
+            if mapfn.is_function() {
+                for i in 0..items.len() {
+                    let it = items[i];
+                    items[i] = call_value_this(
+                        st, mods, mapfn, None, &[it, Value::int(i as i32)],
+                    )?;
+                }
+            }
             Ok(new_array(st, items))
         }
         N_ISNAN => {
@@ -6344,6 +7013,23 @@ fn host_fn(
                     let x = v.to_number_raw();
                     x.is_finite() && x.fract() == 0.0
                 },
+            ))
+        }
+        N_ISSAFEINT => {
+            let v = argv!(0);
+            Ok(Value::boolean(v.is_number() && {
+                let x = v.to_number_raw();
+                x.is_finite()
+                    && x.fract() == 0.0
+                    && x.abs() <= 9_007_199_254_740_991.0
+            }))
+        }
+        O_HAS_OWN => {
+            // Object.hasOwn(o, k) — the static form of hasOwnProperty
+            let o = argv!(0);
+            let k = argv!(1);
+            Ok(Value::boolean(
+                o.is_object() && has_own_property(st, mods, o, k)?,
             ))
         }
         S_FROMCHARCODE => {
@@ -6395,11 +7081,60 @@ fn json_quote(s: &str) -> String {
 /// `None` means "omit" (undefined / function): dropped from objects,
 /// becomes `null` in arrays, yields `undefined` at the top level.
 /// Errs on cyclic structures like real JSON.stringify.
-fn json_stringify(
+/// Options threaded through a JSON.stringify call: the indent unit
+/// (`gap`, empty for compact output), an optional function replacer, and
+/// an optional array replacer allow-list of atom keys.
+struct JsonCtx {
+    gap: String,
+    replacer: Value,
+    allow: Option<Vec<u32>>,
+}
+
+/// Own string-keyed properties of an object in enumeration order: data
+/// slots by insertion, then accessor-only keys. Used by JSON.stringify so
+/// getters are serialized (real engines call them) and defineProperty
+/// accessors are not silently dropped.
+fn json_own_keys(st: &St, oi: usize) -> Vec<u32> {
+    own_keys_ordered(st, oi, true)
+}
+
+/// Full SerializeJSONProperty: applies toJSON, then a function replacer,
+/// then serializes the (possibly replaced) value with `ctx.gap`
+/// indentation. `holder`/`key` provide the receiver and property name the
+/// replacer is invoked with.
+fn json_serialize(
     st: &mut St,
-    v: Value,
+    mods: &ModStore,
+    holder: Value,
+    key: &str,
+    v0: Value,
     seen: &mut Vec<u32>,
+    ctx: &JsonCtx,
+    indent: &str,
 ) -> Result<Option<String>, VmError> {
+    let mut v = v0;
+    // 1. value.toJSON(key) if present
+    if v.is_object() {
+        let oi = v.index() as usize;
+        let tj = st.intern_name("toJSON");
+        let f = match lookup_prop(st, oi, tj) {
+            PropHit::Data(f) => f,
+            PropHit::Getter(g) if g.is_function() => {
+                call_value_this(st, mods, g, Some(v), &[])?
+            }
+            _ => Value::UNDEFINED,
+        };
+        if f.is_function() {
+            let ks = make_string(st, key.to_string());
+            v = call_value_this(st, mods, f, Some(v), &[ks])?;
+        }
+    }
+    // 2. function replacer(holder, key, value)
+    if ctx.replacer.is_function() {
+        let ks = make_string(st, key.to_string());
+        v = call_value_this(st, mods, ctx.replacer, Some(holder), &[ks, v])?;
+    }
+    // 3. serialize
     if v.is_undefined() || v.is_function() {
         return Ok(None);
     }
@@ -6432,28 +7167,60 @@ fn json_stringify(
             return err("structure too deep to JSON.stringify");
         }
         seen.push(oi as u32);
+        let child = format!("{indent}{}", ctx.gap);
+        let pretty = !ctx.gap.is_empty();
         let out = if st.objects[oi].is_array {
             let elems = st.objects[oi].elems.clone();
-            let mut parts = Vec::with_capacity(elems.len());
-            for e in elems {
-                parts.push(json_stringify(st, e, seen)?
-                    .unwrap_or_else(|| "null".to_string()));
-            }
-            format!("[{}]", parts.join(","))
-        } else {
-            let shape = st.objects[oi].shape;
-            let mut pairs: Vec<(u16, u32)> = st.shapes[shape as usize]
-                .props.iter().map(|(&a, &s)| (s, a)).collect();
-            pairs.sort_by_key(|&(slot, _)| slot);
-            let mut parts = Vec::new();
-            for (slot, atom) in pairs {
-                let val = st.objects[oi].slots[slot as usize];
-                if let Some(vs) = json_stringify(st, val, seen)? {
-                    let key = st.names[atom as usize].clone();
-                    parts.push(format!("{}:{}", json_quote(&key), vs));
+            if elems.is_empty() {
+                "[]".to_string()
+            } else {
+                let mut parts = Vec::with_capacity(elems.len());
+                for (i, e) in elems.into_iter().enumerate() {
+                    let ks = i.to_string();
+                    parts.push(
+                        json_serialize(st, mods, v, &ks, e, seen, ctx, &child)?
+                            .unwrap_or_else(|| "null".to_string()),
+                    );
+                }
+                if pretty {
+                    format!("[\n{child}{}\n{indent}]",
+                        parts.join(&format!(",\n{child}")))
+                } else {
+                    format!("[{}]", parts.join(","))
                 }
             }
-            format!("{{{}}}", parts.join(","))
+        } else {
+            let colon = if pretty { ": " } else { ":" };
+            let keys = json_own_keys(st, oi);
+            let mut parts = Vec::new();
+            for atom in keys {
+                if let Some(allow) = &ctx.allow {
+                    if !allow.contains(&atom) {
+                        continue;
+                    }
+                }
+                let pv = match lookup_prop(st, oi, atom) {
+                    PropHit::Data(d) => d,
+                    PropHit::Getter(g) if g.is_function() => {
+                        call_value_this(st, mods, g, Some(v), &[])?
+                    }
+                    _ => Value::UNDEFINED,
+                };
+                let kname = st.names[atom as usize].clone();
+                if let Some(vs) =
+                    json_serialize(st, mods, v, &kname, pv, seen, ctx, &child)?
+                {
+                    parts.push(format!("{}{colon}{vs}", json_quote(&kname)));
+                }
+            }
+            if parts.is_empty() {
+                "{}".to_string()
+            } else if pretty {
+                format!("{{\n{child}{}\n{indent}}}",
+                    parts.join(&format!(",\n{child}")))
+            } else {
+                format!("{{{}}}", parts.join(","))
+            }
         };
         seen.pop();
         return Ok(Some(out));
@@ -9139,13 +9906,17 @@ fn exec_loop(
                                     None => Value::NULL,
                                     Some(gs) => {
                                         let vals: Vec<Value> = gs
-                                            .into_iter()
+                                            .iter()
                                             .map(|g| match g {
-                                                Some(s) => push_str(st, s),
+                                                Some(s) => {
+                                                    push_str(st, s.clone())
+                                                }
                                                 None => Value::UNDEFINED,
                                             })
                                             .collect();
-                                        new_array(st, vals)
+                                        let arr = new_array(st, vals);
+                                        attach_groups(st, arr, ri, &gs);
+                                        arr
                                     }
                                 }
                             }
@@ -9172,6 +9943,7 @@ fn exec_loop(
                             "catch" => {
                                 promise_then(st, pid, Value::UNDEFINED, arg0)
                             }
+                            "finally" => promise_finally(st, pid, arg0),
                             other => {
                                 return err(format!(
                                     "Promise has no method .{other}() yet"
@@ -9362,9 +10134,23 @@ fn exec_loop(
                                 "indexOf" => {
                                     let elems =
                                         st.objects[oi].elems.clone();
+                                    // optional fromIndex (negative counts
+                                    // back from the end)
+                                    let start = if argc > 1 {
+                                        let n = arg1.to_number_raw();
+                                        let len = elems.len() as i64;
+                                        let s = if n < 0.0 {
+                                            (len + n as i64).max(0)
+                                        } else {
+                                            n as i64
+                                        };
+                                        s.max(0) as usize
+                                    } else {
+                                        0
+                                    };
                                     let mut idx = -1i32;
-                                    for (i, &e) in elems.iter().enumerate() {
-                                        if strict_eq(st, e, arg0) {
+                                    for i in start..elems.len() {
+                                        if strict_eq(st, elems[i], arg0) {
                                             idx = i as i32;
                                             break;
                                         }
@@ -9385,9 +10171,17 @@ fn exec_loop(
                                 "includes" => {
                                     let elems =
                                         st.objects[oi].elems.clone();
+                                    // SameValueZero: unlike indexOf, NaN
+                                    // matches NaN
+                                    let want_nan = arg0.is_number()
+                                        && arg0.to_number_raw().is_nan();
                                     let mut found = false;
                                     for &e in elems.iter() {
-                                        if strict_eq(st, e, arg0) {
+                                        if strict_eq(st, e, arg0)
+                                            || (want_nan
+                                                && e.is_number()
+                                                && e.to_number_raw().is_nan())
+                                        {
                                             found = true;
                                             break;
                                         }
@@ -9607,6 +10401,143 @@ fn exec_loop(
                                         )?;
                                     }
                                     acc
+                                }
+                                "reduceRight" => {
+                                    let elems =
+                                        st.objects[oi].elems.clone();
+                                    let n = elems.len() as i64;
+                                    let (mut acc, mut i) = if argc >= 2 {
+                                        (arg1, n - 1)
+                                    } else if !elems.is_empty() {
+                                        (elems[elems.len() - 1], n - 2)
+                                    } else {
+                                        return err(
+                                            "Reduce of empty array with \
+                                             no initial value",
+                                        );
+                                    };
+                                    while i >= 0 {
+                                        acc = call_value(
+                                            st, mods, arg0,
+                                            &[
+                                                acc,
+                                                elems[i as usize],
+                                                Value::int(i as i32),
+                                                ov,
+                                            ],
+                                        )?;
+                                        i -= 1;
+                                    }
+                                    acc
+                                }
+                                "fill" => {
+                                    let len =
+                                        st.objects[oi].elems.len() as i64;
+                                    let clamp = |x: i64| {
+                                        if x < 0 {
+                                            (len + x).max(0)
+                                        } else {
+                                            x.min(len)
+                                        }
+                                    };
+                                    let s = clamp(if argc > 1 {
+                                        num_of(arg1)? as i64
+                                    } else {
+                                        0
+                                    });
+                                    let e_arg = if argc > 2 {
+                                        st.regs[a0 + 2]
+                                    } else {
+                                        Value::UNDEFINED
+                                    };
+                                    let e = if e_arg.is_undefined() {
+                                        len
+                                    } else {
+                                        clamp(num_of(e_arg)? as i64)
+                                    };
+                                    for k in s..e {
+                                        st.objects[oi].elems[k as usize] =
+                                            arg0;
+                                    }
+                                    ov
+                                }
+                                "copyWithin" => {
+                                    let len =
+                                        st.objects[oi].elems.len() as i64;
+                                    let clamp = |x: i64| {
+                                        if x < 0 {
+                                            (len + x).max(0)
+                                        } else {
+                                            x.min(len)
+                                        }
+                                    };
+                                    let target = clamp(if argc > 0 {
+                                        num_of(arg0)? as i64
+                                    } else {
+                                        0
+                                    });
+                                    let start = clamp(if argc > 1 {
+                                        num_of(arg1)? as i64
+                                    } else {
+                                        0
+                                    });
+                                    let e_arg = if argc > 2 {
+                                        st.regs[a0 + 2]
+                                    } else {
+                                        Value::UNDEFINED
+                                    };
+                                    let end = if e_arg.is_undefined() {
+                                        len
+                                    } else {
+                                        clamp(num_of(e_arg)? as i64)
+                                    };
+                                    let count =
+                                        (end - start).min(len - target).max(0);
+                                    let src: Vec<Value> = st.objects[oi]
+                                        .elems[start as usize
+                                            ..(start + count) as usize]
+                                        .to_vec();
+                                    for k in 0..count as usize {
+                                        st.objects[oi].elems
+                                            [target as usize + k] = src[k];
+                                    }
+                                    ov
+                                }
+                                // ES2023 immutable variants return a copy
+                                "toReversed" => {
+                                    let mut e =
+                                        st.objects[oi].elems.clone();
+                                    e.reverse();
+                                    new_array(st, e)
+                                }
+                                "toSorted" => {
+                                    let mut e =
+                                        st.objects[oi].elems.clone();
+                                    let cmp = if argc > 0
+                                        && arg0.is_function()
+                                    {
+                                        Some(arg0)
+                                    } else {
+                                        None
+                                    };
+                                    merge_sort(st, mods, &mut e, cmp)?;
+                                    new_array(st, e)
+                                }
+                                "with" => {
+                                    let mut e =
+                                        st.objects[oi].elems.clone();
+                                    let len = e.len() as i64;
+                                    let mut i = num_of(arg0)? as i64;
+                                    if i < 0 {
+                                        i += len;
+                                    }
+                                    if i < 0 || i >= len {
+                                        return err(
+                                            "Array.with: index out of range",
+                                        );
+                                    }
+                                    e[i as usize] = arg1;
+                                    new_array(st, e)
                                 }
                                 "at" => {
                                     let elems =
@@ -9886,6 +10817,27 @@ fn exec_loop(
                     let s = format!("{:.*}", digits, ov.to_number_raw());
                     reg!(obj) = push_str(st, s);
                 } else if ov.is_string() {
+                    // Fast path: indexed single-char reads reuse a
+                    // memoized UTF-16 unit vector, so a char-by-char scan
+                    // (`for (i;i<s.length;i++) s.charCodeAt(i)`) is O(n)
+                    // amortized, not O(n^2) from rebuilding the string
+                    // every call.
+                    if matches!(
+                        st.names[key as usize].as_str(),
+                        "charAt" | "charCodeAt"
+                    ) {
+                        let a0 = base + obj as usize + 1;
+                        let iv = if argc > 0 {
+                            num_of(st.regs[a0])?
+                        } else {
+                            0.0
+                        };
+                        let code =
+                            st.names[key as usize] == "charCodeAt";
+                        reg!(obj) =
+                            str_char_read(st, ov.index(), iv, code);
+                        continue;
+                    }
                     // String methods. Index semantics use Unicode scalars
                     // (matches ASCII/BMP; astral chars differ from JS's
                     // UTF-16 units — acceptable for now).
@@ -9986,6 +10938,40 @@ fn exec_loop(
                             };
                             push_str(st, out)
                         }
+                        "matchAll" => {
+                            let Some(ri) = regex_index(st, av0) else {
+                                return err(
+                                    "String.matchAll needs a regex arg");
+                            };
+                            let all = st.regexes[ri].re
+                                .captures_all(&s, true);
+                            let mut results = Vec::with_capacity(all.len());
+                            let idx_atom = st.intern_name("index");
+                            let inp_atom = st.intern_name("input");
+                            for (whole, groups, start) in all {
+                                // char offset of the byte position `start`
+                                let cidx = s[..start].chars().count() as i32;
+                                let full: Vec<Option<String>> =
+                                    std::iter::once(Some(whole.clone()))
+                                        .chain(groups.into_iter())
+                                        .collect();
+                                let vals: Vec<Value> = full.iter()
+                                    .map(|g| match g {
+                                        Some(x) => push_str(st, x.clone()),
+                                        None => Value::UNDEFINED,
+                                    })
+                                    .collect();
+                                let arr = new_array(st, vals);
+                                attach_groups(st, arr, ri, &full);
+                                let ai = arr.index() as usize;
+                                raw_set_prop(st, ai, idx_atom, Value::int(cidx));
+                                let inp = push_str(st, s.clone());
+                                raw_set_prop(st, ai, inp_atom, inp);
+                                results.push(arr);
+                            }
+                            // an array is iterable — satisfies for-of/spread
+                            new_array(st, results)
+                        }
                         "match" => {
                             let Some(ri) = regex_index(st, av0) else {
                                 return err(
@@ -10006,12 +10992,16 @@ fn exec_loop(
                                 match groups {
                                     None => Value::NULL,
                                     Some(gs) => {
-                                        let vals: Vec<Value> = gs.into_iter()
+                                        let vals: Vec<Value> = gs.iter()
                                             .map(|g| match g {
-                                                Some(x) => push_str(st, x),
+                                                Some(x) => {
+                                                    push_str(st, x.clone())
+                                                }
                                                 None => Value::UNDEFINED,
                                             }).collect();
-                                        new_array(st, vals)
+                                        let arr = new_array(st, vals);
+                                        attach_groups(st, arr, ri, &gs);
+                                        arr
                                     }
                                 }
                             }
@@ -10034,13 +11024,13 @@ fn exec_loop(
                             }
                         }
                         "split" => {
-                            if let Some(ri) = regex_index(st, av0) {
-                                let parts = st.regexes[ri].re.split_vec(&s);
-                                let vals: Vec<Value> = parts.into_iter()
-                                    .map(|p| push_str(st, p)).collect();
-                                new_array(st, vals)
-                            } else {
-                                let parts: Vec<Value> = if argc == 0 {
+                            let mut vals: Vec<Value> =
+                                if let Some(ri) = regex_index(st, av0) {
+                                    let parts =
+                                        st.regexes[ri].re.split_vec(&s);
+                                    parts.into_iter()
+                                        .map(|p| push_str(st, p)).collect()
+                                } else if argc == 0 {
                                     vec![push_str(st, s.clone())]
                                 } else {
                                     let sep = to_display(st, av0);
@@ -10054,8 +11044,14 @@ fn exec_loop(
                                             .collect::<Vec<_>>()
                                     }
                                 };
-                                new_array(st, parts)
+                            // optional limit argument caps the piece count
+                            if argc > 1 && !av1.is_undefined() {
+                                let lim = av1.to_number_raw();
+                                if lim.is_finite() && lim >= 0.0 {
+                                    vals.truncate(lim as usize);
+                                }
                             }
+                            new_array(st, vals)
                         }
                         "replace" => {
                             if av1.is_function() {
@@ -10080,9 +11076,9 @@ fn exec_loop(
                                 };
                                 push_str(st, out)
                             } else if let Some(ri) = regex_index(st, av0) {
-                                // JS $& (whole match) -> regex crate ${0}
-                                let to = to_display(st, av1)
-                                    .replace("$&", "${0}");
+                                // JS $&/$<name> -> regex crate syntax
+                                let to =
+                                    js_repl_to_rust(&to_display(st, av1));
                                 let out = if st.regexes[ri].global {
                                     st.regexes[ri].re
                                         .replace_all_str(&s, to.as_str())
@@ -10123,6 +11119,12 @@ fn exec_loop(
                                     }
                                     replace_with_fn(st, mods, &s, &m, av1)?
                                 };
+                                push_str(st, out)
+                            } else if let Some(ri) = regex_index(st, av0) {
+                                let to =
+                                    js_repl_to_rust(&to_display(st, av1));
+                                let out = st.regexes[ri].re
+                                    .replace_all_str(&s, to.as_str());
                                 push_str(st, out)
                             } else {
                                 let from = to_display(st, av0);
@@ -10179,13 +11181,47 @@ fn exec_loop(
                                         .unwrap_or(false),
                             )
                         }
-                        // code-point order approximates any locale well
-                        // enough for UI sorts; throwing here kills whole
-                        // React render passes (naver sorts widget rows
-                        // with localeCompare(…, 'ko'))
+                        "padStart" | "padEnd" => {
+                            let target = num_of(av0)? as i64;
+                            let pad = if av1.is_undefined() {
+                                " ".to_string()
+                            } else {
+                                to_display(st, av1)
+                            };
+                            let curlen = s.chars().count() as i64;
+                            if target <= curlen || pad.is_empty() {
+                                push_str(st, s.clone())
+                            } else {
+                                let need = (target - curlen) as usize;
+                                let pc: Vec<char> = pad.chars().collect();
+                                let fill: String =
+                                    (0..need).map(|i| pc[i % pc.len()]).collect();
+                                let out = if method == "padStart" {
+                                    format!("{fill}{s}")
+                                } else {
+                                    format!("{s}{fill}")
+                                };
+                                push_str(st, out)
+                            }
+                        }
+                        "codePointAt" => {
+                            let i = num_of(av0)? as i64;
+                            let ch = if i >= 0 {
+                                s.chars().nth(i as usize)
+                            } else {
+                                None
+                            };
+                            match ch {
+                                Some(c) => Value::int(c as i32),
+                                None => Value::UNDEFINED,
+                            }
+                        }
+                        // no ICU on board: NFC-normalize is a best-effort
+                        // identity (BMP text is already single-form here)
+                        "normalize" => push_str(st, s.clone()),
                         "localeCompare" => {
                             let other = to_display(st, av0);
-                            Value::int(match s.as_str().cmp(&other) {
+                            Value::int(match s.cmp(&other) {
                                 std::cmp::Ordering::Less => -1,
                                 std::cmp::Ordering::Equal => 0,
                                 std::cmp::Ordering::Greater => 1,
@@ -10410,15 +11446,10 @@ fn exec_loop(
                             }
                         }
                     }
-                    // named props in slot (= insertion) order
-                    let mut pairs: Vec<(u16, u32)> = st.shapes
-                        [shape as usize]
-                        .props
-                        .iter()
-                        .map(|(&a, &s)| (s, a))
-                        .collect();
-                    pairs.sort_by_key(|&(slot, _)| slot);
-                    for (_slot, atom) in pairs {
+                    let _ = shape;
+                    // own enumerable named keys, array-index keys ahead of
+                    // string keys (skips enumerable:false props)
+                    for atom in own_keys_ordered(st, oi, true) {
                         let name = st.names[atom as usize].clone();
                         let sv = intern(st, &name);
                         keys.push(sv);
@@ -10648,8 +11679,7 @@ fn exec_loop(
                             None => Value::UNDEFINED,
                         }
                     } else if text == "length" {
-                        Value::int(
-                            sref.encode_utf16().count() as i32)
+                        Value::int(str_u16_len(st, ov.index()) as i32)
                     } else {
                         let key_id = st.intern_name(&text);
                         primitive_prop_read(st, ov, key_id)
@@ -10887,6 +11917,26 @@ fn exec_loop(
                         reg!(dst) = Value::int(elen as i32);
                         continue;
                     }
+                    // An own accessor (Object.defineProperty get/set) wins
+                    // over any data slot of the same name — including one
+                    // the shape still carries because the property used to
+                    // be a plain value before it was redefined. The IC/slot
+                    // fast path below reads the raw slot and cannot see the
+                    // getter, so intercept here (cheap: gated on the flag).
+                    if st.objects[oi].has_accessors {
+                        if let Some(&(g, _s)) =
+                            st.accessors.get(&(oi as u32, key))
+                        {
+                            reg!(dst) = if g.is_function() {
+                                call_value_this(
+                                    st, mods, g, Some(ov), &[],
+                                )?
+                            } else {
+                                Value::UNDEFINED
+                            };
+                            continue;
+                        }
+                    }
                     let slot_ic = ic!(ic);
                     let e = st.ics[slot_ic];
                     let hit = if e.shape == shape {
@@ -11036,7 +12086,7 @@ fn exec_loop(
                         Value::UNDEFINED
                     };
                 } else if ov.is_string() && key == st.ids.length {
-                    let n = str_ref(st, ov.index()).encode_utf16().count();
+                    let n = str_u16_len(st, ov.index());
                     reg!(dst) = Value::int(n as i32);
                 } else if ov.is_string() || ov.is_number()
                     || ov.is_boolean()
@@ -11205,6 +12255,22 @@ fn exec_loop(
                             node as usize, &attr, &val);
                         continue;
                     }
+                    // arr.length = n truncates (or grows with holes) the
+                    // dense element storage — length is not a real slot.
+                    let oi0 = ov.index() as usize;
+                    if st.objects[oi0].is_array && key == st.ids.length {
+                        let n = reg!(src).to_number_raw();
+                        if n >= 0.0 && n.fract() == 0.0 && n <= u32::MAX as f64 {
+                            let newlen = n as usize;
+                            let elems = &mut st.objects[oi0].elems;
+                            if newlen < elems.len() {
+                                elems.truncate(newlen);
+                            } else {
+                                elems.resize(newlen, Value::UNDEFINED);
+                            }
+                        }
+                        continue;
+                    }
                 }
                 if ov.is_function() {
                     // F.prototype = {...} replaces the lazy prototype;
@@ -11238,6 +12304,41 @@ fn exec_loop(
                     let k = key as usize;
                     st.globals[k] = v;
                     st.gdef[k] = true;
+                }
+                // Property-attribute enforcement (sloppy mode: a blocked
+                // write is a silent no-op). Gated on the side-tables being
+                // non-empty so unfrozen objects skip the checks entirely.
+                if !st.non_writable.is_empty()
+                    && st.non_writable.contains(&(oi as u32, key))
+                {
+                    continue; // writable:false / frozen
+                }
+                if !st.non_extensible_objects.is_empty()
+                    && st.non_extensible_objects.contains(&(oi as u32))
+                {
+                    let exists = st.shapes[st.objects[oi].shape as usize]
+                        .props.contains_key(&key)
+                        || (st.objects[oi].has_accessors
+                            && st.accessors.contains_key(&(oi as u32, key)));
+                    if !exists {
+                        continue; // can't add new props to a sealed object
+                    }
+                }
+                // An own accessor takes precedence over the data fast path:
+                // invoke its setter, or drop the write (sloppy mode) when
+                // the property is getter-only. Without this, assigning to a
+                // getter-only property clobbers it into a plain data slot.
+                if st.objects[oi].has_accessors {
+                    if let Some(&(_g, s)) =
+                        st.accessors.get(&(oi as u32, key))
+                    {
+                        if s.is_function() {
+                            call_value_this(
+                                st, mods, s, Some(ov), &[v],
+                            )?;
+                        }
+                        continue;
+                    }
                 }
                 let slot_ic = ic!(ic);
                 let e = st.ics[slot_ic];

@@ -1091,12 +1091,17 @@ class DocumentLayout:
         self.definite_height = None
 
     def layout(self, width, height=None):
-        self.width = width - 2 * HSTEP
-        self.x = HSTEP
-        self.y = VSTEP
+        # The document box is the viewport itself: origin (0,0), full
+        # width. The default page inset comes from the UA `body{margin:8px}`
+        # rule (style.py) — matching real browsers — not a hardcoded
+        # document padding, which would double the margin (and shift every
+        # coordinate vs Chrome, breaking pages that reset body margin).
+        self.width = width
+        self.x = 0
+        self.y = 0
         self.viewport_width = width
         self.viewport_height = height
-        self.definite_height = (max(height - 2 * VSTEP, 0)
+        self.definite_height = (max(height, 0)
                                 if height is not None else None)
         self.children = []
         self.abs_queue = []

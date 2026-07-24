@@ -108,8 +108,16 @@ def audit(url_str):
     samples = []
     for i in range(len(tl)):
         x1, y1, w1, h1, t1 = tl[i]
+        # text whose center sits above the viewport is clipped and not
+        # visible — e.g. `position:absolute; top:-30px` sr-only skip links
+        # and focus-revealed menus. Overlaps among hidden runs are not
+        # visible defects, so don't count them (they otherwise dominate).
+        if y1 + h1 / 2 <= 0:
+            continue
         for j in range(i + 1, len(tl)):
             x2, y2, w2, h2, t2 = tl[j]
+            if y2 + h2 / 2 <= 0:
+                continue
             if y2 - y1 > max(h1, 6):
                 break
             if (abs(y1 - y2) < max(h1, h2) * 0.6

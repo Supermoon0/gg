@@ -1032,7 +1032,19 @@ impl Doc {
         self.ggvm().global_number(&name)
     }
 
-    /// Host settles a fetch the driver performed.
+    /// Current virtual-clock ms (host fixes a settle horizon from this).
+    fn now_ms(&mut self) -> f64 {
+        self.ggvm().now_ms()
+    }
+
+    /// Fire one scheduler slice; host refreshes layout rects between
+    /// steps so geometry-reading effects see real rects. Returns
+    /// (console output, fetches, more-work-remains).
+    fn step(&mut self, horizon_ms: f64) -> (Vec<String>, Vec<(u32, String)>, bool) {
+        self.ggvm().step(horizon_ms)
+    }
+
+    /// Host settles a fetch the driver performed (gg-js only).
     fn resolve_fetch(&mut self, fetch_id: u32, status: u16, body: String) {
         self.ggvm().resolve_fetch(fetch_id, status, body);
     }

@@ -25,3 +25,10 @@ extension-module = ["pyo3/extension-module"]
 [profile.release]
 lto = true
 codegen-units = 1
+
+# The merged gg-js interpreter loop carries very large match arms; at
+# opt-level 0 its stack frame outgrows the 2 MiB test-thread stack and the
+# 24-deep native re-entry guard (vm_stability_regressions) overflows before
+# it trips. Light optimization keeps test frames realistic (and tests fast).
+[profile.test]
+opt-level = 1

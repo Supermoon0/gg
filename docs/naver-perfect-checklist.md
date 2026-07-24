@@ -5,9 +5,9 @@
 | 단계 | 기준 | 필요한 마일스톤 | 상태 (07-16) |
 |---|---|---|---|
 | **A. 크롬 JS-off 동급** | 로고·둥근 검색창·아이콘이 픽셀 수준으로 같음 | M1 | **사실상 달성** (M1 주요 항목 완료, 웹폰트·flex 심화 등 소품 잔여) |
-| **B. 첫 화면 완성** | 뉴스·쇼핑·피드가 실제로 그려짐 | M2 + M3 + M4 | M2 95% (문법 완료, 런타임 롱테일) · M3 스텁 표면 완료(07-18, 잔여: getBoundingClientRect 실측) · M4 라이브 루프 v1 + **부분 무효화 v1**(07-18) |
+| **B. 첫 화면 완성** | 뉴스·쇼핑·피드가 실제로 그려짐 | M2 + M3 + M4 | **07-23: 사실상 달성** — react가 **완전 커밋**, #root에 674 엘리먼트(뉴스스탠드·언론사 탭·쇼핑 캐러셀·이미지 44) 렌더, **JS 오류 0**. (07-20의 "커밋 못 함/88s" 프런티어 해소) |
 | **C. 사용 가능** | 스크롤·호버·검색 타이핑·클릭 이동 | M5 | 스크롤·타이핑·GET 제출·**hover/focus 재스타일**(07-18) · 잔여: IME |
-| **D. 크롬급 속도** | 재방문 1초 내 첫 화면, 스크롤 60fps | M6 | 재방문 0.18s ✅ · 60fps 미측정 |
+| **D. 크롬급 속도** | 재방문 1초 내 첫 화면, 스크롤 60fps | M6 | 재방문 0.18s ✅ · **07-23: settle 57s→~3s**(O(n²) 4곳 제거) · 60fps 미측정 |
 
 **진도 측정 도구**: `python basket_test.py` — 대표 사이트 8개 헤드리스 렌더
 스코어보드. 07-16 실측: **7/8 "읽을만함", 크래시 0** (위키백과 텍스트
@@ -163,6 +163,54 @@ mi/pi/ip, 사망 리스너), `GG_JS_DUMP=<dir>`(사망 프로토+상위 콜러 4
 script 종 추가 [M]), 정규식 lookaround/backref 31건 never-matching 강등
 (fancy-regex 2차 엔진 [M], 서로게이트 클래스 강등은 무해 판명).
 
+**★ 07-23 프런티어 해소 — react 완전 커밋 + 렌더 (07-20의 벽 돌파)**:
+07-20에 "다세션 리서치 규모"로 판정했던 두 objection이 모두 사라짐 —
+(1) 렌더 88s → **~3s**, (2) 커밋 경로 undefined-노드 크래시 → **JS 오류 0**.
+실측(실네트워크, 4.4→3.2s): react가 **#root에 674 엘리먼트 완전 커밋**
+— 뉴스스탠드(언론사편집·엔터·스포츠·게임·경제 탭)·쇼핑 캐러셀(도서
+저자/출판사)·이미지 44개·GNB. 크래시·언캐치 0. **B단계(첫 화면 완성)
+사실상 달성.** 이 세션에서 격파한 근본원인:
+- [x] **인터프리터 O(n²) 4곳 제거 (settle 57s→~3s)** — settle 전체가 한
+  pump 라운드에 몰리고 힙이 커질수록 명령/초 20배 붕괴. `intern()`
+  선형스캔→해시맵, charAt/charCodeAt 매호출 UTF-16 재구성→문자열당
+  유닛 메모, 문자열 `.length` 매읽기 재카운트→길이 메모,
+  method_ref_dispatch 배열 수신자 선(先)클론→무클론 패스. (상세: M6)
+  **88s→~3s가 "커밋은 하는데 느려서 비실용" objection을 제거한 결정타.**
+- [x] **파서 갭 (스크립트 통째 사망 유발)** — class 필드명 get/set/static
+  오인, async 제너레이터 `async function*`/객체 async 메서드, escape/
+  unescape 전역. yna·모던 번들 일반.
+- [x] **문서 박스 = 뷰포트** — DocumentLayout이 UA `body{margin:8px}`
+  위에 (13,18) 인셋을 중복 적용해 전 페이지가 크롬 대비 (13,18) 밀리고
+  26px 좁았음. 원점 (0,0)·풀폭으로 → `top:-30px` sr-only 스킵링크가
+  화면 밖 클립(크롬 정합). smoke 143(인셋 하드코딩 4개 정정).
+현 잔여(롱테일, 저순위): 콘텐츠 영역 산발 오버랩 소수(캐러셀 엣지케이스,
+서빙 콘텐츠 따라 4~36), 동적 `<script src>` 미실행, 정규식 강등.
+**판단: A·B·D 사실상 달성. "완벽"의 남은 격차는 근본원인이 아니라
+시각 디테일·롱테일.**
+
+**★ 07-23 뷰포트-lazy 콘텐츠 로드 (step 프리미티브 + settle_lazy)**:
+헤드리스 렌더가 앱 셸+EAGER-DATA 섹션(뉴스스탠드·피드)만 그리고 데이터
+기반 섹션(쇼핑 피드·푸터·위젯)은 비어 있던 문제를 규명·해소:
+- **근본원인**: 섹션 로드 이펙트가 settle 중 실행되는데 그 시점엔 레이아웃이
+  없어 `getBoundingClientRect`가 0 → "화면 밖" 판정 → 로드 포기. React
+  이펙트는 재실행 안 되므로 사후 rect 푸시로 복구 불가. 그리고 `pump()`은
+  한 번에 모든 타이머를 발화해 commit↔effect 사이에 레이아웃을 못 끼움.
+  (MessageChannel 스케줄러가 `setTimeout(0)` 매크로태스크로 도는 것 확인 —
+  타이머 하나씩 발화하면 끼울 수 있음.)
+- **step 프리미티브** (vm.rs `pump_step` + Doc.step/now_ms): 스케줄러 슬라이스
+  **한 개**(타이머 1개+마이크로태스크)만 발화하고 반환. 호스트가 슬라이스
+  사이에 실제 rect를 push → 다음 슬라이스의 이펙트가 실 geometry를 봄.
+- **settle_lazy** (native.py): step 드라이브 + 레이아웃 인터리브. Naver의
+  lazy 섹션은 단일 `/nvhaproxy/v2/pc/lazy`(142KB) 뒤에 배치돼 있고, 이걸
+  발화·해소하니 **리치 피드(패션/쇼핑 썸네일 다수)+전체 푸터** 렌더. 레이아웃
+  코얼레싱(프레임 단위 스로틀)으로 **27s→~7s**. cargo 189/smoke 143 무회귀
+  (settle_lazy 옵트인).
+- **잔여(진짜 롱테일)**: 우측 사이드바 위젯(날씨/증시/캘린더/VIBE) — 데이터는
+  `/lazy`에 있고(PC-WEATHER/PC-STOCK/PC-CALENDAR) 컬럼(w420)도 있으나 위젯
+  컴포넌트가 **데이터를 받고도 빈 채로 렌더**(캔버스 차트 스텁 + 컴포넌트별
+  이슈). 위젯별 whack-a-mole + 네이버 서빙 콘텐츠 편차 큼. 언론사 풀그리드
+  (6/24)·상단 쇼핑 캐러셀도 유사 잔여.
+
 **시각 격차의 정체(07-19)**: 네이버 서빙 HTML은 `<img>` 0개의 앱 셸 —
 로고·아이콘·썸네일은 전부 JS 부팅 후 생성. @font-face 4종 모두 ttf
 폴백 보유(woff2 갭 안 물림)·사용 요소 0. 그라디언트/그림자 근사도 서빙
@@ -270,8 +318,12 @@ class 2회) 문법 갭이 좁고, `display:grid`·`position:sticky`도 **0회**�
       space-between/space-around/space-evenly — 행별 잔여 공간 분배,
       auto 마진이 흡수했으면 무동작), `align-items`/`align-self`
       (center/flex-end — 교차축은 배치 후 서브트리 시프트, 재레이아웃
-      없음; stretch 크기 늘림은 미지원), `flex-shrink`(nowrap 단일
-      행 오버플로를 shrink×크기 비례로 반납, min-content 바닥 없음),
+      없음; stretch 크기 늘림은 미지원 → **07-23: align stretch 지원**
+      (auto 높이 항목이 행 교차크기로 늘어남, 8660f7c)), `flex-shrink`
+      (nowrap 단일 행 오버플로를 shrink×크기 비례로 반납, min-content
+      바닥 없음 → **07-23: iterative 해석 + min-content 바닥 + max 클램프**
+      (e81bc4e), **`gap`/`flex-direction:column` grow/justify/align**
+      (dd0322f·4f2d3aa)),
       `flex-basis` + **`flex` 축약형**(1 / 0 0 200px / none — 양 엔진
       미러, `flex:1`은 스펙대로 basis 0). 덤 버그 수정: `"wrap" in
       "nowrap"`이 참이라 **모든 flex 컨테이너가 랩 모드였음** — 이제
@@ -283,8 +335,10 @@ class 2회) 문법 갭이 좁고, `display:grid`·`position:sticky`도 **0회**�
       기준 없음 → 속성/비율 폴백). input은 블록 박스 모델이라 기존에
       이미 적용됨
 - [x] **`float` + `clear` v1** (×25) — 07-18: 블록 모드를 증분 배치로
-      전환(앞선 float가 등록돼야 뒤 형제가 회피 가능). **폭 명시된
-      float만 참여**(auto 폭은 일반 흐름 폴백 — v1 게이트):
+      전환(앞선 float가 등록돼야 뒤 형제가 회피 가능). ~~**폭 명시된
+      float만 참여**(auto 폭은 일반 흐름 폴백 — v1 게이트)~~ → **07-23:
+      auto 폭 float도 shrink-to-fit로 참여, 플로팅 요소는 block-level로
+      승격(`<p><img float>text</p>` 이미지가 실제 float, 45315df)**:
       좌/우 가장자리에 흐름 하단 y로 배치, 같은 y의 기존 float 뒤로
       스택. 자동 폭 in-flow 블록은 상단이 겹치는 float만큼 x 시프트+
       폭 축소(라인박스 단위가 아니라 블록 통째 회피 — 근사).
@@ -296,6 +350,14 @@ class 2회) 문법 갭이 좁고, `display:grid`·`position:sticky`도 **0회**�
 - [x] margin collapsing — 인접 형제·부모 첫/마지막 자식·중첩·empty chain,
       양수/음수 집합과 border/padding/BFC 차단까지 07-22 완료
 - [x] ~~grid~~ (×0), ~~sticky~~ (×0) — 네이버 홈 사용량은 0이나 엔진 지원 완료
+- [x] **margin collapsing** — 07-23: 인접 블록 형제의 세로 마진 병합
+      `max(mb,mt,0)+min(mb,mt,0)` (CSS 2.1 §8.3.1). 문단 32px→16px 간격,
+      example.com 높이 587→555 (efc6152)
+- [x] **grid** — 07-23: `display:grid` 전체 구현 — 트랙(fr/minmax/repeat/
+      rem/%), `grid-template-areas` named-area 배치, gap, column/row span.
+      네이버 홈엔 없지만 위키백과 Vector 3열 셸·카드 그리드가 실제 열로
+      배치됨 (0012311). **sticky**는 여전히 흐름 폴백(안전 근사),
+      `position:fixed`는 뷰포트 기준으로 분리 (0603521)
 
 ---
 
@@ -554,7 +616,12 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
       submit/button류 제외, checkbox/radio는 checked만, 한글
       percent-인코딩), action의 기존 쿼리 대체 후 resolve·이동.
       POST는 미지원 안내. file: 스킴이 쿼리를 경로에 섞던 버그 수정
-- [ ] 쿠키 세션 유지 (로그인은 범위 밖 — 별도 대공사)
+- [x] **쿠키 세션 유지** — 07-21 `document.cookie` ↔ 네트워크 자 브리지
+      (코덱스 5f3c8af) + 07-23 **속성 인식 자**(35448e3): Set-Cookie 속성
+      파싱, Domain 서브도메인 공유(.naver.com → nid/www; cross-site Domain
+      거부), Path 스코핑, Expires/Max-Age 만료(=0 삭제), Secure(https 한정),
+      HttpOnly(document.cookie 숨김·요청엔 전송). 12/12 유닛. (로그인 자체는
+      여전히 범위 밖 — 서버 인증 플로우)
 - [ ] iframe (홈 셸엔 0개; 광고·로그인에서 등장 — 후순위)
 
 ---
@@ -586,6 +653,30 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
       (lex 12.5 + parse 11.5 + 스텁 6). 웜 실행 저하 없음.
       네이버 웜 로드 1,003ms 재실측은 로컬에서 (이 세션은 egress
       제한).
+- [x] **인터프리터 O(n²) 핫패스 제거 (네이버 settle ~57s → ~5s)** —
+      07-23: 네이버 클라이언트 렌더를 페이즈·오퍼코드·수신자별로 격리
+      프로파일(임시 계측 후 제거)한 결과, settle 전체가 **한 pump
+      라운드**에 몰려 있고 그 라운드의 명령/초 처리량이 힙이 커질수록
+      20배 붕괴 = 디스패치 처리량이 아니라 몇 개의 핫패스에 숨은
+      O(n²)였다. 네 곳을 고쳐 제거:
+      (a) `intern()` — 문자열 아레나를 선형 스캔으로 디듑 → `for..in`/
+      Object.keys 키 인터닝이 키당 O(n), 빌드 전체 O(n²). content→index
+      해시맵(flat_index)로 O(1). 인터닝된 Flat은 불변이라 무효화 없음.
+      (b) charAt/charCodeAt — 매 호출(직접형 + core-js uncurried
+      `fn.apply` 형)마다 전체 UTF-16 유닛 벡터를 재구성 → 문자 스캔이
+      O(n²). 문자열당 단일 유닛 메모(units_cache)를 str_char_read로
+      경유해 순차 스캔 O(n) 상각. 40만자 스캔 12.4s → 0.07s(175×).
+      (c) 문자열 `.length` — 읽을 때마다 UTF-16 유닛 O(n) 재카운트 →
+      스캐너의 `while (i<s.length)`가 O(n²). 문자열당 길이 메모
+      (ulen_cache/str_u16_len).
+      (d) method_ref_dispatch 배열 수신자 — 호출마다 수신자 배열 전체를
+      선(先)클론 → `push.apply(acc, chunk)`가 O(n²). 제자리/스캔 연산
+      (push/pop/shift/unshift/reverse/indexOf/lastIndexOf/at) 무(無)클론
+      패스 추가, slice는 요청 범위만 클론.
+      전부 표준 준수 문자열/배열 시맨틱(네이버 전용 아님). cargo 189,
+      smoke 143(네트워크 게이트된 google 리다이렉트만 실패=환경 기준선).
+      → line 619 baseline JIT 항목이 예견한 "실행이 새 병목" 지점에서
+      먼저 알고리즘 병목을 제거한 것. JIT은 여전히 후순위.
 - [x] **스크롤 60fps (native 셸 기준)** — 07-18: 디스플레이 리스트를
       **Rust에 상주**(set_display_list — 페인트 변화 시에만 문서좌표·
       기기픽셀로 1회 직렬화), 스크롤 프레임은 오프셋만 전달
@@ -622,12 +713,27 @@ spread/rest·구조분해 전 형태·옵셔널 체이닝). 남은 건 싱글턴
 - [x] **테이블 레이아웃** — auto column sizing·rowspan/colspan 완료
 - [ ] **`overflow: auto` 내부 스크롤 영역** (채팅창·사이드바)
 - [ ] 폼 컨트롤 렌더링 (`<select>`·체크박스·라디오)
+- [x] **`display: grid`** — 07-23: named-area·fr/minmax/repeat·gap·span
+      전체 구현(0012311). `position: sticky`는 흐름 폴백(근사),
+      `position:fixed`는 뷰포트 분리(0603521)
+- [x] **테이블 레이아웃** — 07-23: `display:table/-row/-cell`+`<table>`
+      오토 컬럼 알고리즘(min/max-content, colspan/rowspan, 행/셀 배경).
+      HN 겹침 9→0 (f1ca219)
+- [~] **`overflow: auto` 내부 스크롤 영역** — 07-23: 클립 대상에서
+      **의도적으로 제외**(비스크롤 풀페이지 렌더에서 과소계산 높이로
+      클립하면 읽을 내용을 가림). hidden/clip/scroll은 클립
+- [~] 폼 컨트롤 렌더링 — 07-23: `<input>`/`<textarea>` 기본 폭·
+      checkbox/radio 크기, %폭 인라인블록(97ee65a). `<select>`는 잔여
 - [x] ~~트랜스파일 안 된 모던 JS~~ — 07-16: 구조 분해(선언·대입·for-of 헤드)·
       async/await(전 위치)·클래스 상속·spread/rest **완료**. 잔여:
       제너레이터·**ES 모듈**(import/export)
 - [ ] Web Worker / Service Worker / WebAssembly
 - [ ] `<video>`/`<audio>`/WebGL (유튜브·지도류 — 사실상 별개 프로젝트)
-- [ ] iframe 문서 격리, CORS, 쿠키 전체 속성 (로그인·광고·임베드)
+- [~] iframe 문서 격리, CORS, 쿠키 — 07-21: **`document.cookie` ↔
+      네트워크 쿠키 자 브리지**(세션 쿠키 왕복: 응답 Set-Cookie 캡처 →
+      요청 Cookie 헤더 재생 → 스크립트가 읽고 쓴 값 반영, 5f3c8af).
+      호스트별 저장(도메인 간 누출 없음). 잔여: 전체 속성(Path/Domain/
+      Secure/Expires), iframe 격리, CORS
 - [ ] HTML5 오류 복구 알고리즘 완전판, quirks 모드, **EUC-KR 등 레거시 인코딩**,
       RTL/양방향 텍스트
 - [x] 진행 지표: **사이트 바스켓** — 07-16: `E:\gg\basket_test.py` 상설화
@@ -895,3 +1001,63 @@ overflow formatting context·float/out-of-flow·clear는 collapse 경계를 끊�
 border 차단, empty-through, 양수/음수 혼합, 중첩 전파 좌표 회귀를 추가했고
 grid/sticky를 포함한 순수-Python smoke 구간이 전부 통과했다. 다음 P2 항목은
 transition/@keyframes와 렌더 프레임 스케줄링이다.
+---
+
+## 07-21~23 — **레이아웃 표준 일반화 ("전체가 돌아가도록") + 쿠키 브리지**
+
+지시: *"레이아웃이 네이버 한정적으로 하지말고 전체가 돌아가도록 해줘."*
+`browser/layout.py`를 네이버 튜닝이 아니라 **CSS 표준을 따르는 범용 엔진**으로
+일반화. 감사 도구 `scripts/render_audit.py`(사이트별 겹침/오프스크린/붕괴/JS오류
+JSON 1줄) + 10개 basket으로 각 변경을 실측 게이트.
+
+### 레이아웃 커밋 20개 (전부 smoke 143 불변 · 회귀 게이트 통과)
+- **테이블/인라인/@media** (f1ca219): CSS 테이블 오토 컬럼(min/max-content,
+  colspan/rowspan, 행·셀 배경); 인라인 자식만 있는 블록은 인라인 포매팅
+  (`<div>a <a>b</a> c</div>` 3줄→1줄); `@media` 멀티라인 조건 파싱(줄바꿈된
+  `screen\nand (max-width:750px)`가 데스크톱에 모바일 스타일 누출하던 것 차단,
+  Rust+Python 양 엔진 + 유닛테스트)
+- **absolute 컨테이닝 블록** (940c4bb): 가장 가까운 positioned 조상 기준으로
+  오프셋/％크기 해석(문서 기준 → 표준). 드롭다운/오버레이가 한 좌표에 뭉치던
+  최대 결함 해소 — tistory 28→0, yna 236→16
+- **마진 병합** (efc6152), **min/max-height + flex gap** (dd0322f),
+  **CJK 줄바꿈 + word-break/overflow-wrap** (d92bb56), **폼 컨트롤 기본폭 +
+  %폭 인라인블록** (97ee65a), **white-space pre-wrap/pre-line** (b233139)
+- **CSS Grid** (0012311): 트랙 fr/minmax/repeat/rem, `grid-template-areas`
+  named-area 배치, gap, span. 위키백과 Vector 3열 셸이 실제 열로 배치
+- **vertical-align** (b0bbc11), **position:fixed 뷰포트 고정** (0603521),
+  **box-sizing:content-box 명시 존중** (a115eeb — 기본 border-box는 유지),
+  **flex align stretch** (8660f7c), **인라인 요소 배경** (27ebba7),
+  **aspect-ratio** (f6efe7c)
+- **z-index 음수 페인트 순서** (ef575ea), **인접 인라인 팬텀스페이스**
+  (f813cf3 — `$<b>5</b>`→"$5"), **object-fit/object-position** (e5bdb37),
+  **iterative flex min/max 클램핑 + min-content 바닥** (e81bc4e),
+  **진짜 flex-direction:column** grow/justify/align (4f2d3aa),
+  **auto-width float + float→block-level** (45315df)
+
+### 실측 (render_audit.py, 10개 basket)
+**8/10 완전 클린**: example·HN·cern·motherfucking·gnu·danluu·rfc2616·tistory
+= 겹침 0. **HN 9→0, tistory 28→0, yna 236→9~12.** 위키백과는 Grid+float로
+사이드바·figure가 구조적으로 올바르게 배치(잔여 겹침은 항상 열린 Vector
+드롭다운 내비 = 인터랙션 상태 한계, 레이아웃 버그 아님). MDN 메가메뉴도
+hover 상태 미모델 — 정적 렌더의 근본 한계.
+
+### 의도적으로 남긴 3가지 (미구현 아님)
+- **per-line float intrusion**: 블록 단위 회피가 smoke로 고정된 설계라 유지
+  (문단이 float 옆으로 이동은 됨; 라인 단위로 바꾸면 float 테스트 회귀)
+- **box-sizing 기본값**: border-box 유지(코드베이스의 의도적 "web reality"
+  + `width is border-box` 테스트). 명시적 content-box는 처리
+- **object-fit:cover 소스-rect 크롭**: 드로우 레이어에 소스 rect 없어 clip으로
+  근사(시각 결과 동일)
+
+### 쿠키 브리지 + JS 엔진 심화 (07-21, 코덱스 5f3c8af — 리뷰·검증 완료)
+- **`document.cookie` ↔ 네트워크 쿠키 자**: 응답 Set-Cookie 캡처 → 요청
+  Cookie 헤더 재생 → 스크립트 시드/폴드 왕복. 호스트별 저장(도메인 간 누출
+  없음). 잔여: 전체 속성(Path/Domain/Secure/Expires)
+- 함께 실린 JS 엔진 기능(lodash `_.template` 실행용, 커밋 메시지엔 미기재):
+  **`with`문**, **`Function` 생성자**, **`String.replace(함수 콜백)`**,
+  정규식 캡처. 전부 유닛테스트 포함
+- **검증**: cargo **189/189**, smoke 143(레이아웃 전수, google redirect만
+  환경 게이트), 레이아웃 basket 불변(공존 확인), 쿠키 왕복 실동작 확인
+
+*상태: 레이아웃이 네이버 전용이 아니라 표준 기반 범용 엔진으로 일반화됨.
+워크플로우 감사 랭킹 1–20 전부 + Grid 구현. 8/10 사이트 클린.*

@@ -311,8 +311,16 @@ impl Parser {
             if self.eat_punct(P::Semi) {
                 continue;
             }
+            // `static` is the keyword only when a member name follows it;
+            // `static = x`, `static;`, `static }`, `static()` are a field
+            // or method literally named "static".
             let is_static = matches!(self.kind(), Tok::Ident(k) if k == "static")
-                && !matches!(self.kind_at(1), Some(Tok::Punct(P::LParen)));
+                && !matches!(
+                    self.kind_at(1),
+                    Some(Tok::Punct(
+                        P::LParen | P::Assign | P::Semi | P::RBrace
+                    ))
+                );
             if is_static {
                 self.pos += 1;
             }
@@ -345,10 +353,15 @@ impl Parser {
             // get/set accessor (unless it's a method literally named
             // get/set, i.e. followed by `(`)
             let acc = match self.kind() {
+                // `get`/`set` are accessor keywords only when a member
+                // name follows; `get = x`, `get;`, `get }`, `get()` are a
+                // field or method literally named "get"/"set".
                 Tok::Ident(k) if (k == "get" || k == "set")
                     && !matches!(
                         self.kind_at(1),
-                        Some(Tok::Punct(P::LParen))
+                        Some(Tok::Punct(
+                            P::LParen | P::Assign | P::Semi | P::RBrace
+                        ))
                     ) =>
                 {
                     let is_get = k == "get";
@@ -605,8 +618,9 @@ impl Parser {
                 "async" if matches!(self.kind_at(1), Some(Tok::Ident(k))
                     if k == "function") => {
                     self.pos += 2; // async function
+                    let is_gen = self.eat_punct(P::Star); // async function*
                     let name = self.expect_ident()?;
-                    let f = self.func_lit(Some(name), true)?;
+                    let f = self.func_lit_g(Some(name), true, is_gen)?;
                     Ok(Stmt::FuncDecl(Rc::new(f)))
                 }
                 "class" => {
@@ -815,6 +829,31 @@ impl Parser {
                     ))));
                 }
                 break;
+            }
+            // computed key: `{ [expr]: binding }` (always needs a binding)
+            if self.at_punct(P::LBracket) {
+                self.pos += 1;
+                let key_expr = self.assign_expr()?;
+                self.expect_punct(P::RBracket)?;
+                self.expect_punct(P::Colon)?;
+                let member = Expr::Member {
+                    obj: Box::new(Expr::Ident(tmp.to_string())),
+                    prop: MemberProp::Computed(Box::new(key_expr)),
+                    optional: false,
+                };
+                if self.at_punct(P::LBrace) || self.at_punct(P::LBracket) {
+                    let inner = self.fresh_tmp("d");
+                    out.push((inner.clone(), Some(member)));
+                    self.pattern_binds(&inner, out, false)?;
+                } else {
+                    let bind = self.expect_ident()?;
+                    let init = self.maybe_default(member)?;
+                    out.push((bind, Some(init)));
+                }
+                if !self.eat_punct(P::Comma) {
+                    break;
+                }
+                continue;
             }
             let key = self.expect_ident()?;
             seen.push(key.clone());
@@ -1157,6 +1196,7 @@ impl Parser {
                 match self.kind_at(1) {
                     Some(Tok::Ident(n)) if n == "function" => {
                         self.pos += 2; // async function
+                        let is_gen = self.eat_punct(P::Star); // async fn*
                         let name = match self.kind() {
                             Tok::Ident(nm) if !self.at_punct(P::LParen) => {
                                 let nm = nm.clone();
@@ -1166,7 +1206,7 @@ impl Parser {
                             _ => None,
                         };
                         return Ok(Expr::Func(Rc::new(
-                            self.func_lit(name, true)?,
+                            self.func_lit_g(name, true, is_gen)?,
                         )));
                     }
                     // async x => ...
@@ -1735,6 +1775,75 @@ impl Parser {
                         };
                     }
                 }
+                // tagged template: tag`a${x}b` -> tag(strings, x) where
+                // `strings` is the cooked-chunk array carrying a `.raw`.
+                Tok::Template(_) => {
+                    let Tok::Template(parts) = self.bump() else {
+                        unreachable!()
+                    };
+                    let mut chunks: Vec<Expr> = Vec::new();
+                    let mut holes: Vec<Expr> = Vec::new();
+                    let mut pending_chunk = false;
+                    for part in parts {
+                        match part {
+                            TplElem::Chunk(s) => {
+                                chunks.push(Expr::Str(s));
+                                pending_chunk = true;
+                            }
+                            TplElem::ExprSrc(src) => {
+                                // a hole with no preceding chunk means an
+                                // empty cooked string sits between them
+                                if !pending_chunk {
+                                    chunks.push(Expr::Str(String::new()));
+                                }
+                                pending_chunk = false;
+                                let mut sub =
+                                    Parser::new(Rc::new(tokenize(&src)?));
+                                holes.push(sub.expr()?);
+                            }
+                        }
+                    }
+                    // n holes need n+1 cooked chunks
+                    if chunks.len() <= holes.len() {
+                        chunks.push(Expr::Str(String::new()));
+                    }
+                    // strings = (function(s){ s.raw = s; return s; })([...])
+                    let strings = Expr::Call {
+                        callee: Box::new(Expr::Func(Rc::new(FuncLit {
+                            name: None,
+                            params: vec!["s".to_string()],
+                            body: vec![
+                                Stmt::Expr(Expr::Assign(
+                                    AssignOp::Plain,
+                                    Box::new(Expr::Member {
+                                        obj: Box::new(Expr::Ident(
+                                            "s".to_string(),
+                                        )),
+                                        prop: MemberProp::Static(
+                                            "raw".to_string(),
+                                        ),
+                                        optional: false,
+                                    }),
+                                    Box::new(Expr::Ident("s".to_string())),
+                                )),
+                                Stmt::Return(Some(Expr::Ident(
+                                    "s".to_string(),
+                                ))),
+                            ],
+                            is_async: false,
+                            lazy_body: None,
+                        }))),
+                        args: vec![Expr::Array(chunks)],
+                        optional: false,
+                    };
+                    let mut args = vec![strings];
+                    args.extend(holes);
+                    e = Expr::Call {
+                        callee: Box::new(e),
+                        args,
+                        optional: false,
+                    };
+                }
                 _ => return Ok(e),
             }
         }
@@ -1749,6 +1858,21 @@ impl Parser {
             return Err(self.err("spread in optional call not supported"));
         }
         Ok(args)
+    }
+
+    /// Wrap `e` as `Array.from(e)` — the universal "make this iterable a
+    /// real array" step used when desugaring spread. Array.from copies an
+    /// array cheaply and drains any other iterable (Set/Map/generator).
+    fn array_from(e: Expr) -> Expr {
+        Expr::Call {
+            callee: Box::new(Expr::Member {
+                obj: Box::new(Expr::Ident("Array".to_string())),
+                prop: MemberProp::Static("from".to_string()),
+                optional: false,
+            }),
+            args: vec![e],
+            optional: false,
+        }
     }
 
     /// Parse args; the bool is true when a `...spread` was present, in
@@ -1775,7 +1899,8 @@ impl Parser {
         if !parts.iter().any(|(s, _)| *s) {
             return Ok((parts.into_iter().map(|(_, e)| e).collect(), false));
         }
-        // assemble [a, ...b, c] -> [].concat([a], b, [c])
+        // assemble f(a, ...b, c) args -> [].concat([a], Array.from(b), [c])
+        // (Array.from lets a non-array iterable spread element-wise)
         let mut segs: Vec<Expr> = Vec::new();
         let mut buf: Vec<Expr> = Vec::new();
         for (spread, e) in parts {
@@ -1783,7 +1908,7 @@ impl Parser {
                 if !buf.is_empty() {
                     segs.push(Expr::Array(std::mem::take(&mut buf)));
                 }
-                segs.push(e);
+                segs.push(Self::array_from(e));
             } else {
                 buf.push(e);
             }
@@ -2069,7 +2194,10 @@ impl Parser {
                 parts.into_iter().map(|(_, e)| e).collect(),
             ));
         }
-        // [a, ...b, c] -> [].concat([a], b, [c])
+        // [a, ...b, c] -> [].concat([a], Array.from(b), [c]). Array.from
+        // makes the spread operand a real array first, so a Set/Map/
+        // generator/iterator spreads element-wise instead of landing as a
+        // single [object Object] (concat only spreads array arguments).
         let mut segs: Vec<Expr> = Vec::new();
         let mut buf: Vec<Expr> = Vec::new();
         for (spread, e) in parts {
@@ -2077,7 +2205,7 @@ impl Parser {
                 if !buf.is_empty() {
                     segs.push(Expr::Array(std::mem::take(&mut buf)));
                 }
-                segs.push(e);
+                segs.push(Self::array_from(e));
             } else {
                 buf.push(e);
             }
@@ -2121,6 +2249,37 @@ impl Parser {
                 };
                 let f =
                     self.func_lit_g(Some(key.clone()), false, true)?;
+                props.push(Prop {
+                    key: PropKey::Ident(key),
+                    value: Expr::Func(Rc::new(f)),
+                });
+                if !self.eat_punct(P::Comma) {
+                    self.expect_punct(P::RBrace)?;
+                    break;
+                }
+                continue;
+            }
+            // async method: { async foo() {...} } and async generator
+            // { async *foo() {...} }. `async` is a prefix only when a
+            // method name (or `*`) follows and leads to `(`; `{async: 1}`,
+            // `{async}`, `{async(){}}` keep `async` as the key.
+            if matches!(self.kind(), Tok::Ident(k) if k == "async")
+                && !self.nl_before_at(1)
+                && (matches!(self.kind_at(1), Some(Tok::Punct(P::Star)))
+                    || (matches!(self.kind_at(1),
+                            Some(Tok::Ident(_)) | Some(Tok::Str(_)))
+                        && matches!(self.kind_at(2),
+                            Some(Tok::Punct(P::LParen)))))
+            {
+                self.pos += 1; // consume `async`
+                let is_gen = self.eat_punct(P::Star);
+                let key = match self.bump() {
+                    Tok::Ident(n) => n,
+                    Tok::Str(s) => s,
+                    _ => unreachable!(),
+                };
+                let f =
+                    self.func_lit_g(Some(key.clone()), true, is_gen)?;
                 props.push(Prop {
                     key: PropKey::Ident(key),
                     value: Expr::Func(Rc::new(f)),
@@ -2304,10 +2463,19 @@ impl Parser {
             decls: vec![(tmp.clone(), Some(base))],
         }];
         for (key, getter, setter) in accs {
-            let mut dprops = vec![Prop {
-                key: PropKey::Ident("configurable".to_string()),
-                value: Expr::Bool(true),
-            }];
+            let mut dprops = vec![
+                Prop {
+                    key: PropKey::Ident("configurable".to_string()),
+                    value: Expr::Bool(true),
+                },
+                // object-literal accessors are enumerable (unlike the
+                // defineProperty default) — say so explicitly so the
+                // runtime doesn't hide them from keys/for-in/JSON
+                Prop {
+                    key: PropKey::Ident("enumerable".to_string()),
+                    value: Expr::Bool(true),
+                },
+            ];
             if let Some(g) = getter {
                 dprops.push(Prop {
                     key: PropKey::Ident("get".to_string()),

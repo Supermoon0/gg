@@ -13,9 +13,9 @@ use super::compiler;
 use super::parser;
 use super::value::Value;
 use super::vm::{
-    self, call_value_this, exec, has_pending_work, host,
-    make_native, new_plain_object, pump, pump_microtasks, raw_get_prop,
-    raw_set_prop,
+    self, call_value, call_value_this, exec, has_pending_work, host,
+    make_native, new_plain_object, pump, pump_microtasks, pump_step,
+    raw_get_prop, raw_set_prop,
     reject_fetch, resolve_fetch, resolve_fetch_full, Ids, ModStore, Native,
     PendingFetch, St, DOC_NODE,
 };
@@ -72,22 +72,25 @@ Promise.race = function (arr) {
 
 // Error hierarchy in JS itself — real prototype chains (07-12) make
 // `new TypeError(m) instanceof Error` just work.
-function Error(m) { if (m !== undefined) this.message = '' + m; }
+function Error(m, o) {
+  if (m !== undefined) this.message = '' + m;
+  if (o && typeof o === 'object' && 'cause' in o) this.cause = o.cause;
+}
 Error.prototype.name = 'Error';
 Error.prototype.message = '';
 Error.prototype.toString = function () {
   return this.message ? this.name + ': ' + this.message : this.name;
 };
-function TypeError(m) { if (m !== undefined) this.message = '' + m; }
+function TypeError(m, o) { Error.call(this, m, o); }
 TypeError.prototype = new Error();
 TypeError.prototype.name = 'TypeError';
-function RangeError(m) { if (m !== undefined) this.message = '' + m; }
+function RangeError(m, o) { Error.call(this, m, o); }
 RangeError.prototype = new Error();
 RangeError.prototype.name = 'RangeError';
-function SyntaxError(m) { if (m !== undefined) this.message = '' + m; }
+function SyntaxError(m, o) { Error.call(this, m, o); }
 SyntaxError.prototype = new Error();
 SyntaxError.prototype.name = 'SyntaxError';
-function ReferenceError(m) { if (m !== undefined) this.message = '' + m; }
+function ReferenceError(m, o) { Error.call(this, m, o); }
 ReferenceError.prototype = new Error();
 ReferenceError.prototype.name = 'ReferenceError';
 // Symbol: a string-based stand-in. Unique enough for property keys and
@@ -808,6 +811,82 @@ Date.parse = function (s) {
   P.toUTCString = P.toString;
   P.toGMTString = P.toString;
 })();
+
+// Legacy escape/unescape (still used by older bundles; distinct from
+// encodeURIComponent — %XX / %uXXXX, no UTF-8 transform).
+function unescape(s) {
+  s = '' + s;
+  var out = '', i = 0;
+  while (i < s.length) {
+    var c = s.charAt(i);
+    if (c === '%' && s.charAt(i + 1) === 'u') {
+      out += String.fromCharCode(parseInt(s.substr(i + 2, 4), 16));
+      i += 6;
+    } else if (c === '%') {
+      out += String.fromCharCode(parseInt(s.substr(i + 1, 2), 16));
+      i += 3;
+    } else { out += c; i += 1; }
+  }
+  return out;
+}
+function escape(s) {
+  s = '' + s;
+  var ok = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz' +
+           '0123456789@*_+-./';
+  var out = '';
+  for (var i = 0; i < s.length; i++) {
+    var ch = s.charAt(i), code = s.charCodeAt(i);
+    if (ok.indexOf(ch) >= 0) { out += ch; }
+    else if (code < 256) {
+      out += '%' + ('0' + code.toString(16).toUpperCase()).slice(-2);
+    } else {
+      out += '%u' + ('000' + code.toString(16).toUpperCase()).slice(-4);
+    }
+  }
+  return out;
+}
+String.raw = function (strings) {
+  var raw = (strings && strings.raw) || strings || [];
+  var out = '';
+  for (var i = 0; i < raw.length; i++) {
+    out += raw[i];
+    if (i + 1 < arguments.length) out += arguments[i + 1];
+  }
+  return out;
+};
+Object.getOwnPropertyDescriptors = function (o) {
+  var out = {};
+  var names = Object.getOwnPropertyNames(o);
+  for (var i = 0; i < names.length; i++) {
+    out[names[i]] = Object.getOwnPropertyDescriptor(o, names[i]);
+  }
+  return out;
+};
+var __b64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function btoa(input) {
+  input = '' + input;
+  var out = '', bits = 0, n = 0;
+  for (var i = 0; i < input.length; i++) {
+    bits = (bits << 8) | (input.charCodeAt(i) & 0xFF);
+    n += 8;
+    while (n >= 6) { n -= 6; out += __b64.charAt((bits >> n) & 63); }
+  }
+  if (n > 0) out += __b64.charAt((bits << (6 - n)) & 63);
+  while (out.length % 4) out += '=';
+  return out;
+}
+function atob(input) {
+  input = ('' + input).replace(/=+$/, '');
+  var out = '', bits = 0, n = 0;
+  for (var i = 0; i < input.length; i++) {
+    var idx = __b64.indexOf(input.charAt(i));
+    if (idx < 0) continue;
+    bits = (bits << 6) | idx;
+    n += 6;
+    if (n >= 8) { n -= 8; out += String.fromCharCode((bits >> n) & 0xFF); }
+  }
+  return out;
+}
 "#;
 use crate::dom;
 
@@ -897,6 +976,35 @@ impl PageVm {
             let sidx = vm.st.known.string.index();
             vm.st.fn_props.insert((sidx, key), mv);
         }
+        // Number statics ride fn_props on the Number ctor (same as
+        // String.fromCharCode): method values plus numeric constants.
+        for (m, n) in [
+            ("parseInt", Native::ParseInt),
+            ("parseFloat", Native::ParseFloat),
+            ("isNaN", Native::HostFn(host::N_ISNAN)),
+            ("isFinite", Native::HostFn(host::N_ISFINITE)),
+            ("isInteger", Native::HostFn(host::N_ISINTEGER)),
+            ("isSafeInteger", Native::HostFn(host::N_ISSAFEINT)),
+        ] {
+            let key = vm.name_id(m);
+            let mv = make_native(&mut vm.st, n);
+            let nidx = vm.st.known.number.index();
+            vm.st.fn_props.insert((nidx, key), mv);
+        }
+        for (m, val) in [
+            ("MAX_SAFE_INTEGER", 9_007_199_254_740_991.0_f64),
+            ("MIN_SAFE_INTEGER", -9_007_199_254_740_991.0),
+            ("MAX_VALUE", f64::MAX),
+            ("MIN_VALUE", f64::MIN_POSITIVE),
+            ("EPSILON", f64::EPSILON),
+            ("POSITIVE_INFINITY", f64::INFINITY),
+            ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
+            ("NaN", f64::NAN),
+        ] {
+            let key = vm.name_id(m);
+            let nidx = vm.st.known.number.index();
+            vm.st.fn_props.insert((nidx, key), Value::number(val));
+        }
         // async runtime (P3): timers, microtasks, fetch, Promise
         for (name, n) in [
             ("setTimeout", Native::SetTimeout),
@@ -971,6 +1079,11 @@ impl PageVm {
                 ("entries", Native::HostFn(host::O_ENTRIES)),
                 ("assign", Native::HostFn(host::O_ASSIGN)),
                 ("freeze", Native::HostFn(host::O_FREEZE)),
+                ("seal", Native::HostFn(host::O_SEAL)),
+                ("isFrozen", Native::HostFn(host::O_IS_FROZEN)),
+                ("isSealed", Native::HostFn(host::O_IS_SEALED)),
+                ("preventExtensions", Native::HostFn(host::O_PREVENT_EXT)),
+                ("isExtensible", Native::HostFn(host::O_IS_EXTENSIBLE)),
                 ("defineProperty", Native::HostFn(host::O_DEFINE_PROP)),
                 ("defineProperties",
                  Native::HostFn(host::O_DEFINE_PROPS)),
@@ -985,6 +1098,7 @@ impl PageVm {
                 ("setPrototypeOf", Native::HostFn(host::O_SET_PROTO)),
                 ("is", Native::HostFn(host::O_IS)),
                 ("fromEntries", Native::HostFn(host::O_FROM_ENTRIES)),
+                ("hasOwn", Native::HostFn(host::O_HAS_OWN)),
             ],
         );
         vm.st.known.object = object_ctor;
@@ -994,6 +1108,7 @@ impl PageVm {
             &[
                 ("isArray", Native::HostFn(host::A_ISARRAY)),
                 ("from", Native::HostFn(host::A_FROM)),
+                ("of", Native::HostFn(host::A_OF)),
             ],
         );
         vm.st.known.array = array_ctor;
@@ -1316,6 +1431,22 @@ impl PageVm {
         let id = self.st.intern_name(name) as usize;
         let value = self.st.globals[id];
         value.is_number().then(|| value.to_number_raw())
+    }
+
+    /// Current virtual-clock time (ms). The host reads this to fix a
+    /// settle horizon before stepping.
+    pub fn now_ms(&self) -> f64 {
+        self.st.now_ms
+    }
+
+    /// Fire ONE scheduler slice (see vm::pump_step). Returns
+    /// (console output, fetches to service, more-work-remains). The host
+    /// refreshes layout rects (set_layout_rects) between steps so
+    /// geometry-reading effects see real rects.
+    pub fn step(&mut self, horizon_ms: f64) -> (Vec<String>, Vec<(u32, String)>, bool) {
+        let (fetches, more) =
+            pump_step(&mut self.st, &self.mods, PUMP_BUDGET, horizon_ms);
+        (std::mem::take(&mut self.st.logs), fetches, more)
     }
 
     pub fn resolve_fetch(&mut self, fetch_id: u32, status: u16, body: String) {
@@ -2518,6 +2649,25 @@ mod tests {
                  a: {value: 4}, \
                  b: {get: function() { return this.a * 10; }} }); \
                o.a + o.b"), 44.0);
+        // an accessor redefined OVER an existing data property wins on read
+        // (the shape still carries the old data slot; the getter must be
+        // consulted first — regression: GetProp fast path read the slot)
+        assert_eq!(
+            n("var o = {y: 10}; Object.defineProperty(o, 'y', \
+               {get: function() { return 99; }}); o.y"), 99.0);
+        // assignment to a getter-only accessor is a sloppy no-op, NOT a
+        // clobber back into a data slot (regression: SetProp created a
+        // stray data property that shadowed nothing but leaked the value)
+        assert_eq!(
+            n("var o = {}; Object.defineProperty(o, 'z', \
+               {get: function() { return 7; }}); o.z = 123; o.z"), 7.0);
+        // a setter still intercepts writes when the property already had a
+        // data slot before being redefined as an accessor
+        assert_eq!(
+            n("var o = {w: 1}; Object.defineProperty(o, 'w', \
+               {get: function() { return this._w || 0; }, \
+                set: function(v) { this._w = v * 3; }}); \
+               o.w = 14; o.w"), 42.0);
         // getOwnPropertyNames sees data props AND accessor-only keys
         // (Object.keys skips the accessor side-table)
         assert_eq!(
@@ -2760,6 +2910,267 @@ mod tests {
         assert_eq!(n("(7).valueOf()"), 7.0);
         assert_eq!(
             n("true.toString() === 'true' ? 1 : 0"), 1.0);
+    }
+
+    #[test]
+    fn string_pad_codepoint_and_parse_int() {
+        assert_eq!(n("'5'.padStart(3, '0') === '005' ? 1 : 0"), 1.0);
+        assert_eq!(n("'5'.padEnd(3, '.') === '5..' ? 1 : 0"), 1.0);
+        assert_eq!(n("'ab'.padStart(1) === 'ab' ? 1 : 0"), 1.0);
+        assert_eq!(
+            n("String.fromCodePoint(0x1F600).codePointAt(0)"), 0x1F600 as f64);
+        // parseInt honours a 0x prefix when no radix (or radix 16) is given
+        assert_eq!(n("parseInt('0x1f')"), 31.0);
+        assert_eq!(n("parseInt('0xff', 16)"), 255.0);
+        assert_eq!(n("parseInt('ff', 16)"), 255.0);
+        assert_eq!(n("parseInt('42')"), 42.0);
+    }
+
+    #[test]
+    fn json_stringify_space_replacer_tojson() {
+        // array replacer allow-list
+        assert_eq!(
+            n("JSON.stringify({a:1,b:2}, ['a']) === '{\"a\":1}' ? 1 : 0"), 1.0);
+        // function replacer
+        assert_eq!(
+            n("JSON.stringify({a:1,b:2}, function(k,v){ \
+                 return k==='b' ? undefined : v; }) === '{\"a\":1}' ? 1 : 0"),
+            1.0);
+        // indentation
+        assert_eq!(
+            n("JSON.stringify({a:1}, null, 2) === '{\\n  \"a\": 1\\n}' ? 1 : 0"),
+            1.0);
+        // toJSON hook
+        assert_eq!(
+            n("JSON.stringify({toJSON:function(){return 'X';}}) === '\"X\"' \
+               ? 1 : 0"), 1.0);
+        // getters are serialized
+        assert_eq!(
+            n("JSON.stringify({get x(){return 7;}}) === '{\"x\":7}' ? 1 : 0"),
+            1.0);
+        // nested indentation + arrays
+        assert_eq!(
+            n("JSON.stringify([1,2], null, 1) === '[\\n 1,\\n 2\\n]' ? 1 : 0"),
+            1.0);
+    }
+
+    #[test]
+    fn property_attributes_and_extensibility() {
+        // freeze blocks writes and reports frozen; seal blocks new props
+        assert_eq!(
+            n("var o={a:1}; Object.freeze(o); o.a=2; \
+               (o.a===1 && Object.isFrozen(o)) ? 1 : 0"), 1.0);
+        assert_eq!(
+            n("var o={a:1}; Object.seal(o); o.b=2; o.a=5; \
+               (o.b===undefined && o.a===5 && Object.isSealed(o)) ? 1 : 0"),
+            1.0);
+        assert_eq!(
+            n("var o={}; Object.defineProperty(o,'a',{value:1,writable:false}); \
+               o.a=2; o.a"), 1.0);
+        // non-enumerable defineProperty hidden from keys; enumerable stays
+        assert_eq!(
+            n("var o={a:1}; Object.defineProperty(o,'b',{value:2,enumerable:false}); \
+               Object.keys(o).join()==='a' ? 1 : 0"), 1.0);
+        // array-index keys enumerate ahead of string keys, ascending
+        assert_eq!(
+            n("var o={}; o.b=1; o['2']=1; o.a=1; o['1']=1; \
+               Object.keys(o).join()==='1,2,b,a' ? 1 : 0"), 1.0);
+        // hasOwnProperty sees accessor-only keys
+        assert_eq!(
+            n("var o={get x(){return 1;}}; \
+               (o.hasOwnProperty('x') && !o.hasOwnProperty('y')) ? 1 : 0"), 1.0);
+        // object-literal accessors are enumerable (unlike defineProperty)
+        assert_eq!(
+            n("Object.keys({get x(){return 1;}}).join()==='x' ? 1 : 0"), 1.0);
+        // Object.assign reads source getters
+        assert_eq!(
+            n("Object.assign({}, {get x(){return 7;}}).x"), 7.0);
+    }
+
+    #[test]
+    fn array_length_from_and_own_property() {
+        // setting length shorter drops the tail
+        assert_eq!(
+            n("var a=[1,2,3,4]; a.length=2; \
+               (a.join()==='1,2' && a[2]===undefined) ? 1 : 0"), 1.0);
+        // Array.from over an array-like, a Set, and with a map fn
+        assert_eq!(
+            n("Array.from({length:3,0:'x',1:'y',2:'z'}).join()==='x,y,z' ? 1 : 0"),
+            1.0);
+        assert_eq!(n("Array.from(new Set([1,1,2,3,3])).length"), 3.0);
+        assert_eq!(
+            n("Array.from([1,2,3], function(x){return x*2;}).join()==='2,4,6' \
+               ? 1 : 0"), 1.0);
+        // extracted-builtin hasOwnProperty works on arrays (React uses this)
+        assert_eq!(
+            n("var a=[9]; (a.hasOwnProperty(0) && !a.hasOwnProperty(5)) ? 1 : 0"),
+            1.0);
+    }
+
+    #[test]
+    fn number_math_object_statics() {
+        assert_eq!(n("Number.parseInt('42px')"), 42.0);
+        assert_eq!(n("Number.parseFloat('3.14x')"), 3.14);
+        assert_eq!(n("Number.MAX_SAFE_INTEGER"), 9_007_199_254_740_991.0);
+        assert_eq!(n("Number.isSafeInteger(5) && !Number.isSafeInteger(1.5) \
+                      ? 1 : 0"), 1.0);
+        assert_eq!(n("Number.EPSILON > 0 ? 1 : 0"), 1.0);
+        // Math.sign: 0 stays 0 (not 1)
+        assert_eq!(n("(Math.sign(-5)===-1 && Math.sign(0)===0 \
+                      && Math.sign(3)===1) ? 1 : 0"), 1.0);
+        assert_eq!(n("Object.hasOwn({a:1},'a') && !Object.hasOwn({},'a') \
+                      ? 1 : 0"), 1.0);
+        // Array.indexOf with a fromIndex
+        assert_eq!(n("[1,2,1].indexOf(1,1)"), 2.0);
+        // Error cause option
+        assert_eq!(n("new Error('x',{cause:5}).cause"), 5.0);
+    }
+
+    #[test]
+    fn logical_assignment_and_immutable_arrays() {
+        assert_eq!(n("var x=0; x||=5; x"), 5.0);
+        assert_eq!(n("var x=3; x||=9; x"), 3.0); // truthy: no assign
+        assert_eq!(n("var x=1; x&&=7; x"), 7.0);
+        assert_eq!(n("var x=null; x??=3; x"), 3.0);
+        assert_eq!(n("var y=0; y??=9; y"), 0.0); // 0 is not nullish
+        // ES2023 immutable array methods
+        assert_eq!(n("var a=[3,1,2]; var b=a.toSorted(); \
+                      (b.join()==='1,2,3' && a[0]===3) ? 1 : 0"), 1.0);
+        assert_eq!(n("[1,2,3].toReversed().join()==='3,2,1' ? 1 : 0"), 1.0);
+        assert_eq!(n("[1,2,3].with(1,9).join()==='1,9,3' ? 1 : 0"), 1.0);
+        // btoa/atob round-trip
+        assert_eq!(n("atob(btoa('hi'))==='hi' ? 1 : 0"), 1.0);
+    }
+
+    #[test]
+    fn string_match_all() {
+        // matchAll yields one array per match, iterable via spread
+        assert_eq!(
+            n("var a=[...'a1b2'.matchAll(/(\\w)(\\d)/g)]; \
+               (a.length===2 && a[0][1]==='a' && a[1][2]==='2') ? 1 : 0"),
+            1.0);
+        // each result carries .index and named .groups
+        assert_eq!(
+            n("var a=[...'x9'.matchAll(/(?<c>\\w)(?<d>\\d)/g)]; \
+               (a[0].index===0 && a[0].groups.c==='x' && a[0].groups.d==='9') \
+               ? 1 : 0"), 1.0);
+        // for-of also works
+        assert_eq!(
+            n("var n=0; for (var m of 'aaa'.matchAll(/a/g)) n++; n"), 3.0);
+    }
+
+    #[test]
+    fn regex_named_replacement() {
+        // $<name> in a replacement string refers to a named group
+        assert_eq!(
+            n("'2020'.replace(/(?<y>\\d{4})/,'$<y>!')==='2020!' ? 1 : 0"), 1.0);
+        // $& (whole match) still works alongside
+        assert_eq!(
+            n("'abc'.replace(/b/,'[$&]')==='a[b]c' ? 1 : 0"), 1.0);
+        // named replacement over a global regex
+        assert_eq!(
+            n("'a1b2'.replace(/(?<c>[a-z])(?<n>\\d)/g,'$<n>$<c>')==='1a2b' \
+               ? 1 : 0"), 1.0);
+    }
+
+    #[test]
+    fn regex_named_groups() {
+        assert_eq!(
+            n("var m='2021-05'.match(/(?<y>\\d+)-(?<mo>\\d+)/); \
+               (m.groups.y==='2021' && m.groups.mo==='05') ? 1 : 0"), 1.0);
+        // exec exposes .groups too
+        assert_eq!(
+            n("var m=/(?<a>\\w)(?<b>\\w)/.exec('xy'); \
+               (m.groups.a==='x' && m.groups.b==='y') ? 1 : 0"), 1.0);
+        // no named groups -> groups is undefined
+        assert_eq!(
+            n("'ab'.match(/(\\w)/).groups === undefined ? 1 : 0"), 1.0);
+    }
+
+    #[test]
+    fn promise_finally_forwards() {
+        // .finally() is callable and chains (value-forwarding is verified
+        // end-to-end through the page event loop)
+        assert_eq!(
+            n("Promise.resolve(1).finally(function(){}) \
+                 .finally(function(){}); 5"), 5.0);
+        assert_eq!(
+            n("Promise.reject('e').finally(function(){}).catch(function(){}); \
+               5"), 5.0);
+    }
+
+    #[test]
+    fn computed_destructuring() {
+        assert_eq!(
+            n("var k='x'; var {[k]:v}={x:9}; v"), 9.0);
+        assert_eq!(
+            n("var k='a'; var {[k]:v=7}={}; v"), 7.0);
+        assert_eq!(
+            n("var {['a'+'b']:v}={ab:3}; v"), 3.0);
+    }
+
+    #[test]
+    fn more_array_and_string_builtins() {
+        // Array statics/methods
+        assert_eq!(n("Array.of(1,2,3).join()==='1,2,3' ? 1 : 0"), 1.0);
+        assert_eq!(n("[1,2,3].fill(0,1).join()==='1,0,0' ? 1 : 0"), 1.0);
+        assert_eq!(
+            n("['a','b','c'].reduceRight(function(a,b){return a+b;}) === 'cba' \
+               ? 1 : 0"), 1.0);
+        assert_eq!(
+            n("[1,2,3,4,5].copyWithin(0,3).join()==='4,5,3,4,5' ? 1 : 0"), 1.0);
+        assert_eq!(n("[NaN].includes(NaN) ? 1 : 0"), 1.0);
+        // string split with a limit; replaceAll with a global regex
+        assert_eq!(n("'a,b,c,d'.split(',',2).join()==='a,b' ? 1 : 0"), 1.0);
+        assert_eq!(n("'a1b2'.replaceAll(/\\d/g,'X')==='aXbX' ? 1 : 0"), 1.0);
+        // numeric separators
+        assert_eq!(n("1_000_000"), 1000000.0);
+        assert_eq!(n("0xFF_FF"), 65535.0);
+        // toLocaleString returns a string
+        assert_eq!(n("typeof (1234).toLocaleString()==='string' ? 1 : 0"), 1.0);
+        // getOwnPropertyDescriptors
+        assert_eq!(
+            n("var d=Object.getOwnPropertyDescriptors({a:1}); \
+               (d.a.value===1 && d.a.enumerable===true) ? 1 : 0"), 1.0);
+    }
+
+    #[test]
+    fn tagged_templates() {
+        // tag receives (cooked-strings, ...substitutions)
+        assert_eq!(
+            n("function t(s, v){ return s[0] + v + s[1]; } \
+               t`a${9}b` === 'a9b' ? 1 : 0"), 1.0);
+        // multiple substitutions and the strings array length
+        assert_eq!(
+            n("function t(s){ return s.length; } t`${1}${2}${3}`"), 4.0);
+        // the strings array carries a `.raw`
+        assert_eq!(
+            n("function t(s){ return s.raw[0]; } t`hi${1}` === 'hi' ? 1 : 0"),
+            1.0);
+        // String.raw builtin pattern (cooked === raw here)
+        assert_eq!(
+            n("function t(s,a){ return s[0]+a+s[1]; } t`x${5}y` === 'x5y' \
+               ? 1 : 0"), 1.0);
+    }
+
+    #[test]
+    fn iterable_spread_and_from() {
+        // spreading a generator expands element-wise (not [object Object])
+        assert_eq!(
+            n("function* g(){yield 1;yield 2;} \
+               [...g()].join()==='1,2' ? 1 : 0"), 1.0);
+        // spreading a Set and a string
+        assert_eq!(
+            n("[...new Set([1,1,2])].join()==='1,2' ? 1 : 0"), 1.0);
+        assert_eq!(n("[...'abc'].length"), 3.0);
+        // Array.from over a generator drains the iterator
+        assert_eq!(
+            n("function* g(){yield 5;yield 6;} \
+               Array.from(g()).join()==='5,6' ? 1 : 0"), 1.0);
+        // spread into a call argument list
+        assert_eq!(
+            n("function* g(){yield 1;yield 2;yield 3;} \
+               Math.max(...g())"), 3.0);
     }
 
     #[test]

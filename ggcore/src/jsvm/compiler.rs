@@ -4048,6 +4048,25 @@ impl Compiler {
         target: &Expr,
         value: &Expr,
     ) -> Result<u8, CompileError> {
+        // Logical assignment short-circuits: `a ||= b` evaluates and assigns
+        // b only when a is falsy (`&&=` when truthy, `??=` when nullish).
+        // Desugar to `a <logop> (a = b)` and reuse the logical + plain-assign
+        // paths. (`a` is read for the test and again in the assign target;
+        // for member targets the object subexpression is evaluated twice —
+        // an accepted deviation from the once-evaluated reference spec.)
+        if let AssignOp::Log(logop) = op {
+            let plain = Expr::Assign(
+                AssignOp::Plain,
+                Box::new(target.clone()),
+                Box::new(value.clone()),
+            );
+            let logical = Expr::Logical(
+                logop,
+                Box::new(target.clone()),
+                Box::new(plain),
+            );
+            return self.expr(&logical);
+        }
         match target {
             Expr::Ident(name) => match op {
                 AssignOp::Plain => {
@@ -4088,7 +4107,7 @@ impl Compiler {
                         Ok(rv)
                     }
                 }
-                AssignOp::Log(_) => self.err("logical assignment not yet"),
+                AssignOp::Log(_) => unreachable!("logical assignment desugared in assign()"),
             },
             Expr::Member { obj, prop, optional } => {
                 if *optional {
@@ -4130,7 +4149,7 @@ impl Compiler {
                             Ok(dst)
                         }
                         AssignOp::Log(_) => {
-                            self.err("logical assignment not yet")
+                            unreachable!("logical assignment desugared in assign()")
                         }
                     };
                 };
@@ -4167,7 +4186,7 @@ impl Compiler {
                         Ok(dst)
                     }
                     AssignOp::Log(_) => {
-                        self.err("logical assignment not yet")
+                        unreachable!("logical assignment desugared in assign()")
                     }
                 }
             }
