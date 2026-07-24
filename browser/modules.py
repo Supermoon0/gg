@@ -338,6 +338,12 @@ def _module_statement_spans(source):
         if source.startswith(("//", "/*"), pos):
             pos = _skip_space_comments(source, pos)
             continue
+        if ch == "/" and _regex_may_start(source, pos):
+            # a regex literal may hold quotes (/["']/) or unbalanced
+            # brackets/braces (/[{]/) that would otherwise desync the
+            # string-skip and depth counters and hide a later export
+            pos = _skip_regex(source, pos)
+            continue
         if ch == "(":
             paren += 1
         elif ch == ")":
