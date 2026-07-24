@@ -1,0 +1,21 @@
+<html><head><style>
+body { margin: 0; }
+.base { width: 120px; height: 30px; background-color: #4a90d9;
+        margin-bottom: 8px; }
+.t1 { transform: translate(40px, 10px); background-color: #d9534f; }
+.t2 { transform: translateX(-20px) translateY(5px);
+      background-color: #5cb85c; }
+.t3 { transform: translate(-50%, 0); background-color: #f0ad4e; }
+.hidden { transform: scale(0); background-color: #000000; }
+.outer { transform: translate(30px, 0); width: 300px;
+         background-color: #eeeeee; padding: 6px; }
+.outer .base { transform: translate(10px, 4px); }
+</style></head><body>
+<div class="base">plain</div>
+<div class="base t1">t1</div>
+<div class="base t2">t2</div>
+<div class="base t3">t3</div>
+<div class="base hidden">gone</div>
+<div class="outer"><div class="base">nested</div></div>
+<div class="base">after</div>
+</body></html>

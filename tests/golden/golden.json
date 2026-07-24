@@ -1,0 +1,37 @@
+{
+ "boxes": {
+  "cmds": 28,
+  "height": 349.28,
+  "raster": "0fa508fd9c60748d4c6a79edcd6c78d7a7c8829430fcfc5d6dcd99827ebd841c"
+ },
+ "flex-dashboard": {
+  "cmds": 43,
+  "height": 348.0,
+  "raster": "4c29071ae1a0b06a1b22fcc15a87c2988d08740277b7e7a1523825dcb3da7fe7"
+ },
+ "form-page": {
+  "cmds": 23,
+  "height": 207.84,
+  "raster": "cc595fa3a5a322147314df5afbcc4d60e9809848de0ea66d1842910910dd8064"
+ },
+ "news-list": {
+  "cmds": 49,
+  "height": 301.48,
+  "raster": "612e1dd4912f10a7d0e99d47f429e32e74730687bc90f77d9df72cace40ef390"
+ },
+ "replaced": {
+  "cmds": 13,
+  "height": 263.28,
+  "raster": "f75bbd02ca922ce023380ad8edca9d14d44f82840754f3ab4ac9d92e165368c8"
+ },
+ "transform-page": {
+  "cmds": 13,
+  "height": 278.0,
+  "raster": "45137c156d0528ed9e9489dcd4ac3dac5ff6778401520a7b65793e1dbe9819d2"
+ },
+ "typography": {
+  "cmds": 69,
+  "height": 412.07,
+  "raster": "29ada1fd64ec1e742c41fe59d0e77471ade9e2e37ccaf7ce9b88ee2e7fc8edcf"
+ }
+}

@@ -1,0 +1,30 @@
+<html><head><style>
+body { margin: 0; font-family: sans-serif; }
+.row { display: flex; width: 720px; margin-bottom: 8px;
+       background-color: #f4f4f4; }
+.card { height: 40px; background-color: #4a90d9; margin: 4px;
+        color: white; }
+.jc-center { justify-content: center; }
+.jc-between { justify-content: space-between; }
+.ai-center { align-items: center; }
+.tall { height: 70px; background-color: #2e6da4; }
+.grow1 { flex: 1; }
+.grow2 { flex: 2; }
+.fixed { width: 100px; }
+.wide { width: 300px; }
+.shrinky > .wide { height: 30px; background-color: #d9534f; }
+</style></head><body>
+<div class="row"><div class="card fixed">a</div>
+  <div class="card fixed">b</div><div class="card fixed">c</div></div>
+<div class="row jc-center"><div class="card fixed">центр</div>
+  <div class="card fixed">two</div></div>
+<div class="row jc-between"><div class="card fixed">L</div>
+  <div class="card fixed">M</div><div class="card fixed">R</div></div>
+<div class="row ai-center"><div class="card tall fixed">tall</div>
+  <div class="card fixed">mid</div></div>
+<div class="row"><div class="card grow1">grow 1</div>
+  <div class="card grow2">grow 2</div>
+  <div class="card fixed">fixed</div></div>
+<div class="row shrinky"><div class="wide">shrink a</div>
+  <div class="wide">shrink b</div><div class="wide">shrink c</div></div>
+</body></html>

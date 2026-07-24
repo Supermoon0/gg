@@ -1,0 +1,19 @@
+<html><head><style>
+body { margin: 0; font-family: sans-serif; }
+form { width: 480px; padding: 16px; background-color: #fafafa;
+       border-width: 1px; border-color: #cccccc; }
+label { display: block; margin-bottom: 4px; font-weight: bold; }
+input { width: 300px; border-width: 1px; border-color: #999999;
+        margin-bottom: 12px; }
+.pill { width: 420px; height: 44px; border-width: 2px;
+        border-color: #03c75a; border-radius: 22px; padding-left: 16px; }
+</style></head><body>
+<form action="/search">
+  <label>검색어</label>
+  <input class="pill" name="q" placeholder="검색어를 입력해 주세요.">
+  <label>이름</label>
+  <input name="name" value="홍길동">
+  <label>hidden field below (must not paint)</label>
+  <input type="hidden" name="secret" value="x">
+</form>
+</body></html>
