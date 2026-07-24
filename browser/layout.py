@@ -2536,9 +2536,15 @@ class BlockLayout:
                 # image handle — never lay out path/defs children
                 self.image(node)
                 return
-            elif node.tag in ("::before", "::after"):
+            elif node.tag in ("::before", "::after") \
+                    and node is not self.node:
                 # synthesized icon: a fixed-size inline box painted by
-                # its background layer; text content flows normally
+                # its background layer; text content flows normally.
+                # Never for self.node: an absolutely-positioned pseudo
+                # laid out from the abs queue recurses into itself for
+                # its children — re-adding it as an icon box here would
+                # paint the sprite twice at offset positions (every
+                # naver shortcut icon showed doubled)
                 w = parse_size(node.style.get("width", ""), self.width)
                 h = parse_size(node.style.get("height", ""))
                 if w and h and getattr(node, "_bg", None):
