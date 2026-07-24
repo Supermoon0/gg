@@ -1037,14 +1037,19 @@ impl Doc {
         self.ggvm().resolve_fetch(fetch_id, status, body);
     }
 
+    /// `headers` is optional so callers built against the older 4-arg
+    /// signature keep working (they just get a header-less Response).
+    #[pyo3(signature = (fetch_id, status, url, body, headers=None))]
     fn resolve_fetch_full(
         &mut self,
         fetch_id: u32,
         status: u16,
         url: String,
         body: String,
+        headers: Option<Vec<(String, String)>>,
     ) {
-        self.ggvm().resolve_fetch_full(fetch_id, status, url, body);
+        self.ggvm().resolve_fetch_full(
+            fetch_id, status, url, body, headers.unwrap_or_default());
     }
 
     fn reject_fetch(&mut self, fetch_id: u32, message: String) {

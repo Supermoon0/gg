@@ -929,9 +929,16 @@ def service_script_fetch(doc, base_url, request, *, network_timeout=15.0,
             base_url, request, timeout=network_timeout,
             cancel_token=cancel_token, context=network_context)
         if hasattr(doc, "resolve_fetch_full"):
-            doc.resolve_fetch_full(
-                fetch_id, response.status, str(response.final_url),
-                response.body)
+            header_items = [(str(k), str(v)) for k, v in
+                            dict(response.headers or {}).items()]
+            try:
+                doc.resolve_fetch_full(
+                    fetch_id, response.status, str(response.final_url),
+                    response.body, header_items)
+            except TypeError:  # older wheel: 4-arg signature
+                doc.resolve_fetch_full(
+                    fetch_id, response.status, str(response.final_url),
+                    response.body)
         else:
             doc.resolve_fetch(fetch_id, response.status, response.body)
         return True

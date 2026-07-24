@@ -1376,7 +1376,15 @@ fn make_string(st: &mut St, s: String) -> Value {
 
 /// Build a fetch Response object: { ok, status, url, text(), json() }.
 /// The body is stored under a hidden atom so text()/json() can find it.
-fn new_response(st: &mut St, status: u16, url: &str, body: String) -> Value {
+/// Response headers land in a plain `_h` map (lower-cased names); the JS
+/// prelude wraps it into a Headers-like `headers` facade on first access.
+fn new_response(
+    st: &mut St,
+    status: u16,
+    url: &str,
+    body: String,
+    headers: &[(String, String)],
+) -> Value {
     let v = new_plain_object(st);
     let oi = v.index() as usize;
     let ok_key = st.intern_name("ok");
@@ -1390,6 +1398,15 @@ fn new_response(st: &mut St, status: u16, url: &str, body: String) -> Value {
     let body_v = make_string(st, body);
     let body_atom = st.fetch_body_atom;
     raw_set_prop(st, oi, body_atom, body_v);
+    let hmap = new_plain_object(st);
+    let hi = hmap.index() as usize;
+    for (name, value) in headers {
+        let key = st.intern_name(&name.to_ascii_lowercase());
+        let val = make_string(st, value.clone());
+        raw_set_prop(st, hi, key, val);
+    }
+    let h_key = st.intern_name("_h");
+    raw_set_prop(st, oi, h_key, hmap);
     v
 }
 
@@ -1617,7 +1634,7 @@ pub(super) fn pump_bounded(
 
 /// Host (driver) settles a fetch: fulfill its promise with a Response.
 pub(super) fn resolve_fetch(st: &mut St, fetch_id: u32, status: u16, body: String) {
-    resolve_fetch_full(st, fetch_id, status, String::new(), body);
+    resolve_fetch_full(st, fetch_id, status, String::new(), body, Vec::new());
 }
 
 pub(super) fn resolve_fetch_full(
@@ -1626,9 +1643,10 @@ pub(super) fn resolve_fetch_full(
     status: u16,
     url: String,
     body: String,
+    headers: Vec<(String, String)>,
 ) {
     if let Some(pid) = st.awaiting.remove(&fetch_id) {
-        let resp = new_response(st, status, &url, body);
+        let resp = new_response(st, status, &url, body, &headers);
         promise_settle(st, pid, resp, false);
     }
 }

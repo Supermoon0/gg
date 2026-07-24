@@ -340,32 +340,129 @@ function Worker() {}
 Worker.prototype.postMessage = function () {};
 Worker.prototype.terminate = function () {};
 Worker.prototype.addEventListener = function () {};
+// Headers-like facade over a plain lower-cased {name: value} map. Fetch
+// Responses carry the raw map as `_h` (set by the engine); XHR reuses it.
+function __ggMakeHeaders(map) {
+  map = map || {};
+  return {
+    get: function (n) {
+      var v = map[('' + n).toLowerCase()];
+      return v === undefined ? null : v;
+    },
+    has: function (n) { return map[('' + n).toLowerCase()] !== undefined; },
+    forEach: function (cb, thisArg) {
+      for (var k in map) cb.call(thisArg, map[k], k, this);
+    },
+    entries: function () {
+      var out = [];
+      for (var k in map) out.push([k, map[k]]);
+      return out[Symbol.iterator] ? out[Symbol.iterator]() : out;
+    },
+    keys: function () {
+      var out = [];
+      for (var k in map) out.push(k);
+      return out[Symbol.iterator] ? out[Symbol.iterator]() : out;
+    },
+  };
+}
 function XMLHttpRequest() {
   this.readyState = 0;
   this.status = 0;
+  this.statusText = '';
   this.responseText = '';
   this.response = '';
+  this.responseURL = '';
+  this.responseType = '';
+  this.timeout = 0;
   this._headers = {};
+  this._resH = {};
+  this._lis = {};
   this.withCredentials = false;
+  // handler slots must EXIST so `'onloadend' in xhr` feature checks
+  // (axios and friends) take the modern path
+  this.onreadystatechange = null;
+  this.onload = null;
+  this.onloadend = null;
+  this.onloadstart = null;
+  this.onerror = null;
+  this.onabort = null;
+  this.ontimeout = null;
+  this.onprogress = null;
 }
+XMLHttpRequest.UNSENT = 0; XMLHttpRequest.OPENED = 1;
+XMLHttpRequest.HEADERS_RECEIVED = 2; XMLHttpRequest.LOADING = 3;
+XMLHttpRequest.DONE = 4;
+XMLHttpRequest.prototype.UNSENT = 0;
+XMLHttpRequest.prototype.OPENED = 1;
+XMLHttpRequest.prototype.HEADERS_RECEIVED = 2;
+XMLHttpRequest.prototype.LOADING = 3;
+XMLHttpRequest.prototype.DONE = 4;
 XMLHttpRequest.prototype.open = function (method, url) {
   this._method = method;
   this._url = url;
   this.readyState = 1;
+  this._fire('readystatechange');
 };
 XMLHttpRequest.prototype.setRequestHeader = function (k, v) {
   this._headers[k] = v;
 };
-XMLHttpRequest.prototype.getResponseHeader = function () {
-  return null;
+XMLHttpRequest.prototype.getResponseHeader = function (n) {
+  var v = this._resH[('' + n).toLowerCase()];
+  return v === undefined ? null : v;
 };
-XMLHttpRequest.prototype.abort = function () {};
+XMLHttpRequest.prototype.getAllResponseHeaders = function () {
+  var out = '';
+  for (var k in this._resH) out += k + ': ' + this._resH[k] + '\r\n';
+  return out;
+};
+XMLHttpRequest.prototype.abort = function () {
+  this._aborted = true;
+  this.readyState = 4;
+  this.status = 0;
+  this._fire('readystatechange');
+  this._fire('abort');
+  this._fire('loadend');
+};
+XMLHttpRequest.prototype.overrideMimeType = function () {};
 XMLHttpRequest.prototype.addEventListener = function (ty, cb) {
-  if (ty === 'load') this.onload = cb;
-  if (ty === 'error') this.onerror = cb;
+  if (typeof cb !== 'function') return;
+  if (!this._lis[ty]) this._lis[ty] = [];
+  this._lis[ty].push(cb);
+};
+XMLHttpRequest.prototype.removeEventListener = function (ty, cb) {
+  var l = this._lis[ty];
+  if (!l) return;
+  var i = l.indexOf(cb);
+  if (i >= 0) l.splice(i, 1);
+};
+XMLHttpRequest.prototype._fire = function (ty, extra) {
+  var ev = { type: ty, target: this, currentTarget: this };
+  if (extra) for (var k in extra) ev[k] = extra[k];
+  var h = this['on' + ty];
+  if (typeof h === 'function') {
+    try { h.call(this, ev); } catch (e) { console.log('[gg-js error] xhr on' + ty + ': ' + e); }
+  }
+  var l = this._lis[ty];
+  if (l) for (var i = 0; i < l.length; i++) {
+    try { l[i].call(this, ev); } catch (e2) { console.log('[gg-js error] xhr ' + ty + ' listener: ' + e2); }
+  }
+};
+XMLHttpRequest.prototype._finish = function () {
+  var t = this.responseText;
+  if (this.responseType === 'json') {
+    try { this.response = JSON.parse(t); }
+    catch (e) { this.response = null; }
+  } else {
+    this.response = t;
+  }
+  this.readyState = 4;
+  this._fire('readystatechange');
+  this._fire('load');
+  this._fire('loadend');
 };
 XMLHttpRequest.prototype.send = function (body) {
   var self = this;
+  this._fire('loadstart');
   fetch(this._url, {
     method: this._method || 'GET',
     headers: this._headers,
@@ -373,19 +470,43 @@ XMLHttpRequest.prototype.send = function (body) {
     mode: 'cors',
     credentials: this.withCredentials ? 'include' : 'same-origin'
   }).then(function (r) {
+    if (self._aborted) return '';
     self.status = r.status;
+    self.statusText = r.ok ? 'OK' : '';
+    self.responseURL = r.url || self._url;
+    self._resH = r._h || {};
     return r.text();
   }).then(function (t) {
-    self.readyState = 4;
+    if (self._aborted) return;
     self.responseText = t;
-    self.response = t;
-    if (self.onreadystatechange) self.onreadystatechange();
-    if (self.onload) self.onload();
+    self._finish();
   }, function (e) {
+    if (self._aborted) return;
     self.readyState = 4;
     self.status = 0;
-    if (self.onreadystatechange) self.onreadystatechange();
-    if (self.onerror) self.onerror(e);
+    self._fire('readystatechange');
+    self._fire('error', { error: e });
+    self._fire('loadend');
+  });
+};
+// Dress the engine's bare fetch Response ({ok,status,url,text,json,_h})
+// with the standard surface page code expects: headers facade,
+// statusText, clone(), arrayBuffer()/blob() shims.
+var __ggNativeFetch = fetch;
+fetch = function (input, init) {
+  return __ggNativeFetch(input, init).then(function (r) {
+    if (r && typeof r === 'object' && !r.headers) {
+      r.headers = __ggMakeHeaders(r._h);
+      if (r.statusText === undefined) r.statusText = r.ok ? 'OK' : '';
+      if (!r.clone) r.clone = function () { return r; };
+      if (!r.arrayBuffer) r.arrayBuffer = function () {
+        return r.text().then(function (t) {
+          return new TextEncoder().encode(t);
+        });
+      };
+      if (!r.blob) r.blob = function () { return r.text(); };
+    }
+    return r;
   });
 };
 // DOM interface constructors: patch surfaces for polyfills
@@ -1170,8 +1291,9 @@ impl PageVm {
         status: u16,
         url: String,
         body: String,
+        headers: Vec<(String, String)>,
     ) {
-        resolve_fetch_full(&mut self.st, fetch_id, status, url, body);
+        resolve_fetch_full(&mut self.st, fetch_id, status, url, body, headers);
     }
 
     pub fn reject_fetch(&mut self, fetch_id: u32, message: String) {
@@ -5309,6 +5431,7 @@ console.log('B typeof it: ' + typeof it);
             201,
             "https://api.example/final".to_string(),
             "ok".to_string(),
+            vec![("Content-Type".to_string(), "text/plain".to_string())],
         );
         let (logs, more) = vm.pump();
         assert!(more.is_empty());
