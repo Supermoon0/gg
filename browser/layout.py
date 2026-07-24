@@ -1413,14 +1413,14 @@ class BlockLayout:
                     box = BlockLayout(child, self, None)
                     box.forced_width = fw
                     box.float_side = fside
-                    box.flex_origin = (
-                        self._float_x(fside, cur_y, fw), cur_y)
+                    flx, fly = self._float_pos(fside, cur_y, fw)
+                    box.flex_origin = (flx, fly)
                     self.children.append(box)
                     box.layout()
                     self._floats.append((
                         fside,
                         box.x - box.ml - box.bw - box.pl,
-                        cur_y,
+                        fly,
                         box.outer_width(),
                         box.outer_height(),
                     ))
@@ -1577,21 +1577,33 @@ class BlockLayout:
             return None
         return max(box - self.pt - self.pb - 2 * self.bw, 0.0)
 
-    def _float_x(self, side, y, w):
-        """Margin-edge x for a new float: after the floats already
-        occupying this y, from the matching side."""
+    def _float_pos(self, side, y, w):
+        """(x, y) for a new float: packed after the floats already at
+        this y; when it no longer fits between the float edges it drops
+        below the shortest blocking float and retries (CSS 2.1 §9.5.1
+        rules 4/7 — this wrap is what turns naver's 24 float:left
+        16.66% press boxes into a 6×4 logo grid instead of one clipped
+        row)."""
         left_edge = self.x
         right_edge = self.x + self.width
-        for (s, fx, fy, fw, fh) in self._floats:
-            if not (fy <= y < fy + fh):
-                continue
-            if s == "left":
-                left_edge = max(left_edge, fx + fw)
-            else:
-                right_edge = min(right_edge, fx)
+        for _ in range(len(self._floats) + 1):
+            left_edge = self.x
+            right_edge = self.x + self.width
+            blockers = []
+            for (s, fx, fy, fw, fh) in self._floats:
+                if not (fy <= y < fy + fh):
+                    continue
+                blockers.append((fy, fh))
+                if s == "left":
+                    left_edge = max(left_edge, fx + fw)
+                else:
+                    right_edge = min(right_edge, fx)
+            if not blockers or w <= right_edge - left_edge + 0.5:
+                break
+            y = min(fy + fh for (fy, fh) in blockers)
         if side == "left":
-            return left_edge
-        return max(right_edge - w, left_edge)
+            return left_edge, y
+        return max(right_edge - w, left_edge), y
 
     def _layout_flex_column(self, node, em, kids, row_gap):
         """flex-direction:column — the flex algorithm on a vertical main

@@ -976,6 +976,8 @@ impl PageVm {
                  Native::HostFn(host::O_DEFINE_PROPS)),
                 ("getOwnPropertyDescriptor",
                  Native::HostFn(host::O_GET_OWN_PD)),
+                ("getOwnPropertyDescriptors",
+                 Native::HostFn(host::O_GET_OWN_PDS)),
                 ("getOwnPropertyNames",
                  Native::HostFn(host::O_GET_OWN_NAMES)),
                 ("create", Native::HostFn(host::O_CREATE)),
@@ -2546,6 +2548,71 @@ mod tests {
         assert_eq!(
             n("Object.getOwnPropertyDescriptor([1], '5') === undefined \
                ? 1 : 0"), 1.0);
+    }
+
+    #[test]
+    fn numeric_string_keys_survive_descriptor_round_trips() {
+        // Plain objects store numeric keys in element storage; the
+        // descriptor APIs must see them there. Babel's _objectSpread2
+        // copies {"907": press} one property at a time through
+        // getOwnPropertyDescriptor(s) + defineProperty/ies — any gap
+        // silently emptied naver's newsstand pressInfo map.
+        assert_eq!(
+            n("var o = {}; o['907'] = 'x'; \
+               var d = Object.getOwnPropertyDescriptor(o, '907'); \
+               d && d.value === 'x' && d.enumerable ? 1 : 0"), 1.0);
+        // defineProperty with a numeric key is visible to reads + keys
+        assert_eq!(
+            n("var o = {}; Object.defineProperty(o, '32', \
+               {value: 'p', enumerable: true, writable: true, \
+                configurable: true}); \
+               (o['32'] === 'p' ? 1 : 0) + \
+               (Object.keys(o).indexOf('32') >= 0 ? 2 : 0)"), 3.0);
+        // no phantom keys from the sparse element range
+        assert_eq!(
+            n("var o = {}; o['200'] = 1; o['abc'] = 2; \
+               Object.keys(o).length"), 2.0);
+        assert_eq!(
+            n("var o = {}; o['200'] = 1; \
+               Object.getOwnPropertyNames(o).join(',') === '200' \
+               ? 1 : 0"), 1.0);
+        // getOwnPropertyDescriptors + defineProperties round-trip
+        assert_eq!(
+            n("var src = {}; src['907'] = {pid: '907'}; src.name = 'n'; \
+               var ds = Object.getOwnPropertyDescriptors(src); \
+               var dst = Object.defineProperties({}, ds); \
+               (dst['907'].pid === '907' ? 1 : 0) + \
+               (dst.name === 'n' ? 2 : 0) + \
+               (Object.keys(dst).length === 2 ? 4 : 0)"), 7.0);
+        // the full babel spread chain: reduce + per-key copy
+        assert_eq!(
+            n("var blocks = [{pid:'907'},{pid:'032'},{pid:'315'}]; \
+               var b = blocks.reduce(function(acc, t){ \
+                 var e = Object.defineProperties({}, \
+                   Object.getOwnPropertyDescriptors(acc)); \
+                 e[t.pid] = t; return e; }, {}); \
+               (Object.keys(b).length === 3 ? 1 : 0) + \
+               (b['907'] && b['032'] && b['315'] ? 2 : 0)"), 3.0);
+        // only CANONICAL numeric strings are element indices: "032"
+        // stays a distinct named property (naver's zero-padded press
+        // ids) and survives keys/descriptor round-trips verbatim
+        assert_eq!(
+            n("var o = {}; o['032'] = 'a'; o['32'] = 'b'; \
+               (o['032'] === 'a' ? 1 : 0) + (o['32'] === 'b' ? 2 : 0) + \
+               (Object.keys(o).indexOf('032') >= 0 ? 4 : 0) + \
+               (Object.getOwnPropertyDescriptor(o, '032').value === 'a' \
+                ? 8 : 0)"), 15.0);
+        assert_eq!(
+            n("var src = {}; src['032'] = 'p'; \
+               var dst = Object.defineProperties({}, \
+                 Object.getOwnPropertyDescriptors(src)); \
+               (dst['032'] === 'p' ? 1 : 0) + \
+               (Object.keys(dst).join(',') === '032' ? 2 : 0)"), 3.0);
+        // delete works on both storages
+        assert_eq!(
+            n("var o = {}; o['907'] = 1; o['032'] = 2; \
+               delete o['907']; delete o['032']; \
+               Object.keys(o).length"), 0.0);
     }
 
     #[test]

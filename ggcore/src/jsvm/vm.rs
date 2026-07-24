@@ -371,6 +371,7 @@ pub(super) mod host {
     pub const O_GET_OWN_NAMES: u16 = 51;
     pub const O_IS: u16 = 52;
     pub const O_FROM_ENTRIES: u16 = 53;
+    pub const O_GET_OWN_PDS: u16 = 54;
     pub const A_ISARRAY: u16 = 60;
     pub const A_FROM: u16 = 61;
     pub const N_ISNAN: u16 = 80;
@@ -1756,6 +1757,24 @@ fn str_ref(st: &mut St, i: u32) -> &str {
     }
 }
 
+/// The element index a property name denotes, or None when the name is
+/// an ordinary named property. Only the CANONICAL numeric form is an
+/// index ("32" yes, "032"/"+1" no) — naver press ids are zero-padded
+/// strings ("032"), and routing them through element storage made
+/// o["032"] and o["32"] alias and then diverge across babel spreads.
+fn elem_index(name: &str) -> Option<usize> {
+    if name == "0" {
+        return Some(0);
+    }
+    if name.is_empty() || name.starts_with('0') {
+        return None;
+    }
+    if !name.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    name.parse::<usize>().ok()
+}
+
 pub(super) fn raw_get_prop(
     st: &St,
     oi: usize,
@@ -2014,8 +2033,10 @@ fn has_own_property(
     }
     // numeric keys live in dense element storage on every object
     // (SetIndex stores them there whether or not it is an array)
-    if let Ok(i) = name.parse::<usize>() {
-        if i < st.objects[oi].elems.len() {
+    if let Some(i) = elem_index(&name) {
+        if i < st.objects[oi].elems.len()
+            && !st.objects[oi].elems[i].is_undefined()
+        {
             return Ok(true);
         }
     }
@@ -3490,11 +3511,12 @@ fn delete_property(st: &mut St, obj: Value, key: Value) -> bool {
     }
     let oi = obj.index() as usize;
     let name = to_display(st, key);
-    if let Ok(i) = name.parse::<usize>() {
+    if let Some(i) = elem_index(&name) {
         if i < st.objects[oi].elems.len() {
             st.objects[oi].elems[i] = Value::UNDEFINED;
+            return true;
         }
-        return true;
+        // absent from elems: may still be a named prop below
     }
     let Some(&key_id) = st.name_ids.get(&name) else {
         return true;
@@ -3649,7 +3671,7 @@ fn internal_get(
         if name == "length" && st.objects[oi].is_array {
             return Ok(Value::int(st.objects[oi].elems.len() as i32));
         }
-        if let Ok(index) = name.parse::<usize>() {
+        if let Some(index) = elem_index(&name) {
             if let Some(&value) = st.objects[oi].elems.get(index) {
                 if !value.is_undefined() {
                     return Ok(value);
@@ -3805,7 +3827,7 @@ fn internal_set(
         st.objects[oi].elems.resize(len as usize, Value::UNDEFINED);
         return Ok(true);
     }
-    if let Ok(index) = name.parse::<usize>() {
+    if let Some(index) = elem_index(&name) {
         if index >= st.objects[oi].elems.len()
             && st.non_extensible_objects.contains(&target.index())
         {
@@ -3890,9 +3912,16 @@ fn internal_has(
     if st.objects[oi].is_array && name == "length" {
         return Ok(true);
     }
-    if let Ok(index) = name.parse::<usize>() {
-        return Ok(st.objects[oi].elems.get(index)
-            .is_some_and(|value| !value.is_undefined()));
+    if let Some(index) = elem_index(&name) {
+        if st.objects[oi].elems.get(index)
+            .is_some_and(|value| !value.is_undefined())
+        {
+            return Ok(true);
+        }
+        // non-arrays: a numeric name can still be a shape prop
+        if st.objects[oi].is_array {
+            return Ok(false);
+        }
     }
     Ok(!matches!(lookup_prop(st, oi, key), PropHit::Missing))
 }
@@ -4098,13 +4127,17 @@ fn ordinary_get_own_descriptor(
             true, false, false,
         ));
     }
-    if let Ok(index) = name.parse::<usize>() {
+    if let Some(index) = elem_index(&name) {
         if let Some(&value) = st.objects[oi].elems.get(index) {
             if !value.is_undefined() {
                 return Ok(descriptor_object(st, value, true, true, true));
             }
         }
-        return Ok(Value::UNDEFINED);
+        if st.objects[oi].is_array {
+            return Ok(Value::UNDEFINED);
+        }
+        // plain object: a numeric name can also be a shape prop
+        // (stored via a constant-key opcode) — fall through
     }
     if let Some(&(get, set)) = st.accessors.get(&(target.index(), key)) {
         let out = new_plain_object(st);
@@ -5608,7 +5641,21 @@ fn define_one_prop(
             st.globals[key as usize] = v;
             st.gdef[key as usize] = true;
         }
-        raw_set_prop(st, oi, key, v);
+        // numeric keys go to element storage (where gets/keys look),
+        // matching ordinary assignment — a shape prop named "907"
+        // would be invisible to o["907"] reads
+        if let Some(index) = elem_index(&st.names[key as usize].clone())
+        {
+            let elems = &mut st.objects[oi].elems;
+            if index >= elems.len() {
+                elems.resize(index, Value::UNDEFINED);
+                elems.push(v);
+            } else {
+                elems[index] = v;
+            }
+        } else {
+            raw_set_prop(st, oi, key, v);
+        }
     }
     Ok(())
 }
@@ -5743,10 +5790,16 @@ fn host_fn(
                 .props.iter().map(|(&a, &s)| (s, a)).collect();
             pairs.sort_by_key(|&(slot, _)| slot);
             let mut out = Vec::new();
-            // array index keys first (like for-in)
+            // array index keys first (like for-in). Plain objects store
+            // numeric keys sparsely in elems (o["907"]=x pads 0..906
+            // with holes) — enumerating the range would fabricate
+            // hundreds of phantom undefined keys, so skip holes.
             for k in 0..nelems {
-                let key = intern(st, &k.to_string());
                 let val = st.objects[oi].elems[k];
+                if !is_array && val.is_undefined() {
+                    continue;
+                }
+                let key = intern(st, &k.to_string());
                 out.push(host_entry(st, id, key, val));
             }
             for (slot, atom) in pairs {
@@ -5755,7 +5808,6 @@ fn host_fn(
                 let val = st.objects[oi].slots[slot as usize];
                 out.push(host_entry(st, id, key, val));
             }
-            let _ = is_array;
             Ok(new_array(st, out))
         }
         O_ASSIGN => {
@@ -5869,6 +5921,20 @@ fn host_fn(
                 return err("defineProperties needs a descriptor map");
             }
             let di = descs.index() as usize;
+            // numeric keys of the descriptor map live in element
+            // storage ({"907": {...}} — getOwnPropertyDescriptors
+            // output); iterating only shape props silently defined
+            // nothing for them
+            for i in 0..st.objects[di].elems.len() {
+                let desc = st.objects[di].elems[i];
+                if desc.is_undefined() {
+                    continue; // hole
+                }
+                let key = st.intern_name(&i.to_string());
+                if !internal_define_property(st, mods, obj, key, desc)? {
+                    return type_err("Object.defineProperties was rejected");
+                }
+            }
             let shape = st.objects[di].shape;
             let mut pairs: Vec<(u16, u32)> = st.shapes[shape as usize]
                 .props.iter().map(|(&a, &s)| (s, a)).collect();
@@ -5910,12 +5976,16 @@ fn host_fn(
                 return Ok(new_array(st, Vec::new()));
             }
             let oi = v.index() as usize;
-            let (nelems, shape, has_acc) = {
+            let (nelems, shape, has_acc, v_is_array) = {
                 let o = &st.objects[oi];
-                (o.elems.len(), o.shape, o.has_accessors)
+                (o.elems.len(), o.shape, o.has_accessors, o.is_array)
             };
             let mut out = Vec::new();
+            // skip plain-object element holes (sparse numeric keys)
             for k in 0..nelems {
+                if !v_is_array && st.objects[oi].elems[k].is_undefined() {
+                    continue;
+                }
                 out.push(intern(st, &k.to_string()));
             }
             let mut pairs: Vec<(u16, u32)> = st.shapes[shape as usize]
@@ -6024,39 +6094,36 @@ fn host_fn(
             // setter reads `getOwnPropertyDescriptor(arr, "length").writable`
             // before every mutation — an undefined descriptor makes it throw
             // "Cannot set read only .length", which aborts React's commit.
-            if st.objects[oi].is_array {
-                if key_name == "length" {
-                    let n = st.objects[oi].elems.len() as i32;
-                    let out = new_plain_object(st);
-                    let pi = out.index() as usize;
-                    let f = Value::boolean(false);
-                    let vid = st.intern_name("value");
-                    let wid = st.intern_name("writable");
-                    let eid = st.intern_name("enumerable");
-                    let cid = st.intern_name("configurable");
-                    raw_set_prop(st, pi, vid, Value::int(n));
-                    raw_set_prop(st, pi, wid, Value::boolean(true));
-                    raw_set_prop(st, pi, eid, f);
-                    raw_set_prop(st, pi, cid, f);
-                    return Ok(out);
-                }
-                if let Ok(i) = key_name.parse::<usize>() {
-                    if i < st.objects[oi].elems.len() {
-                        let v = st.objects[oi].elems[i];
-                        let out = new_plain_object(st);
-                        let pi = out.index() as usize;
-                        let t = Value::boolean(true);
-                        let vid = st.intern_name("value");
-                        let wid = st.intern_name("writable");
-                        let eid = st.intern_name("enumerable");
-                        let cid = st.intern_name("configurable");
-                        raw_set_prop(st, pi, vid, v);
-                        raw_set_prop(st, pi, wid, t);
-                        raw_set_prop(st, pi, eid, t);
-                        raw_set_prop(st, pi, cid, t);
-                        return Ok(out);
+            if st.objects[oi].is_array && key_name == "length" {
+                let n = st.objects[oi].elems.len() as i32;
+                let out = new_plain_object(st);
+                let pi = out.index() as usize;
+                let f = Value::boolean(false);
+                let vid = st.intern_name("value");
+                let wid = st.intern_name("writable");
+                let eid = st.intern_name("enumerable");
+                let cid = st.intern_name("configurable");
+                raw_set_prop(st, pi, vid, Value::int(n));
+                raw_set_prop(st, pi, wid, Value::boolean(true));
+                raw_set_prop(st, pi, eid, f);
+                raw_set_prop(st, pi, cid, f);
+                return Ok(out);
+            }
+            // numeric keys live in element storage on EVERY object, not
+            // just arrays (o["907"]=x). Babel's object-spread copies one
+            // property at a time through gOPD + defineProperty; missing
+            // this made naver's pressInfo map lose all 246 entries.
+            if let Some(i) = elem_index(&key_name) {
+                if let Some(&v) = st.objects[oi].elems.get(i) {
+                    if st.objects[oi].is_array || !v.is_undefined() {
+                        return Ok(descriptor_object(st, v, true, true,
+                                                    true));
                     }
                 }
+                if st.objects[oi].is_array {
+                    return Ok(Value::UNDEFINED);
+                }
+                // non-array: a hole; fall through to the shape lookup
             }
             let Some(&key) = st.name_ids.get(&key_name) else {
                 return Ok(Value::UNDEFINED);
@@ -6093,6 +6160,45 @@ fn host_fn(
             let cid = st.intern_name("configurable");
             raw_set_prop(st, pi, eid, t);
             raw_set_prop(st, pi, cid, t);
+            Ok(out)
+        }
+        O_GET_OWN_PDS => {
+            // Object.getOwnPropertyDescriptors: {key: descriptor} for
+            // every own property. Babel's _objectSpread2 prefers this
+            // (with defineProperties) whenever it is truthy, so the
+            // pair must round-trip element-stored numeric keys.
+            let obj = argv!(0);
+            let out = new_plain_object(st);
+            if !obj.is_object() && !obj.is_function() {
+                return Ok(out);
+            }
+            let keys = internal_own_keys(st, mods, obj)?;
+            for key_value in keys {
+                let name = to_display(st, key_value);
+                if name == "length" && obj.is_object()
+                    && st.objects[obj.index() as usize].is_array
+                {
+                    continue; // parity with Object.keys-based spreads
+                }
+                let key = st.intern_name(&name);
+                let desc =
+                    internal_get_own_descriptor(st, mods, obj, key)?;
+                if desc.is_undefined() {
+                    continue;
+                }
+                let ii = out.index() as usize;
+                if let Some(index) = elem_index(&name) {
+                    let elems = &mut st.objects[ii].elems;
+                    if index >= elems.len() {
+                        elems.resize(index, Value::UNDEFINED);
+                        elems.push(desc);
+                    } else {
+                        elems[index] = desc;
+                    }
+                } else {
+                    raw_set_prop(st, ii, key, desc);
+                }
+            }
             Ok(out)
         }
         O_CREATE => {
@@ -10363,7 +10469,7 @@ fn exec_loop(
                     // integer-string keys hit dense elems on ANY object
                     // (numeric literal keys live there); gaps fall
                     // through to the named lookup below
-                    if let Ok(n) = text.parse::<usize>() {
+                    if let Some(n) = elem_index(&text) {
                         if let Some(&v) = st.objects[oi].elems.get(n) {
                             if !v.is_undefined() {
                                 reg!(dst) = v;
@@ -10628,7 +10734,7 @@ fn exec_loop(
                     let text = str_ref(st, kv.index()).to_string();
                     let oi = ov.index() as usize;
                     if st.objects[oi].is_array {
-                        if let Ok(k) = text.parse::<usize>() {
+                        if let Some(k) = elem_index(&text) {
                             let elems = &mut st.objects[oi].elems;
                             if k < elems.len() {
                                 elems[k] = v;
