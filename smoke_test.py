@@ -1920,7 +1920,7 @@ LAYOUT_PAGE = """<html><body style="margin: 0">
 dom3 = HTMLParser(LAYOUT_PAGE).parse()
 style(dom3, sorted(ua, key=cascade_priority))
 doc3 = DocumentLayout(dom3)
-doc3.layout(800)  # content width 800 - 2*HSTEP = 774
+doc3.layout(800)  # html fills the viewport: content width 800
 boxes = {}
 for b in layout_tree_to_list(doc3, []):
     if isinstance(b, BlockLayout) and isinstance(b.node, Element):
@@ -1929,8 +1929,9 @@ for b in layout_tree_to_list(doc3, []):
             boxes[node_id] = b
 
 center = boxes["center"]
-# border-box 200 = content 176 + padding 20 + border 4, centered in 774
-check("margin auto centers", abs(center.x - (HSTEP + 287 + 12)) < 1,
+# border-box 200 = content 176 + padding 20 + border 4, centered in 800:
+# auto margin (800-200)/2 = 300, + border-left 2 + padding-left 10 = 12
+check("margin auto centers", abs(center.x - (HSTEP + 300 + 12)) < 1,
       f"x={center.x}")
 check("width is border-box", abs(center.width - 176) < 1,
       f"w={center.width}")
@@ -1940,7 +1941,7 @@ check("flex row placement", fa.y == fb.y == fc.y and fa.x < fb.x < fc.x,
 # the two auto items grow from their content basis and together consume
 # all free space; each gets ~half, up to the b/c glyph-width difference
 check("flex grow shares space",
-      abs((fb.width + fc.width) - (774 - 100)) < 1
+      abs((fb.width + fc.width) - (800 - 100)) < 1
       and abs(fb.width - fc.width) < 4,
       f"fb.width={fb.width:.0f} fc.width={fc.width:.0f}")
 # a `flex:1 0 0` pane fills the row while a `flex:0 0 auto` label keeps

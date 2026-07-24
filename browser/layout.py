@@ -16,7 +16,14 @@ from .draw import (DrawBgImage, DrawClipPop, DrawClipPush, DrawImage,
 from .html_parser import Element, Text
 from .style import parse_px, parse_size
 
-HSTEP = 13
+# The initial containing block IS the viewport: html fills it edge to
+# edge (x=0, full width). Any page gutter comes from the UA sheet's
+# `body { margin: 8px }`, exactly like a real browser — a nonzero HSTEP
+# here would double-inset and, worse, shrink the usable width so a page
+# whose own centered container is sized to the full viewport (naver's
+# `.container { width: 1280px; margin: auto }`) no longer fits and its
+# right column spills past the edge.
+HSTEP = 0
 VSTEP = 18
 
 BLOCK_ELEMENTS = {
