@@ -213,14 +213,13 @@ def effective_opacity(node):
     return o
 
 
-def line_height_factor(node, font_px):
-    """CSS line-height as a multiple of the font's natural linespace.
-    `normal` (default) keeps the engine's 1.25; a number multiplies the
-    font size; a length is taken relative to the font size. Returns the
-    factor to apply to (ascent+descent)."""
+def line_height_px(node, font_px):
+    """CSS line-height resolved to a used line-box height in px, or
+    None for `normal` (the engine's default leading applies). A number
+    multiplies the font size; a length is taken relative to it."""
     raw = node.style.get("line-height", "").strip().casefold()
     if not raw or raw == "normal":
-        return 1.25
+        return None
     try:
         if raw.endswith("px"):
             target = float(raw[:-2])
@@ -231,8 +230,18 @@ def line_height_factor(node, font_px):
         else:
             target = float(raw) * font_px  # unitless multiplier
     except ValueError:
+        return None
+    return target if target >= 0 else None
+
+
+def line_height_factor(node, font_px):
+    """CSS line-height as a multiple of the font size (`normal` keeps
+    the engine's 1.25). Kept for callers that only know the font size;
+    LineLayout itself resolves against real font metrics via
+    line_height_px so `line-height: 20px` yields a 20px line box."""
+    target = line_height_px(node, font_px)
+    if target is None:
         return 1.25
-    # convert the target line box height into a factor over font metrics
     return max(target / font_px, 0.1) if font_px else 1.25
 
 
@@ -349,7 +358,12 @@ def _child_is_block_level(child):
     d = child.style.get("display", "")
     if d in ("inline", "inline-block", "inline-flex", "inline-table"):
         return False
-    if d in ("block", "flex", "grid", "table", "list-item"):
+    # -webkit-box is the legacy flexbox used solely as the line-clamp
+    # container (`display:block;display:-webkit-box` — last wins): it
+    # must be a block-level box or an inline <strong class=title> never
+    # gets its own box and the clamp/max-height are silently dropped
+    if d in ("block", "flex", "grid", "table", "list-item",
+             "-webkit-box"):
         return True
     return child.tag in BLOCK_ELEMENTS
 
@@ -2958,10 +2972,24 @@ class LineLayout:
         font_px = next((c.font.size for c in self.children if c.font),
                        parse_px(self.node.style.get("font-size", "16px"),
                                 16.0))
-        factor = line_height_factor(self.node, font_px)
-        baseline = self.y + factor * max_ascent
         max_descent = max(descent(w) for w in self.children)
-        self.height = factor * (max_ascent + max_descent)
+        natural = max_ascent + max_descent
+        target = line_height_px(self.node, font_px)
+        if target is not None and natural > 0:
+            # an explicit line-height IS the line-box height (leading is
+            # distributed, glyphs may poke out when it is tighter than
+            # the font) — naver clamps 2×20px titles into 40px, so a
+            # 20/14×linespace box would spill past max-height and get
+            # its glyphs clipped mid-height. Atomic boxes (icons,
+            # inline-blocks) taller than the target still grow the line.
+            atomic_max = max(
+                (c.height for c in self.children if c.font is None),
+                default=0.0)
+            factor = max(target, atomic_max) / natural
+        else:
+            factor = 1.25
+        baseline = self.y + factor * max_ascent
+        self.height = factor * natural
         line_bottom = self.y + self.height
 
         # vertical-align (CSS 2.1 §10.8): offset each inline box from the
