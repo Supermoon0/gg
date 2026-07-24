@@ -167,6 +167,8 @@ def module_script_url(page_url, src, node_idx, inline=False):
 
 def _skip_quoted(source, pos):
     quote = source[pos]
+    if quote == "`":
+        return _skip_template(source, pos)
     pos += 1
     while pos < len(source):
         ch = source[pos]
@@ -177,6 +179,47 @@ def _skip_quoted(source, pos):
         if ch == quote:
             return pos
     raise ModuleSyntaxError("unterminated string or template literal")
+
+
+def _skip_template(source, pos):
+    """Skip a template literal, descending into ${...} holes. A hole can
+    contain strings, comments, and NESTED templates whose backticks must
+    not terminate the outer scan — a naive next-backtick skip flips the
+    lexer's string/code parity and poisons everything after it."""
+    pos += 1  # opening backtick
+    while pos < len(source):
+        ch = source[pos]
+        if ch == "\\":
+            pos += 2
+            continue
+        if ch == "`":
+            return pos + 1
+        if ch == "$" and source.startswith("${", pos):
+            pos = _skip_template_hole(source, pos + 2)
+            continue
+        pos += 1
+    raise ModuleSyntaxError("unterminated string or template literal")
+
+
+def _skip_template_hole(source, pos):
+    """Skip a ${...} hole body; `pos` is just past the opening brace."""
+    depth = 1
+    while pos < len(source):
+        ch = source[pos]
+        if ch in "'\"`":
+            pos = _skip_quoted(source, pos)
+            continue
+        if source.startswith(("//", "/*"), pos):
+            pos = _skip_space_comments(source, pos)
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return pos + 1
+        pos += 1
+    raise ModuleSyntaxError("unterminated template literal hole")
 
 
 def _skip_space_comments(source, pos):
@@ -487,16 +530,74 @@ def _declared_names(declaration):
     return names
 
 
+def _regex_may_start(source, pos):
+    """Division/regex disambiguation: a `/` starts a regex literal when
+    the previous significant token cannot end an expression. Heuristic
+    (prev non-space char + keyword check) — the cases minified bundles
+    actually produce."""
+    j = pos - 1
+    while j >= 0 and source[j] in " \t\r\n":
+        j -= 1
+    if j < 0:
+        return True
+    prev = source[j]
+    if prev in "(,=:[!&|?{};+-*%~^<>":
+        return True
+    # identifier tail: regex after return/typeof/case/in/of/new/do/else...
+    if prev.isalnum() or prev in "_$":
+        k = j
+        while k >= 0 and (source[k].isalnum() or source[k] in "_$"):
+            k -= 1
+        word = source[k + 1:j + 1]
+        return word in (
+            "return", "typeof", "instanceof", "in", "of", "new", "do",
+            "else", "void", "delete", "throw", "case", "yield", "await")
+    return False
+
+
+def _skip_regex(source, pos):
+    """Skip a regex literal starting at `pos` (the `/`). Handles escapes
+    and [...] classes; returns the offset past the flags."""
+    pos += 1
+    in_class = False
+    while pos < len(source):
+        ch = source[pos]
+        if ch == "\\":
+            pos += 2
+            continue
+        if ch == "\n":
+            break  # not a regex after all; treat conservatively
+        if in_class:
+            if ch == "]":
+                in_class = False
+        elif ch == "[":
+            in_class = True
+        elif ch == "/":
+            pos += 1
+            while pos < len(source) and (source[pos].isalpha()):
+                pos += 1
+            return pos
+        pos += 1
+    return pos
+
+
 def _code_mask(source):
     chars = list(source)
     pos = 0
     while pos < len(source):
-        if source[pos] in "'\"`":
+        ch = source[pos]
+        if ch in "'\"`":
             end = _skip_quoted(source, pos)
             chars[pos:end] = " " * (end - pos)
             pos = end
         elif source.startswith(("//", "/*"), pos):
             end = _skip_space_comments(source, pos)
+            chars[pos:end] = " " * (end - pos)
+            pos = end
+        elif ch == "/" and _regex_may_start(source, pos):
+            # regex literals may contain quotes (/["']/) that would
+            # otherwise open a bogus string and poison the whole mask
+            end = _skip_regex(source, pos)
             chars[pos:end] = " " * (end - pos)
             pos = end
         else:
