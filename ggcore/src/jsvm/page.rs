@@ -3180,6 +3180,46 @@ mod tests {
     }
 
     #[test]
+    fn async_switch_lowers_to_if_chain() {
+        // awaits inside switch cases (naver's gfp SDK adapter dispatch)
+        // compile via the switch->if-chain lowering. Verify VALUES, not
+        // just the absence of logs — an unhandled rejection is silent.
+        let mut vm = PageVm::new(None);
+        vm.run_scripts(&["\
+            var out = [];\n\
+            function P(v){ return Promise.resolve(v); }\n\
+            (async function(){ var r=0; switch(2){\n\
+               case 1: { r = await P(10); break; }\n\
+               case 2: { r = await P(20); break; }\n\
+               default: { r = await P(30); } } return r; })()\n\
+              .then(function(v){ out.push('basic=' + v); },\n\
+                    function(e){ out.push('basic-REJ ' + e); });\n\
+            (async function(){ var r=0; switch(9){\n\
+               case 1: { r = 1; break; }\n\
+               default: { r = await P(42); } } return r; })()\n\
+              .then(function(v){ out.push('dflt=' + v); },\n\
+                    function(e){ out.push('dflt-REJ ' + e); });\n\
+            (async function(){ var r=0; switch(2){\n\
+               case 1: case 2: { r = await P(7); break; }\n\
+               case 3: { r = 3; break; } } return r; })()\n\
+              .then(function(v){ out.push('share=' + v); },\n\
+                    function(e){ out.push('share-REJ ' + e); });\n"
+            .to_string()]);
+        let (_l1, _) = vm.pump();
+        let (_l2, _) = vm.pump();
+        let logs = vm.run_scripts(&[
+            "console.log(out.sort().join('|'));\n".to_string(),
+        ]);
+        let joined = format!("{logs:?}");
+        assert!(
+            joined.contains("basic=20")
+                && joined.contains("dflt=42")
+                && joined.contains("share=7"),
+            "async switch results wrong: {joined}"
+        );
+    }
+
+    #[test]
     fn promise_adopts_foreign_thenables() {
         // Fulfilling with a `{then}` object must adopt its eventual
         // value (Promise Resolution Procedure), not pass the thenable

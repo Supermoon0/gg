@@ -67,7 +67,10 @@ pub fn compile_lazy(src: &LazySrc) -> Result<Module, CompileError> {
             name: src.lit.name.clone(),
             params: src.lit.params.clone(),
             body,
-            is_async: false,
+            // the deferred stub keeps the original async flag — dropping
+            // it here skipped await normalization for every lazily
+            // compiled async function
+            is_async: src.lit.is_async,
             lazy_body: None,
         })
     } else {
@@ -1274,6 +1277,21 @@ fn normalize_stmt(s: Stmt, n: &mut usize) -> Vec<Stmt> {
             vec![Stmt::Try { block, catch, finally }]
         }
         Stmt::Switch { disc, cases } => {
+            // chain_async can't lift awaits out of a switch. When every
+            // case is fallthrough-free, lower the whole switch to an
+            // if/else-if chain over a once-evaluated discriminant — the
+            // chainer already handles If. Otherwise keep the switch
+            // (awaits inside will still error, same as before).
+            if cases.iter().any(|c| c.body.iter().any(stmt_has_await)) {
+                if let Some(lowered) =
+                    switch_to_if_chain(disc.clone(), &cases, n)
+                {
+                    for s in lowered {
+                        pre.extend(normalize_stmt(s, n));
+                    }
+                    return pre;
+                }
+            }
             let disc = hoist_expr(disc, &mut pre, n);
             let cases = cases
                 .into_iter()
@@ -1287,6 +1305,147 @@ fn normalize_stmt(s: Stmt, n: &mut usize) -> Vec<Stmt> {
         }
         other => vec![other],
     }
+}
+
+/// `switch` -> `var __swN = disc; if (__swN === t1) B1 else if ... else
+/// BD` when every case body is fallthrough-free: empty, or ending in an
+/// unconditional break/return/throw, with no OTHER unlabeled break that
+/// would have exited the switch (an unlabeled continue targets the
+/// enclosing loop either way and needs no rewrite). Returns None when
+/// any case needs real fallthrough semantics.
+fn switch_to_if_chain(
+    disc: Expr,
+    cases: &[SwitchCase],
+    n: &mut usize,
+) -> Option<Vec<Stmt>> {
+    // an unlabeled break at switch level (outside nested loops/switches)
+    fn has_switch_break(stmts: &[Stmt]) -> bool {
+        fn walk(s: &Stmt) -> bool {
+            match s {
+                Stmt::Break(None) => true,
+                Stmt::If { cons, alt, .. } => {
+                    walk(cons)
+                        || alt.as_deref().is_some_and(walk)
+                }
+                Stmt::Block(v) => v.iter().any(walk),
+                Stmt::Labeled { body, .. } => walk(body),
+                Stmt::Try { block, catch, finally } => {
+                    block.iter().any(walk)
+                        || catch
+                            .as_ref()
+                            .is_some_and(|c| c.body.iter().any(walk))
+                        || finally
+                            .as_ref()
+                            .is_some_and(|f| f.iter().any(walk))
+                }
+                // a nested loop/switch owns its own breaks
+                _ => false,
+            }
+        }
+        stmts.iter().any(walk)
+    }
+    // `case X: { ...; break; }` nests the terminator inside a block —
+    // look through trailing blocks for both the check and the strip
+    fn ends_unconditionally(stmts: &[Stmt]) -> bool {
+        match stmts.last() {
+            None
+            | Some(Stmt::Break(None))
+            | Some(Stmt::Return(_))
+            | Some(Stmt::Throw(_)) => true,
+            Some(Stmt::Block(v)) => ends_unconditionally(v),
+            _ => false,
+        }
+    }
+    fn strip_trailing_break(stmts: &mut Vec<Stmt>) {
+        match stmts.last_mut() {
+            Some(Stmt::Break(None)) => {
+                stmts.pop();
+            }
+            Some(Stmt::Block(v)) => strip_trailing_break(v),
+            _ => {}
+        }
+    }
+    let mut bodies: Vec<(Option<Expr>, Vec<Stmt>)> = Vec::new();
+    for (i, c) in cases.iter().enumerate() {
+        let mut body = c.body.clone();
+        // empty non-terminal case WITHOUT its own break shares the next
+        // body (`case A: case B: {...}`): allow the empty-fallthrough
+        // idiom by chaining into the following case's condition
+        if body.is_empty() && i + 1 < cases.len() {
+            bodies.push((c.test.clone(), Vec::new()));
+            continue;
+        }
+        if !ends_unconditionally(&body) && i + 1 < cases.len() {
+            return None; // real fallthrough into the next case
+        }
+        strip_trailing_break(&mut body);
+        if has_switch_break(&body) {
+            return None; // a conditional switch-exit we can't express
+        }
+        bodies.push((c.test.clone(), body));
+    }
+    *n += 1;
+    let dv = format!("__sw{n}");
+    let mut out = vec![Stmt::VarDecl {
+        kind: DeclKind::Var,
+        decls: vec![(dv.clone(), Some(disc))],
+    }];
+    // merge empty cases into the next non-empty one (OR of tests)
+    let mut merged: Vec<(Vec<Expr>, Vec<Stmt>)> = Vec::new();
+    let mut pending: Vec<Expr> = Vec::new();
+    let mut default_body: Option<Vec<Stmt>> = None;
+    for (test, body) in bodies {
+        match test {
+            Some(t) => {
+                pending.push(t);
+                if !body.is_empty() || pending.is_empty() {
+                    merged.push((std::mem::take(&mut pending), body));
+                }
+            }
+            None => {
+                // default: captured separately (order-independent
+                // since nothing falls through)
+                if body.is_empty() && default_body.is_none() {
+                    default_body = Some(Vec::new());
+                } else {
+                    default_body = Some(body);
+                }
+            }
+        }
+    }
+    if !pending.is_empty() {
+        // trailing empty labels with no body: nothing to run
+        pending.clear();
+    }
+    let mut chain: Option<Stmt> = default_body.map(Stmt::Block);
+    for (tests, body) in merged.into_iter().rev() {
+        let mut cond: Option<Expr> = None;
+        for t in tests {
+            let cmp = Expr::Binary(
+                BinOp::StrictEq,
+                Box::new(ast_ident(&dv)),
+                Box::new(t),
+            );
+            cond = Some(match cond {
+                None => cmp,
+                Some(prev) => Expr::Logical(
+                    LogOp::Or,
+                    Box::new(prev),
+                    Box::new(cmp),
+                ),
+            });
+        }
+        let Some(cond) = cond else { continue };
+        chain = Some(Stmt::If {
+            test: cond,
+            cons: Box::new(Stmt::Block(body)),
+            alt: chain.map(Box::new),
+        });
+    }
+    if let Some(c) = chain {
+        out.push(c);
+    }
+    Some(out)
 }
 
 fn normalize_body(body: Vec<Stmt>, n: &mut usize) -> Vec<Stmt> {
@@ -1518,12 +1677,15 @@ fn chain_async(stmts: &[Stmt], n: &mut usize) -> Vec<Stmt> {
                 kind: DeclKind::Var,
                 decls: vec![(
                     loop_name.clone(),
-                    Some(Expr::Func(Rc::new(FuncLit {
+                    // an arrow so `this` inside the loop body is the
+                    // enclosing method's receiver (naver: `for (…) await
+                    // this.displayAd(e)`); a regular fn would rebind it
+                    Some(Expr::Arrow(Rc::new(FuncLit {
                         name: None,
                         params: Vec::new(),
                         body: lf,
                         is_async: false,
-                lazy_body: None,
+                        lazy_body: None,
                     }))),
                 )],
             });
@@ -1589,12 +1751,15 @@ fn chain_async(stmts: &[Stmt], n: &mut usize) -> Vec<Stmt> {
                 kind: DeclKind::Var,
                 decls: vec![(
                     loop_name.clone(),
-                    Some(Expr::Func(Rc::new(FuncLit {
+                    // an arrow so `this` inside the loop body is the
+                    // enclosing method's receiver (naver: `for (…) await
+                    // this.displayAd(e)`); a regular fn would rebind it
+                    Some(Expr::Arrow(Rc::new(FuncLit {
                         name: None,
                         params: Vec::new(),
                         body: lf,
                         is_async: false,
-                lazy_body: None,
+                        lazy_body: None,
                     }))),
                 )],
             });
@@ -1663,6 +1828,67 @@ fn chain_async(stmts: &[Stmt], n: &mut usize) -> Vec<Stmt> {
                     vec![ast_arrow(Vec::new(), rest)],
                 ))));
             }
+        }
+        // for-of with an awaiting body: desugar to an explicit
+        // iterator while-loop (`var it = obj[Symbol.iterator]();
+        // while (!(step = it.next()).done) { V = step.value; BODY }`)
+        // which the while arm above already chains. `for await` reduces
+        // to the same shape (values arrive un-awaited — see for_stmt).
+        Stmt::ForIn { decl_kind, var, obj, body, of: true } => {
+            let body_v = block_stmts(body);
+            if has_early_exit(&body_v) {
+                out.push(stmts[j].clone());
+                out.extend(chain_async(&stmts[j + 1..], n));
+                return out;
+            }
+            *n += 1;
+            let it_name = format!("__it{n}");
+            let step_name = format!("__step{n}");
+            // var it = (obj)[Symbol.iterator]()
+            let sym_iter =
+                ast_member(ast_ident("Symbol"), "iterator");
+            let it_call = ast_call(
+                Expr::Member {
+                    obj: Box::new(obj.clone()),
+                    prop: MemberProp::Computed(Box::new(sym_iter)),
+                    optional: false,
+                },
+                vec![],
+            );
+            out.push(Stmt::VarDecl {
+                kind: DeclKind::Var,
+                decls: vec![(it_name.clone(), Some(it_call))],
+            });
+            out.push(Stmt::VarDecl {
+                kind: DeclKind::Var,
+                decls: vec![(step_name.clone(), None)],
+            });
+            // while (!(step = it.next()).done)
+            let next_call =
+                ast_call(ast_member(ast_ident(&it_name), "next"), vec![]);
+            let assign = Expr::Assign(
+                AssignOp::Plain,
+                Box::new(ast_ident(&step_name)),
+                Box::new(next_call),
+            );
+            let test = Expr::Unary(
+                UnOp::Not,
+                Box::new(ast_member(assign, "done")),
+            );
+            // loop body: bind the value, then the original body
+            let value_read =
+                ast_member(ast_ident(&step_name), "value");
+            let mut loop_body = vec![Stmt::VarDecl {
+                kind: decl_kind.unwrap_or(DeclKind::Var),
+                decls: vec![(var.clone(), Some(value_read))],
+            }];
+            loop_body.extend(body_v);
+            let mut merged = vec![Stmt::While {
+                test,
+                body: Box::new(Stmt::Block(loop_body)),
+            }];
+            merged.extend_from_slice(&stmts[j + 1..]);
+            out.extend(chain_async(&merged, n));
         }
         // other constructs (do-while with await bodies) are beyond
         // this chain — keep them; codegen reports the await cleanly
