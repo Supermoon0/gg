@@ -416,11 +416,14 @@ def layout_mode(node):
     # inline-block / inline-flex / inline-table direct children are laid
     # out side by side (and wrapped into rows) by the block formatter's
     # inline-block cursor — the card/column-grid path. Keep those in block
-    # flow rather than the line-based inline path.
+    # flow rather than the line-based inline path. Synthesized ::before/
+    # ::after boxes don't count: an inline-block pseudo (naver's 1px link
+    # dividers, dot separators) must flow on the same line as the text
+    # beside it, not push the text into a stacked block row.
     if any(isinstance(child, Element)
            and child.style.get("display", "") in (
                "inline-block", "inline-flex", "inline-table")
-           and child.tag not in ("img", "svg", "br")
+           and child.tag not in ("img", "svg", "br", "::before", "::after")
            for child in node.children):
         return "block"
     if node.tag in ("svg", "::before", "::after"):
@@ -618,6 +621,26 @@ def _nearest_positioned(layout_box):
 def is_out_of_flow(node):
     return (isinstance(node, Element)
             and node.style.get("position") in ("absolute", "fixed"))
+
+
+def _list_marker_visible(node):
+    """Whether an <li> paints its bullet. `list-style(-type): none`
+    (checked up the chain — the property inherits and sites set it on
+    the <ul>) and any display other than the default list box suppress
+    the marker; nav/tab <li>s are inline-block and must stay clean."""
+    disp = (node.style.get("display") or "").strip().casefold()
+    if disp and disp not in ("list-item", "block"):
+        return False
+    n = node
+    for _ in range(12):
+        if not isinstance(n, Element):
+            break
+        for prop in ("list-style-type", "list-style"):
+            v = (n.style.get(prop) or "").strip().casefold()
+            if v:
+                return "none" not in v
+        n = getattr(n, "parent", None)
+    return True
 
 
 def _split_top_level(spec):
@@ -2806,7 +2829,7 @@ class BlockLayout:
                     cmds.append(DrawLine(
                         cx, ty, cx, ty + ch, "#333333", 1))
 
-            if self.node.tag == "li":
+            if self.node.tag == "li" and _list_marker_visible(self.node):
                 font = cached_font(self.node)
                 r = 2
                 cy = self.y + font.gg_linespace / 2
@@ -3008,7 +3031,14 @@ class LineLayout:
         block = self.node
         for child in self.children:
             n = getattr(child, "node", None)
-            anc = n.parent if isinstance(n, Text) else n
+            # atomic inline-block boxes paint their own background via
+            # their inner block (a 1px divider pseudo would otherwise be
+            # re-filled across its margin box and the whole line height);
+            # only ancestor backgrounds apply to them here
+            if isinstance(n, Text) or hasattr(child, "place_inner"):
+                anc = getattr(n, "parent", None)
+            else:
+                anc = n
             x0 = child.x
             x1 = child.x + getattr(child, "width", 0)
             while isinstance(anc, Element) and anc is not block:

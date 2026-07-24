@@ -29,10 +29,26 @@ pub enum Simple {
     Focus,
 }
 
+/// How a compound relates to the compound on its right.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Combinator {
+    /// `A B` — A is any ancestor of B.
+    Descendant,
+    /// `A > B` — A is B's parent.
+    Child,
+    /// `A + B` — A is the element sibling immediately before B.
+    NextSibling,
+    /// `A ~ B` — A is any earlier element sibling of B.
+    SubsequentSibling,
+}
+
 #[derive(Clone, Debug)]
 pub struct Selector {
-    /// Descendant chain of compound selectors; rightmost is last.
+    /// Chain of compound selectors; rightmost is last.
     pub chain: Vec<Vec<Simple>>,
+    /// combinators[k] links chain[k] to chain[k+1]
+    /// (always chain.len() - 1 entries).
+    pub combinators: Vec<Combinator>,
     pub specificity: (u32, u32, u32),
     /// ::before / ::after — the rule styles a synthesized child of
     /// whatever the base selector matches (0 = before, 1 = after).
@@ -68,23 +84,75 @@ impl Selector {
         if !compound_matches(doc, idx, &self.chain[last]) {
             return false;
         }
-        let mut cur = doc.nodes[idx].parent;
-        for comp in self.chain[..last].iter().rev() {
-            loop {
-                match cur {
-                    None => return false,
-                    Some(p) => {
-                        let hit = compound_matches(doc, p, comp);
-                        cur = doc.nodes[p].parent;
-                        if hit {
-                            break;
-                        }
+        self.matches_prefix(doc, idx, last)
+    }
+
+    /// chain[..upto] must match to the left of `idx` (which matched
+    /// chain[upto]). Recursive so indefinite combinators (descendant,
+    /// `~`) can backtrack past a candidate whose own left side fails.
+    fn matches_prefix(&self, doc: &Document, idx: usize, upto: usize) -> bool {
+        if upto == 0 {
+            return true;
+        }
+        let comp = &self.chain[upto - 1];
+        match self.combinators[upto - 1] {
+            Combinator::Descendant => {
+                let mut cur = doc.nodes[idx].parent;
+                while let Some(p) = cur {
+                    if compound_matches(doc, p, comp)
+                        && self.matches_prefix(doc, p, upto - 1)
+                    {
+                        return true;
                     }
+                    cur = doc.nodes[p].parent;
+                }
+                false
+            }
+            Combinator::Child => match doc.nodes[idx].parent {
+                Some(p) => {
+                    compound_matches(doc, p, comp)
+                        && self.matches_prefix(doc, p, upto - 1)
+                }
+                None => false,
+            },
+            Combinator::NextSibling => {
+                match prev_element_sibling(doc, idx) {
+                    Some(s) => {
+                        compound_matches(doc, s, comp)
+                            && self.matches_prefix(doc, s, upto - 1)
+                    }
+                    None => false,
                 }
             }
+            Combinator::SubsequentSibling => {
+                let mut cur = prev_element_sibling(doc, idx);
+                while let Some(s) = cur {
+                    if compound_matches(doc, s, comp)
+                        && self.matches_prefix(doc, s, upto - 1)
+                    {
+                        return true;
+                    }
+                    cur = prev_element_sibling(doc, s);
+                }
+                false
+            }
         }
-        true
     }
+}
+
+/// The nearest element sibling before `idx` (None at the front).
+fn prev_element_sibling(doc: &Document, idx: usize) -> Option<usize> {
+    let p = doc.nodes[idx].parent?;
+    let mut prev = None;
+    for &c in &doc.nodes[p].children {
+        if c == idx {
+            return prev;
+        }
+        if doc.nodes[c].is_element() {
+            prev = Some(c);
+        }
+    }
+    None
 }
 
 pub fn compound_matches(doc: &Document, idx: usize, compound: &[Simple]) -> bool {
@@ -532,13 +600,19 @@ impl<'a> CssParser<'a> {
 
     fn selector(&mut self) -> Result<Selector, ()> {
         let mut chain = vec![self.simple_selector()?];
+        let mut combinators = Vec::new();
         self.whitespace();
         while self.i < self.b.len()
             && self.b[self.i] != b'{'
             && self.b[self.i] != b','
         {
-            // >, +, ~ degrade to descendant (same as Python engine)
+            let mut comb = Combinator::Descendant;
             if b">+~".contains(&self.b[self.i]) {
+                comb = match self.b[self.i] {
+                    b'>' => Combinator::Child,
+                    b'+' => Combinator::NextSibling,
+                    _ => Combinator::SubsequentSibling,
+                };
                 self.i += 1;
                 self.whitespace();
             }
@@ -550,6 +624,7 @@ impl<'a> CssParser<'a> {
                         Selector::compute_specificity(&chain);
                     return Ok(Selector {
                         chain,
+                        combinators,
                         specificity,
                         pseudo: Some(p),
                     });
@@ -567,10 +642,11 @@ impl<'a> CssParser<'a> {
                 }
             }
             chain.push(self.simple_selector()?);
+            combinators.push(comb);
             self.whitespace();
         }
         let specificity = Selector::compute_specificity(&chain);
-        Ok(Selector { chain, specificity, pseudo: None })
+        Ok(Selector { chain, combinators, specificity, pseudo: None })
     }
 
     /// Consume ::before/::after (and the legacy single-colon forms).

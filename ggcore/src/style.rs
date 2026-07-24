@@ -797,6 +797,41 @@ mod tests {
     }
 
     #[test]
+    fn sibling_and_child_combinators_match() {
+        let css = "li+li{padding-left:26px} \
+                   div>p{color:red} \
+                   b~i{font-weight:bold} \
+                   span+span::before{content:\"|\"}";
+        let html_src = "<ul><li id=a>a</li><li id=b>b</li></ul>\
+                        <div><section><p id=deep>x</p></section>\
+                        <p id=direct>y</p></div>\
+                        <b>1</b><u>2</u><i>3</i>\
+                        <span id=s1>1</span><span id=s2>2</span>";
+        let doc = styled(css, html_src);
+        let by_id = |id: &str| {
+            (0..doc.nodes.len())
+                .find(|&i| doc.nodes[i].attr("id") == Some(id))
+                .unwrap()
+        };
+        // li + li hits only the second list item
+        assert!(!doc.nodes[by_id("a")].style.contains_key("padding-left"));
+        assert_eq!(doc.nodes[by_id("b")].style["padding-left"], "26px");
+        // div > p hits the direct child, not the deeper descendant
+        assert_eq!(doc.nodes[by_id("direct")].style["color"], "red");
+        assert!(doc.nodes[by_id("deep")].style.get("color")
+            .map(|c| c != "red").unwrap_or(true));
+        // b ~ i skips over the intervening <u>
+        assert_eq!(tag_style(&doc, "i")["font-weight"], "bold");
+        // A + B::before synthesizes only on the second span
+        assert!(doc.nodes[by_id("s1")].children.iter().all(|&c| {
+            doc.nodes[c].tag.as_deref() != Some("::before")
+        }));
+        assert!(doc.nodes[by_id("s2")].children.iter().any(|&c| {
+            doc.nodes[c].tag.as_deref() == Some("::before")
+        }));
+    }
+
+    #[test]
     fn content_none_makes_no_box() {
         let doc = styled("p::before{content:none; color:red}",
                          "<p>hi</p>");
