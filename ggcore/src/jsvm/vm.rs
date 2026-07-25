@@ -792,6 +792,14 @@ pub(super) struct St {
     /// real geometry (document-origin approximation: scroll offset is
     /// not subtracted)
     pub(super) layout_rects: HashMap<u32, (f64, f64, f64, f64)>,
+    /// Per-node scroll state fed back by the host after layout:
+    /// (scrollTop, scrollLeft, scrollHeight, scrollWidth). Mirrors
+    /// `layout_rects` — the engine owns scrolling, JS only observes it.
+    pub(super) scroll_state: HashMap<u32, (f64, f64, f64, f64)>,
+    /// `el.scrollTop = n` writes the host has not applied yet, in
+    /// order. The shell drains this each turn and moves the real
+    /// scroller (page scripts scroll chat logs and carousels this way).
+    pub(super) scroll_writes: Vec<(u32, f64, f64)>,
     /// Map/Set backing stores, keyed by the owning object's index
     /// (entries in insertion order; lookups are linear strict-eq)
     pub(super) map_data: HashMap<u32, Vec<(Value, Value)>>,
@@ -930,6 +938,8 @@ impl St {
             cookies: Vec::new(),
             cookie_writes: Vec::new(),
             layout_rects: HashMap::new(),
+            scroll_state: HashMap::new(),
+            scroll_writes: Vec::new(),
             map_data: HashMap::new(),
             set_data: HashMap::new(),
             style_nodes: HashMap::new(),
@@ -8367,12 +8377,32 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
             let is_el = doc.borrow().nodes[node_us].is_element();
             return Ok(Value::int(if is_el { 1 } else { 3 }));
         }
+        "scrollTop" | "scrollLeft" => {
+            // the host feeds real scroll state back after layout, the
+            // same way layout_rects feeds getBoundingClientRect
+            let top = st.names[key as usize] == "scrollTop";
+            let v = st
+                .scroll_state
+                .get(&node)
+                .map(|&(t, l, _, _)| if top { t } else { l })
+                .unwrap_or(0.0);
+            return Ok(Value::number(v));
+        }
         "clientWidth" | "clientHeight" | "offsetWidth" | "offsetHeight"
         | "scrollWidth" | "scrollHeight" | "clientTop" | "clientLeft"
         | "offsetTop" | "offsetLeft" => {
             let name = st.names[key as usize].as_str();
             if name == "clientTop" || name == "clientLeft" {
                 return Ok(Value::int(0));
+            }
+            // scrollWidth/scrollHeight are the CONTENT size, which for a
+            // scroll container exceeds its box — the host reports both
+            if matches!(name, "scrollWidth" | "scrollHeight") {
+                if let Some(&(_, _, sh, sw)) = st.scroll_state.get(&node) {
+                    return Ok(Value::int(
+                        if name == "scrollHeight" { sh } else { sw } as i32,
+                    ));
+                }
             }
             let want_h = name.ends_with("Height");
             let want_pos = name == "offsetTop" || name == "offsetLeft";
@@ -8624,7 +8654,32 @@ fn dom_set_prop(
             }
             Ok(())
         }
-        "scrollTop" | "scrollLeft" | "selected" | "checked"
+        "scrollTop" | "scrollLeft" => {
+            // record the request; the host applies it to the real
+            // scroller and feeds the clamped result back. Updating the
+            // observable value now keeps a read-after-write consistent
+            // within the same turn (`el.scrollTop = el.scrollHeight`
+            // then reading it back is a common auto-scroll idiom).
+            let want = if v.is_string() {
+                str_ref(st, v.index()).trim().parse::<f64>().unwrap_or(0.0)
+            } else {
+                v.to_number_raw()
+            };
+            let want = if want.is_finite() { want } else { 0.0 };
+            let top = st.names[key as usize] == "scrollTop";
+            let entry = st.scroll_state.entry(node).or_insert((
+                0.0, 0.0, 0.0, 0.0,
+            ));
+            if top {
+                entry.0 = want.max(0.0);
+            } else {
+                entry.1 = want.max(0.0);
+            }
+            let (t, l) = (entry.0, entry.1);
+            st.scroll_writes.push((node, t, l));
+            Ok(())
+        }
+        "selected" | "checked"
         | "disabled" | "hidden" | "draggable"
         | "contentEditable" | "crossOrigin"
         | "charset" | "referrerPolicy" | "integrity"

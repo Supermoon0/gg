@@ -1107,6 +1107,78 @@ def scroll_container_by(obj, dy, dx=0.0):
     return (node._scroll_y, node._scroll_x) != before
 
 
+def collect_scroll_state(layout_list):
+    """[(ridx, scrollTop, scrollLeft, scrollHeight, scrollWidth)] for
+    every scroll container — what page JS observes on the element."""
+    out = []
+    for obj in layout_list:
+        if not is_scroll_container(obj):
+            continue
+        ridx = getattr(getattr(obj, "node", None), "_ridx", None)
+        if ridx is None:
+            continue
+        y, x = scroll_position(obj)
+        max_y, max_x = scroll_range(obj)
+        out.append((int(ridx), float(y), float(x),
+                    float(obj.height + max_y), float(obj.width + max_x)))
+    return out
+
+
+def apply_scroll_writes(layout_list, writes):
+    """Apply `el.scrollTop = n` requests from page JS to the real
+    scrollers. Returns True when any of them moved."""
+    if not writes:
+        return False
+    wanted = {int(ridx): (float(top), float(left))
+              for ridx, top, left in writes}
+    moved = False
+    for obj in layout_list:
+        if not is_scroll_container(obj):
+            continue
+        ridx = getattr(getattr(obj, "node", None), "_ridx", None)
+        target = wanted.get(int(ridx)) if ridx is not None else None
+        if target is None:
+            continue
+        cur_y, cur_x = scroll_position(obj)
+        if scroll_container_by(obj, target[0] - cur_y,
+                               target[1] - cur_x):
+            moved = True
+    return moved
+
+
+def capture_scroll_state(root):
+    """{ridx: (y, x)} for every node with a non-zero scroll offset.
+
+    The native path rebuilds the Python tree from the Rust arena on
+    every DOM-changing tick, so brand-new Element objects would lose
+    the offsets stored on them — inner scroll positions would snap back
+    to the top under any live page. The shells keep this snapshot
+    across rebuilds, keyed by the stable arena index (the same trick
+    `_remap_marks` uses for focus and hover)."""
+    state = {}
+    if root is None:
+        return state
+    for node in tree_to_list(root, []):
+        ridx = getattr(node, "_ridx", None)
+        if ridx is None:
+            continue
+        y = getattr(node, "_scroll_y", 0.0)
+        x = getattr(node, "_scroll_x", 0.0)
+        if y or x:
+            state[ridx] = (y, x)
+    return state
+
+
+def restore_scroll_state(root, state):
+    """Re-apply captured offsets onto a freshly exported tree."""
+    if not state or root is None:
+        return
+    for node in tree_to_list(root, []):
+        hit = state.get(getattr(node, "_ridx", None))
+        if hit is not None:
+            node._scroll_y, node._scroll_x = hit
+
+
 def scrolled_ancestor_offset(layout_obj):
     """Total (dy, dx) the ancestor scrollers shift this box by — the
     hit-test counterpart of the paint-time translation."""

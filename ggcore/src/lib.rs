@@ -1083,6 +1083,21 @@ impl Doc {
         self.ggvm().set_layout_rects(rects);
     }
 
+    /// Push scroll-container state (node, scrollTop, scrollLeft,
+    /// scrollHeight, scrollWidth) so page JS observes real scrolling.
+    fn set_scroll_state(
+        &mut self,
+        state: Vec<(u32, f64, f64, f64, f64)>,
+    ) {
+        self.ggvm().set_scroll_state(state);
+    }
+
+    /// Drain `el.scrollTop = n` writes page scripts made this turn:
+    /// [(node, scrollTop, scrollLeft)] for the host to apply.
+    fn take_scroll_writes(&mut self) -> Vec<(u32, f64, f64)> {
+        self.ggvm().take_scroll_writes()
+    }
+
     /// Shell-side hover update: mark the element under the pointer
     /// and its ancestors so `:hover` rules match on the next
     /// compute_styles. Pass None when the pointer leaves the page.

@@ -70,6 +70,10 @@ class RendererSession(Protocol):
 
     def set_layout_rects(self, rects): ...
 
+    def set_scroll_state(self, state): ...
+
+    def take_scroll_writes(self): ...
+
     def restyle_diff(self): ...
 
     def close(self): ...
@@ -295,6 +299,16 @@ class LocalRendererSession:
             return self.doc.set_layout_rects(rects)
         return None
 
+    def set_scroll_state(self, state):
+        if hasattr(self.doc, "set_scroll_state"):
+            return self.doc.set_scroll_state(state)
+        return None
+
+    def take_scroll_writes(self):
+        if self.doc is not None and hasattr(self.doc, "take_scroll_writes"):
+            return list(self.doc.take_scroll_writes())
+        return []
+
     def restyle_diff(self):
         if not hasattr(self.doc, "restyle_diff"):
             return 3, []
@@ -372,6 +386,12 @@ class _RemoteDocProxy:
 
     def set_layout_rects(self, rects):
         return self._session.set_layout_rects(rects)
+
+    def set_scroll_state(self, state):
+        return self._session.set_scroll_state(state)
+
+    def take_scroll_writes(self):
+        return self._session.take_scroll_writes()
 
     def restyle_diff(self, _css_sources=None):
         return self._session.restyle_diff()
@@ -546,6 +566,16 @@ class RemoteRendererSession:
         return self.host.call(
             "renderer.set_layout_rects", {"rects": list(rects)},
             timeout=self.timeout).get("result")
+
+    def set_scroll_state(self, state):
+        return self.host.call(
+            "renderer.set_scroll_state", {"state": list(state)},
+            timeout=self.timeout).get("result")
+
+    def take_scroll_writes(self):
+        return self.host.call(
+            "renderer.take_scroll_writes",
+            timeout=self.timeout).get("writes", [])
 
     def restyle_diff(self):
         response = self.host.call("renderer.restyle_diff", timeout=self.timeout)

@@ -233,7 +233,15 @@ timing-function 오버라이드.
       내용을 감추지 않기 위함). 덤으로 `translate_cmds`가 중첩 clip
       브래킷의 실제 rect(clip_top/clip_bottom)를 함께 옮기도록 수정 —
       transform·iframe 경로에도 있던 잠복 버그. smoke 18종.
-      후속: 스크롤바 드래그, 키보드 스크롤, `scrollTop` DOM 프로퍼티.
+      후속(일부 완료): `scrollTop`/`scrollLeft`/`scrollHeight`/
+      `scrollWidth` DOM 프로퍼티 연결 완료(2026-07-25) — 셸이 레이아웃
+      후 실제 스크롤 상태를 VM에 밀어넣고(`set_scroll_state`,
+      `set_layout_rects`와 같은 패턴), 페이지가 쓴 `el.scrollTop = n`은
+      `take_scroll_writes`로 회수해 라이브 틱에서 실제 스크롤러에
+      적용·클램프한다(채팅 로그 자동 스크롤 관용구가 동작). 또한 노드에
+      두던 스크롤 오프셋이 **네이티브 트리 재구축마다 초기화되던 결함**을
+      수정 — arena index 기준 스냅샷을 focus/hover와 같은 지점에서 복원.
+      남은 후속: 스크롤바 드래그, 키보드 스크롤, `scrollTo`/`scrollIntoView`.
 - [x] `<select>`·체크박스·라디오의 네이티브 수준 렌더링 (2026-07-25)
       — 엔진이 위젯 페이스를 직접 그린다: 체크박스(테두리 상자 + 체크
       상태의 체크마크 2획), 라디오(원 + 선택 시 점), select(닫힌 컨트롤
@@ -257,8 +265,8 @@ timing-function 오버라이드.
 ## 현재 검증 기준
 
 - Rust: 221 passed, 2 ignored (2026-07-25)
-- Python smoke: 373/373 (2026-07-25, Linux + 새로 빌드한 native wheel;
-  transition/@keyframes 36종 + iframe 18종 + 접근성 21종 + 폼 컨트롤 20종 + overflow 스크롤 18종 포함. native
+- Python smoke: 382/382 (2026-07-25, Linux + 새로 빌드한 native wheel;
+  transition/@keyframes 36종 + iframe 18종 + 접근성 21종 + 폼 컨트롤 20종 + overflow 스크롤 27종 포함. native
   shell 구간은 local renderer를 명시해 top-level 스크립트의 spawn
   재import 자폭을 제거)
 - Golden 렌더링 회귀: 8/8 (form-controls 픽스처 추가)

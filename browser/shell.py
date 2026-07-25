@@ -14,9 +14,11 @@ from . import (animation, forms, frames, keyboard, native, navigation,
                net, textengine)
 from .draw import scale_cmds
 from .html_parser import Element, Text, tree_to_list
-from .layout import (HSTEP, VSTEP, DocumentLayout, find_scrollable,
-                     get_font, hit_test_at, layout_tree_to_list, measure,
-                     paint_tree, scroll_container_by)
+from .layout import (HSTEP, VSTEP, DocumentLayout, apply_scroll_writes,
+                     capture_scroll_state, collect_scroll_state,
+                     find_scrollable, get_font, hit_test_at,
+                     layout_tree_to_list, measure, paint_tree,
+                     restore_scroll_state, scroll_container_by)
 from .pages import error_page
 from .network_backend import default_network_backend
 from .renderer_session import create_renderer_session
@@ -110,6 +112,7 @@ class Shell:
         self._live_next = 0.0
         self.animator = animation.AnimationEngine()
         self.frames = None
+        self._scroll_state = {}
         self._mouse_pos = (0, 0)
         self.status = ""
         self.ui_font = get_font(15, "normal", "roman", "default")
@@ -242,6 +245,7 @@ class Shell:
         self.frames = frames.FrameManager(
             self.network, top_url=url, timeout=self.navigation_timeout,
             dispatch_event=self._dispatch_frame_event)
+        self._scroll_state = {}
         self.animator.reset(self._css_sources)
         # Paint the DOM committed by parser-time scripts first. Async data,
         # images and lazy cards continue from tick_live after this frame.
@@ -297,12 +301,15 @@ class Shell:
                 # sample CSS animations/transitions (a relayout above
                 # already sampled inside relayout())
                 result = self.animator.on_frame(self.nodes)
+                # page scripts may have set el.scrollTop this turn
+                scrolled = self._apply_scroll_writes()
                 # child frames run their own event loops + animations
                 frames_changed = (self.frames.tick(dt)
                                   if self.frames is not None else False)
                 if result.damage == "layout":
                     self.relayout()
-                elif result.damage == "paint" or frames_changed:
+                elif result.damage == "paint" or frames_changed \
+                        or scrolled:
                     self.repaint()
             if self.animator.active or (
                     self.frames is not None
@@ -432,8 +439,36 @@ class Shell:
             (o.y + o.height for o in self.layout_list
              if getattr(o, "height", None) is not None),
             default=self.document.height + 2 * VSTEP)
+        self._push_scroll_state()
         self.clamp_scroll()
         self.dirty = True
+
+    def _push_scroll_state(self):
+        """Feed real scroll offsets and content sizes to the JS engine
+        so `el.scrollTop`/`scrollHeight` observe the actual scrollers."""
+        if self._doc is None:
+            return
+        try:
+            self.renderer.set_scroll_state(
+                collect_scroll_state(self.layout_list))
+        except Exception:
+            pass  # older wheel without the scroll seam
+
+    def _apply_scroll_writes(self):
+        """Apply `el.scrollTop = n` writes page scripts made this turn."""
+        if self._doc is None:
+            return False
+        try:
+            writes = self.renderer.take_scroll_writes()
+        except Exception:
+            return False
+        if not writes:
+            return False
+        moved = apply_scroll_writes(self.layout_list, writes)
+        if moved:
+            self._scroll_state = capture_scroll_state(self.nodes)
+            self._push_scroll_state()
+        return moved
 
     def refresh_after_js(self):
         # a click handler may have scheduled fetch/timers — settle them
@@ -488,6 +523,7 @@ class Shell:
                     and scroll_container_by(scroller, -b, -a):
                 # an inner scroll container consumes the wheel until it
                 # bottoms out, then the page scrolls (scroll chaining)
+                self._scroll_state = capture_scroll_state(self.nodes)
                 self.repaint()
             else:
                 self.scroll -= b
@@ -526,6 +562,9 @@ class Shell:
                      if getattr(node, "_ridx", None) == ridx), None)
 
     def _remap_focus(self):
+        # inner scroll offsets live on nodes the native path rebuilds
+        # each tick, so they are restored here alongside the focus mark
+        restore_scroll_state(self.nodes, self._scroll_state)
         self.focus_node = self._node_by_ridx(self._focus_ridx)
         if self.focus_node is not None:
             self.focus_node.is_focused = True

@@ -3989,6 +3989,89 @@ def _sc_inner_clip(doc):
 _sc_clip_before = _sc_inner_clip(_sc_trdoc)
 scroll_container_by(_sc_trbox, 30)
 _sc_clip_after = _sc_inner_clip(_sc_trdoc)
+# the native path rebuilds the Python tree from the Rust arena on every
+# DOM-changing tick; inner scroll offsets must ride across that
+from browser.layout import (capture_scroll_state,  # noqa: E402
+                            restore_scroll_state)
+
+_sc_rebuild = _styled("body { margin: 0 }", """<body>
+<div id=keep style="overflow:auto;height:80px;width:200px">
+  <div style="height:400px">tall</div></div></body>""")
+_sc_kdoc = DocumentLayout(_sc_rebuild)
+_sc_kdoc.layout(600, 300)
+_sc_keep = next(o for o in layout_tree_to_list(_sc_kdoc, [])
+                if isinstance(o, BlockLayout)
+                and getattr(o.node, "attributes", {}).get("id") == "keep")
+_sc_keep.node._ridx = 42          # stands in for the Rust arena index
+scroll_container_by(_sc_keep, 45)
+_sc_state = capture_scroll_state(_sc_rebuild)
+check("overflow: scroll state is captured by arena index",
+      _sc_state == {42: (45.0, 0.0)}, repr(_sc_state))
+# a rebuilt tree starts blank, then adopts the captured offsets
+_sc_fresh = _styled("body { margin: 0 }", """<body>
+<div id=keep style="overflow:auto;height:80px;width:200px">
+  <div style="height:400px">tall</div></div></body>""")
+_sc_fdoc = DocumentLayout(_sc_fresh)
+_sc_fdoc.layout(600, 300)
+_sc_fkeep = next(o for o in layout_tree_to_list(_sc_fdoc, [])
+                 if isinstance(o, BlockLayout)
+                 and getattr(o.node, "attributes", {}).get("id") == "keep")
+_sc_fkeep.node._ridx = 42
+check("overflow: a freshly rebuilt tree starts unscrolled",
+      scroll_position(_sc_fkeep) == (0.0, 0.0))
+restore_scroll_state(_sc_fresh, _sc_state)
+check("overflow: restoring re-applies the offset after a tree rebuild",
+      scroll_position(_sc_fkeep) == (45.0, 0.0),
+      repr(scroll_position(_sc_fkeep)))
+
+# JS observes and drives the engine's scrollers (scrollTop/scrollHeight)
+from browser.layout import (apply_scroll_writes,  # noqa: E402
+                            collect_scroll_state)
+
+_sc_js = _styled("body { margin: 0 }", """<body>
+<div id=j style="overflow:auto;height:100px;width:200px">
+  <div style="height:500px">msg</div></div></body>""")
+_sc_jdoc = DocumentLayout(_sc_js)
+_sc_jdoc.layout(600, 300)
+_sc_jlist = layout_tree_to_list(_sc_jdoc, [])
+_sc_jbox = next(o for o in _sc_jlist
+                if isinstance(o, BlockLayout)
+                and getattr(o.node, "attributes", {}).get("id") == "j")
+_sc_jbox.node._ridx = 7
+_sc_report = collect_scroll_state(_sc_jlist)
+check("overflow: scroll state reported to JS is (top, left, sh, sw)",
+      _sc_report == [(7, 0.0, 0.0, 500.0, 200.0)], repr(_sc_report))
+check("overflow: a JS scrollTop write moves the real scroller",
+      apply_scroll_writes(_sc_jlist, [(7, 120.0, 0.0)])
+      and scroll_position(_sc_jbox)[0] == 120.0,
+      repr(scroll_position(_sc_jbox)))
+check("overflow: an out-of-range JS write clamps like a browser",
+      apply_scroll_writes(_sc_jlist, [(7, 10 ** 6, 0.0)])
+      and scroll_position(_sc_jbox)[0] == 400.0
+      and collect_scroll_state(_sc_jlist)[0][1] == 400.0,
+      repr(scroll_position(_sc_jbox)))
+check("overflow: a write to a non-scroller is ignored",
+      not apply_scroll_writes(_sc_jlist, [(999, 50.0, 0.0)]))
+
+if native.available():
+    _sjp = Page()
+    _sjp.goto("data:text/html," + (
+        "<div id=sc style='overflow:auto;height:100px;width:200px'>"
+        "<div style='height:500px'>x</div></div>"), settle=False)
+    check("overflow: scrollTop reads 0 and is writable from page JS",
+          _sjp.evaluate("document.getElementById('sc').scrollTop") == 0
+          and _sjp.evaluate(
+              "(function(){var e=document.getElementById('sc');"
+              "e.scrollTop = 42; return e.scrollTop;})()") == 42,
+          "scrollTop must round-trip within a turn")
+    check("overflow: scrollTop writes reach the host as pending work",
+          any(int(w[0]) >= 0 and w[1] == 42
+              for w in _sjp._renderer.take_scroll_writes()),
+          "the host must see the write it has to apply")
+    _sjp.close()
+else:
+    print("[SKIP] scrollTop driver checks - native ggcore not built")
+
 check("overflow: a nested clip rect scrolls with its content",
       _sc_clip_before and _sc_clip_after
       and abs((_sc_clip_before[0].clip_top - _sc_clip_after[0].clip_top)

@@ -1538,6 +1538,25 @@ impl PageVm {
         }
     }
 
+    /// Feed real scroll state back so `el.scrollTop`/`scrollHeight`
+    /// read the engine's actual scrollers (the counterpart of
+    /// `set_layout_rects` for scrolling).
+    pub fn set_scroll_state(
+        &mut self,
+        state: Vec<(u32, f64, f64, f64, f64)>,
+    ) {
+        self.st.scroll_state.clear();
+        for (idx, top, left, sh, sw) in state {
+            self.st.scroll_state.insert(idx, (top, left, sh, sw));
+        }
+    }
+
+    /// Drain the `el.scrollTop = n` writes page scripts have made
+    /// since the last call, so the host can move the real scroller.
+    pub fn take_scroll_writes(&mut self) -> Vec<(u32, f64, f64)> {
+        std::mem::take(&mut self.st.scroll_writes)
+    }
+
     pub fn run_source(&mut self, src: &str) -> Result<Value, String> {
         let ast =
             parser::parse_program(src).map_err(|e| format!("{e:?}"))?;

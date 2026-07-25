@@ -14,9 +14,10 @@ from .css_parser import CSSParser
 from .draw import DrawStickyPop, DrawStickyPush
 from .style import RuleIndex, cascade_priority, default_rules, style
 from .layout import (VSTEP, BlockLayout, DocumentLayout, ImageLayout,
-                     TextLayout, find_scrollable, hit_test_at,
+                     TextLayout, apply_scroll_writes, capture_scroll_state,
+                     collect_scroll_state, find_scrollable, hit_test_at,
                      layout_tree_to_list, paint_tree,
-                     scroll_container_by)
+                     restore_scroll_state, scroll_container_by)
 from .pages import error_page
 from .network_backend import default_network_backend
 from .renderer_session import create_renderer_session
@@ -74,6 +75,9 @@ class Browser:
         self.animator = animation.AnimationEngine()
         self._anim_job = None
         self.frames = None
+        # inner scroll offsets by Rust arena index, so they survive the
+        # native tree rebuild every DOM-changing tick performs
+        self._scroll_state = {}
 
         self.canvas.bind("<Button-1>", self.on_click)
         self.canvas.bind("<Key>", self.on_key)
@@ -243,6 +247,7 @@ class Browser:
             self.frames.dispose()
         self.frames = frames.FrameManager(
             self.network, top_url=url, timeout=self.navigation_timeout)
+        self._scroll_state = {}
 
         if native.available():
             # Rust fast path: parse + gg-js + cascade + style in ggcore.
@@ -434,12 +439,15 @@ class Browser:
                 # sample CSS animations/transitions; a full relayout
                 # (above) already sampled inside relayout()
                 result = self.animator.on_frame(self.nodes)
+                # page scripts may have set el.scrollTop this turn
+                scrolled = self._apply_scroll_writes()
                 # child frames run their own event loops + animations
                 frames_changed = (self.frames.tick(dt)
                                   if self.frames is not None else False)
                 if result.damage == "layout":
                     self.relayout()
-                elif result.damage == "paint" or frames_changed:
+                elif result.damage == "paint" or frames_changed \
+                        or scrolled:
                     self.repaint()
         except Exception as e:
             print(f"[live] tick error: {e}")
@@ -749,6 +757,36 @@ class Browser:
                   float(b[2] - b[0]), float(b[3] - b[1]))
                  for r, b in boxes.items()]
         self.renderer.set_layout_rects(rects)
+        self._push_scroll_state()
+
+    def _push_scroll_state(self):
+        """Feed real scroll offsets and content sizes back to the JS
+        engine so `el.scrollTop`/`scrollHeight` read the engine's actual
+        scrollers — the scrolling counterpart of _push_layout_rects."""
+        if self._doc is None:
+            return
+        try:
+            self.renderer.set_scroll_state(
+                collect_scroll_state(self.layout_list))
+        except Exception:
+            pass  # older wheel without the scroll seam
+
+    def _apply_scroll_writes(self):
+        """Apply `el.scrollTop = n` writes page scripts made this turn.
+        Returns True when a scroller actually moved."""
+        if self._doc is None:
+            return False
+        try:
+            writes = self.renderer.take_scroll_writes()
+        except Exception:
+            return False
+        if not writes:
+            return False
+        moved = apply_scroll_writes(self.layout_list, writes)
+        if moved:
+            self._scroll_state = capture_scroll_state(self.nodes)
+            self._push_scroll_state()
+        return moved
 
     def _push_display_list(self):
         """Hand the display list to Rust once per paint change, in
@@ -851,6 +889,7 @@ class Browser:
             scroller = find_scrollable(obj, -ticks * SCROLL_STEP)
             if scroller is not None and scroll_container_by(
                     scroller, -ticks * SCROLL_STEP):
+                self._scroll_state = capture_scroll_state(self.nodes)
                 self.repaint()
                 return
         self.scroll -= ticks * SCROLL_STEP
@@ -998,7 +1037,9 @@ class Browser:
     def _remap_marks(self):
         """After a native tree rebuild, re-find the focused/hovered
         nodes by their Rust indices so the caret survives live ticks
-        and hover restyles (the Rust document keeps the real state)."""
+        and hover restyles (the Rust document keeps the real state).
+        Inner scroll offsets ride along the same way."""
+        restore_scroll_state(self.nodes, getattr(self, "_scroll_state", {}))
         focus_ridx = getattr(self, "_focus_ridx", None)
         hover_ridx = getattr(self, "_hover_ridx", None)
         self.focus_node = None
