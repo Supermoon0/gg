@@ -5,8 +5,8 @@
 
 ## 현재 진행 요약
 
-- 완료: P0 9/9, P1 8/8, P2 15/17, Boa 제거와 gg-js 단일화
-- 진행할 핵심: renderer crash isolation 완료 → shared frame/network service → iframe 문서 격리
+- 완료: P0 9/9, P1 8/8, P2 16/17, Boa 제거와 gg-js 단일화
+- 진행할 핵심: renderer crash isolation 완료 → shared frame/network service → 접근성 트리 확대
 - 제품화: P3 0/6
 - 검증 부채: 새 GitHub Actions workflow의 Windows/Linux 최초 green run 확인
 
@@ -50,15 +50,28 @@
 남은 후속 후보: transitionend/animation* DOM 이벤트 발화, per-keyframe
 timing-function 오버라이드.
 
-### 2. iframe 문서 격리 — 다음 작업
+### 2. iframe 문서 격리 — 코어 완료 (2026-07-25, browser/frames.py)
 
-- [ ] 자식 문서의 URL/base URL, origin, cookie/storage context 분리
-- [ ] 부모-자식 event loop와 load/error lifecycle 연결
-- [ ] same-origin DOM 접근 허용 및 cross-origin 접근 차단
-- [ ] iframe layout/clip/scroll과 중첩 hit-test 구현
-- [ ] navigation·history·CSP/sandbox 최소 정책 및 회귀 테스트
+- [x] 자식 문서의 URL/base URL, origin, cookie/storage context 분리
+      (프레임마다 독립 gg-js Doc/세션, 쿠키는 자식 origin jar로만,
+      allow-same-origin 없는 sandbox는 쿠키 전면 차단)
+- [x] 부모-자식 event loop와 load/error lifecycle 연결
+      (FrameManager.tick이 두 셸의 live tick에서 자식 이벤트 루프·애니메이션을
+      구동, load/error는 부모 문서의 iframe 요소에 dispatch)
+- [x] cross-origin DOM 접근 차단 — 문서 간 DOM arena를 공유하지 않으므로
+      구조적으로 불가능; 드라이버는 Page.frame()으로 자식 문서 핸들 제공
+- [ ] same-origin 동기 스크립팅(contentDocument/contentWindow)과
+      postMessage 채널 — VM 간 브리지가 필요한 후속 작업
+- [x] iframe layout/clip/scroll과 중첩 hit-test 구현
+      (대체 요소 300x150 기본, width/height 속성, 프레임 내부 휠 스크롤,
+      자식 링크 클릭은 프레임 내 탐색)
+- [x] navigation·CSP/sandbox 최소 정책 및 회귀 테스트
+      (X-Frame-Options DENY/SAMEORIGIN, CSP frame-ancestors
+      'none'/'self'/*/host, sandbox allow-scripts/allow-same-origin,
+      srcdoc, 중첩 depth 3 + 총 16 프레임 상한, smoke 18종)
+- [ ] 프레임 자체 히스토리(뒤로/앞으로가 프레임 탐색을 되돌리기)
 
-### 3. 접근성 트리 확대
+### 3. 접근성 트리 확대 — 다음 작업
 
 - [ ] 기존 implicit/explicit role snapshot에 accessible-name 계산 확대
 - [ ] `aria-label`/`aria-labelledby`/`aria-describedby`와 hidden 상태 반영
@@ -116,7 +129,7 @@ timing-function 오버라이드.
 - [x] `position: sticky` 스크롤 시점 paint·containing-block 제한·hit-test
 - [x] 부모-자식·빈 블록과 양수/음수 집합을 포함한 margin collapsing
 - [x] transition/@keyframes와 렌더 프레임 스케줄링
-- [ ] iframe과 문서별 origin/event loop 격리
+- [x] iframe과 문서별 origin/event loop 격리
 - [ ] 접근성 트리와 ARIA role/name/state 확대
 
 ## P3 — 제품화·성능·격리
@@ -144,9 +157,9 @@ timing-function 오버라이드.
 ## 현재 검증 기준
 
 - Rust: 198 passed, 2 ignored
-- Python smoke: 296/296 (2026-07-25, Linux + 새로 빌드한 native wheel;
-  transition/@keyframes 36종 포함. native shell 구간은 local renderer를
-  명시해 top-level 스크립트의 spawn 재import 자폭을 제거)
+- Python smoke: 314/314 (2026-07-25, Linux + 새로 빌드한 native wheel;
+  transition/@keyframes 36종 + iframe 18종 포함. native shell 구간은
+  local renderer를 명시해 top-level 스크립트의 spawn 재import 자폭을 제거)
 - Golden 렌더링 회귀: 7/7
 - Network gauntlet: 41/41
 - CSS gauntlet: 23/23 (이 컨테이너에서는 폰트 메트릭 차이로

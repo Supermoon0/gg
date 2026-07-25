@@ -10,8 +10,8 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from . import (animation, forms, keyboard, native, navigation, net,
-               textengine)
+from . import (animation, forms, frames, keyboard, native, navigation,
+               net, textengine)
 from .draw import scale_cmds
 from .html_parser import Element, Text, tree_to_list
 from .layout import (HSTEP, VSTEP, DocumentLayout, get_font,
@@ -109,6 +109,8 @@ class Shell:
         self._live_last = time.monotonic()
         self._live_next = 0.0
         self.animator = animation.AnimationEngine()
+        self.frames = None
+        self._mouse_pos = (0, 0)
         self.status = ""
         self.ui_font = get_font(15, "normal", "roman", "default")
         self.ui_small = get_font(12, "normal", "roman", "default")
@@ -235,6 +237,11 @@ class Shell:
         self._form_defaults = forms.capture_defaults(self.nodes)
 
         self.apply_title()
+        if self.frames is not None:
+            self.frames.dispose()
+        self.frames = frames.FrameManager(
+            self.network, top_url=url, timeout=self.navigation_timeout,
+            dispatch_event=self._dispatch_frame_event)
         self.animator.reset(self._css_sources)
         # Paint the DOM committed by parser-time scripts first. Async data,
         # images and lazy cards continue from tick_live after this frame.
@@ -280,6 +287,7 @@ class Shell:
                 self._deferred_resources = False
                 self.load_images(keep_cache=True)
                 self.apply_title()
+                self._load_frames()
                 self.relayout()
                 if first_resources:
                     self._load_timings["deferred_resources"] = \
@@ -289,16 +297,42 @@ class Shell:
                 # sample CSS animations/transitions (a relayout above
                 # already sampled inside relayout())
                 result = self.animator.on_frame(self.nodes)
+                # child frames run their own event loops + animations
+                frames_changed = (self.frames.tick(dt)
+                                  if self.frames is not None else False)
                 if result.damage == "layout":
                     self.relayout()
-                elif result.damage == "paint":
+                elif result.damage == "paint" or frames_changed:
                     self.repaint()
-            if self.animator.active:
+            if self.animator.active or (
+                    self.frames is not None
+                    and self.frames.animations_active()):
                 # animations want frame pace, not the 80ms page tick;
                 # idle pages keep the slower cadence (no timer runaway)
                 self._live_next = now + 0.016
         except Exception as exc:
             print(f"[live] tick error: {exc}")
+
+    def _load_frames(self):
+        if self.frames is None or self.nodes is None:
+            return False
+        try:
+            return self.frames.sync(
+                self.nodes, self.url, cancel_token=self._loading_token)
+        except net.RequestCancelled:
+            raise
+        except Exception as exc:
+            print(f"[frames] load error: {exc}")
+            return False
+
+    def _dispatch_frame_event(self, ridx, event_type):
+        try:
+            logs, _handled, _prevented = self.renderer.dispatch_event(
+                ridx, event_type, False, False, None)
+            for line in logs:
+                print(f"[js console] {line}")
+        except Exception:
+            pass
 
     def apply_title(self):
         title = "GG Browser"
@@ -364,7 +398,10 @@ class Shell:
     def relayout(self):
         if self.nodes is None:
             return
-        # sample animations first so layout sees the animated values
+        # re-point iframe boxes after tree rebuilds, then sample
+        # animations so layout sees the animated values
+        if self.frames is not None:
+            self.frames.attach(self.nodes)
         self.animator.on_frame(self.nodes)
         w, h = self.logical_size()
         # width-dependent @media rules must re-evaluate when the window is
@@ -403,6 +440,7 @@ class Shell:
         self.renderer.settle(timeout=self.navigation_timeout, refresh=False)
         self.nodes = self.renderer.frame(self._styled_width)
         self._remap_focus()
+        self._load_frames()
         self.load_images(keep_cache=True)
         self.apply_title()
         self.relayout()
@@ -436,11 +474,21 @@ class Shell:
         elif kind in ("ready", "resize"):
             self.relayout()
         elif kind == "wheel":
-            self.scroll -= b
-            self.hscroll -= a
-            self.clamp_scroll()
-            self.dirty = True
+            mx, my = self._mouse_pos
+            obj = (self.hit_test(mx + self.hscroll,
+                                 my - TOOLBAR_H + self.scroll)
+                   if my >= TOOLBAR_H and self.document else None)
+            frame = frames.frame_of(obj) if obj else None
+            if frame is not None and frame.root is not None \
+                    and frame.scroll_by(-b, obj.width, obj.height):
+                self.repaint()
+            else:
+                self.scroll -= b
+                self.hscroll -= a
+                self.clamp_scroll()
+                self.dirty = True
         elif kind == "mouse_move":
+            self._mouse_pos = (a, b)
             self.on_motion(a, b)
         elif kind == "mouse_down" and text == "left":
             self.on_click(a, b)
@@ -652,6 +700,14 @@ class Shell:
         if not obj:
             self.set_focus(None)
             return
+        # clicks over an <iframe> box route into the child document
+        frame = frames.frame_of(obj)
+        if frame is not None and frame.root is not None:
+            cx, cy = frames.child_coords(
+                obj, x + self.hscroll, y - TOOLBAR_H + self.scroll, frame)
+            if frame.click_at(cx, cy, obj.width, obj.height):
+                self.repaint()
+            return
         clicked_ridx = self._ridx_of(obj.node)
         self.set_focus(keyboard.focus_target(obj.node))
         default_node = self._node_by_ridx(clicked_ridx) or obj.node
@@ -781,12 +837,19 @@ class Shell:
             return
         self._last_motion = now
         href = None
+        base = self.url
         if y >= TOOLBAR_H:
             obj = self.hit_test(x + self.hscroll,
                                 y - TOOLBAR_H + self.scroll)
             href = self.find_link(obj.node) if obj else None
+            frame = frames.frame_of(obj) if obj else None
+            if frame is not None and frame.root is not None:
+                hit = frames.hit_frame(obj, x + self.hscroll,
+                                       y - TOOLBAR_H + self.scroll)
+                href = frame.find_link(hit[1].node) if hit else None
+                base = frame.url
         self.win.set_cursor_pointer(href is not None)
-        status = str(self.url.resolve(href)) if href and self.url else ""
+        status = str(base.resolve(href)) if href and base else ""
         if status != self.status:
             self.status = status
             self.dirty = True
@@ -942,6 +1005,8 @@ def run(url_string=None):
             shell.tick_live()
     finally:
         shell._navigation.shutdown()
+        if shell.frames is not None:
+            shell.frames.dispose()
         shutdown = getattr(shell.renderer, "shutdown", None)
         if shutdown is not None:
             shutdown()

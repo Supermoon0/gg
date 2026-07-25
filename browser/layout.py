@@ -3052,6 +3052,13 @@ class BlockLayout:
             if bg_img:
                 cmds.append(bg_img)
 
+            # an <iframe>'s box embeds its child document's painted
+            # output (browser/frames.py), clipped to the frame rect
+            frame = getattr(self.node, "_frame", None)
+            if frame is not None:
+                cmds.extend(frame.paint_cmds(
+                    self.x, self.y, self.width, self.height))
+
             if self.node.tag == "input":
                 value = self.node.attributes.get("value", "")
                 text = value or self.node.attributes.get("placeholder", "")

@@ -3218,4 +3218,283 @@ _anim_box = next(o for o in layout_tree_to_list(_anim_doc, [])
 check("anim: sampled keyframe height feeds layout",
       abs(_anim_box.height - 60.0) < 0.01, _anim_box.height)
 
+# --- iframe: isolated child browsing contexts (browser/frames.py) ---
+from browser import frames as gg_frames  # noqa: E402
+
+check("iframe: schemeful origin model",
+      gg_frames.same_origin(net.URL("https://a.test/x"),
+                            net.URL("https://a.test/y"))
+      and not gg_frames.same_origin(net.URL("https://a.test/"),
+                                    net.URL("http://a.test/"))
+      and not gg_frames.same_origin(net.URL("https://a.test/"),
+                                    net.URL("https://b.test/"))
+      and gg_frames.origin_of(net.URL("about:home")) is None)
+check("iframe: sandbox attribute parses",
+      gg_frames.parse_sandbox(None) is None
+      and gg_frames.parse_sandbox("") == set()
+      and gg_frames.parse_sandbox("allow-scripts ALLOW-SAME-ORIGIN")
+      == {"allow-scripts", "allow-same-origin"})
+check("iframe: X-Frame-Options gates embedding",
+      gg_frames.frame_blocked_reason(
+          {"X-Frame-Options": "DENY"}, net.URL("https://c.test/"),
+          net.URL("https://p.test/")) is not None
+      and gg_frames.frame_blocked_reason(
+          {"x-frame-options": "SAMEORIGIN"}, net.URL("https://p.test/a"),
+          net.URL("https://p.test/")) is None
+      and gg_frames.frame_blocked_reason(
+          {"x-frame-options": "SAMEORIGIN"}, net.URL("https://c.test/"),
+          net.URL("https://p.test/")) is not None)
+check("iframe: CSP frame-ancestors overrides XFO",
+      gg_frames.frame_blocked_reason(
+          {"content-security-policy": "frame-ancestors 'none'",
+           "x-frame-options": "SAMEORIGIN"},
+          net.URL("https://p.test/child"),
+          net.URL("https://p.test/")) is not None
+      and gg_frames.frame_blocked_reason(
+          {"content-security-policy": "frame-ancestors 'self'"},
+          net.URL("https://p.test/child"),
+          net.URL("https://p.test/")) is None
+      and gg_frames.frame_blocked_reason(
+          {"content-security-policy":
+           "default-src 'self'; frame-ancestors https://p.test"},
+          net.URL("https://c.test/"), net.URL("https://p.test/")) is None
+      and gg_frames.frame_blocked_reason(
+          {"content-security-policy": "frame-ancestors *.p.test"},
+          net.URL("https://c.test/"),
+          net.URL("https://sub.p.test/")) is None)
+
+# a tiny fake web the frame loader fetches from
+_FRAME_SITES = {
+    "https://frchild.test/": (
+        {},
+        "<style>body{margin:0} .red{background-color:#ff0000;"
+        "width:50px;height:30px} p{margin:0}</style>"
+        '<div class=red></div><a href="/next">go next</a>'
+        '<div style="height:400px"></div>'),
+    "https://frchild.test/next": (
+        {}, "<p id=second>second page</p>"),
+    "https://frdeny.test/": (
+        {"x-frame-options": "DENY"}, "<p>secret</p>"),
+}
+
+
+def _fake_frame_request_text(url, *args, **kwargs):
+    key = str(url)
+    if key in _FRAME_SITES:
+        headers, body = _FRAME_SITES[key]
+        return dict(headers), body, url
+    raise OSError(f"no fake page for {key}")
+
+
+_real_rt = net.request_text
+net.request_text = _fake_frame_request_text
+try:
+    _fr_parent_url = net.URL("https://frparent.test/")
+    _fr_parent = _styled(
+        "body { margin: 0 }",
+        '<iframe id=fr src="https://frchild.test/" width=200 height=100>'
+        "fallback content</iframe>")
+    _fr_mgr = gg_frames.FrameManager(
+        top_url=_fr_parent_url, use_native=False)
+    _fr_mgr.sync(_fr_parent, _fr_parent_url)
+    _fr_node = _find(_fr_parent, "iframe")
+    _fr = _fr_node._frame
+    check("iframe: fallback child document loads isolated",
+          _fr is not None and _fr.status == "loaded"
+          and str(_fr.url) == "https://frchild.test/"
+          and _fr_node.children == []
+          and _fr_node.style["width"] == "200.0px"
+          and _fr_node.style["height"] == "100.0px",
+          repr((_fr and _fr.status, _fr_node.style.get("width"))))
+
+    _fr_doc = DocumentLayout(_fr_parent)
+    _fr_doc.layout(800)
+    _fr_box = next(o for o in layout_tree_to_list(_fr_doc, [])
+                   if getattr(getattr(o, "node", None), "tag", None)
+                   == "iframe" and getattr(o, "height", 0) > 0
+                   and o.__class__.__name__ == "BlockLayout")
+    _fr_cmds = paint_tree(_fr_doc, [])
+    _fr_clips = [c for c in _fr_cmds
+                 if c.__class__.__name__ == "DrawClipPush"
+                 and abs(c.left - _fr_box.x) < 0.01
+                 and abs(c.right - (_fr_box.x + _fr_box.width)) < 0.01]
+    _fr_red = [c for c in _fr_cmds
+               if getattr(c, "color", "") == "#ff0000"]
+    check("iframe: child paints inside the clipped frame box",
+          _fr_clips and _fr_red
+          and abs(_fr_red[0].left - _fr_box.x) < 0.01
+          and abs(_fr_red[0].top - _fr_box.y) < 0.01
+          and _fr_red[0].right <= _fr_box.x + _fr_box.width + 0.01,
+          repr((_fr_box.x, _fr_box.y,
+                [(c.left, c.top) for c in _fr_red])))
+
+    # nested hit test resolves the child link under parent coordinates
+    def _in_anchor(o):
+        node = getattr(o, "node", None)
+        while node is not None:
+            if getattr(node, "tag", None) == "a":
+                return True
+            node = getattr(node, "parent", None)
+        return False
+
+    _child_doc = _fr._document_layout(_fr_box.width, _fr_box.height)
+    _child_a = next(o for o in layout_tree_to_list(_child_doc, [])
+                    if _in_anchor(o) and getattr(o, "width", 0) > 0
+                    and getattr(o, "height", 0) > 0)
+    _hit = gg_frames.hit_frame(
+        _fr_box, _fr_box.x + _child_a.x + 1, _fr_box.y + _child_a.y + 1)
+    check("iframe: nested hit-test finds the child link",
+          _hit is not None
+          and _fr.find_link(_hit[1].node) == "/next",
+          repr(_hit))
+
+    # frame-internal scrolling: content shifts, page does not
+    _scrolled = _fr.scroll_by(30, _fr_box.width, _fr_box.height)
+    _fr_doc2 = DocumentLayout(_fr_parent)
+    _fr_doc2.layout(800)
+    _fr_red2 = [c for c in paint_tree(_fr_doc2, [])
+                if getattr(c, "color", "") == "#ff0000"]
+    check("iframe: wheel scroll moves only the frame content",
+          _scrolled and _fr_red2
+          and abs(_fr_red2[0].top - (_fr_box.y - 30)) < 0.01,
+          repr([(c.top) for c in _fr_red2]))
+    _fr.scroll = 0.0
+
+    # in-frame navigation replaces the child document only
+    _fr.navigate("/next")
+    check("iframe: link navigation stays inside the frame",
+          str(_fr.url) == "https://frchild.test/next"
+          and any(isinstance(n, Element)
+                  and n.attributes.get("id") == "second"
+                  for n in tree_to_list(_fr.root, []))
+          and _fr.status == "loaded")
+
+    # X-Frame-Options refusal renders a placeholder, not the content
+    _xfo_parent = _styled(
+        "", '<iframe id=x src="https://frdeny.test/"></iframe>')
+    _xfo_mgr = gg_frames.FrameManager(
+        top_url=_fr_parent_url, use_native=False)
+    _xfo_mgr.sync(_xfo_parent, _fr_parent_url)
+    _xfo = _find(_xfo_parent, "iframe")._frame
+    check("iframe: X-Frame-Options DENY blocks the document",
+          _xfo.status == "blocked" and _xfo.root is None
+          and "X-Frame-Options" in _xfo.blocked_reason
+          and len(_xfo.paint_cmds(0, 0, 100, 50)) == 3)
+
+    # srcdoc: inline markup, parent base URL (same-origin content)
+    _sd_parent = _styled(
+        "", "<iframe id=sd srcdoc=\"<p id=inner>hello</p>\"></iframe>")
+    _sd_mgr = gg_frames.FrameManager(
+        top_url=_fr_parent_url, use_native=False)
+    _sd_mgr.sync(_sd_parent, _fr_parent_url)
+    _sd = _find(_sd_parent, "iframe")._frame
+    check("iframe: srcdoc renders with the parent base URL",
+          _sd.status == "loaded" and _sd.url is _fr_parent_url
+          and any(isinstance(n, Element)
+                  and n.attributes.get("id") == "inner"
+                  for n in tree_to_list(_sd.root, [])))
+
+    # removing the element disposes its frame and returns the budget
+    _budget_before = _fr_mgr.budget[0]
+    for n in tree_to_list(_fr_parent, []):
+        if isinstance(n, Element) and n.tag == "body":
+            n.children = []
+    _fr_mgr.sync(_fr_parent, _fr_parent_url)
+    check("iframe: removed elements drop their frame documents",
+          not _fr_mgr.frames and _fr_mgr.budget[0] == _budget_before + 1)
+finally:
+    net.request_text = _real_rt
+
+if native.available():
+    from browser.network_backend import default_network_backend \
+        as _frame_backend_factory
+
+    _FRAME_SITES.update({
+        "https://frparent.test/": (
+            {},
+            '<div id=out>pending</div>'
+            '<iframe id=f src="https://frchild2.test/"></iframe>'
+            "<script>document.getElementById('f').addEventListener("
+            "'load', function () { document.getElementById('out')"
+            ".textContent = 'frame-loaded'; });</script>"),
+        "https://frchild2.test/": (
+            {},
+            '<h1 id=t>child title</h1>'
+            "<script>document.cookie = 'fc=1; path=/';"
+            "document.getElementById('t').textContent = 'scripted';"
+            "</script>"),
+        "https://frsandbox.test/": (
+            {},
+            '<p id=s>static</p>'
+            "<script>document.getElementById('s').textContent="
+            "'scripted';</script>"),
+        "https://frsbparent.test/": (
+            {}, '<iframe id=sb sandbox src="https://frsandbox.test/">'
+                "</iframe>"),
+        "https://frdeep.test/1": (
+            {}, '<p>d1</p><iframe id=d src="https://frdeep.test/2">'
+                "</iframe>"),
+        "https://frdeep.test/2": (
+            {}, '<p>d2</p><iframe id=d src="https://frdeep.test/3">'
+                "</iframe>"),
+        "https://frdeep.test/3": (
+            {}, '<p>d3</p><iframe id=d src="https://frdeep.test/4">'
+                "</iframe>"),
+        "https://frdeep.test/4": ({}, "<p>d4</p>"),
+        "https://frdeepparent.test/": (
+            {}, '<iframe id=d0 src="https://frdeep.test/1"></iframe>'),
+    })
+    net.request_text = _fake_frame_request_text
+    try:
+        _fpage = Page()
+        _fpage.goto("https://frparent.test/", settle=True)
+        _fp = _fpage.frame("#f")
+        check("iframe: driver frame() opens the isolated child",
+              _fp is not None and _fp.status == "loaded"
+              and str(_fp.url) == "https://frchild2.test/"
+              and _fp.text("#t") == "scripted",
+              repr((_fp and _fp.status, _fp and _fp.text("#t"))))
+        check("iframe: load event fires on the parent element",
+              _fpage.text("#out") == "frame-loaded",
+              repr(_fpage.text("#out")))
+        _fbackend = _frame_backend_factory()
+        _child_jar = _fbackend.cookies_for(net.URL("https://frchild2.test/"))
+        _parent_jar = _fbackend.cookies_for(net.URL("https://frparent.test/"))
+        check("iframe: child cookies stay in the child origin's jar",
+              "fc=1" in _child_jar and "fc" not in _parent_jar,
+              repr((_child_jar, _parent_jar)))
+        check("iframe: frame document.title/DOM invisible to parent DOM",
+              not any(isinstance(n, Element)
+                      and n.attributes.get("id") == "t"
+                      for n in tree_to_list(
+                          native.build_tree(_fpage._export()), [])))
+        _fpage.close()
+
+        _spage = Page()
+        _spage.goto("https://frsbparent.test/", settle=True)
+        _sp = _spage.frame("#sb")
+        check("iframe: sandbox without allow-scripts blocks child JS",
+              _sp is not None and _sp.status == "loaded"
+              and _sp.text("#s") == "static",
+              repr(_sp and _sp.text("#s")))
+        _spage.close()
+
+        _dpage = Page()
+        _dpage.goto("https://frdeepparent.test/", settle=True)
+        _d0 = _dpage.frame("#d0")
+        _fd1 = _d0._fd
+        _fd2 = next(iter(_fd1.subframes.frames.values()))
+        _fd3 = next(iter(_fd2.subframes.frames.values()))
+        check("iframe: nesting stops at the depth limit",
+              _fd1.status == "loaded" and _fd2.status == "loaded"
+              and _fd3.status == "loaded"
+              and (_fd3.subframes is None
+                   or not _fd3.subframes.frames),
+              repr((_fd1.status, _fd2.status, _fd3.status)))
+        _dpage.close()
+    finally:
+        net.request_text = _real_rt
+else:
+    print("[SKIP] iframe driver checks - native ggcore not built")
+
 print(f"\n{passed} checks passed - engine pipeline OK")
