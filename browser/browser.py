@@ -959,11 +959,13 @@ class Browser:
             self.choose_file(input_node)
             return
         checkable = forms.find_checkable(default_node)
+        select = forms.find_select(default_node)
         resetter = forms.find_resetter(default_node)
         submitter = forms.find_submitter(default_node)
-        if checkable is not None or resetter is not None \
-                or submitter is not None:
-            self.activate_form_control(checkable or resetter or submitter)
+        if checkable is not None or select is not None \
+                or resetter is not None or submitter is not None:
+            self.activate_form_control(
+                checkable or select or resetter or submitter)
             return
 
     # ---------- text input focus / typing ----------
@@ -1144,21 +1146,20 @@ class Browser:
         if event.keysym == "Escape":
             self.set_focus(None)
             return "break"
-        if event.keysym == "Return":
-            action = keyboard.key_action(node, "Enter")
+        key = {"Return": "Enter", "space": "Space", "Up": "ArrowUp",
+               "Down": "ArrowDown", "Left": "ArrowLeft",
+               "Right": "ArrowRight"}.get(event.keysym)
+        if key is not None:
+            action = keyboard.key_action(node, key)
             if action == "activate":
                 self.activate_node(node)
             elif action == "submit":
                 self.submit_form(node)
             elif action == "newline":
                 self._append_text(node, "\n")
-            else:
-                return None
-            return "break"
-        if event.keysym == "space":
-            action = keyboard.key_action(node, "Space")
-            if action == "activate":
-                self.activate_node(node)
+            elif action in ("select-next", "select-prev"):
+                self.activate_form_control(
+                    node, select_step=1 if action == "select-next" else -1)
             elif action == "text":
                 self._append_text(node, " ")
             elif action == "scroll":
@@ -1209,7 +1210,7 @@ class Browser:
         except Exception as e:
             self.set_status(f"폼 제출 실패: {e}")
 
-    def activate_form_control(self, control):
+    def activate_form_control(self, control, select_step=1):
         try:
             activation = forms.activate_control(
                 control, self.url, self._form_defaults,
@@ -1217,7 +1218,8 @@ class Browser:
                 refresh_tree=self._fresh_form_tree,
                 set_attr=(self.renderer.set_attr if self._doc else None),
                 remove_attr=(self.renderer.remove_attr
-                             if self._doc is not None else None))
+                             if self._doc is not None else None),
+                select_step=select_step)
             self._finish_form_activation(activation)
         except Exception as exc:
             self.set_status(f"폼 동작 실패: {exc}")

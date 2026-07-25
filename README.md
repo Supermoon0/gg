@@ -158,6 +158,13 @@ collapse하며 border·padding·overflow formatting context에서는 차단한�
 (URL-encoded·text/plain·multipart 파일), 외부 `form=` owner, submit/reset/invalid
 이벤트와 required/type/pattern/min/max 길이·수치 검증, 실측 getBoundingClientRect
 
+**폼 컨트롤**: 엔진이 위젯 페이스를 직접 그린다 — 체크박스(체크마크),
+라디오(점), `<select>`(선택된 option 라벨 + 셰브론), textarea(현재 값,
+클리핑), 버튼 페이스, 포커스 링. 페이지가 직접 스타일을 준 컨트롤
+(`appearance:none` 관용구)은 자기 모양을 유지하고 상태 표시만 덧그린다.
+팝업 레이어가 없으므로 select는 클릭/Enter/Space/방향키로 선택을 순환하며
+input·change를 발화한다.
+
 **크롬**: 주소창, 히스토리, 세로/가로 스크롤(네이티브 셸은 Rust 상주 디스플레이
 리스트로 오프셋 전용 프레임), 링크 히트 테스트, EAGER-DATA 리더 모드(네이버
 헤드라인·피드 추출 렌더). 상위 탐색은 UI 스레드 밖에서 실행되며 새 탐색·중지로

@@ -9,8 +9,13 @@
   "height": 348.0,
   "raster": "4c29071ae1a0b06a1b22fcc15a87c2988d08740277b7e7a1523825dcb3da7fe7"
  },
+ "form-controls": {
+  "cmds": 68,
+  "height": 328.25,
+  "raster": "945ef0f634b475be6d2119d3334f3da995a35b64095e019c6d8a4208d5a9729f"
+ },
  "form-page": {
-  "cmds": 23,
+  "cmds": 27,
   "height": 207.84,
   "raster": "cc595fa3a5a322147314df5afbcc4d60e9809848de0ea66d1842910910dd8064"
  },
@@ -20,9 +25,9 @@
   "raster": "612e1dd4912f10a7d0e99d47f429e32e74730687bc90f77d9df72cace40ef390"
  },
  "replaced": {
-  "cmds": 13,
+  "cmds": 21,
   "height": 263.28,
-  "raster": "f75bbd02ca922ce023380ad8edca9d14d44f82840754f3ab4ac9d92e165368c8"
+  "raster": "c703b7dfc3e8bf55d61cd0bb8a42cd3e7422307855bc58a1723fdf753f956727"
  },
  "transform-page": {
   "cmds": 13,

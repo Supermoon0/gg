@@ -3683,4 +3683,147 @@ if native.available():
 else:
     print("[SKIP] ax driver checks - native ggcore not built")
 
+# --- form controls: widget faces + select interaction ---
+from browser import forms as gg_forms  # noqa: E402
+
+_fc_dom = _styled("body { margin: 0 }", """<body>
+<input type=checkbox id=cb0><input type=checkbox id=cb1 checked>
+<input type=radio name=g id=rb0><input type=radio name=g id=rb1 checked>
+<select id=sel><option>Apple<option selected>Banana<option>Cherry</select>
+<textarea id=ta>hello
+world</textarea>
+<input type=submit value=Go id=sub>
+<input type=text value=typed id=txt>
+<span>tail</span></body>""")
+_fc_doc = DocumentLayout(_fc_dom)
+_fc_doc.layout(800, 600)
+_fc_cmds = paint_tree(_fc_doc, [])
+_fc_boxes = {}
+for _o in layout_tree_to_list(_fc_doc, []):
+    _nid = getattr(getattr(_o, "node", None), "attributes", {}).get("id")
+    if _nid and isinstance(_o, BlockLayout):
+        _fc_boxes.setdefault(_nid, _o)
+
+
+def _fc_in(box, cmd, slack=3.0):
+    """Is a painted command inside (or on) a control's box?"""
+    return (cmd.left >= box.x - slack and cmd.top >= box.y - slack
+            and getattr(cmd, "right", cmd.left) <= box.x + box.width + slack
+            and cmd.bottom <= box.y + box.height + slack)
+
+
+def _fc_kinds(box, kind):
+    return [c for c in _fc_cmds
+            if c.__class__.__name__ == kind and _fc_in(box, c)]
+
+
+check("forms: options no longer leak into the page as inline text",
+      not any(getattr(c, "text", "") in ("Apple", "Cherry")
+              for c in _fc_cmds),
+      repr([getattr(c, "text", "") for c in _fc_cmds
+            if getattr(c, "text", "")]))
+check("forms: a <select> gets its own box and paints the selected label",
+      "sel" in _fc_boxes
+      and any(getattr(c, "text", "") == "Banana"
+              for c in _fc_kinds(_fc_boxes["sel"], "DrawText")),
+      repr(sorted(_fc_boxes)))
+check("forms: select paints a dropdown chevron inside its box",
+      len(_fc_kinds(_fc_boxes["sel"], "DrawLine")) == 2)
+check("forms: unchecked checkbox paints a visible empty box",
+      len(_fc_kinds(_fc_boxes["cb0"], "DrawRect")) == 2
+      and not _fc_kinds(_fc_boxes["cb0"], "DrawLine"),
+      repr(_fc_kinds(_fc_boxes["cb0"], "DrawRect")))
+check("forms: checked checkbox paints a checkmark",
+      len(_fc_kinds(_fc_boxes["cb1"], "DrawLine")) == 2,
+      repr(_fc_kinds(_fc_boxes["cb1"], "DrawLine")))
+check("forms: radio paints circles, and only the checked one has a dot",
+      len(_fc_kinds(_fc_boxes["rb0"], "DrawOval")) == 2
+      and len(_fc_kinds(_fc_boxes["rb1"], "DrawOval")) == 3)
+_fc_escapes = [
+    (i, c.__class__.__name__, c.left, c.top)
+    for i in ("cb0", "cb1", "rb0", "rb1", "sel", "ta", "sub", "txt")
+    for c in _fc_boxes[i].paint()
+    # clip markers carry sentinel top/bottom so the viewport cull can
+    # never drop them — only real painted geometry is checked here
+    if c.__class__.__name__ not in ("DrawClipPush", "DrawClipPop")
+    and not _fc_in(_fc_boxes[i], c, slack=0.01)]
+check("forms: control faces never paint outside their own box",
+      not _fc_escapes, repr(_fc_escapes))
+check("forms: textarea renders its lines, clipped to the control",
+      [getattr(c, "text", "") for c in
+       _fc_kinds(_fc_boxes["ta"], "DrawText")] == ["hello", "world"]
+      and any(c.__class__.__name__ == "DrawClipPush" for c in _fc_cmds))
+check("forms: submit button paints a face with a centred label",
+      any(getattr(c, "text", "") == "Go" for c in _fc_cmds)
+      and len(_fc_kinds(_fc_boxes["sub"], "DrawRect")) == 2)
+check("forms: text input value is clipped to its box",
+      any(getattr(c, "text", "") == "typed" for c in _fc_cmds))
+
+# a styled control keeps the page's own look (the appearance:none idiom)
+_fc_styled = _styled(
+    "input { background-color: #222222; border-width: 2px }",
+    "<input type=checkbox id=sc checked>")
+_fc_sdoc = DocumentLayout(_fc_styled)
+_fc_sdoc.layout(400)
+_fc_scmds = paint_tree(_fc_sdoc, [])
+check("forms: an author-styled control keeps its own face + state mark",
+      not any(getattr(c, "color", "") == "#ffffff" for c in _fc_scmds)
+      and sum(1 for c in _fc_scmds
+              if c.__class__.__name__ == "DrawLine") == 2,
+      repr([(c.__class__.__name__, getattr(c, "color", ""))
+            for c in _fc_scmds]))
+
+# <option> auto-closes so a select's label is only its own text
+_fc_opts = HTMLParser(
+    "<select><option>A<option selected>B<option>C</select>").parse()
+_fc_sel = next(n for n in tree_to_list(_fc_opts, [])
+               if isinstance(n, Element) and n.tag == "select")
+check("forms: <option> auto-closes instead of nesting",
+      [len([c for c in o.children if isinstance(c, Element)])
+       for o in gg_forms.select_options(_fc_sel)] == [0, 0, 0],
+      repr([o.children for o in gg_forms.select_options(_fc_sel)]))
+
+# select activation: click/keyboard cycle the selection and submission
+# follows it (gg paints a closed control, with no popup layer)
+_fc_form = _styled(
+    "", "<form><select id=s2><option>A<option selected>B<option>C"
+        "</select></form>")
+_fc_s2 = next(n for n in tree_to_list(_fc_form, [])
+              if isinstance(n, Element) and n.tag == "select")
+_fc_defaults = gg_forms.capture_defaults(_fc_form)
+check("forms: select starts on its selected option",
+      gg_forms.selected_index(_fc_s2) == 1
+      and gg_forms._select_values(_fc_s2) == ["B"])
+_fc_act = gg_forms.activate_control(_fc_s2, None, _fc_defaults)
+check("forms: activating a select advances and reports a change",
+      _fc_act is not None and _fc_act.kind == "select"
+      and _fc_act.changed and gg_forms.selected_index(_fc_s2) == 2
+      and gg_forms._select_values(_fc_s2) == ["C"],
+      repr((_fc_act and _fc_act.kind, gg_forms.selected_index(_fc_s2))))
+gg_forms.activate_control(_fc_s2, None, _fc_defaults)
+check("forms: selection wraps at the end",
+      gg_forms.selected_index(_fc_s2) == 0)
+gg_forms.activate_control(_fc_s2, None, _fc_defaults, select_step=-1)
+check("forms: a negative step walks backwards",
+      gg_forms.selected_index(_fc_s2) == 2)
+check("forms: exactly one option stays selected",
+      sum(1 for o in gg_forms.select_options(_fc_s2)
+          if "selected" in o.attributes) == 1)
+check("forms: keyboard maps Enter/Space/arrows onto a select",
+      keyboard.key_action(_fc_s2, "Enter") == "select-next"
+      and keyboard.key_action(_fc_s2, "Space") == "select-next"
+      and keyboard.key_action(_fc_s2, "ArrowDown") == "select-next"
+      and keyboard.key_action(_fc_s2, "ArrowUp") == "select-prev")
+_fc_disabled = _styled(
+    "", "<select disabled id=d><option>A<option>B</select>")
+_fc_d = next(n for n in tree_to_list(_fc_disabled, [])
+             if isinstance(n, Element) and n.tag == "select")
+check("forms: a disabled select never activates",
+      gg_forms.activate_control(_fc_d, None, {}) is None
+      and keyboard.key_action(_fc_d, "Enter") is None)
+check("forms: reset restores the original selection",
+      (lambda: (
+          gg_forms.reset_form(gg_forms.find_form(_fc_s2), _fc_defaults),
+          gg_forms.selected_index(_fc_s2))[1])() == 1)
+
 print(f"\n{passed} checks passed - engine pipeline OK")

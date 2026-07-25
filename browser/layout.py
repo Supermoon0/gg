@@ -13,7 +13,7 @@ from .draw import (DrawBgImage, DrawClipPop, DrawClipPush, DrawImage,
                    DrawLine, DrawOval, DrawRect, DrawStickyPop,
                    DrawStickyPush, DrawText,
                    translate_cmds)
-from .html_parser import Element, Text
+from .html_parser import Element, Text, tree_to_list
 from .style import parse_px, parse_size
 
 # The initial containing block IS the viewport: html fills it edge to
@@ -35,6 +35,13 @@ BLOCK_ELEMENTS = {
     "legend", "details", "summary", "center", "tr", "td", "th",
     "thead", "tbody", "caption",
 }
+
+# Form controls the engine paints itself (a "widget face"), whose
+# children therefore never take part in layout: <select> renders the
+# selected option's label + a chevron, <textarea> renders its current
+# value. Their DOM children stay intact for submission, scripting and
+# the accessibility tree — they simply do not flow.
+REPLACED_CONTROLS = {"input", "select", "textarea"}
 
 FONT_FAMILIES = {
     "default": "Segoe UI",
@@ -198,6 +205,26 @@ def paint_background_image(node, x1, y1, x2, y2):
     rep_y = rep in ("repeat", "repeat-y")
     return DrawBgImage(x1, y1, box_w, box_h, image_id,
                        off_x, off_y, tile_w, tile_h, rep_x, rep_y)
+
+
+def _ellipsize(text, font, avail):
+    """Longest prefix of `text` that fits `avail` px, with "…" when it
+    had to cut. Used by the widget faces (a select label or a textarea
+    line must never spill out of its control)."""
+    text = text or ""
+    if avail <= 0:
+        return ""
+    if measure(font, text) <= avail:
+        return text
+    ell = measure(font, "…")
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if measure(font, text[:mid]) + ell <= avail:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + "…"
 
 
 def effective_opacity(node):
@@ -2764,14 +2791,18 @@ class BlockLayout:
                 sy = line.y if line is not None else self.y
                 self._queue_abs(node, self.x + self.cursor_x, sy)
                 return
+            if node is self.node and node.tag in REPLACED_CONTROLS:
+                # a replaced control paints its own face (selected option
+                # label, typed textarea value); its children never flow
+                return
             _disp = node.style.get("display", "")
             if node is not self.node and (
-                    node.tag == "input"
+                    node.tag in REPLACED_CONTROLS
                     or (_disp in ("inline-block", "inline-flex",
                                   "inline-table")
                         and node.tag not in ("img", "svg", "br"))):
-                # a descendant inline-block (or a replaced <input>) becomes
-                # an atomic box; the container node itself (node is
+                # a descendant inline-block (or a replaced form control)
+                # becomes an atomic box; the container node itself (node is
                 # self.node) falls through so its own children flow,
                 # avoiding infinite re-entry.
                 self.inline_block(node)
@@ -3059,22 +3090,8 @@ class BlockLayout:
                 cmds.extend(frame.paint_cmds(
                     self.x, self.y, self.width, self.height))
 
-            if self.node.tag == "input":
-                value = self.node.attributes.get("value", "")
-                text = value or self.node.attributes.get("placeholder", "")
-                font = cached_font(self.node)
-                ty = self.y + max(
-                    0.0, (self.height - font.metrics("linespace")) / 2)
-                if text.strip():
-                    tcolor = (safe_color(self.node.style.get("color"))
-                              if value else "#9e9e9e")
-                    cmds.append(DrawText(self.x, ty, text, font, tcolor))
-                if getattr(self.node, "is_focused", False):
-                    # caret after the typed value (not the placeholder)
-                    cx = self.x + (measure(font, value) if value else 0)
-                    ch = font.metrics("linespace")
-                    cmds.append(DrawLine(
-                        cx, ty, cx, ty + ch, "#333333", 1))
+            if self.node.tag in REPLACED_CONTROLS:
+                cmds.extend(self._paint_control())
 
             if self.node.tag == "li" and _list_marker_visible(self.node):
                 font = cached_font(self.node)
@@ -3092,6 +3109,253 @@ class BlockLayout:
             # overflow:hidden clips descendants to the padding box
             if self._clips():
                 cmds.append(DrawClipPush(x1, y1, x2, y2))
+        return cmds
+
+    # ----- form-control faces -----
+    #
+    # The engine draws its own widget faces: without them a checkbox is
+    # an invisible 13px box (checked state entirely unpaintable) and a
+    # <select> has no box at all. A page that styles a control itself —
+    # the `appearance: none` idiom, which shows up as an author
+    # background or border — keeps its own face; only the state
+    # indicator (checkmark, radio dot, chevron, label) paints on top.
+
+    _FACE_BG = "#ffffff"
+    _FACE_BORDER = "#767676"
+    _FACE_ACCENT = "#1a73e8"
+    _BUTTON_BG = "#efefef"
+    _PLACEHOLDER = "#9e9e9e"
+
+    def _author_styled_face(self):
+        """Whether the page supplies the control's own box appearance."""
+        style = self.node.style
+        if self.bw > 0:
+            return True
+        for prop in ("background-color", "background", "background-image",
+                     "appearance", "-webkit-appearance"):
+            value = (style.get(prop) or "").strip().casefold()
+            if value and value not in ("none", "auto", "transparent",
+                                       "initial", "unset"):
+                return True
+        return False
+
+    def _input_type(self):
+        return self.node.attributes.get(
+            "type", "text").strip().casefold()
+
+    def _paint_control(self):
+        tag = self.node.tag
+        itype = self._input_type() if tag == "input" else ""
+        if tag == "input" and itype in ("checkbox", "radio"):
+            return self._paint_toggle(itype)
+        if tag == "select":
+            return self._paint_select()
+        if tag == "textarea":
+            return self._paint_textarea()
+        if tag == "input" and itype in ("submit", "reset", "button"):
+            return self._paint_button()
+        return self._paint_text_field()
+
+    def _face_rect(self, cmds, radius=2.0, bg=None):
+        """Default box face (background + 1px border) when the page has
+        not styled the control itself. The border is drawn INSIDE the
+        box, so a control never paints outside its own layout rect.
+        Returns True if it painted."""
+        if self._author_styled_face():
+            return False
+        x2, y2 = self.x + self.width, self.y + self.height
+        cmds.append(DrawRect(self.x, self.y, x2, y2,
+                             self._FACE_BORDER, radius=radius))
+        cmds.append(DrawRect(self.x + 1, self.y + 1, x2 - 1, y2 - 1,
+                             bg or self._FACE_BG, radius=max(radius - 1, 0)))
+        return True
+
+    def _focus_ring(self, cmds, radius=2.0):
+        """A 2px accent ring just outside the control (drawn first, so
+        the face covers its inner edge) — the keyboard-focus affordance
+        every native control has."""
+        if not getattr(self.node, "is_focused", False):
+            return
+        x2, y2 = self.x + self.width, self.y + self.height
+        cmds.append(DrawRect(self.x - 2, self.y - 2, x2 + 2, y2 + 2,
+                             self._FACE_ACCENT, radius=radius + 2))
+
+    def _paint_toggle(self, itype):
+        """checkbox / radio: a real box or circle, and a visible checked
+        state (previously `checked` painted nothing at all)."""
+        cmds = []
+        w, h = self.width, self.height
+        x1, y1 = self.x, self.y
+        x2, y2 = x1 + w, y1 + h
+        checked = "checked" in self.node.attributes
+        styled = self._author_styled_face()
+        accent = safe_color(
+            self.node.style.get("accent-color", ""), default="") \
+            or self._FACE_ACCENT
+        self._focus_ring(cmds, radius=w / 2 if itype == "radio" else 2.0)
+        if itype == "radio":
+            if not styled:
+                cmds.append(DrawOval(x1, y1, x2, y2, self._FACE_BORDER))
+                cmds.append(DrawOval(x1 + 1, y1 + 1, x2 - 1, y2 - 1,
+                                     self._FACE_BG))
+            if checked:
+                # the dot: a filled circle inset to ~40% of the box
+                inset = max(w * 0.28, 2.0)
+                cmds.append(DrawOval(x1 + inset, y1 + inset,
+                                     x2 - inset, y2 - inset, accent))
+            return cmds
+        # checkbox
+        if not styled:
+            edge = accent if checked else self._FACE_BORDER
+            cmds.append(DrawRect(x1, y1, x2, y2, edge, radius=2.0))
+            cmds.append(DrawRect(x1 + 1, y1 + 1, x2 - 1, y2 - 1,
+                                 accent if checked else self._FACE_BG,
+                                 radius=1.0))
+        if checked:
+            # a checkmark built from two strokes (no glyph font needed);
+            # white on the accent fill, accent-coloured on an author face
+            ink = self._FACE_BG if not styled else accent
+            t = max(1.0, round(w / 8.0))
+            cmds.append(DrawLine(x1 + w * 0.22, y1 + h * 0.52,
+                                 x1 + w * 0.42, y1 + h * 0.72, ink, t))
+            cmds.append(DrawLine(x1 + w * 0.42, y1 + h * 0.72,
+                                 x1 + w * 0.78, y1 + h * 0.28, ink, t))
+        return cmds
+
+    def _selected_option_label(self):
+        """The label a closed <select> shows: the selected option, else
+        the first one (matching the submitted value, forms._select_values)."""
+        options = [n for n in tree_to_list(self.node, [])
+                   if isinstance(n, Element) and n.tag == "option"]
+        chosen = next(
+            (o for o in options if "selected" in o.attributes), None)
+        if chosen is None:
+            chosen = options[0] if options else None
+        if chosen is None:
+            return ""
+        label = chosen.attributes.get("label")
+        if label:
+            return label.strip()
+        # only this option's own text — malformed markup can still nest
+        # options, and a nested one's label is not part of this label
+        parts = []
+        stack = list(chosen.children)
+        while stack:
+            n = stack.pop(0)
+            if isinstance(n, Text):
+                parts.append(n.text)
+            elif isinstance(n, Element) and n.tag != "option":
+                stack = list(n.children) + stack
+        return " ".join("".join(parts).split())
+
+    def _paint_select(self):
+        cmds = []
+        self._focus_ring(cmds)
+        self._face_rect(cmds)
+        font = cached_font(self.node)
+        pad = 6.0
+        chevron_w = 16.0
+        text_w = max(self.width - pad - chevron_w, 0.0)
+        label = self._selected_option_label()
+        ty = self.y + max(0.0, (self.height - font.gg_linespace) / 2)
+        if label and text_w > 4:
+            label = _ellipsize(label, font, text_w)
+            cmds.append(DrawText(self.x + pad, ty, label, font,
+                                 safe_color(self.node.style.get("color"))))
+        # dropdown chevron: two strokes forming a "v" on the right edge
+        cx = self.x + self.width - chevron_w / 2 - 2
+        cy = self.y + self.height / 2
+        arm = 3.5
+        cmds.append(DrawLine(cx - arm, cy - arm / 2, cx, cy + arm / 2,
+                             "#5f6368", 2))
+        cmds.append(DrawLine(cx, cy + arm / 2, cx + arm, cy - arm / 2,
+                             "#5f6368", 2))
+        return cmds
+
+    def _textarea_value(self):
+        """Current textarea contents: the typed value when the shells
+        have recorded one, else the original child text."""
+        if "value" in self.node.attributes:
+            return self.node.attributes["value"]
+        return "".join(t.text for t in tree_to_list(self.node, [])
+                       if isinstance(t, Text))
+
+    def _paint_textarea(self):
+        cmds = []
+        self._focus_ring(cmds)
+        self._face_rect(cmds)
+        font = cached_font(self.node)
+        value = self._textarea_value()
+        pad = 3.0
+        line_h = font.gg_linespace
+        avail_w = max(self.width - 2 * pad, 0.0)
+        color = safe_color(self.node.style.get("color"))
+        # clip so long content cannot escape the control's own box
+        cmds.append(DrawClipPush(self.x, self.y,
+                                 self.x + self.width,
+                                 self.y + self.height))
+        ty = self.y + pad
+        last_x = self.x + pad
+        for raw in (value.split("\n") if value else []):
+            if ty > self.y + self.height:
+                break
+            shown = _ellipsize(raw, font, avail_w) if raw else ""
+            if shown:
+                cmds.append(DrawText(self.x + pad, ty, shown, font, color))
+            last_x = self.x + pad + measure(font, shown)
+            ty += line_h
+        if getattr(self.node, "is_focused", False):
+            cy = min(ty - line_h, self.y + self.height - line_h) \
+                if value else self.y + pad
+            cmds.append(DrawLine(last_x, cy, last_x, cy + line_h,
+                                 "#333333", 1))
+        cmds.append(DrawClipPop())
+        return cmds
+
+    def _paint_button(self):
+        cmds = []
+        self._focus_ring(cmds)
+        self._face_rect(cmds, bg=self._BUTTON_BG)
+        font = cached_font(self.node)
+        label = self.node.attributes.get("value") or {
+            "submit": "제출", "reset": "재설정"}.get(self._input_type(), "")
+        if label:
+            tw = measure(font, label)
+            tx = self.x + max(0.0, (self.width - tw) / 2)
+            ty = self.y + max(0.0, (self.height - font.gg_linespace) / 2)
+            cmds.append(DrawText(tx, ty, label, font,
+                                 safe_color(self.node.style.get("color"))))
+        return cmds
+
+    def _paint_text_field(self):
+        """text/search/password/... inputs: value or placeholder, clipped
+        to the control, with the caret when focused."""
+        cmds = []
+        self._focus_ring(cmds)
+        self._face_rect(cmds)
+        node = self.node
+        raw = node.attributes.get("value", "")
+        itype = self._input_type()
+        if itype == "password" and raw:
+            raw = "•" * len(raw)
+        if itype == "file":
+            raw = raw or "파일 선택"
+        text = raw or node.attributes.get("placeholder", "")
+        font = cached_font(node)
+        ty = self.y + max(0.0, (self.height - font.metrics("linespace")) / 2)
+        cmds.append(DrawClipPush(self.x, self.y,
+                                 self.x + self.width,
+                                 self.y + self.height))
+        if text.strip():
+            tcolor = (safe_color(node.style.get("color")) if raw
+                      else self._PLACEHOLDER)
+            cmds.append(DrawText(self.x, ty, text, font, tcolor))
+        if getattr(node, "is_focused", False):
+            # caret after the typed value (not the placeholder)
+            cx = self.x + (measure(font, raw) if raw else 0)
+            ch = font.metrics("linespace")
+            cmds.append(DrawLine(cx, ty, cx, ty + ch, "#333333", 1))
+        cmds.append(DrawClipPop())
         return cmds
 
     def _clips(self):

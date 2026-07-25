@@ -139,13 +139,19 @@ class HTMLParser:
             node = Element(tag, attributes, parent)
             parent.children.append(node)
         else:
-            # Auto-close <p> and <li> when a sibling opens
+            # Auto-close <p>, <li> and <option>/<optgroup> when a sibling
+            # opens. Without the option rule `<option>a<option>b` nests,
+            # and a <select>'s label picks up every later option's text.
             if self.unfinished:
                 open_tag = self.unfinished[-1].tag
                 if open_tag == "p" and tag in P_CLOSERS:
                     self._close_tag("p")
                 elif open_tag == "li" and tag == "li":
                     self._close_tag("li")
+                elif open_tag == "option" and tag in ("option", "optgroup"):
+                    self._close_tag("option")
+                elif open_tag == "optgroup" and tag == "optgroup":
+                    self._close_tag("optgroup")
             parent = self.unfinished[-1] if self.unfinished else None
             node = Element(tag, attributes, parent)
             self.unfinished.append(node)

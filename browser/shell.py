@@ -591,6 +591,9 @@ class Shell:
             if action == "activate":
                 self.activate_node(self.focus_node)
                 return
+            if action == "select-next":
+                self.activate_form_control(self.focus_node, select_step=1)
+                return
             if action == "text":
                 self._edit_focused(text=" ")
                 return
@@ -642,9 +645,19 @@ class Shell:
                 self.submit_form(self.focus_node)
             elif action == "newline":
                 self._edit_focused(text="\n")
+            elif action == "select-next":
+                self.activate_form_control(self.focus_node, select_step=1)
             return
         if name == "Backspace" and self._edit_focused(backspace=True):
             return
+        # arrows drive a focused <select> before they scroll the page
+        if self.focus_node is not None and name.startswith("Arrow"):
+            action = keyboard.key_action(self.focus_node, name)
+            if action in ("select-next", "select-prev"):
+                self.activate_form_control(
+                    self.focus_node,
+                    select_step=1 if action == "select-next" else -1)
+                return
         if name == "ArrowDown":
             self.scroll += SCROLL_STEP
         elif name == "ArrowUp":
@@ -753,11 +766,13 @@ class Shell:
             self.set_status("파일 선택은 tkinter 셸에서 지원합니다")
             return
         checkable = forms.find_checkable(default_node)
+        select = forms.find_select(default_node)
         resetter = forms.find_resetter(default_node)
         submitter = forms.find_submitter(default_node)
-        if checkable is not None or resetter is not None \
-                or submitter is not None:
-            self.activate_form_control(checkable or resetter or submitter)
+        if checkable is not None or select is not None \
+                or resetter is not None or submitter is not None:
+            self.activate_form_control(
+                checkable or select or resetter or submitter)
 
     def submit_form(self, node, submitter=None):
         form = forms.find_form(node)
@@ -779,14 +794,15 @@ class Shell:
         except Exception as exc:
             self.set_status(f"폼 제출 실패: {exc}")
 
-    def activate_form_control(self, control):
+    def activate_form_control(self, control, select_step=1):
         try:
             activation = forms.activate_control(
                 control, self.url, self._form_defaults,
                 dispatch_event=self._dispatch_form_event,
                 refresh_tree=self._fresh_form_tree,
                 set_attr=self.renderer.set_attr,
-                remove_attr=self.renderer.remove_attr)
+                remove_attr=self.renderer.remove_attr,
+                select_step=select_step)
             self._finish_form_activation(activation)
         except Exception as exc:
             self.set_status(f"폼 동작 실패: {exc}")

@@ -85,6 +85,57 @@ def find_checkable(node):
     return None
 
 
+def find_select(node):
+    """Return a <select> at or above an event target."""
+    while node is not None:
+        if isinstance(node, Element) and node.tag == "select":
+            return node
+        node = node.parent
+    return None
+
+
+def select_options(select):
+    """The select's option elements in document order (enabled first-class
+    children of the control, including those inside an <optgroup>)."""
+    return [n for n in tree_to_list(select, [])
+            if isinstance(n, Element) and n.tag == "option"]
+
+
+def selected_index(select):
+    """Index of the chosen option — the last `selected` one, else 0 (the
+    implicit first-option default `_select_values` submits)."""
+    options = select_options(select)
+    for i, option in enumerate(options):
+        if "selected" in option.attributes:
+            return i
+    return 0 if options else -1
+
+
+def cycle_selection(select, step, *, set_attr=None, remove_attr=None):
+    """Move the selection by `step` enabled options, wrapping at the end.
+
+    gg has no popup window layer, so a closed <select> advances through
+    its options on click / Enter / Space / arrow keys instead — the
+    control stays operable (and submits the right value) without one.
+    Returns the newly selected option, or None when nothing changed.
+    """
+    options = [o for o in select_options(select)
+               if "disabled" not in o.attributes]
+    if not options:
+        return None
+    current = 0
+    for i, option in enumerate(options):
+        if "selected" in option.attributes:
+            current = i
+    target = options[(current + step) % len(options)]
+    if target is options[current] and len(options) == 1:
+        return None
+    for option in select_options(select):
+        _set_state_attr(option, "selected", option is target, "",
+                        set_attr, remove_attr)
+    return target
+
+
 def _document_root(node):
     while node is not None and node.parent is not None:
         node = node.parent
@@ -417,17 +468,20 @@ def _node_by_ridx(root, ridx):
 
 def activate_control(target, document_url, defaults, *,
                      dispatch_event=None, refresh_tree=None,
-                     set_attr=None, remove_attr=None):
+                     set_attr=None, remove_attr=None, select_step=1):
     """Run a clicked submit/reset control's browser default-action steps.
 
     ``dispatch_event`` receives (ridx, type, bubbles, cancelable,
     submitter_ridx) and returns (logs, handled, prevented). ``refresh_tree``
     re-exports the native DOM after handlers so submission sees mutations.
+    ``select_step`` is how far a <select> activation moves its selection
+    (+1 for a click or Down, -1 for Up).
     """
     checkable = find_checkable(target)
+    select = find_select(target)
     resetter = find_resetter(target)
     submitter = find_submitter(target)
-    control = checkable or resetter or submitter
+    control = checkable or select or resetter or submitter
     if control is None:
         return None
     form = find_form(control)
@@ -480,6 +534,17 @@ def activate_control(target, document_url, defaults, *,
         fire(checkable, "change", True, None, False)
         return FormActivation(
             "check", logs=tuple(logs), handled=handled, changed=True)
+
+    if select is not None:
+        if "disabled" in select.attributes:
+            return None
+        if cycle_selection(select, select_step, set_attr=set_attr,
+                           remove_attr=remove_attr) is None:
+            return FormActivation("select")
+        fire(select, "input", True, None, False)
+        fire(select, "change", True, None, False)
+        return FormActivation(
+            "select", logs=tuple(logs), handled=handled, changed=True)
 
     if form is None:
         return None
