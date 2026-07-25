@@ -6419,6 +6419,81 @@ console.log('B typeof it: ' + typeof it);
     }
 
     #[test]
+    fn memory_bombs_throw_range_errors_instead_of_aborting() {
+        // rope doubling: ~30 statements reach gigabytes well under the
+        // fuel budget; the engine must throw a catchable RangeError,
+        // never abort the process on a failed allocation (namuwiki's
+        // Cloudflare challenge script killed the renderer this way)
+        let mut vm = PageVm::new(None);
+        let logs = vm.run_scripts(&[
+            "var s = 'a';\n\
+             try { while (true) { s += s; } }\n\
+             catch (e) { console.log('caught ' + e.name); }\n\
+             console.log('len ' + (s.length <= 67108864));"
+                .to_string(),
+        ]);
+        assert!(logs.contains(&"caught RangeError".to_string()), "{logs:?}");
+        assert!(logs.contains(&"len true".to_string()), "{logs:?}");
+
+        // repeat / padStart with hostile counts fail the same way
+        for src in [
+            "try { 'ab'.repeat(1e9); console.log('no'); } \
+             catch (e) { console.log('caught ' + e.name); }",
+            "try { 'x'.padStart(1e9); console.log('no'); } \
+             catch (e) { console.log('caught ' + e.name); }",
+        ] {
+            let mut vm = PageVm::new(None);
+            let logs = vm.run_scripts(&[src.to_string()]);
+            assert!(
+                logs.contains(&"caught RangeError".to_string()),
+                "{src}: {logs:?}"
+            );
+        }
+
+        // split('') of a huge string materializes per-char strings —
+        // capped instead of exploding
+        let mut vm = PageVm::new(None);
+        let logs = vm.run_scripts(&[
+            "var s = 'abcdefgh';\n\
+             for (var i = 0; i < 21; i++) s += s; // 16M chars\n\
+             try { s.split(''); console.log('no'); }\n\
+             catch (e) { console.log('caught ' + e.name); }"
+                .to_string(),
+        ]);
+        assert!(logs.contains(&"caught RangeError".to_string()), "{logs:?}");
+
+        // giant array length / sparse index (gov.kr) throw RangeError
+        // instead of forcing a hundred-MB dense allocation
+        for src in [
+            "try { var a = []; a.length = 1e8; console.log('no'); } \
+             catch (e) { console.log('caught ' + e.name); }",
+            "try { var a = []; a[1e8] = 1; console.log('no'); } \
+             catch (e) { console.log('caught ' + e.name); }",
+            "try { var a = []; a.length = -1; console.log('no'); } \
+             catch (e) { console.log('caught ' + e.name); }",
+        ] {
+            let mut vm = PageVm::new(None);
+            let logs = vm.run_scripts(&[src.to_string()]);
+            assert!(
+                logs.contains(&"caught RangeError".to_string()),
+                "{src}: {logs:?}"
+            );
+        }
+        // a modest length set still works
+        let (v, _) = eval("var a = []; a.length = 5; a.length").unwrap();
+        assert_eq!(v.to_number_raw(), 5.0);
+
+        // the VM survives and keeps executing after every bomb
+        let mut vm = PageVm::new(None);
+        let logs = vm.run_scripts(&[
+            "try { var q = 'q'; while (true) q += q; } catch (e) {}"
+                .to_string(),
+            "console.log('alive ' + (6 * 7));".to_string(),
+        ]);
+        assert!(logs.contains(&"alive 42".to_string()), "{logs:?}");
+    }
+
+    #[test]
     fn promise_all_and_race() {
         let mut vm = PageVm::new(None);
         vm.run_scripts(&["\

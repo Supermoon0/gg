@@ -194,11 +194,22 @@ timing-function 오버라이드.
   동일: 네이버 1,133/400 읽을만함, 나무위키·정부24 자식 abort로 격리,
   러너 생존. 연합뉴스는 CI에서도 ConnectionReset — 환경 문제가 아니라
   서버가 이 클라이언트(TLS 지문/보안장비 추정)를 끊는 것으로 보인다.
-- **새 조사 과제**: 나무위키·정부24가 settle 중 메모리 폭주로 abort
-  (`memory allocation of 1855015488 bytes failed` — 단일 1.86GB 할당
-  시도, 4GiB RLIMIT_AS에 걸려 Rust abort). 격리는 의도대로 동작하지만
-  gg-js/스타일 경로의 실제 폭주 원인을 찾아야 한다. 재현:
-  `xvfb-run python basket_test.py` 로컬에서 항상 발생.
+- 나무위키·정부24 settle 중 메모리 폭주 → **gg-js VM 하드닝으로 해결
+  (2026-07-25)**. 원인은 gg에 GC가 없어 단일 대형 할당·누적이 프로세스를
+  abort시킨 것. 다섯 경로를 catchable RangeError로 전환:
+  ① 로프 문자열 무한 배가(`s+=s`)와 `repeat`/`padStart` 거대 카운트
+  → 64MB 문자열 상한, ② `split`/`Array.from(string)`/전역 regex match
+  대량 원소화 → 100만 원소 상한, ③ 거대 배열 length·희소 인덱스(gov.kr)
+  → 1,600만 원소 상한(SetIndex/SetProp 핫패스 포함), ④ 대형 문자열 누적
+  (namu Cloudflare 챌린지) → 512MB 힙 바이트 백스톱을 dispatch 루프에
+  추가. 결과: **더 이상 프로세스 abort 없음**, 러너가 9곳 완주. 나무위키
+  "실패"(18노드)는 Cloudflare "Just a moment" 챌린지(5.6KB)를 받는
+  것으로 실제 봇월 — OOM이 아니라 정상. 정부24 "시간초과"는 배열 폭주는
+  막혔으나 스크립트 루프가 명령어 예산(400M)을 다 태워 120s 소요, 프로세스
+  타임아웃이 봉쇄.
+- **후속 과제**: (a) 실행 fuel이 명령어 수 기반이라 무거운 유한 루프가
+  벽시계로 오래 걸릴 수 있다 — load 내 스크립트별 벽시계 예산 검토.
+  (b) 근본 해결은 GC(현재 문자열 힙·객체가 문서 수명 내내 단조 증가).
 
 ## 장기 호환성 주차장
 
