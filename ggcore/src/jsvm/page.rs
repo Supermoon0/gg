@@ -2202,6 +2202,17 @@ impl PageVm {
     /// before scripts run).
     /// Seed `document.cookie` from the network jar (a `k=v; k2=v2`
     /// string) before page scripts run, so JS sees the server session.
+    /// Replace the `document.cookie` replica with the host's filtered
+    /// snapshot.
+    ///
+    /// Distinct from `seed_cookies`, which merges: a snapshot has to be
+    /// able to *remove*, or a cookie the server expired would linger in
+    /// the page's view forever.
+    pub fn set_cookie_snapshot(&mut self, s: &str) {
+        self.st.cookies.clear();
+        self.seed_cookies(s);
+    }
+
     pub fn seed_cookies(&mut self, s: &str) {
         for pair in s.split(';') {
             let pair = pair.trim();

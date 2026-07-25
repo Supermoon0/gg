@@ -193,6 +193,12 @@ class LocalRendererSession:
         self.sync_cookie_writes()
         for request in requests:
             self.service_fetch(request)
+        if requests:
+            # a response may have carried Set-Cookie; JS writes were
+            # already drained above, so the jar is now the truth
+            native.refresh_cookie_replica(
+                self.doc, self.url, network_backend=self.network,
+                network_context=self.network_context)
         version = (self.doc.dom_version()
                    if hasattr(self.doc, "dom_version") else None)
         changed = version != self._dom_version

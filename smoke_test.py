@@ -2541,6 +2541,26 @@ net._store_set_cookie(_cu, ["gone=1; Path=/; Max-Age=10"])
 net._store_set_cookie(_cu, ["gone=; Path=/; Max-Age=0"])
 check("Max-Age deletes a cookie", "gone=" not in net._cookie_header(_cu))
 
+# `document.cookie` is a synchronous read, so the VM keeps a replica of
+# what the jar allows script to see. It has to be able to shrink: a
+# merging seed can never un-see a cookie the server expired.
+if native.available():
+    _ck_doc = native.ggcore.parse_html("<html><body></body></html>")
+    _ck_doc.set_page_url("https://ck.test/")
+    _ck_doc.set_cookie_snapshot("a=1; b=2")
+    check("cookie replica: a snapshot is what document.cookie reads",
+          sorted(_ck_doc.read_cookies().split("; ")) == ["a=1", "b=2"],
+          repr(_ck_doc.read_cookies()))
+    _ck_doc.set_cookie_snapshot("a=9")
+    check("cookie replica: a later snapshot removes what the jar dropped",
+          _ck_doc.read_cookies() == "a=9",
+          "a merging seed would still be showing b=2")
+    _ck_doc.set_cookie_snapshot("")
+    check("cookie replica: an empty snapshot clears the page's view",
+          _ck_doc.read_cookies() == "", repr(_ck_doc.read_cookies()))
+else:
+    print("[SKIP] cookie replica checks - native ggcore not built")
+
 from concurrent.futures import ThreadPoolExecutor as _CookiePool
 _cookie_errors = []
 def _cookie_worker(i):

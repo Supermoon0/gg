@@ -72,8 +72,17 @@
       호출자는 서비스가 죽은 줄 모른다. 죽는 순간 in-flight였던 요청은
       정직하게 `NetworkCrashed`로 실패한다. gauntlet
       `service-crash-restarts-and-restores-grants` + unittest.
-      남은 후속: HttpOnly 제거 replica push(현재 `document.cookie`는
-      매번 서비스 왕복), OS 샌드박스.
+      **cookie replica 갱신(2026-07-25)**: `document.cookie`는 동기
+      읽기라 VM이 replica를 들고 있는데(로드 시 seed), 그 뒤 아무도
+      갱신하지 않았다. 즉 **`fetch()`로 로그인하면 서버가 준 세션 쿠키를
+      페이지가 탐색 전까지 볼 수 없었다** — local/service 양쪽 모두. 이제
+      fetch를 처리한 틱마다 jar의 현재 가시 상태로 스냅샷을 다시 민다.
+      `seed_cookies`는 merge라 **줄어들 수가 없어서** 새로
+      `set_cookie_snapshot`(clear 후 적용)을 추가했다 — 서버가 만료시킨
+      쿠키가 페이지 시야에서 사라져야 로그아웃이 성립한다. jar가 이미
+      HttpOnly를 걸러내므로 스냅샷은 정확히 스크립트가 알아도 되는
+      것뿐이다. smoke 3종 + unittest(로그인 왕복).
+      남은 후속: OS 샌드박스.
       이전 진행 기록: net gauntlet을 **IPC 경로에서도** 돌리기 시작했고
       (`ipc-initiator-survives-broker`, `ipc-cookie-samesite-cross-site-block`),
       그 과정에서 **isolated 모델의 쿠키 유출 결함**을 발견·수정했다

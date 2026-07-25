@@ -973,6 +973,30 @@ def service_script_fetch(doc, base_url, request, *, network_timeout=15.0,
         return False
 
 
+def refresh_cookie_replica(doc, page_url, *, network_backend=None,
+                           network_context=None):
+    """Re-point `document.cookie` at the jar's current visible state.
+
+    `document.cookie` is a synchronous read, so the VM keeps a replica
+    seeded at load. Nothing refreshed it afterwards, which meant a
+    `fetch()` that logged the user in set a session cookie the page
+    could not see until it navigated. The jar filters HttpOnly, so the
+    snapshot is exactly what script is allowed to know.
+    """
+    if doc is None or page_url is None or not getattr(page_url, "host", None):
+        return False
+    setter = getattr(doc, "set_cookie_snapshot", None)
+    if setter is None:
+        return False          # older wheel: only the merging seed exists
+    try:
+        network_backend = _resolve_network_backend(network_backend)
+        setter(network_backend.cookies_for(
+            page_url, context=network_context) or "")
+        return True
+    except Exception:
+        return False
+
+
 def sync_cookie_writes(doc, page_url, *, network_backend=None,
                        network_context=None):
     """Drain document.cookie setter strings into the scoped network jar."""

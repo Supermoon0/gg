@@ -1217,6 +1217,14 @@ impl Doc {
         }
     }
 
+    /// Replace the document.cookie replica with the host's snapshot
+    /// (HttpOnly already filtered out by the cookie layer). Unlike
+    /// seed_cookies this can remove, which is what makes a cookie the
+    /// server expired stop being visible.
+    fn set_cookie_snapshot(&mut self, cookies: String) {
+        self.ggvm().set_cookie_snapshot(&cookies);
+    }
+
     /// Read the current document.cookie-visible string.
     fn read_cookies(&self) -> String {
         self.ggjs

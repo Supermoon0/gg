@@ -52,6 +52,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"ok")
         elif self.path == "/cookie/echo":
             self._send(self.headers.get("Cookie", "").encode())
+        elif self.path == "/page":
+            body = b"<title>page</title><p id=x>page</p>"
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         else:
             self._send(b"hello" + self.path.encode())
 
@@ -209,6 +219,30 @@ class TestNetworkService(unittest.TestCase):
             with self.assertRaises(NetworkCrashed):
                 backend.request_text(net.URL(self.base + "/x"))
         finally:
+            backend.close()
+
+    def test_a_fetch_response_refreshes_what_document_cookie_sees(self):
+        """`document.cookie` is synchronous, so the VM reads a replica.
+        Nothing refreshed it after load, which meant a fetch() that
+        logged the user in set a session cookie the page could not see
+        until it navigated."""
+        from browser import native
+
+        if not native.available():
+            self.skipTest("native ggcore not built")
+        from browser.driver import Page
+
+        backend = create_network_backend("service")
+        page = None
+        try:
+            page = Page(network_backend=backend)
+            page.goto(self.base + "/page")
+            page.evaluate("fetch('/cookie/set')")
+            page.settle()
+            self.assertIn("sid=abc", page.evaluate("document.cookie"))
+        finally:
+            if page is not None:
+                page.close()
             backend.close()
 
     def test_unknown_model_is_refused(self):
