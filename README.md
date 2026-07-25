@@ -21,7 +21,10 @@ cd ggcore && cargo test --lib --no-default-features  # 198 통과 + 진단용 2�
 ```
 
 native shell은 renderer child process를 기본 사용한다. 디버그/테스트에서 로컬
-renderer를 강제하려면 `GG_PROCESS_MODEL=local`을 설정한다. Headless API는 명시적으로
+renderer를 강제하려면 `GG_PROCESS_MODEL=local`을 설정한다. renderer child는
+시작 시 OS 샌드박스를 스스로 적용한다(POSIX setrlimit CPU/메모리/파일 +
+no_new_privs, Windows Job object; `GG_RENDERER_CPU_S`/`GG_RENDERER_MEMORY_MB`
+로 조정, `GG_RENDERER_SANDBOX=0`으로 해제). Headless API는 명시적으로
 선택할 수 있다.
 
 ```python

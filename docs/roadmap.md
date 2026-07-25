@@ -20,7 +20,16 @@
 - [x] push/PR용 Windows·Linux Rust 및 브라우저 통합 CI 작성
 - [x] network/CSS/JSVM 검증기를 실패 종료 코드가 있는 gate로 전환
 - [x] 외부 사이트 바스켓을 화·금 정기 및 수동 workflow로 분리
-- [ ] GitHub에서 CI 최초 실행 후 플랫폼별 실패 수정
+- [ ] GitHub에서 CI 최초 실행 후 플랫폼별 실패 수정 — **진단 완료,
+      소유자 조치 대기 (2026-07-25)**: 워크플로 실행 이력 98건 전수 확인
+      결과, 7-23 오전까지 wheels.yml은 정상 성공했고 7-23 15:17부터는
+      ci/conformance/site-basket의 모든 실행(런 1~26)이 **잡 0개로 즉시
+      실패**한다. 세 YAML 모두 로컬 파싱 정상 → 코드/워크플로 문제가
+      아니라 계정 단위 Actions 차단(사설 저장소 무료 분 소진 또는 지출
+      한도/결제 문제)이다. GitHub Settings → Billing → Actions 사용량을
+      확인하거나 저장소를 public으로 전환해야 CI가 다시 돈다. 이 세션의
+      게이트는 로컬에서 전부 실행해 green을 확인했다(smoke 335, cargo
+      221, golden 7/7, gauntlet/conformance/evidence 통과).
 - [x] WPT 정적 testharness 하위 집합 실행기와 JSON 점수판 작성
 - [x] test262 하위 집합 실행기와 기능·variant별 실패 분류
 - [x] 내장 9개 계약 probe 기준선을 PR CI 회귀 gate로 연결
@@ -30,7 +39,15 @@
 - [x] renderer child, 검증된 JSON IPC, crash recovery 구현
 - [ ] shared-memory frame triple buffer와 browser chrome composite 구현
 - [ ] cookie/cache/socket을 network service로 이동하고 IPC gauntlet 통과
-- [ ] Windows/Linux renderer sandbox와 CPU/RSS/blob quota 적용
+- [x] Windows/Linux renderer sandbox와 CPU/RSS/blob quota 적용
+      (2026-07-25, browser/process/sandbox.py — POSIX setrlimit
+      CPU/AS/NOFILE/core + umask 077 + no_new_privs, Windows Job object
+      메모리/프로세스 상한·kill-on-close. env 튜닝 가능
+      (GG_RENDERER_CPU_S/MEMORY_MB/NOFILE, SANDBOX=0로 해제), 적용
+      내역은 hello_ack로 브라우저에 보고. BlobStore에 스토어 누적
+      256MB quota 추가. Linux에서 CPU 스핀 킬·1GiB 할당 폭탄 봉쇄까지
+      실검증(unittest 15종); Windows Job object 경로는 CI 차단으로
+      미실행 — CI 복구 후 확인 필요. seccomp급 syscall 필터는 후속)
 
 ### 1. Transition과 keyframes — 완료 (2026-07-25, browser/animation.py)
 
