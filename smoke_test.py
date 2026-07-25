@@ -3474,6 +3474,18 @@ if native.available():
             "  'framed=' + (window.top !== window);"
             "</script>"),
         "https://frother.test/child": ({}, '<p id=c>cross</p>'),
+        # same-origin contentDocument (the child DOM mirror)
+        "https://frdom.test/": (
+            {},
+            '<iframe id=same src="https://frdom.test/child"></iframe>'
+            '<iframe id=cross src="https://frother.test/child"></iframe>'
+            '<iframe id=sb sandbox="allow-scripts"'
+            ' src="https://frdom.test/child"></iframe>'),
+        "https://frdom.test/child": (
+            {},
+            '<title>child doc</title>'
+            '<h1 id=t class="a b">hello</h1>'
+            '<input id=v value="xyz"><p>p1</p><p>p2</p>'),
         # per-frame session history
         "https://frhist.test/": (
             {}, '<h1>top</h1>'
@@ -3589,6 +3601,70 @@ if native.available():
                   _msb._fd, net.URL("https://frmsg.test/")),
               "allow-same-origin is what grants the real origin back")
         _mpage.close()
+
+        # --- same-origin contentDocument (the child DOM mirror) ---
+        _dpg = Page()
+        _dpg.goto("https://frdom.test/", settle=True)
+        _dpg.frame("#same")
+        _dpg.pump_frames()
+
+        def _ev(js):
+            return _dpg.evaluate(js)
+
+        _cd = "document.getElementById('same').contentDocument"
+        check("iframe: a same-origin frame exposes contentDocument",
+              _ev(f"{_cd} !== null") is True
+              and _ev(f"{_cd}.URL") == "https://frdom.test/child",
+              repr(_ev(f"{_cd}.URL")))
+        check("iframe: the mirror answers the engine's real selector engine",
+              _ev(f"{_cd}.getElementById('t').textContent") == "hello"
+              and _ev(f"{_cd}.querySelectorAll('p').length") == 2
+              and _ev(f"{_cd}.querySelector('.a')"
+                      f" === {_cd}.getElementById('t')") is True,
+              "querySelector runs against a real dom::Document")
+        check("iframe: mirror element wrappers have stable identity",
+              _ev(f"{_cd}.getElementById('t')"
+                  f" === {_cd}.getElementById('t')") is True,
+              "a fresh object per read would break every === in page code")
+        check("iframe: mirror reads cover the common element properties",
+              _ev(f"{_cd}.getElementById('t').tagName") == "H1"
+              and _ev(f"{_cd}.getElementById('t').className") == "a b"
+              and _ev(f"{_cd}.getElementById('v').value") == "xyz"
+              and _ev(f"{_cd}.getElementById('t').getAttribute('id')") == "t"
+              and _ev(f"{_cd}.getElementById('t').getAttribute('no')") is None,
+              "a missing attribute is null, not empty string")
+        check("iframe: a scoped query stays inside its subtree",
+              _ev(f"{_cd}.body.querySelector('h1')"
+                  f" === {_cd}.getElementById('t')") is True
+              and _ev(f"{_cd}.getElementById('t').querySelector('p')"
+                      " === null") is True,
+              "an h1 has no p inside it")
+        # a write moves the mirror now and the real child on the pump
+        _ev(f"{_cd}.getElementById('t').setAttribute('data-x', '1')")
+        check("iframe: a mirror write is readable in the same turn",
+              _ev(f"{_cd}.getElementById('t').getAttribute('data-x')") == "1",
+              "the mirror moves optimistically, like a scroll write")
+        _dpg.pump_frames()
+        check("iframe: a mirror write reaches the real child document",
+              _dpg.frame("#same").query("#t").attr("data-x") == "1",
+              repr(_dpg.frame("#same").query("#t").attrs))
+        _ev(f"{_cd}.getElementById('t').textContent = 'rewritten'")
+        _dpg.pump_frames()
+        check("iframe: a textContent write replaces the child's content",
+              _dpg.frame("#same").text("#t") == "rewritten"
+              and _ev(f"{_cd}.getElementById('t').textContent")
+              == "rewritten",
+              repr(_dpg.frame("#same").text("#t")))
+        # the isolation proof, again at the DOM level
+        check("iframe: a cross-origin frame has no contentDocument",
+              _ev("document.getElementById('cross').contentDocument"
+                  " === null") is True,
+              "the host never pushes a mirror it did not authorize")
+        check("iframe: a sandboxed frame has no contentDocument either",
+              _ev("document.getElementById('sb').contentDocument"
+                  " === null") is True,
+              "an opaque origin is not the embedder's origin")
+        _dpg.close()
 
         # --- per-frame session history (browser/navigation.py) ---
         from browser import navigation as gg_nav  # noqa: E402

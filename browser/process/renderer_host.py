@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import json
 import multiprocessing
 import os
 import secrets
@@ -310,6 +311,25 @@ def renderer_worker(connection, renderer_id):
                         "logs": session.deliver_message(
                             p.get("data", "null"), p.get("origin", "null"),
                             int(p.get("source", 0)))})
+                elif kind == "renderer.set_frame_document":
+                    p = request["payload"]
+                    rows = json.loads(read_blob(p["rows_blob"]))
+                    # JSON flattens every tuple, including the nested
+                    # attribute pairs, and the binding wants real ones
+                    session.set_frame_document(
+                        int(p.get("node", 0)), int(p.get("handle", 0)),
+                        p.get("url", ""),
+                        [(a, b, c, d, [tuple(x) for x in e])
+                         for a, b, c, d, e in rows])
+                    _worker_result(channel, request, {"result": None})
+                elif kind == "renderer.take_frame_dom_writes":
+                    _worker_result(channel, request, {
+                        "writes": session.take_frame_dom_writes()})
+                elif kind == "renderer.set_text_content":
+                    p = request["payload"]
+                    session.set_text_content(
+                        int(p.get("node_idx", 0)), p.get("text", ""))
+                    _worker_result(channel, request, {"result": None})
                 elif kind == "renderer.restyle_diff":
                     outcome, patches = session.doc.restyle_diff(session.css_sources)
                     _worker_result(channel, request, {

@@ -1125,6 +1125,37 @@ impl Doc {
         self.ggvm().take_frame_writes()
     }
 
+    /// Publish a same-origin child's DOM so `iframe.contentDocument`
+    /// can read it. `rows` are the child's export() with the style
+    /// pairs stripped; empty rows drop the mirror.
+    fn set_frame_document(
+        &mut self,
+        node: u32,
+        handle: u32,
+        url: String,
+        rows: Vec<(i64, u64, Option<String>, Option<String>,
+                   Vec<(String, String)>)>,
+    ) {
+        self.ggvm().set_frame_document(node, handle, url, rows);
+    }
+
+    /// Drain mutations page JS made through a child's mirror, as
+    /// (handle, child node index, op, a, b, seq).
+    fn take_frame_dom_writes(
+        &mut self,
+    ) -> Vec<(u32, u32, u8, String, String, u64)> {
+        self.ggvm().take_frame_dom_writes()
+    }
+
+    /// `el.textContent = s` on this document's own DOM. The embedder
+    /// uses this to replay a same-origin write made through a mirror.
+    fn set_text_content(&mut self, node_idx: usize, text: String) {
+        let mut d = self.doc.borrow_mut();
+        if node_idx < d.nodes.len() {
+            d.set_text_content(node_idx, &text);
+        }
+    }
+
     /// Deliver one message into this document; returns console output.
     fn deliver_message(
         &mut self,

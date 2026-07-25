@@ -678,7 +678,12 @@ class FrameManager:
             self.session.set_frame_graph(
                 frame_bridge.frame_graph(self, root, owner_url))
         except Exception:
-            pass   # older wheel without the frame seam
+            return   # older wheel without the frame seam
+        # the mirror has to exist before `load` fires: reading
+        # `this.contentDocument` from an onload handler is the whole
+        # point of the same-origin case
+        if self.contexts is not None:
+            frame_bridge.sync_mirrors(self.contexts)
 
     def ordered_frames(self):
         """The frames this document embeds, in document order — the
@@ -710,7 +715,28 @@ class FrameManager:
         not to need advancing."""
         if self.contexts is None:
             return False
-        return frame_bridge.pump(self.contexts, log=_console_line)
+        frame_bridge.sync_mirrors(self.contexts)
+        messaged = frame_bridge.pump(self.contexts, log=_console_line)
+        wrote = frame_bridge.pump_dom_writes(
+            self.contexts, log=_console_line)
+        if wrote:
+            self._refresh_written_frames()
+        return messaged or wrote
+
+    def _refresh_written_frames(self):
+        """A parent write landed in a child: re-read its tree so the
+        next paint shows it."""
+        for fd in self.frames.values():
+            if fd.session is None:
+                continue
+            try:
+                fd.root = fd.session.frame()
+            except Exception:
+                continue
+            fd._version += 1
+            fd._layout_cache = None
+            if fd.subframes is not None:
+                fd.subframes._refresh_written_frames()
 
     def _lifecycle(self, node, ok):
         """Fire load/error on the owning <iframe> element."""

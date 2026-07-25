@@ -198,6 +198,17 @@ impl Document {
         }
     }
 
+    /// `el.textContent = s`: drop the subtree, leave one text node.
+    pub fn set_text_content(&mut self, idx: usize, text: &str) {
+        self.version += 1;
+        for child in std::mem::take(&mut self.nodes[idx].children) {
+            self.nodes[child].parent = None;
+        }
+        if !text.is_empty() {
+            self.new_text(text.to_string(), idx);
+        }
+    }
+
     pub fn new_text(&mut self, text: String, parent: usize) -> usize {
         self.version += 1;
         let idx = self.nodes.len();

@@ -21,7 +21,7 @@ use std::rc::Rc;
 use super::bytecode::{CapSrc, Instr, Module};
 use super::value::Value;
 use crate::dom;
-use crate::dom_api::{find_tag, query, serialize_children};
+use crate::dom_api::{find_tag, query, query_within, serialize_children};
 use crate::html;
 
 pub struct VmError {
@@ -303,6 +303,10 @@ pub(super) enum Native {
     /// fires the window's "message" listeners *and* `window.onmessage`,
     /// which plain `dispatchEvent` does not do.
     WinDeliver,
+    /// One operation on a same-origin child document's mirror.
+    /// `frame` is the context handle, `node` the child's arena index
+    /// (0 for document-level ops), `op` a `framedom::*` constant.
+    FrameDom { frame: u32, node: u32, op: u8 },
     /// encodeURI(Component)/decodeURI(Component)
     UriCoder { encode: bool, component: bool },
     /// Map()/WeakMap() constructor (weak = no difference: no GC)
@@ -853,6 +857,15 @@ pub(super) struct St {
     /// Pushed by the host after it decides what this document may
     /// reach; an entry missing here makes `contentWindow` read null.
     pub(super) frame_ctx: HashMap<u32, (u32, bool)>,
+    /// context handle -> the same-origin child DOM this document may
+    /// read. Only frames the host judged same-origin ever get one.
+    pub(super) frame_mirrors: HashMap<u32, FrameMirror>,
+    /// iframe element node index -> its `contentDocument` object
+    pub(super) frame_docs: HashMap<u32, Value>,
+    /// mutations page JS made through a mirror, as
+    /// (handle, child node index, op, arg a, arg b, seq). Applied to
+    /// the mirror immediately and to the real child by the host.
+    pub(super) frame_dom_writes: Vec<(u32, u32, u8, String, String, u64)>,
     /// Map/Set backing stores, keyed by the owning object's index
     /// (entries in insertion order; lookups are linear strict-eq)
     pub(super) map_data: HashMap<u32, Vec<(Value, Value)>>,
@@ -1000,6 +1013,9 @@ impl St {
             frame_seq: 0,
             ctx_proxies: HashMap::new(),
             frame_ctx: HashMap::new(),
+            frame_mirrors: HashMap::new(),
+            frame_docs: HashMap::new(),
+            frame_dom_writes: Vec::new(),
             map_data: HashMap::new(),
             set_data: HashMap::new(),
             style_nodes: HashMap::new(),
@@ -1492,6 +1508,25 @@ pub(super) enum Job {
         reject_fn: Value,
         pid: u32,
     },
+}
+
+/// A same-origin child document, rebuilt inside the *parent's* VM.
+///
+/// This is a copy, not a handle: the host serializes the child's arena
+/// and the parent reconstructs its own `dom::Document` from the bytes.
+/// The engine's real selector engine and serializer then run against
+/// it, so `contentDocument.querySelector(...)` is the same code path a
+/// document uses on itself — while there is still no pointer from one
+/// document's heap into another's.
+pub(super) struct FrameMirror {
+    pub(super) doc: dom::Document,
+    /// child arena index -> mirror index, and back
+    pub(super) idx_of: HashMap<u32, usize>,
+    pub(super) ridx_of: Vec<u32>,
+    /// child arena index -> the one element wrapper handed to JS, so
+    /// `d.getElementById('x') === d.getElementById('x')` holds
+    pub(super) wrappers: HashMap<u32, Value>,
+    pub(super) url: String,
 }
 
 pub(super) struct Timer {
@@ -6058,6 +6093,148 @@ fn do_native(
             }
             Ok(Value::UNDEFINED)
         }
+        Native::FrameDom { frame, node, op } => {
+            let a0 = if argc > 0 {
+                to_display(st, st.regs[args_base])
+            } else {
+                String::new()
+            };
+            let a1 = if argc > 1 {
+                to_display(st, st.regs[args_base + 1])
+            } else {
+                String::new()
+            };
+            // A mirror the host dropped (the frame navigated away, or
+            // went cross-origin) makes every read empty and every
+            // write a no-op — the wrapper is detached, not an error.
+            let Some(m) = st.frame_mirrors.get(&frame) else {
+                return Ok(Value::NULL);
+            };
+            let doc_op = op >= framedom::DOC_QUERY;
+            let idx = if doc_op {
+                m.doc.root
+            } else {
+                match m.idx_of.get(&node) {
+                    Some(&i) if i < m.doc.nodes.len() => i,
+                    _ => return Ok(Value::NULL),
+                }
+            };
+            // reads first: they only borrow the mirror
+            let text = match op {
+                framedom::GET_TEXT => Some(m.doc.collect_text(idx)),
+                framedom::GET_HTML => Some(serialize_children(&m.doc, idx)),
+                framedom::GET_ID => Some(
+                    m.doc.nodes[idx].attr("id").unwrap_or("").to_string()),
+                framedom::GET_CLASS => Some(
+                    m.doc.nodes[idx].attr("class").unwrap_or("").to_string()),
+                framedom::GET_TAG => Some(
+                    m.doc.nodes[idx].tag.clone().unwrap_or_default()
+                        .to_uppercase()),
+                framedom::GET_VALUE => Some(
+                    m.doc.nodes[idx].attr("value").unwrap_or("").to_string()),
+                framedom::DOC_TITLE => Some(
+                    find_tag(&m.doc, "title")
+                        .map(|t| m.doc.collect_text(t))
+                        .unwrap_or_default()),
+                framedom::DOC_URL => Some(m.url.clone()),
+                framedom::GET_ATTR => match m.doc.nodes[idx].attr(&a0) {
+                    Some(v) => Some(v.to_string()),
+                    None => return Ok(Value::NULL),
+                },
+                framedom::HAS_ATTR => {
+                    return Ok(Value::boolean(
+                        m.doc.nodes[idx].attr(&a0).is_some()));
+                }
+                framedom::MATCHES => {
+                    let hits = query(&m.doc, &a0, false);
+                    return Ok(Value::boolean(hits.contains(&idx)));
+                }
+                _ => None,
+            };
+            if let Some(t) = text {
+                return Ok(push_str(st, t));
+            }
+            // node-returning reads
+            let picked: Option<Vec<usize>> = match op {
+                framedom::QUERY | framedom::DOC_QUERY => {
+                    Some(query_within(&m.doc, idx, &a0, true))
+                }
+                framedom::QUERY_ALL | framedom::DOC_QUERY_ALL => {
+                    Some(query_within(&m.doc, idx, &a0, false))
+                }
+                framedom::DOC_BY_ID => Some(
+                    m.doc.get_element_by_id(&a0).into_iter().take(1).collect()),
+                framedom::DOC_BY_TAG => Some(
+                    query_within(&m.doc, m.doc.root, &a0, false)),
+                framedom::DOC_BODY => Some(
+                    find_tag(&m.doc, "body").into_iter().collect()),
+                framedom::DOC_ROOT => Some(
+                    find_tag(&m.doc, "html").into_iter().collect()),
+                framedom::GET_CHILDREN => Some(
+                    m.doc.nodes[idx].children.iter().copied()
+                        .filter(|&c| m.doc.nodes[c].is_element()).collect()),
+                framedom::GET_PARENT => Some(
+                    m.doc.nodes[idx].parent
+                        .filter(|&p| m.doc.nodes[p].is_element())
+                        .into_iter().collect()),
+                _ => None,
+            };
+            if let Some(hits) = picked {
+                let many = matches!(op, framedom::QUERY_ALL
+                                    | framedom::DOC_QUERY_ALL
+                                    | framedom::DOC_BY_TAG
+                                    | framedom::GET_CHILDREN);
+                let ridxs: Vec<u32> = hits.iter()
+                    .filter_map(|&i| m.ridx_of.get(i).copied())
+                    .collect();
+                if many {
+                    let elems: Vec<Value> = ridxs.iter()
+                        .map(|&r| frame_element_value(st, frame, r))
+                        .collect();
+                    return Ok(new_array(st, elems));
+                }
+                return Ok(match ridxs.first() {
+                    Some(&r) => frame_element_value(st, frame, r),
+                    None => Value::NULL,
+                });
+            }
+            // writes: the mirror moves now, the real child on the next
+            // host pump (the queue_scroll pattern), so a read-after-
+            // write inside one turn is coherent
+            if !framedom::is_write(op) {
+                return Ok(Value::UNDEFINED);
+            }
+            let m = st.frame_mirrors.get_mut(&frame).unwrap();
+            let (a, b) = match op {
+                framedom::SET_TEXT => {
+                    m.doc.set_text_content(idx, &a0);
+                    (a0.clone(), String::new())
+                }
+                framedom::SET_ID => {
+                    m.doc.set_attr(idx, "id", &a0);
+                    ("id".to_string(), a0.clone())
+                }
+                framedom::SET_CLASS => {
+                    m.doc.set_attr(idx, "class", &a0);
+                    ("class".to_string(), a0.clone())
+                }
+                framedom::SET_VALUE => {
+                    m.doc.set_attr(idx, "value", &a0);
+                    ("value".to_string(), a0.clone())
+                }
+                framedom::SET_ATTR => {
+                    m.doc.set_attr(idx, &a0, &a1);
+                    (a0.clone(), a1.clone())
+                }
+                framedom::REMOVE_ATTR => {
+                    m.doc.remove_attr(idx, &a0);
+                    (a0.clone(), String::new())
+                }
+                _ => (String::new(), String::new()),
+            };
+            queue_frame_write(st, frame, node, op, a, b);
+            Ok(Value::UNDEFINED)
+        }
         Native::UriCoder { encode, component } => {
             let s = if argc > 0 {
                 to_display(st, st.regs[args_base])
@@ -7653,6 +7830,48 @@ fn scroll_args(st: &mut St, a0: Value, a1: Value) -> (Option<f64>, Option<f64>) 
     (left, top)
 }
 
+/// Operations available on a same-origin child document's mirror.
+pub(super) mod framedom {
+    // element reads
+    pub const GET_TEXT: u8 = 0;
+    pub const GET_HTML: u8 = 1;
+    pub const GET_ID: u8 = 2;
+    pub const GET_CLASS: u8 = 3;
+    pub const GET_TAG: u8 = 4;
+    pub const GET_VALUE: u8 = 5;
+    pub const GET_CHILDREN: u8 = 6;
+    pub const GET_PARENT: u8 = 7;
+    // element writes (mirror first, then queued for the host)
+    pub const SET_TEXT: u8 = 8;
+    pub const SET_ID: u8 = 9;
+    pub const SET_CLASS: u8 = 10;
+    pub const SET_VALUE: u8 = 11;
+    // element methods
+    pub const GET_ATTR: u8 = 12;
+    pub const SET_ATTR: u8 = 13;
+    pub const REMOVE_ATTR: u8 = 14;
+    pub const HAS_ATTR: u8 = 15;
+    pub const QUERY: u8 = 16;
+    pub const QUERY_ALL: u8 = 17;
+    pub const MATCHES: u8 = 18;
+    pub const CLICK: u8 = 19;
+    // document-level (node is ignored)
+    pub const DOC_QUERY: u8 = 20;
+    pub const DOC_QUERY_ALL: u8 = 21;
+    pub const DOC_BY_ID: u8 = 22;
+    pub const DOC_BY_TAG: u8 = 23;
+    pub const DOC_BODY: u8 = 24;
+    pub const DOC_ROOT: u8 = 25;
+    pub const DOC_TITLE: u8 = 26;
+    pub const DOC_URL: u8 = 27;
+
+    /// Writes the host has to replay against the real child document.
+    pub fn is_write(op: u8) -> bool {
+        matches!(op, SET_TEXT | SET_ID | SET_CLASS | SET_VALUE
+                 | SET_ATTR | REMOVE_ATTR | CLICK)
+    }
+}
+
 /// The `Window` object JS sees for another browsing context.
 ///
 /// A proxy carries `postMessage` and the handful of properties that
@@ -7685,6 +7904,89 @@ pub(super) fn window_proxy(st: &mut St, ctx: u32) -> Value {
     raw_set_prop(st, oi, k, empty);
     st.ctx_proxies.insert(ctx, w);
     w
+}
+
+/// The object JS gets for one element of a mirrored child document.
+///
+/// Cached per node, so identity comparisons hold. Property reads that
+/// look like fields (`textContent`, `id`, ...) are real accessors, not
+/// snapshots: the mirror can be rewritten under them by a write or a
+/// re-push, and a stale snapshot would silently lie.
+pub(super) fn frame_element_value(
+    st: &mut St,
+    frame: u32,
+    node: u32,
+) -> Value {
+    if let Some(m) = st.frame_mirrors.get(&frame) {
+        if let Some(&v) = m.wrappers.get(&node) {
+            return v;
+        }
+    }
+    let w = new_plain_object(st);
+    let oi = w.index() as usize;
+    let one = st.intern_name("nodeType");
+    raw_set_prop(st, oi, one, Value::int(1));
+    // accessor pairs; a missing setter makes the property read-only
+    for (name, get, set) in [
+        ("textContent", framedom::GET_TEXT, Some(framedom::SET_TEXT)),
+        ("innerText", framedom::GET_TEXT, Some(framedom::SET_TEXT)),
+        ("innerHTML", framedom::GET_HTML, None),
+        ("id", framedom::GET_ID, Some(framedom::SET_ID)),
+        ("className", framedom::GET_CLASS, Some(framedom::SET_CLASS)),
+        ("tagName", framedom::GET_TAG, None),
+        ("nodeName", framedom::GET_TAG, None),
+        ("value", framedom::GET_VALUE, Some(framedom::SET_VALUE)),
+        ("children", framedom::GET_CHILDREN, None),
+        ("parentElement", framedom::GET_PARENT, None),
+    ] {
+        let k = st.intern_name(name);
+        let g = make_native(st, Native::FrameDom { frame, node, op: get });
+        let sfn = match set {
+            Some(op) => make_native(st, Native::FrameDom { frame, node, op }),
+            None => Value::UNDEFINED,
+        };
+        st.accessors.insert((oi as u32, k), (g, sfn));
+    }
+    st.objects[oi].has_accessors = true;
+    for (name, op) in [
+        ("getAttribute", framedom::GET_ATTR),
+        ("setAttribute", framedom::SET_ATTR),
+        ("removeAttribute", framedom::REMOVE_ATTR),
+        ("hasAttribute", framedom::HAS_ATTR),
+        ("querySelector", framedom::QUERY),
+        ("querySelectorAll", framedom::QUERY_ALL),
+        ("matches", framedom::MATCHES),
+        ("click", framedom::CLICK),
+    ] {
+        let k = st.intern_name(name);
+        let f = make_native(st, Native::FrameDom { frame, node, op });
+        raw_set_prop(st, oi, k, f);
+    }
+    if let Some(m) = st.frame_mirrors.get_mut(&frame) {
+        m.wrappers.insert(node, w);
+    }
+    w
+}
+
+/// Install a read-only accessor on an object (page.rs cannot touch
+/// `Obj.has_accessors` directly — the field is private to this module).
+pub(super) fn define_getter(
+    st: &mut St,
+    oi: usize,
+    name: &str,
+    getter: Value,
+) {
+    let k = st.intern_name(name);
+    st.accessors.insert((oi as u32, k), (getter, Value::UNDEFINED));
+    st.objects[oi].has_accessors = true;
+}
+
+/// Record a mutation for the host to replay against the real child.
+fn queue_frame_write(st: &mut St, frame: u32, node: u32, op: u8,
+                     a: String, b: String) {
+    st.frame_seq += 1;
+    let seq = st.frame_seq;
+    st.frame_dom_writes.push((frame, node, op, a, b, seq));
 }
 
 /// Parse a JSON payload back into a value in *this* document's heap.
@@ -8504,11 +8806,13 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
                 None => Value::NULL,
             });
         }
-        "contentDocument" => {
-            // Same-origin DOM access is a separate, larger seam; until
-            // it lands this reads null rather than a half-real stub a
-            // page would branch on.
-            return Ok(Value::NULL);
+        "contentDocument" | "contentWindowDocument" => {
+            // Only frames the host judged same-origin ever get a
+            // mirror pushed, so this is null for everything else.
+            return Ok(match st.frame_docs.get(&node) {
+                Some(&d) => d,
+                None => Value::NULL,
+            });
         }
         "classList" => {
             // a fresh object whose methods carry the node id

@@ -6,6 +6,7 @@
 //! through the native document bridge.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::bytecode::Module;
@@ -1587,8 +1588,121 @@ impl PageVm {
         self.st.frame_ctx.clear();
         for (node, handle, same_origin) in frames {
             vm::window_proxy(&mut self.st, handle);
+            if !same_origin {
+                // a frame that navigated cross-origin must lose the
+                // DOM the parent could read a moment ago
+                self.st.frame_mirrors.remove(&handle);
+                self.st.frame_docs.remove(&node);
+            }
             self.st.frame_ctx.insert(node, (handle, same_origin));
         }
+    }
+
+    /// Publish a same-origin child's DOM into this document, so
+    /// `iframe.contentDocument` can read it.
+    ///
+    /// `rows` are the child's exported arena as
+    /// (parent, index, tag, text, attrs) — the host strips the style
+    /// pairs `export()` also carries. The mirror is a *rebuild*, not a
+    /// handle: the engine's own selector engine then runs against a
+    /// `dom::Document` that lives in this VM. Empty rows drop the
+    /// mirror, which is how a frame that went away reads null again.
+    pub fn set_frame_document(
+        &mut self,
+        node: u32,
+        handle: u32,
+        url: String,
+        rows: Vec<(i64, u64, Option<String>, Option<String>,
+                   Vec<(String, String)>)>,
+    ) {
+        if rows.is_empty() {
+            self.st.frame_mirrors.remove(&handle);
+            self.st.frame_docs.remove(&node);
+            return;
+        }
+        // `with_capacity` starts with an empty arena, so the first
+        // row has to *create* the root rather than be mapped onto a
+        // node that does not exist yet.
+        let mut doc = dom::Document::with_capacity(rows.len());
+        let mut idx_of: HashMap<u32, usize> = HashMap::new();
+        let mut ridx_of: Vec<u32> = Vec::with_capacity(rows.len());
+        for (parent, ridx, tag, text, attrs) in rows {
+            let ridx = ridx as u32;
+            let p = if parent < 0 {
+                None
+            } else {
+                match idx_of.get(&(parent as u32)) {
+                    Some(&p) => Some(p),
+                    // parent was pruned: so is this whole subtree
+                    None => continue,
+                }
+            };
+            let new = match (tag, p) {
+                (Some(t), _) => doc.new_element(t, attrs, p),
+                // a text node with no parent cannot exist; skip it
+                (None, Some(p)) => doc.new_text(text.unwrap_or_default(), p),
+                (None, None) => continue,
+            };
+            if idx_of.is_empty() {
+                doc.root = new;
+            }
+            idx_of.insert(ridx, new);
+            while ridx_of.len() <= new {
+                ridx_of.push(u32::MAX);
+            }
+            ridx_of[new] = ridx;
+        }
+        // a rebuilt DOM invalidates every wrapper handed out before:
+        // the nodes they named may not exist any more
+        self.st.frame_mirrors.insert(handle, vm::FrameMirror {
+            doc,
+            idx_of,
+            ridx_of,
+            wrappers: HashMap::new(),
+            url: url.clone(),
+        });
+        let d = self.build_frame_document(handle, url);
+        self.st.frame_docs.insert(node, d);
+    }
+
+    fn build_frame_document(&mut self, frame: u32, url: String) -> Value {
+        let d = new_plain_object(&mut self.st);
+        let oi = d.index() as usize;
+        for (name, op) in [
+            ("body", vm::framedom::DOC_BODY),
+            ("documentElement", vm::framedom::DOC_ROOT),
+            ("title", vm::framedom::DOC_TITLE),
+            ("URL", vm::framedom::DOC_URL),
+        ] {
+            let g = make_native(
+                &mut self.st, Native::FrameDom { frame, node: 0, op });
+            vm::define_getter(&mut self.st, oi, name, g);
+        }
+        for (name, op) in [
+            ("querySelector", vm::framedom::DOC_QUERY),
+            ("querySelectorAll", vm::framedom::DOC_QUERY_ALL),
+            ("getElementById", vm::framedom::DOC_BY_ID),
+            ("getElementsByTagName", vm::framedom::DOC_BY_TAG),
+        ] {
+            let f = make_native(
+                &mut self.st, Native::FrameDom { frame, node: 0, op });
+            self.set_object_prop(d, name, f);
+        }
+        let loc = new_plain_object(&mut self.st);
+        let href = vm::push_str(&mut self.st, url);
+        self.set_object_prop(loc, "href", href);
+        self.set_object_prop(d, "location", loc);
+        let ready = vm::push_str(&mut self.st, "complete".to_string());
+        self.set_object_prop(d, "readyState", ready);
+        d
+    }
+
+    /// Drain the mutations page JS made through a child's mirror, as
+    /// (handle, child node index, op, a, b, seq).
+    pub fn take_frame_dom_writes(
+        &mut self,
+    ) -> Vec<(u32, u32, u8, String, String, u64)> {
+        std::mem::take(&mut self.st.frame_dom_writes)
     }
 
     /// Drain the `postMessage` calls page scripts made since the last

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import json
 import os
 import time
 from typing import Protocol, runtime_checkable
@@ -81,6 +82,12 @@ class RendererSession(Protocol):
     def take_frame_writes(self): ...
 
     def deliver_message(self, data_json, origin, source_handle): ...
+
+    def set_frame_document(self, node, handle, url, rows): ...
+
+    def take_frame_dom_writes(self): ...
+
+    def set_text_content(self, node_idx, text): ...
 
     def restyle_diff(self): ...
 
@@ -333,6 +340,23 @@ class LocalRendererSession:
             return list(self.doc.take_frame_writes())
         return []
 
+    def set_frame_document(self, node, handle, url, rows):
+        if self.doc is None or not hasattr(self.doc, "set_frame_document"):
+            return None
+        return self.doc.set_frame_document(
+            int(node), int(handle), str(url), [tuple(r) for r in rows])
+
+    def take_frame_dom_writes(self):
+        if self.doc is not None \
+                and hasattr(self.doc, "take_frame_dom_writes"):
+            return list(self.doc.take_frame_dom_writes())
+        return []
+
+    def set_text_content(self, node_idx, text):
+        if self.doc is None or not hasattr(self.doc, "set_text_content"):
+            return None
+        return self.doc.set_text_content(int(node_idx), str(text))
+
     def deliver_message(self, data_json, origin, source_handle):
         if self.doc is None or not hasattr(self.doc, "deliver_message"):
             return []
@@ -452,6 +476,15 @@ class _RemoteDocProxy:
     def deliver_message(self, data_json, origin, source_handle):
         return self._session.deliver_message(
             data_json, origin, source_handle)
+
+    def set_frame_document(self, node, handle, url, rows):
+        return self._session.set_frame_document(node, handle, url, rows)
+
+    def take_frame_dom_writes(self):
+        return self._session.take_frame_dom_writes()
+
+    def set_text_content(self, node_idx, text):
+        return self._session.set_text_content(node_idx, text)
 
     def restyle_diff(self, _css_sources=None):
         return self._session.restyle_diff()
@@ -659,6 +692,34 @@ class RemoteRendererSession:
                 "data": str(data_json), "origin": str(origin),
                 "source": int(source_handle),
             }, timeout=self.timeout).get("logs", [])
+
+    def set_frame_document(self, node, handle, url, rows):
+        from .ipc.blobs import BlobStore
+
+        # a mirror can be thousands of nodes; MAX_CONTROL_BYTES is 1MiB
+        blobs = BlobStore()
+        try:
+            return self.host.call(
+                "renderer.set_frame_document", {
+                    "node": int(node), "handle": int(handle),
+                    "url": str(url),
+                    "rows_blob": blobs.pack(
+                        json.dumps(rows).encode("utf-8"),
+                        "application/json"),
+                }, timeout=self.timeout).get("result")
+        finally:
+            blobs.release_all()
+
+    def take_frame_dom_writes(self):
+        return self.host.call(
+            "renderer.take_frame_dom_writes",
+            timeout=self.timeout).get("writes", [])
+
+    def set_text_content(self, node_idx, text):
+        return self.host.call(
+            "renderer.set_text_content",
+            {"node_idx": int(node_idx), "text": str(text)},
+            timeout=self.timeout).get("result")
 
     def restyle_diff(self):
         response = self.host.call("renderer.restyle_diff", timeout=self.timeout)

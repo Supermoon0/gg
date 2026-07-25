@@ -30,6 +30,37 @@ pub(crate) fn query(
     out
 }
 
+/// `query`, but restricted to the descendants of `root`.
+///
+/// Selectors still match against the whole document (a descendant
+/// combinator may reach above `root`, exactly as in a browser); only
+/// the *results* are limited to the subtree.
+pub(crate) fn query_within(
+    doc: &Document,
+    root: usize,
+    selector_text: &str,
+    first_only: bool,
+) -> Vec<usize> {
+    if root == doc.root {
+        return query(doc, selector_text, first_only);
+    }
+    let mut out = Vec::new();
+    for idx in query(doc, selector_text, false) {
+        let mut cur = doc.nodes[idx].parent;
+        while let Some(p) = cur {
+            if p == root {
+                out.push(idx);
+                if first_only {
+                    return out;
+                }
+                break;
+            }
+            cur = doc.nodes[p].parent;
+        }
+    }
+    out
+}
+
 pub(crate) fn find_tag(doc: &Document, tag: &str) -> Option<usize> {
     doc.nodes
         .iter()

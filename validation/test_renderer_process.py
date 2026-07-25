@@ -191,6 +191,48 @@ class TestRendererProcess(unittest.TestCase):
         finally:
             session.close()
 
+    @unittest.skipUnless(native.available(), "native ggcore not built")
+    def test_frame_dom_mirror_crosses_the_json_boundary(self):
+        """A mirror is thousands of rows, so it travels as a blob — and
+        JSON flattens every tuple in it, including the nested attribute
+        pairs the binding insists on."""
+        body = "<iframe id='f'></iframe>"
+        session = RemoteRendererSession(RecordingBackend(body))
+        try:
+            session.commit(net.URL("https://example.test/"), body)
+            ridx = int([r for r in session.export()
+                        if r[2] == "iframe"][0][1])
+            session.set_frame_graph([(ridx, 4, True)])
+            rows = [
+                (-1, 0, "html", None, []),
+                (0, 1, "body", None, []),
+                (1, 2, "h1", None, [("id", "t"), ("class", "a")]),
+                (2, 3, None, "hello", []),
+            ]
+            session.set_frame_document(ridx, 4, "https://example.test/c", rows)
+            cd = "document.getElementById('f').contentDocument"
+            self.assertEqual(
+                session.run([f"console.log({cd}.getElementById('t')"
+                             ".textContent)"]),
+                ["hello"])
+            self.assertEqual(
+                session.run([f"console.log({cd}.querySelector('.a')"
+                             f" === {cd}.getElementById('t'))"]),
+                ["true"])
+            # a write comes back out as (handle, child node, op, a, b, seq)
+            session.run([f"{cd}.getElementById('t')"
+                         ".setAttribute('data-x', '1')"])
+            writes = [tuple(w) for w in session.take_frame_dom_writes()]
+            self.assertEqual([(int(w[0]), int(w[1]), int(w[2]), w[3], w[4])
+                              for w in writes],
+                             [(4, 2, 13, "data-x", "1")])
+            # an empty push drops the mirror, as a frame going away must
+            session.set_frame_document(ridx, 4, "", [])
+            self.assertEqual(session.run([f"console.log({cd} === null)"]),
+                             ["true"])
+        finally:
+            session.close()
+
     def test_large_commit_uses_blob_and_stale_response_is_discarded(self):
         session = RemoteRendererSession(RecordingBackend())
         try:

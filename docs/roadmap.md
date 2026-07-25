@@ -70,7 +70,7 @@
 남은 후속 후보: transitionend/animation* DOM 이벤트 발화, per-keyframe
 timing-function 오버라이드.
 
-### 2. iframe 문서 격리 — contentDocument만 남음 (2026-07-25)
+### 2. iframe 문서 격리 — 완료 (2026-07-25, browser/frames.py)
 
 - [x] 자식 문서의 URL/base URL, origin, cookie/storage context 분리
       (프레임마다 독립 gg-js Doc/세션, 쿠키는 자식 origin jar로만,
@@ -80,9 +80,8 @@ timing-function 오버라이드.
       구동, load/error는 부모 문서의 iframe 요소에 dispatch)
 - [x] cross-origin DOM 접근 차단 — 문서 간 DOM arena를 공유하지 않으므로
       구조적으로 불가능; 드라이버는 Page.frame()으로 자식 문서 핸들 제공
-- [~] same-origin 동기 스크립팅(contentDocument/contentWindow)과
-      postMessage 채널 — **메시징 완료(2026-07-25,
-      browser/frame_bridge.py), contentDocument는 후속**.
+- [x] same-origin 동기 스크립팅(contentDocument/contentWindow)과
+      postMessage 채널 — **완료 (2026-07-25, browser/frame_bridge.py)**.
       문서마다 독립 VM이므로 `postMessage`는 **객체 그래프가 아니라
       바이트의 채널**이다: 보내는 쪽 VM에서 JSON으로 직렬화하고, 호스트가
       라우팅하고, 받는 쪽 VM이 자기 힙으로 파싱한다. 한 문서의 Value에서
@@ -104,8 +103,33 @@ timing-function 오버라이드.
       함께 고친 것: `FrameManager.dispose()`가 프레임 예산을 반환하지
       않아 프레임 트리를 갈아끼우는 페이지가 쓰지도 않는 예산을 소진하던
       누수. smoke 7종 + IPC 경계 unittest.
-      남은 후속: `contentDocument`(부모 VM 안의 자식 DOM 미러),
-      MessageChannel의 문서 간 port 전달, `frameElement` 실제 노드.
+      **contentDocument(2026-07-25)**: 자식 DOM을 부모 VM 안에
+      **미러**로 세운다 — 핸들이 아니라 복사본이다. 호스트가 자식 arena를
+      직렬화하고 부모가 자기 안에 `dom::Document`를 재구축한 뒤, 엔진의
+      **진짜 셀렉터 엔진**(`dom_api::query`가 임의의 `&Document`를 받는다)과
+      직렬화기가 그 위에서 돈다. 즉 `contentDocument.querySelector(...)`는
+      문서가 자기 자신에게 쓰는 것과 **같은 코드 경로**이면서, 여전히 한
+      문서의 힙에서 다른 문서로 가는 포인터는 없다.
+      읽기: `getElementById`/`querySelector(All)`/`getElementsByTagName`/
+      `body`/`documentElement`/`title`/`URL`, 요소의 `textContent`/
+      `innerHTML`/`id`/`className`/`tagName`/`value`/`children`/
+      `parentElement`/`getAttribute`/`hasAttribute`/`matches`. 프로퍼티는
+      스냅샷이 아니라 **실제 accessor**다 — 미러는 쓰기나 재푸시로 아래에서
+      바뀔 수 있고 스냅샷은 조용히 거짓말을 하게 된다. 요소 래퍼는 노드별
+      캐시라 `d.getElementById('x') === d.getElementById('x')`가 성립한다.
+      쓰기(`setAttribute`/`removeAttribute`/`textContent=`/`className=`/
+      `value=`/`click()`)는 **미러에 먼저 적용하고 호스트가 실제 자식에
+      재생**한다(스크롤 쓰기와 같은 낙관적 큐 패턴) — 같은 턴 안의
+      read-after-write가 일관된다. 미러는 자식 DOM 버전이 움직였을 때만
+      다시 푸시한다(재구축은 부모가 들고 있던 래퍼를 전부 무효화하므로).
+      `load` 발화 **전에** 푸시하는데, `iframe.onload`에서
+      `this.contentDocument`를 읽는 것이 same-origin 케이스의 전부이기
+      때문이다. cross-origin·불투명 origin 프레임은 미러를 아예 받지
+      못하므로 `contentDocument`가 null이다. 4000노드 상한.
+      함께 추가: `Document::set_text_content`, `dom_api::query_within`
+      (서브트리 한정 결과), `Doc.set_text_content` pyo3 seam.
+      남은 후속: MessageChannel의 문서 간 port 전달, `frameElement` 실제
+      노드, `innerHTML` 쓰기(파서가 필요).
 - [x] iframe layout/clip/scroll과 중첩 hit-test 구현
       (대체 요소 300x150 기본, width/height 속성, 프레임 내부 휠 스크롤,
       자식 링크 클릭은 프레임 내 탐색)

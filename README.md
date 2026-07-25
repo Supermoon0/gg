@@ -154,6 +154,14 @@ VM이 자기 힙으로 파싱한다 — 한 문서의 값에서 다른 문서로
 같은 사이트라도 불투명 origin(`e.origin === "null"`)이며, cross-origin
 프레임은 `contentWindow`는 주되 `document`/`location`은 `undefined`다.
 
+same-origin 프레임은 `contentDocument`로 DOM까지 읽는다. 이것도 핸들이 아니라
+**미러**다 — 호스트가 자식 arena를 직렬화하고 부모가 자기 안에 문서를 재구축한
+뒤 엔진의 진짜 셀렉터 엔진이 그 위에서 돈다. 요소 래퍼는 노드별 캐시라
+`d.getElementById('x') === d.getElementById('x')`가 성립하고, 프로퍼티는
+스냅샷이 아니라 실제 accessor다. 쓰기는 미러에 먼저 적용되고 호스트가 실제
+자식에 재생하므로 같은 턴의 read-after-write가 일관된다. cross-origin이나
+불투명 origin 프레임은 미러를 받지 못해 `contentDocument`가 null이다.
+
 프레임 안의 링크를 따라가는 것은 그 자체로 세션 히스토리 항목이라, 뒤로가기는
 페이지를 다시 받지 않고 프레임을 되돌린다. 항목은 프레임마다 깊이별 문서 순서
 경로로 한 행을 들고 있고(arena index는 DOM 재구축마다 갈리므로), 부모 프레임이
@@ -227,7 +235,6 @@ disabled/value 등 상태, landmark·heading 아웃라인, aria-hidden 서브트
 
 - baseline JIT, GC, 레이아웃 러스트 이식 (React 실측 병목을 기준으로 결정)
 - HTTP/2, `<video>`/WebGL, 로그인 호환성, transition/animation DOM 이벤트
-- iframe `contentDocument`(부모 VM 안의 자식 DOM 미러)
 - [browser/renderer/network 프로세스 격리와 IPC](docs/process-isolation-ipc.md)
 - process-neutral local seam: `browser/renderer_session.py`, `browser/network_backend.py`
 

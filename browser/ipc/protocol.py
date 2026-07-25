@@ -28,6 +28,8 @@ MESSAGE_TYPES = {
     "renderer.set_scroll_state", "renderer.take_scroll_writes",
     "renderer.take_scroll_into_view", "renderer.set_frame_graph",
     "renderer.take_frame_writes", "renderer.deliver_message",
+    "renderer.set_frame_document", "renderer.take_frame_dom_writes",
+    "renderer.set_text_content",
     "renderer.restyle_diff", "renderer.close", "renderer.shutdown",
     "renderer.test_crash", "renderer.test_hang", "renderer.test_stale",
     "renderer.response", "renderer.error",

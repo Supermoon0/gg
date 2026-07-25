@@ -31,6 +31,24 @@ CTX_SELF = 0xFFFFFFFF
 CTX_PARENT = 0xFFFFFFFE
 CTX_TOP = 0xFFFFFFFD
 
+# A same-origin parent may read the child's DOM through a *mirror*: the
+# host serializes the child's arena and the parent rebuilds its own copy
+# (see Page::set_frame_document). Big documents are not worth copying
+# into every embedder on every change, so the mirror is capped.
+MAX_MIRROR_NODES = 4000
+
+# Mutation ops a mirror write can carry (vm.rs `framedom`).
+OP_SET_TEXT = 8
+OP_SET_ID = 9
+OP_SET_CLASS = 10
+OP_SET_VALUE = 11
+OP_SET_ATTR = 13
+OP_REMOVE_ATTR = 14
+OP_CLICK = 19
+
+# ops whose (a, b) is already an attribute name/value pair
+_ATTR_OPS = {OP_SET_ID: "id", OP_SET_CLASS: "class", OP_SET_VALUE: "value"}
+
 
 def effective_origin(fd):
     """A frame's origin for scripting purposes, or None when opaque.
@@ -237,6 +255,114 @@ def pump(table, log=None):
     return delivered
 
 
+def mirror_rows(session):
+    """The child's arena as `set_frame_document` wants it.
+
+    `export()` rows carry the computed style pairs too; those are the
+    bulk of the payload and the parent's mirror has no use for them —
+    it answers DOM queries, not layout.
+    """
+    try:
+        rows = session.export()
+    except Exception:
+        return None
+    if len(rows) > MAX_MIRROR_NODES:
+        return None
+    return [tuple(row[:5]) for row in rows]
+
+
+def apply_dom_write(fd, node, op, a, b):
+    """Replay one mirror mutation against the real child document.
+
+    Returns a console line when the write could not be applied, so a
+    divergence between what the parent sees and what the child holds is
+    never silent."""
+    session = getattr(fd, "session", None)
+    if session is None:
+        return "frame write dropped: child document is gone"
+    try:
+        if op == OP_SET_TEXT:
+            session.set_text_content(node, a)
+        elif op == OP_SET_ATTR:
+            session.set_attr(node, a, b)
+        elif op in _ATTR_OPS:
+            session.set_attr(node, _ATTR_OPS[op], b or a)
+        elif op == OP_REMOVE_ATTR:
+            session.remove_attr(node, a)
+        elif op == OP_CLICK:
+            session.dispatch_click(node)
+        else:
+            return f"frame write dropped: unknown op {op}"
+    except Exception as exc:
+        return f"frame write failed: {type(exc).__name__}"
+    return None
+
+
+def sync_mirrors(table):
+    """Push each same-origin child's DOM into its embedder.
+
+    Re-pushed only when the child's DOM version moved, since rebuilding
+    the mirror invalidates every element wrapper the parent is holding.
+    """
+    for ctx in list(table.by_token.values()):
+        fd = ctx.frame
+        if fd is None or not getattr(fd, "mirror_node", None):
+            continue
+        owner = table.by_token.get(ctx.parent)
+        if owner is None or owner.session is None:
+            continue
+        version = None
+        if getattr(fd, "mirror_ok", False) and fd.session is not None:
+            try:
+                version = fd.session.state().dom_version
+            except Exception:
+                version = None
+            rows = (mirror_rows(fd.session)
+                    if version != getattr(fd, "_mirror_version", object())
+                    else None)
+            if rows is None:
+                continue
+        else:
+            # not scriptable (cross-origin, sandboxed, gone): an empty
+            # push is what makes contentDocument read null again
+            if getattr(fd, "_mirror_version", None) is None:
+                continue
+            rows = []
+        try:
+            owner.session.set_frame_document(
+                int(fd.mirror_node), int(fd.handle),
+                str(fd.url or ""), rows)
+            fd._mirror_version = version
+        except Exception:
+            pass   # older wheel without the mirror seam
+
+
+def pump_dom_writes(table, log=None):
+    """Apply mirror mutations back to the documents they name."""
+    moved = False
+    by_handle = {c.frame.handle: c.frame
+                 for c in table.by_token.values()
+                 if c.frame is not None and c.frame.handle}
+    for ctx in list(table.by_token.values()):
+        if ctx.session is None:
+            continue
+        try:
+            writes = ctx.session.take_frame_dom_writes()
+        except Exception:
+            continue
+        for write in sorted(writes or [], key=lambda w: w[5]):
+            fd = by_handle.get(int(write[0]))
+            if fd is None:
+                continue
+            note = apply_dom_write(
+                fd, int(write[1]), int(write[2]), str(write[3]), str(write[4]))
+            if note is not None and log is not None:
+                log(ctx, note)
+            else:
+                moved = True
+    return moved
+
+
 def frame_graph(manager, root, owner_url):
     """[(iframe node index, context handle, same_origin)] for the
     iframes a document embeds — what the VM needs to answer
@@ -252,5 +378,10 @@ def frame_graph(manager, root, owner_url):
         handle = getattr(fd, "handle", 0)
         if not handle:
             continue
-        rows.append((int(ridx), int(handle), scriptable(fd, owner_url)))
+        ok = scriptable(fd, owner_url)
+        # remembered so the mirror sync (which runs every tick, without
+        # the parent tree in hand) knows where to push and whether to
+        fd.mirror_node = int(ridx)
+        fd.mirror_ok = ok
+        rows.append((int(ridx), int(handle), ok))
     return rows
