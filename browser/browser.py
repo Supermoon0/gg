@@ -14,8 +14,9 @@ from .css_parser import CSSParser
 from .draw import DrawStickyPop, DrawStickyPush
 from .style import RuleIndex, cascade_priority, default_rules, style
 from .layout import (VSTEP, BlockLayout, DocumentLayout, ImageLayout,
-                     TextLayout, layout_tree_to_list, paint_tree,
-                     sticky_offset)
+                     TextLayout, find_scrollable, hit_test_at,
+                     layout_tree_to_list, paint_tree,
+                     scroll_container_by)
 from .pages import error_page
 from .network_backend import default_network_backend
 from .renderer_session import create_renderer_session
@@ -834,16 +835,25 @@ class Browser:
         self.draw()
 
     def on_mousewheel(self, event):
-        # a wheel over a scrollable iframe scrolls the frame, not the page
+        # a wheel inside an iframe or an overflow scroll container moves
+        # that box; only when it cannot move further does the page take
+        # over (scroll chaining)
         obj = self.hit_test(event.x, event.y + self.scroll) \
             if self.document else None
+        ticks = int(event.delta / 120)
         frame = frames.frame_of(obj) if obj else None
         if frame is not None and frame.root is not None:
-            delta = -int(event.delta / 120) * frames.FRAME_SCROLL_STEP
+            delta = -ticks * frames.FRAME_SCROLL_STEP
             if frame.scroll_by(delta, obj.width, obj.height):
                 self.repaint()
                 return
-        self.scroll -= int(event.delta / 120) * SCROLL_STEP
+        if obj is not None:
+            scroller = find_scrollable(obj, -ticks * SCROLL_STEP)
+            if scroller is not None and scroll_container_by(
+                    scroller, -ticks * SCROLL_STEP):
+                self.repaint()
+                return
+        self.scroll -= ticks * SCROLL_STEP
         self.clamp_scroll()
         self.draw()
 
@@ -858,11 +868,7 @@ class Browser:
     # ---------- interaction ----------
 
     def hit_test(self, x, y):
-        objs = [o for o in self.layout_list
-                if o.x <= x < o.x + o.width
-                and o.y + sticky_offset(o, self.scroll) <= y
-                < o.y + sticky_offset(o, self.scroll) + o.height]
-        return objs[-1] if objs else None
+        return hit_test_at(self.layout_list, x, y, self.scroll)
 
     def find_link(self, node):
         while node:
@@ -959,11 +965,13 @@ class Browser:
             self.choose_file(input_node)
             return
         checkable = forms.find_checkable(default_node)
+        select = forms.find_select(default_node)
         resetter = forms.find_resetter(default_node)
         submitter = forms.find_submitter(default_node)
-        if checkable is not None or resetter is not None \
-                or submitter is not None:
-            self.activate_form_control(checkable or resetter or submitter)
+        if checkable is not None or select is not None \
+                or resetter is not None or submitter is not None:
+            self.activate_form_control(
+                checkable or select or resetter or submitter)
             return
 
     # ---------- text input focus / typing ----------
@@ -1144,21 +1152,20 @@ class Browser:
         if event.keysym == "Escape":
             self.set_focus(None)
             return "break"
-        if event.keysym == "Return":
-            action = keyboard.key_action(node, "Enter")
+        key = {"Return": "Enter", "space": "Space", "Up": "ArrowUp",
+               "Down": "ArrowDown", "Left": "ArrowLeft",
+               "Right": "ArrowRight"}.get(event.keysym)
+        if key is not None:
+            action = keyboard.key_action(node, key)
             if action == "activate":
                 self.activate_node(node)
             elif action == "submit":
                 self.submit_form(node)
             elif action == "newline":
                 self._append_text(node, "\n")
-            else:
-                return None
-            return "break"
-        if event.keysym == "space":
-            action = keyboard.key_action(node, "Space")
-            if action == "activate":
-                self.activate_node(node)
+            elif action in ("select-next", "select-prev"):
+                self.activate_form_control(
+                    node, select_step=1 if action == "select-next" else -1)
             elif action == "text":
                 self._append_text(node, " ")
             elif action == "scroll":
@@ -1209,7 +1216,7 @@ class Browser:
         except Exception as e:
             self.set_status(f"폼 제출 실패: {e}")
 
-    def activate_form_control(self, control):
+    def activate_form_control(self, control, select_step=1):
         try:
             activation = forms.activate_control(
                 control, self.url, self._form_defaults,
@@ -1217,7 +1224,8 @@ class Browser:
                 refresh_tree=self._fresh_form_tree,
                 set_attr=(self.renderer.set_attr if self._doc else None),
                 remove_attr=(self.renderer.remove_attr
-                             if self._doc is not None else None))
+                             if self._doc is not None else None),
+                select_step=select_step)
             self._finish_form_activation(activation)
         except Exception as exc:
             self.set_status(f"폼 동작 실패: {exc}")

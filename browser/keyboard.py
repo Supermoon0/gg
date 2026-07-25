@@ -117,8 +117,18 @@ def is_text_editable(node):
 
 
 def key_action(node, key):
-    """Classify the browser default action for Enter or Space."""
+    """Classify the browser default action for Enter, Space or an arrow.
+
+    A focused <select> advances its selection: gg paints a closed
+    control with no popup layer, so Enter/Space/Down move to the next
+    option and Up to the previous one (see forms.cycle_selection)."""
     if not isinstance(node, Element) or "disabled" in node.attributes:
+        return None
+    if node.tag == "select":
+        if key in ("Enter", "Space", "ArrowDown", "ArrowRight"):
+            return "select-next"
+        if key in ("ArrowUp", "ArrowLeft"):
+            return "select-prev"
         return None
     if key == "Enter":
         if node.tag == "a" and "href" in node.attributes:

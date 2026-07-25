@@ -82,15 +82,23 @@ def scale_cmds(cmds, scale):
 
 def translate_cmds(cmds, dx, dy):
     """Shift painted commands in place (CSS transform: translate is
-    paint-only — sibling layout is unaffected). Every command class
-    keeps its geometry in left/top/right/bottom, so one shift covers
-    text, rects, images, background tiles, and clip brackets alike."""
+    paint-only — sibling layout is unaffected; a scroll container
+    offsets its descendants the same way). Every command class keeps
+    its geometry in left/top/right/bottom, so one shift covers text,
+    rects, images and background tiles alike."""
     for c in cmds:
         c.left += dx
         c.top += dy
         if hasattr(c, "right"):
             c.right += dx
         c.bottom += dy
+        # a clip bracket's real rect lives in clip_top/clip_bottom —
+        # top/bottom are cull-proof sentinels — so a nested clipper
+        # inside a translated subtree must move its rect too, or it
+        # keeps clipping where the content used to be
+        if hasattr(c, "clip_top"):
+            c.clip_top += dy
+            c.clip_bottom += dy
     return cmds
 
 

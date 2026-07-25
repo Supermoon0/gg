@@ -210,14 +210,44 @@ timing-function 오버라이드.
 - **후속 과제**: (a) 실행 fuel이 명령어 수 기반이라 무거운 유한 루프가
   벽시계로 오래 걸릴 수 있다 — load 내 스크립트별 벽시계 예산 검토.
   (b) 근본 해결은 GC(현재 문자열 힙·객체가 문서 수명 내내 단조 증가).
+- 폼 컨트롤·overflow 스크롤 적용 후 재측정(2026-07-25): 바스켓 판정은
+  그대로다(네이버·위키백과·티스토리·HN·MDN 읽을만함). 네이버·HN의 수치
+  변동은 실사이트 콘텐츠 변화이며, **고정 덤프 A/B로 회귀가 아님을
+  확인**했다 — 같은 입력에서 naver/HN/MDN 모두 element·text·height가
+  기준(4266eea)과 동일하고, 늘어난 paint 명령은 새 입력 클리핑
+  브래킷뿐이다(HN +4, MDN ±0).
 
 ## 장기 호환성 주차장
 
 핵심 P2/P3를 지연시키지 않되, 범위에서 잃어버리지 않을 항목이다.
 
 - [ ] inline-block 정식 formatting context와 baseline 정렬
-- [ ] `overflow:auto` 내부 스크롤 영역과 중첩 스크롤 입력
-- [ ] `<select>`·체크박스·라디오의 네이티브 수준 렌더링
+- [x] `overflow:auto` 내부 스크롤 영역과 중첩 스크롤 입력 (2026-07-25)
+      — 명시 크기를 가진 `overflow:auto|scroll` 박스가 자체 스크롤러가
+      된다: 자식을 클리핑하고 노드에 보관한 스크롤 오프셋만큼 페인트
+      시점에 이동시킨다(iframe 내부 스크롤과 같은 구조). 오버플로 시
+      박스 안쪽에 스크롤바 표시, 히트테스트가 sticky·스크롤 오프셋을
+      합성, 휠은 가장 안쪽의 아직 움직일 수 있는 스크롤러부터 소비하고
+      끝에 닿으면 바깥/페이지로 넘긴다(scroll chaining). 내용 크기로
+      자라는 auto 박스는 예전처럼 클리핑하지 않는다(스크롤할 수 없는
+      내용을 감추지 않기 위함). 덤으로 `translate_cmds`가 중첩 clip
+      브래킷의 실제 rect(clip_top/clip_bottom)를 함께 옮기도록 수정 —
+      transform·iframe 경로에도 있던 잠복 버그. smoke 18종.
+      후속: 스크롤바 드래그, 키보드 스크롤, `scrollTop` DOM 프로퍼티.
+- [x] `<select>`·체크박스·라디오의 네이티브 수준 렌더링 (2026-07-25)
+      — 엔진이 위젯 페이스를 직접 그린다: 체크박스(테두리 상자 + 체크
+      상태의 체크마크 2획), 라디오(원 + 선택 시 점), select(닫힌 컨트롤
+      박스 + 선택된 option 라벨 + 셰브론), textarea(현재 값 다중 행,
+      클리핑), submit/reset 버튼 페이스, 포커스 링. 텍스트 필드 값은
+      컨트롤 박스에 클리핑되고 password는 마스킹된다. 페이지가 자체
+      스타일을 준 컨트롤(`appearance:none` 관용구 = author background/
+      border)은 자기 모양을 유지하고 상태 표시만 위에 그린다.
+      `<select>`/`<textarea>`는 대체 컨트롤이라 자식이 흐르지 않는다
+      (이전에는 모든 `<option>` 텍스트가 페이지에 나란히 렌더됐다).
+      상호작용: 팝업 레이어가 없으므로 클릭/Enter/Space/방향키가 선택을
+      순환하고 input·change를 발화하며 제출값이 따라간다. `<option>`
+      자동 닫힘을 두 HTML 파서에 추가.
+      후속: 팝업 목록 UI, `size`/`multiple` 리스트박스, optgroup 그룹핑.
 - [ ] Web Worker / Service Worker / WebAssembly
 - [ ] HTTP/2 연결 및 캐시 동작 검증
 - [ ] `<video>`/`<audio>`/WebGL
@@ -227,11 +257,11 @@ timing-function 오버라이드.
 ## 현재 검증 기준
 
 - Rust: 221 passed, 2 ignored (2026-07-25)
-- Python smoke: 335/335 (2026-07-25, Linux + 새로 빌드한 native wheel;
-  transition/@keyframes 36종 + iframe 18종 + 접근성 21종 포함. native
+- Python smoke: 373/373 (2026-07-25, Linux + 새로 빌드한 native wheel;
+  transition/@keyframes 36종 + iframe 18종 + 접근성 21종 + 폼 컨트롤 20종 + overflow 스크롤 18종 포함. native
   shell 구간은 local renderer를 명시해 top-level 스크립트의 spawn
   재import 자폭을 제거)
-- Golden 렌더링 회귀: 7/7
+- Golden 렌더링 회귀: 8/8 (form-controls 픽스처 추가)
 - Network gauntlet: 41/41
 - CSS gauntlet: 23/23 (2026-07-25 — position-absolute-offsets는 ICB
   원점 기준으로, line-height-px는 "명시 40px == 40px 라인박스" 계약으로

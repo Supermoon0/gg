@@ -13,7 +13,7 @@ from .draw import (DrawBgImage, DrawClipPop, DrawClipPush, DrawImage,
                    DrawLine, DrawOval, DrawRect, DrawStickyPop,
                    DrawStickyPush, DrawText,
                    translate_cmds)
-from .html_parser import Element, Text
+from .html_parser import Element, Text, tree_to_list
 from .style import parse_px, parse_size
 
 # The initial containing block IS the viewport: html fills it edge to
@@ -35,6 +35,13 @@ BLOCK_ELEMENTS = {
     "legend", "details", "summary", "center", "tr", "td", "th",
     "thead", "tbody", "caption",
 }
+
+# Form controls the engine paints itself (a "widget face"), whose
+# children therefore never take part in layout: <select> renders the
+# selected option's label + a chevron, <textarea> renders its current
+# value. Their DOM children stay intact for submission, scripting and
+# the accessibility tree — they simply do not flow.
+REPLACED_CONTROLS = {"input", "select", "textarea"}
 
 FONT_FAMILIES = {
     "default": "Segoe UI",
@@ -198,6 +205,26 @@ def paint_background_image(node, x1, y1, x2, y2):
     rep_y = rep in ("repeat", "repeat-y")
     return DrawBgImage(x1, y1, box_w, box_h, image_id,
                        off_x, off_y, tile_w, tile_h, rep_x, rep_y)
+
+
+def _ellipsize(text, font, avail):
+    """Longest prefix of `text` that fits `avail` px, with "…" when it
+    had to cut. Used by the widget faces (a select label or a textarea
+    line must never spill out of its control)."""
+    text = text or ""
+    if avail <= 0:
+        return ""
+    if measure(font, text) <= avail:
+        return text
+    ell = measure(font, "…")
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if measure(font, text[:mid]) + ell <= avail:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + "…"
 
 
 def effective_opacity(node):
@@ -962,6 +989,169 @@ def _sticky_metrics(box):
                      + getattr(box.parent, "pb", 0.0))
     maximum = max(normal, parent_bottom - box.outer_height())
     return normal, maximum, inset
+
+
+# --- overflow scroll containers ------------------------------------
+#
+# A box with `overflow: auto|scroll` and a definite height becomes its
+# own scroller: it clips its descendants and offsets them by a scroll
+# position kept on the NODE (so it survives relayout, exactly like a
+# frame's own scroll in browser/frames.py). The offset is applied at
+# paint time — inner scrolling is driven by wheel events, which the
+# shells already process, so it costs a repaint rather than the
+# resident-display-list machinery the page scroll needs.
+
+SCROLLABLE_OVERFLOW = ("auto", "scroll")
+
+
+def _definite_size(node, prop):
+    """A specified, non-auto length for the given axis, if any."""
+    for name in (prop, "max-" + prop):
+        raw = (node.style.get(name) or "").strip().casefold()
+        if raw and raw not in ("auto", "none", "inherit", "initial",
+                               "unset", "fit-content", "max-content",
+                               "min-content"):
+            return True
+    return False
+
+
+def scroll_axes(node):
+    """(scrolls_y, scrolls_x) for a node's own box.
+
+    Only a box that is BOTH scrollable and definitely sized can
+    actually overflow: an `overflow:auto` box with content-driven
+    height simply grows, and clipping one would hide readable content
+    (which is why `auto` was historically left unclipped)."""
+    if not isinstance(node, Element):
+        return (False, False)
+    style = node.style
+    generic = (style.get("overflow") or "").strip().casefold()
+    oy = (style.get("overflow-y") or "").strip().casefold() or generic
+    ox = (style.get("overflow-x") or "").strip().casefold() or generic
+    return (oy in SCROLLABLE_OVERFLOW and _definite_size(node, "height"),
+            ox in SCROLLABLE_OVERFLOW and _definite_size(node, "width"))
+
+
+def is_scroll_container(obj):
+    node = getattr(obj, "node", None)
+    return any(scroll_axes(node)) if node is not None else False
+
+
+def _subtree_extent(obj):
+    """(right, bottom) of the deepest painted descendant geometry.
+
+    Memoized on the layout object: hit-testing asks every box for its
+    ancestors' scroll offsets, and re-walking a scroller's subtree each
+    time would make a hit test quadratic in page size. Layout objects
+    are rebuilt from scratch by every relayout, so the cache can never
+    go stale."""
+    cached = getattr(obj, "_extent_cache", None)
+    if cached is not None:
+        return cached
+    right = bottom = 0.0
+    stack = list(getattr(obj, "children", ()) or ())
+    while stack:
+        box = stack.pop()
+        w = getattr(box, "width", None)
+        h = getattr(box, "height", None)
+        if w is not None:
+            right = max(right, box.x + w)
+        if h is not None:
+            bottom = max(bottom, box.y + h)
+        stack.extend(getattr(box, "children", ()) or ())
+    try:
+        obj._extent_cache = (right, bottom)
+    except AttributeError:
+        pass  # __slots__ layout object: recompute each time
+    return right, bottom
+
+
+def scroll_range(obj):
+    """(max_scroll_y, max_scroll_x) for a scroll container's layout box.
+    Zero on an axis whose content fits (or which does not scroll)."""
+    node = getattr(obj, "node", None)
+    scrolls_y, scrolls_x = scroll_axes(node)
+    if not (scrolls_y or scrolls_x):
+        return (0.0, 0.0)
+    right, bottom = _subtree_extent(obj)
+    max_y = max(0.0, bottom - (obj.y + obj.height)) if scrolls_y else 0.0
+    max_x = max(0.0, right - (obj.x + obj.width)) if scrolls_x else 0.0
+    return (max_y, max_x)
+
+
+def scroll_position(obj):
+    """This box's current (y, x) scroll offset, clamped to its range."""
+    node = getattr(obj, "node", None)
+    if node is None:
+        return (0.0, 0.0)
+    max_y, max_x = scroll_range(obj)
+    y = min(max(getattr(node, "_scroll_y", 0.0), 0.0), max_y)
+    x = min(max(getattr(node, "_scroll_x", 0.0), 0.0), max_x)
+    node._scroll_y, node._scroll_x = y, x
+    return (y, x)
+
+
+def scroll_container_by(obj, dy, dx=0.0):
+    """Scroll a container. Returns True when it actually moved — the
+    shells use that to decide whether the wheel event was consumed or
+    should chain to the next scroller out (and finally the page)."""
+    node = getattr(obj, "node", None)
+    if node is None:
+        return False
+    max_y, max_x = scroll_range(obj)
+    if max_y <= 0 and max_x <= 0:
+        return False
+    before = scroll_position(obj)
+    node._scroll_y = min(max(before[0] + dy, 0.0), max_y)
+    node._scroll_x = min(max(before[1] + dx, 0.0), max_x)
+    return (node._scroll_y, node._scroll_x) != before
+
+
+def scrolled_ancestor_offset(layout_obj):
+    """Total (dy, dx) the ancestor scrollers shift this box by — the
+    hit-test counterpart of the paint-time translation."""
+    dy = dx = 0.0
+    cur = getattr(layout_obj, "parent", None)
+    while cur is not None:
+        if is_scroll_container(cur):
+            y, x = scroll_position(cur)
+            dy += y
+            dx += x
+        cur = getattr(cur, "parent", None)
+    return dy, dx
+
+
+def find_scrollable(layout_obj, dy, dx=0.0):
+    """Nearest scroller at or above `layout_obj` that can still move in
+    the requested direction (scroll chaining): a wheel inside a
+    bottomed-out inner box keeps scrolling the page."""
+    cur = layout_obj
+    while cur is not None:
+        if is_scroll_container(cur):
+            max_y, max_x = scroll_range(cur)
+            y, x = scroll_position(cur)
+            if (dy > 0 and y < max_y) or (dy < 0 and y > 0) \
+                    or (dx > 0 and x < max_x) or (dx < 0 and x > 0):
+                return cur
+        cur = getattr(cur, "parent", None)
+    return None
+
+
+def hit_test_at(layout_list, x, y, page_scroll):
+    """Deepest painted box under a point in document coordinates.
+
+    A box paints where layout put it, shifted by its sticky ancestors
+    and by every scroll container it sits inside — hit-testing has to
+    compose the same offsets or clicks inside a scrolled area land on
+    the wrong node."""
+    hit = None
+    for obj in layout_list:
+        dy, dx = scrolled_ancestor_offset(obj)
+        oy = obj.y + sticky_offset(obj, page_scroll) - dy
+        ox = obj.x - dx
+        if ox <= x < ox + obj.width and oy <= y < oy + obj.height:
+            hit = obj
+    return hit
 
 
 def sticky_offset(layout_obj, scroll):
@@ -2764,14 +2954,18 @@ class BlockLayout:
                 sy = line.y if line is not None else self.y
                 self._queue_abs(node, self.x + self.cursor_x, sy)
                 return
+            if node is self.node and node.tag in REPLACED_CONTROLS:
+                # a replaced control paints its own face (selected option
+                # label, typed textarea value); its children never flow
+                return
             _disp = node.style.get("display", "")
             if node is not self.node and (
-                    node.tag == "input"
+                    node.tag in REPLACED_CONTROLS
                     or (_disp in ("inline-block", "inline-flex",
                                   "inline-table")
                         and node.tag not in ("img", "svg", "br"))):
-                # a descendant inline-block (or a replaced <input>) becomes
-                # an atomic box; the container node itself (node is
+                # a descendant inline-block (or a replaced form control)
+                # becomes an atomic box; the container node itself (node is
                 # self.node) falls through so its own children flow,
                 # avoiding infinite re-entry.
                 self.inline_block(node)
@@ -3059,22 +3253,8 @@ class BlockLayout:
                 cmds.extend(frame.paint_cmds(
                     self.x, self.y, self.width, self.height))
 
-            if self.node.tag == "input":
-                value = self.node.attributes.get("value", "")
-                text = value or self.node.attributes.get("placeholder", "")
-                font = cached_font(self.node)
-                ty = self.y + max(
-                    0.0, (self.height - font.metrics("linespace")) / 2)
-                if text.strip():
-                    tcolor = (safe_color(self.node.style.get("color"))
-                              if value else "#9e9e9e")
-                    cmds.append(DrawText(self.x, ty, text, font, tcolor))
-                if getattr(self.node, "is_focused", False):
-                    # caret after the typed value (not the placeholder)
-                    cx = self.x + (measure(font, value) if value else 0)
-                    ch = font.metrics("linespace")
-                    cmds.append(DrawLine(
-                        cx, ty, cx, ty + ch, "#333333", 1))
+            if self.node.tag in REPLACED_CONTROLS:
+                cmds.extend(self._paint_control())
 
             if self.node.tag == "li" and _list_marker_visible(self.node):
                 font = cached_font(self.node)
@@ -3094,20 +3274,303 @@ class BlockLayout:
                 cmds.append(DrawClipPush(x1, y1, x2, y2))
         return cmds
 
+    # ----- form-control faces -----
+    #
+    # The engine draws its own widget faces: without them a checkbox is
+    # an invisible 13px box (checked state entirely unpaintable) and a
+    # <select> has no box at all. A page that styles a control itself —
+    # the `appearance: none` idiom, which shows up as an author
+    # background or border — keeps its own face; only the state
+    # indicator (checkmark, radio dot, chevron, label) paints on top.
+
+    _FACE_BG = "#ffffff"
+    _FACE_BORDER = "#767676"
+    _FACE_ACCENT = "#1a73e8"
+    _BUTTON_BG = "#efefef"
+    _PLACEHOLDER = "#9e9e9e"
+
+    def _author_styled_face(self):
+        """Whether the page supplies the control's own box appearance."""
+        style = self.node.style
+        if self.bw > 0:
+            return True
+        for prop in ("background-color", "background", "background-image",
+                     "appearance", "-webkit-appearance"):
+            value = (style.get(prop) or "").strip().casefold()
+            if value and value not in ("none", "auto", "transparent",
+                                       "initial", "unset"):
+                return True
+        return False
+
+    def _input_type(self):
+        return self.node.attributes.get(
+            "type", "text").strip().casefold()
+
+    def _paint_control(self):
+        tag = self.node.tag
+        itype = self._input_type() if tag == "input" else ""
+        if tag == "input" and itype in ("checkbox", "radio"):
+            return self._paint_toggle(itype)
+        if tag == "select":
+            return self._paint_select()
+        if tag == "textarea":
+            return self._paint_textarea()
+        if tag == "input" and itype in ("submit", "reset", "button"):
+            return self._paint_button()
+        return self._paint_text_field()
+
+    def _face_rect(self, cmds, radius=2.0, bg=None):
+        """Default box face (background + 1px border) when the page has
+        not styled the control itself. The border is drawn INSIDE the
+        box, so a control never paints outside its own layout rect.
+        Returns True if it painted."""
+        if self._author_styled_face():
+            return False
+        x2, y2 = self.x + self.width, self.y + self.height
+        cmds.append(DrawRect(self.x, self.y, x2, y2,
+                             self._FACE_BORDER, radius=radius))
+        cmds.append(DrawRect(self.x + 1, self.y + 1, x2 - 1, y2 - 1,
+                             bg or self._FACE_BG, radius=max(radius - 1, 0)))
+        return True
+
+    def _focus_ring(self, cmds, radius=2.0):
+        """A 2px accent ring just outside the control (drawn first, so
+        the face covers its inner edge) — the keyboard-focus affordance
+        every native control has."""
+        if not getattr(self.node, "is_focused", False):
+            return
+        x2, y2 = self.x + self.width, self.y + self.height
+        cmds.append(DrawRect(self.x - 2, self.y - 2, x2 + 2, y2 + 2,
+                             self._FACE_ACCENT, radius=radius + 2))
+
+    def _paint_toggle(self, itype):
+        """checkbox / radio: a real box or circle, and a visible checked
+        state (previously `checked` painted nothing at all)."""
+        cmds = []
+        w, h = self.width, self.height
+        x1, y1 = self.x, self.y
+        x2, y2 = x1 + w, y1 + h
+        checked = "checked" in self.node.attributes
+        styled = self._author_styled_face()
+        accent = safe_color(
+            self.node.style.get("accent-color", ""), default="") \
+            or self._FACE_ACCENT
+        self._focus_ring(cmds, radius=w / 2 if itype == "radio" else 2.0)
+        if itype == "radio":
+            if not styled:
+                cmds.append(DrawOval(x1, y1, x2, y2, self._FACE_BORDER))
+                cmds.append(DrawOval(x1 + 1, y1 + 1, x2 - 1, y2 - 1,
+                                     self._FACE_BG))
+            if checked:
+                # the dot: a filled circle inset to ~40% of the box
+                inset = max(w * 0.28, 2.0)
+                cmds.append(DrawOval(x1 + inset, y1 + inset,
+                                     x2 - inset, y2 - inset, accent))
+            return cmds
+        # checkbox
+        if not styled:
+            edge = accent if checked else self._FACE_BORDER
+            cmds.append(DrawRect(x1, y1, x2, y2, edge, radius=2.0))
+            cmds.append(DrawRect(x1 + 1, y1 + 1, x2 - 1, y2 - 1,
+                                 accent if checked else self._FACE_BG,
+                                 radius=1.0))
+        if checked:
+            # a checkmark built from two strokes (no glyph font needed);
+            # white on the accent fill, accent-coloured on an author face
+            ink = self._FACE_BG if not styled else accent
+            t = max(1.0, round(w / 8.0))
+            cmds.append(DrawLine(x1 + w * 0.22, y1 + h * 0.52,
+                                 x1 + w * 0.42, y1 + h * 0.72, ink, t))
+            cmds.append(DrawLine(x1 + w * 0.42, y1 + h * 0.72,
+                                 x1 + w * 0.78, y1 + h * 0.28, ink, t))
+        return cmds
+
+    def _selected_option_label(self):
+        """The label a closed <select> shows: the selected option, else
+        the first one (matching the submitted value, forms._select_values)."""
+        options = [n for n in tree_to_list(self.node, [])
+                   if isinstance(n, Element) and n.tag == "option"]
+        chosen = next(
+            (o for o in options if "selected" in o.attributes), None)
+        if chosen is None:
+            chosen = options[0] if options else None
+        if chosen is None:
+            return ""
+        label = chosen.attributes.get("label")
+        if label:
+            return label.strip()
+        # only this option's own text — malformed markup can still nest
+        # options, and a nested one's label is not part of this label
+        parts = []
+        stack = list(chosen.children)
+        while stack:
+            n = stack.pop(0)
+            if isinstance(n, Text):
+                parts.append(n.text)
+            elif isinstance(n, Element) and n.tag != "option":
+                stack = list(n.children) + stack
+        return " ".join("".join(parts).split())
+
+    def _paint_select(self):
+        cmds = []
+        self._focus_ring(cmds)
+        self._face_rect(cmds)
+        font = cached_font(self.node)
+        pad = 6.0
+        chevron_w = 16.0
+        text_w = max(self.width - pad - chevron_w, 0.0)
+        label = self._selected_option_label()
+        ty = self.y + max(0.0, (self.height - font.gg_linespace) / 2)
+        if label and text_w > 4:
+            label = _ellipsize(label, font, text_w)
+            cmds.append(DrawText(self.x + pad, ty, label, font,
+                                 safe_color(self.node.style.get("color"))))
+        # dropdown chevron: two strokes forming a "v" on the right edge
+        cx = self.x + self.width - chevron_w / 2 - 2
+        cy = self.y + self.height / 2
+        arm = 3.5
+        cmds.append(DrawLine(cx - arm, cy - arm / 2, cx, cy + arm / 2,
+                             "#5f6368", 2))
+        cmds.append(DrawLine(cx, cy + arm / 2, cx + arm, cy - arm / 2,
+                             "#5f6368", 2))
+        return cmds
+
+    def _textarea_value(self):
+        """Current textarea contents: the typed value when the shells
+        have recorded one, else the original child text."""
+        if "value" in self.node.attributes:
+            return self.node.attributes["value"]
+        return "".join(t.text for t in tree_to_list(self.node, [])
+                       if isinstance(t, Text))
+
+    def _paint_textarea(self):
+        cmds = []
+        self._focus_ring(cmds)
+        self._face_rect(cmds)
+        font = cached_font(self.node)
+        value = self._textarea_value()
+        pad = 3.0
+        line_h = font.gg_linespace
+        avail_w = max(self.width - 2 * pad, 0.0)
+        color = safe_color(self.node.style.get("color"))
+        # clip so long content cannot escape the control's own box
+        cmds.append(DrawClipPush(self.x, self.y,
+                                 self.x + self.width,
+                                 self.y + self.height))
+        ty = self.y + pad
+        last_x = self.x + pad
+        for raw in (value.split("\n") if value else []):
+            if ty > self.y + self.height:
+                break
+            shown = _ellipsize(raw, font, avail_w) if raw else ""
+            if shown:
+                cmds.append(DrawText(self.x + pad, ty, shown, font, color))
+            last_x = self.x + pad + measure(font, shown)
+            ty += line_h
+        if getattr(self.node, "is_focused", False):
+            cy = min(ty - line_h, self.y + self.height - line_h) \
+                if value else self.y + pad
+            cmds.append(DrawLine(last_x, cy, last_x, cy + line_h,
+                                 "#333333", 1))
+        cmds.append(DrawClipPop())
+        return cmds
+
+    def _paint_button(self):
+        cmds = []
+        self._focus_ring(cmds)
+        self._face_rect(cmds, bg=self._BUTTON_BG)
+        font = cached_font(self.node)
+        label = self.node.attributes.get("value") or {
+            "submit": "제출", "reset": "재설정"}.get(self._input_type(), "")
+        if label:
+            tw = measure(font, label)
+            tx = self.x + max(0.0, (self.width - tw) / 2)
+            ty = self.y + max(0.0, (self.height - font.gg_linespace) / 2)
+            cmds.append(DrawText(tx, ty, label, font,
+                                 safe_color(self.node.style.get("color"))))
+        return cmds
+
+    def _paint_text_field(self):
+        """text/search/password/... inputs: value or placeholder, clipped
+        to the control, with the caret when focused."""
+        cmds = []
+        self._focus_ring(cmds)
+        self._face_rect(cmds)
+        node = self.node
+        raw = node.attributes.get("value", "")
+        itype = self._input_type()
+        if itype == "password" and raw:
+            raw = "•" * len(raw)
+        if itype == "file":
+            raw = raw or "파일 선택"
+        text = raw or node.attributes.get("placeholder", "")
+        font = cached_font(node)
+        ty = self.y + max(0.0, (self.height - font.metrics("linespace")) / 2)
+        cmds.append(DrawClipPush(self.x, self.y,
+                                 self.x + self.width,
+                                 self.y + self.height))
+        if text.strip():
+            tcolor = (safe_color(node.style.get("color")) if raw
+                      else self._PLACEHOLDER)
+            cmds.append(DrawText(self.x, ty, text, font, tcolor))
+        if getattr(node, "is_focused", False):
+            # caret after the typed value (not the placeholder)
+            cx = self.x + (measure(font, raw) if raw else 0)
+            ch = font.metrics("linespace")
+            cmds.append(DrawLine(cx, ty, cx, ty + ch, "#333333", 1))
+        cmds.append(DrawClipPop())
+        return cmds
+
     def _clips(self):
         if not isinstance(self.node, Element):
             return False
         for axis in ("overflow", "overflow-x", "overflow-y"):
-            # note: overflow:auto is intentionally NOT clipped here — in a
-            # non-scrolling full-page render, clipping an auto scroll
-            # container to a possibly under-computed height would hide
-            # readable content, which is worse than letting it flow.
             if self.node.style.get(axis) in ("hidden", "clip", "scroll"):
                 return True
-        return False
+        # `overflow:auto` clips only once the box is a real scroller
+        # (definitely sized, so its content can actually overflow and
+        # the user can scroll to it). An auto box with content-driven
+        # height simply grows, and clipping that would hide readable
+        # content — the reason auto went unclipped before scrolling
+        # existed.
+        return any(scroll_axes(self.node))
 
     def paint_after(self):
-        return [DrawClipPop()] if self._clips() else []
+        cmds = [DrawClipPop()] if self._clips() else []
+        # the scrollbar paints after (on top of) the scrolled content
+        # and outside the clip, so it always stays visible
+        cmds.extend(self._scrollbar_cmds())
+        return cmds
+
+    _SCROLLBAR_W = 6.0
+    _SCROLLBAR_MIN = 20.0
+    _SCROLLBAR_INK = "#b0b0b0"
+
+    def _scrollbar_cmds(self):
+        """A thin indicator inside an overflowing scroll container —
+        what makes an inner scroll area discoverable at all."""
+        if not is_scroll_container(self):
+            return []
+        max_y, max_x = scroll_range(self)
+        y, x = scroll_position(self)
+        cmds = []
+        w, h = self.width, self.height
+        bar = self._SCROLLBAR_W
+        if max_y > 0 and h > self._SCROLLBAR_MIN:
+            content = h + max_y
+            thumb = max(h * h / content, self._SCROLLBAR_MIN)
+            top = self.y + (y / max_y) * (h - thumb)
+            cmds.append(DrawRect(
+                self.x + w - bar, top, self.x + w, top + thumb,
+                self._SCROLLBAR_INK, radius=bar / 2))
+        if max_x > 0 and w > self._SCROLLBAR_MIN:
+            content = w + max_x
+            thumb = max(w * w / content, self._SCROLLBAR_MIN)
+            left = self.x + (x / max_x) * (w - thumb)
+            cmds.append(DrawRect(
+                left, self.y + h - bar, left + thumb, self.y + h,
+                self._SCROLLBAR_INK, radius=bar / 2))
+        return cmds
 
 
 class InlineBlockLayout:
@@ -3624,9 +4087,17 @@ def _paint_tree_inner(layout_object, display_list):
     # its own stacking context; equal z keeps document order (stable).
     groups = []
     reorder = False
+    # a scroll container offsets its DESCENDANTS (never its own
+    # background/border/scrollbar, which stay put) — the same shape as
+    # an iframe painting its child document at -scroll
+    sdy, sdx = (0.0, 0.0)
+    if is_scroll_container(layout_object):
+        sdy, sdx = scroll_position(layout_object)
     for i, child in enumerate(layout_object.children):
         sub = []
         paint_tree(child, sub)
+        if sdy or sdx:
+            translate_cmds(sub, -sdx, -sdy)
         z = _z_index(child)
         if z != 0:
             reorder = True

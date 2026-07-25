@@ -31,6 +31,10 @@ input[type=hidden] { display: none; }
 input { height: 1.5em; width: 175px; }
 input[type=checkbox], input[type=radio] { width: 13px; height: 13px; }
 textarea { width: 250px; height: 3em; }
+/* select is a replaced control: its own box paints the selected
+   option's label plus a dropdown chevron, and its <option> children
+   never flow (they stay in the DOM for submission and the a11y tree) */
+select { height: 1.5em; width: 175px; }
 
 html { display: block; }
 body { display: block; margin: 8px; }

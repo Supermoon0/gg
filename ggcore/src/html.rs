@@ -165,6 +165,15 @@ impl<'a> Parser<'a> {
                     self.close_tag("p");
                 } else if open == "li" && tag == "li" {
                     self.close_tag("li");
+                } else if open == "option"
+                    && (tag == "option" || tag == "optgroup")
+                {
+                    // without this `<option>a<option>b` nests, and a
+                    // <select>'s painted label swallows every later
+                    // option's text (mirrors browser/html_parser.py)
+                    self.close_tag("option");
+                } else if open == "optgroup" && tag == "optgroup" {
+                    self.close_tag("optgroup");
                 }
             }
             let parent = self.unfinished.last().copied();
