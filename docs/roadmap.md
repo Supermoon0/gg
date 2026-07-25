@@ -188,7 +188,15 @@ timing-function 오버라이드.
   120s 타임아웃)에서 `load_document → settle_lazy(20s) → 채점`을
   수행한다. 폭주 사이트는 자기 프로세스만 죽는다 — 나무위키 측정 중
   hosted 러너가 shutdown signal(143)로 죽던 문제의 가드.
-- 위키백과는 CI에서도 "읽을만함" 정상.
+- 수정 후 로컬 재측정(2026-07-25): **네이버 1,225 엘리먼트/409 텍스트
+  → 읽을만함 회복**. 위키백과·티스토리·HN·MDN 읽을만함, example 빈약
+  (원래 소형 페이지), 연합뉴스는 이 컨테이너의 프록시 환경에서
+  ConnectionReset(CI에서 재확인 필요).
+- **새 조사 과제**: 나무위키·정부24가 settle 중 메모리 폭주로 abort
+  (`memory allocation of 1855015488 bytes failed` — 단일 1.86GB 할당
+  시도, 4GiB RLIMIT_AS에 걸려 Rust abort). 격리는 의도대로 동작하지만
+  gg-js/스타일 경로의 실제 폭주 원인을 찾아야 한다. 재현:
+  `xvfb-run python basket_test.py` 로컬에서 항상 발생.
 
 ## 장기 호환성 주차장
 
