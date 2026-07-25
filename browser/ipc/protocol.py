@@ -37,6 +37,11 @@ MESSAGE_TYPES = {
     "broker.request_text", "broker.request", "broker.request_raw",
     "broker.script_fetch", "broker.cookies_for", "broker.cookie_set",
     "broker.response", "broker.error",
+    "network.bind_context", "network.drop_context",
+    "network.request_text", "network.request", "network.request_raw",
+    "network.script_fetch", "network.cookies_for", "network.cookie_set",
+    "network.cancel", "network.cancel_new", "network.shutdown",
+    "network.response", "network.error",
 }
 
 

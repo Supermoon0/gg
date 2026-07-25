@@ -40,8 +40,33 @@
 - [x] `RendererSession`/`NetworkBackend` process-neutral interface 추출
 - [x] renderer child, 검증된 JSON IPC, crash recovery 구현
 - [ ] shared-memory frame triple buffer와 browser chrome composite 구현
-- [ ] cookie/cache/socket을 network service로 이동하고 IPC gauntlet 통과
-      진행: net gauntlet을 **IPC 경로에서도** 돌리기 시작했고
+- [x] cookie/cache/socket을 network service로 이동하고 IPC gauntlet 통과
+      (2026-07-25, browser/process/network_host.py) — 쿠키 jar·커넥션
+      풀·HTTP 캐시는 **프로필의 권한 그 자체**다(사용자가 방문한 모든
+      사이트의 자격 증명). 브라우저 프로세스에 두면 그 프로세스의 버그
+      하나가 전부에 닿으므로, renderer가 이미 쓰던 검증된 JSON 채널
+      뒤로 옮겼다. `GG_NETWORK_MODEL=service`로 선택한다(기본은 아직
+      local — 제품 기본 전환은 M4).
+      전송 설계에서 두 가지가 결정적이었고 둘 다 "브로커가 병목이
+      되지 않기"에 관한 것이다. ① **request-id 라우팅**: 페이지 로드는
+      서브리소스 fetch 열몇 개를 워커 스레드로 부채질하는데, lock-step
+      파이프면 전부 직렬화된다. 브라우저 쪽이 리더 스레드 하나로
+      `reply_to`를 맞춰 각 호출자에게 자기 응답을 준다 — **3초짜리 6개가
+      18초가 아니라 3.01초**에 끝나는 것으로 확인. ② **I/O에서 블록하지
+      않는 리더 루프**: 서비스는 모든 fetch를 스레드 풀로 넘겨서 리더
+      루프가 다음 요청, 무엇보다 **cancel**을 즉시 받는다 — 멈추려는
+      그 요청 뒤에 줄 서는 cancel은 cancel이 아니다.
+      예외 타입도 hop을 건너간다(`net.RequestCancelled`) — 호출자가
+      취소된 탐색과 실패한 탐색을 타입으로 가르기 때문이다.
+      kwargs 마샬링은 `browser/ipc/wire.py` 하나로 합쳤다(중복이 바로
+      직전 쿠키 유출 버그의 원인이었다).
+      게이트: net gauntlet 46/46 — 서비스 경로에서 **jar가 브라우저
+      프로세스에 없음**·SameSite cross-site 차단·in-flight cancel 3종
+      추가, unittest 8종, 두 renderer 모델 모두에서 실제 페이지 로드
+      (탐색+서브리소스 CSS+쿠키) 확인.
+      남은 후속: HttpOnly 제거 replica push(현재 `document.cookie`는
+      매번 서비스 왕복), 서비스 프로세스 crash 복구·재시작, OS 샌드박스.
+      이전 진행 기록: net gauntlet을 **IPC 경로에서도** 돌리기 시작했고
       (`ipc-initiator-survives-broker`, `ipc-cookie-samesite-cross-site-block`),
       그 과정에서 **isolated 모델의 쿠키 유출 결함**을 발견·수정했다
       (2026-07-25). renderer가 브라우저 프로세스로 넘기는 kwargs를

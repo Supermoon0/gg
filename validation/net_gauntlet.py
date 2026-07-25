@@ -319,6 +319,64 @@ def _ipc_cookie_policy_cases(base):
         session.close()
 
 
+def _network_service_cases(base):
+    """Re-run the policies that decide what leaves the machine, with the
+    cookie jar, cache and sockets in a *separate process*.
+
+    Moving them out is only worth anything if the rules move with them,
+    so these are the same claims as above, asserted through the service.
+    """
+    from browser.network_backend import create_network_backend
+
+    backend = create_network_backend("service")
+    try:
+        # the service owns the jar: a Set-Cookie it applied must not be
+        # readable in this process
+        backend.request_text(net.URL(base + "/cookie/set"), no_cache=True)
+        _h, echoed, _f = backend.request_text(
+            net.URL(base + "/cookie/echo"), no_cache=True)
+        here = net.cookies_for(net.URL(base + "/cookie/echo"))
+        record("service-owns-the-cookie-jar",
+               "server=secret" in echoed and "server=secret" not in here,
+               f"service echo={echoed!r}; browser-process jar={here!r}")
+
+        # ...and still enforces SameSite against the initiator
+        _h, cross, _f = backend.request_text(
+            net.URL(base + "/cookie/echo"), no_cache=True,
+            site_for_cookies=net.URL("https://cross-site.test/"),
+            top_level_navigation=False)
+        record("service-cookie-samesite-cross-site-block",
+               "server=secret" not in cross,
+               f"cross-site subresource via service echoed Cookie={cross!r}")
+
+        # a cancel has to reach a request already in flight, and arrive
+        # as the type callers branch on
+        token = backend.new_cancel_token()
+        outcome = {}
+
+        def slow():
+            try:
+                backend.request_text(net.URL(base + "/slow/cancel"),
+                                     cancel_token=token, no_cache=True)
+                outcome["r"] = "completed"
+            except net.RequestCancelled:
+                outcome["r"] = "cancelled"
+            except Exception as exc:
+                outcome["r"] = type(exc).__name__
+
+        worker = threading.Thread(target=slow)
+        worker.start()
+        time.sleep(0.3)
+        backend.cancel(token)
+        worker.join(timeout=8)
+        record("service-cancel-reaches-in-flight-request",
+               outcome.get("r") == "cancelled",
+               f"in-flight request through the service ended as "
+               f"{outcome.get('r')!r}")
+    finally:
+        backend.close()
+
+
 def main():
     with net._COOKIE_LOCK:
         net._COOKIE_JAR.clear()
@@ -849,6 +907,7 @@ def main():
            f"about:blank -> {len(t)} chars: {t[:60]!r}")
 
     _ipc_cookie_policy_cases(base)
+    _network_service_cases(base)
 
     srv.shutdown()
     passed = sum(r["ok"] for r in RESULTS)

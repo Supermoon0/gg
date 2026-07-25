@@ -98,3 +98,23 @@ _LOCAL_BACKEND = LocalNetworkBackend()
 def default_network_backend():
     """Return the shared local backend used until an IPC client is selected."""
     return _LOCAL_BACKEND
+
+
+def create_network_backend(model=None):
+    """Pick a backend by process model.
+
+    "local" keeps the cookie jar, cache and sockets in this process;
+    "service" moves them into a child that owns the profile's
+    credentials, so a browser-process bug no longer reaches them. The
+    default stays local until the product default is switched (M4).
+    """
+    import os
+
+    model = (model or os.environ.get("GG_NETWORK_MODEL", "local")).casefold()
+    if model == "local":
+        return _LOCAL_BACKEND
+    if model == "service":
+        from .process.network_host import RemoteNetworkBackend
+
+        return RemoteNetworkBackend()
+    raise ValueError(f"unknown GG_NETWORK_MODEL: {model}")

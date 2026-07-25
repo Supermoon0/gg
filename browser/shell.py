@@ -20,7 +20,8 @@ from .layout import (HSTEP, VSTEP, DocumentLayout, apply_scroll_requests,
                      layout_tree_to_list, measure, paint_tree,
                      restore_scroll_state, scroll_container_by)
 from .pages import error_page
-from .network_backend import default_network_backend
+from .network_backend import (create_network_backend,
+                              default_network_backend)
 from .renderer_session import create_renderer_session
 
 TOOLBAR_H = 44
@@ -69,7 +70,7 @@ def _fetch_many(urls, base, binary=False, *, timeout=net.DEFAULT_TIMEOUT,
 class Shell:
     def __init__(self, win, network_backend=None, process_model=None):
         self.win = win
-        self.network = network_backend or default_network_backend()
+        self.network = network_backend or create_network_backend()
         model = process_model or os.environ.get(
             "GG_PROCESS_MODEL", "isolated")
         self.renderer = create_renderer_session(

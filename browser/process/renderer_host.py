@@ -15,6 +15,7 @@ from .. import native, net
 from ..ipc.blobs import BlobStore, read_blob
 from ..ipc.channel import JsonChannel
 from ..ipc.protocol import BUILD_ID, MAX_IN_FLIGHT, ProtocolError
+from ..ipc.wire import from_wire, to_wire
 from ..renderer_session import LocalRendererSession
 from ..security import ScriptFetchResponse
 from .sandbox import apply_renderer_sandbox
@@ -84,31 +85,7 @@ class _BrokerNetworkBackend:
                 raise ProtocolError("unexpected_type", "expected broker.response")
             return response["payload"]
 
-    @staticmethod
-    def _kwargs(kwargs):
-        context = kwargs.pop("context", None)
-        kwargs.pop("cancel_token", None)
-        # A URL-valued kwarg is not a JSON scalar, so a plain type
-        # filter silently drops it — and dropping `site_for_cookies` is
-        # not a lost hint: `_same_site_allows` reads None as *same
-        # site*, which would send SameSite=Strict cookies on cross-site
-        # subresource loads, and `_mixed_content_blocked` reads it as
-        # nothing to block. They travel as strings and are rebuilt.
-        urls = {}
-        for key in list(kwargs):
-            value = kwargs[key]
-            if value is not None and hasattr(value, "scheme") \
-                    and hasattr(value, "host"):
-                urls[key] = str(kwargs.pop(key))
-        clean = {
-            key: value for key, value in kwargs.items()
-            if value is None or isinstance(value, (str, int, float, bool, dict, list))
-        }
-        if urls:
-            clean["url_kwargs"] = urls
-        if context is not None:
-            clean["context_id"] = context.get("context_id")
-        return clean
+    _kwargs = staticmethod(to_wire)
 
     def bind_context(self, document_url, *, profile_id="default"):
         return self._rpc("broker.bind_context", {
@@ -528,18 +505,9 @@ class RendererProcessHost:
             leases.release_all()
 
     def _network_kwargs(self, payload):
-        kwargs = dict(payload.get("kwargs") or {})
-        for key, value in (kwargs.pop("url_kwargs", None) or {}).items():
-            kwargs[key] = net.URL(value)
-        context_id = kwargs.pop("context_id", None)
-        if context_id is not None:
-            context = self._contexts.get(context_id)
-            if context is None:
-                raise ProtocolError("invalid_context", "unknown network context")
-            kwargs["context"] = context
-        if self._active_cancel_token is not None:
-            kwargs["cancel_token"] = self._active_cancel_token
-        return kwargs
+        return from_wire(
+            payload.get("kwargs"), contexts=self._contexts,
+            cancel_token=self._active_cancel_token)
 
     def _handle_broker(self, message, leases):
         kind = message["type"]

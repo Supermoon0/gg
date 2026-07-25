@@ -19,7 +19,7 @@ from .layout import (VSTEP, BlockLayout, DocumentLayout, ImageLayout,
                      layout_tree_to_list, paint_tree,
                      restore_scroll_state, scroll_container_by)
 from .pages import error_page
-from .network_backend import default_network_backend
+from .network_backend import create_network_backend
 from .renderer_session import create_renderer_session
 
 SCROLL_STEP = 90
@@ -28,7 +28,7 @@ HOME_URL = "about:home"
 
 class Browser:
     def __init__(self, network_backend=None, process_model=None):
-        self.network = network_backend or default_network_backend()
+        self.network = network_backend or create_network_backend()
         model = process_model or os.environ.get("GG_PROCESS_MODEL", "local")
         self.renderer = (create_renderer_session(
             self.network, process_model=model, timeout=net.DEFAULT_TIMEOUT)

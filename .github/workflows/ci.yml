@@ -98,7 +98,7 @@ jobs:
         run: python validation/jsvm_gauntlet.py
 
       - name: Test conformance harness utilities
-        run: python -m unittest validation.test_conformance validation.test_process_seams validation.test_renderer_process -v
+        run: python -m unittest validation.test_conformance validation.test_process_seams validation.test_renderer_process validation.test_network_service -v
 
       - name: Run conformance regression scorecard
         run: python validation/conformance.py
