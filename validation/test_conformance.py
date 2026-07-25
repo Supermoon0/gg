@@ -61,7 +61,10 @@ features:
 
     def test_capped_selection_is_round_robin(self):
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            # resolve() so Windows 8.3 short paths (RUNNER~1) from
+            # tempfile match the long-form paths glob returns —
+            # relative_to() raises across the two spellings
+            root = Path(temp).resolve()
             for folder in ("a", "b"):
                 (root / folder).mkdir()
                 for number in range(3):
