@@ -16,6 +16,7 @@ from ..ipc.channel import JsonChannel
 from ..ipc.protocol import BUILD_ID, MAX_IN_FLIGHT, ProtocolError
 from ..renderer_session import LocalRendererSession
 from ..security import ScriptFetchResponse
+from .sandbox import apply_renderer_sandbox
 
 
 class RendererProcessError(RuntimeError):
@@ -164,6 +165,8 @@ def _worker_error(channel, request, exc):
 
 def renderer_worker(connection, renderer_id):
     """Spawn target. Page-controlled data crosses only JsonChannel bytes."""
+    # quota + privilege reduction BEFORE any page bytes are parsed
+    sandbox_report = apply_renderer_sandbox()
     channel = JsonChannel(connection, renderer_id)
     session = None
     state = {"generation": 0, "document_token": "", "timeout": 15.0}
@@ -178,7 +181,8 @@ def renderer_worker(connection, renderer_id):
         channel.send(
             "hello_ack", reply_to=hello["msg_id"],
             payload={"role": "renderer", "build_id": BUILD_ID,
-                     "nonce": hp["nonce"], "pid": os.getpid()})
+                     "nonce": hp["nonce"], "pid": os.getpid(),
+                     "sandbox": sandbox_report})
 
         backend = _BrokerNetworkBackend(channel, state)
         while True:
@@ -340,6 +344,7 @@ class RendererProcessHost:
         self._contexts = {}
         self._active_cancel_token = None
         self._in_flight = 0
+        self.sandbox_report = []
         self.start()
 
     @property
@@ -377,6 +382,7 @@ class RendererProcessHost:
                 or payload.get("nonce") != nonce:
             self._mark_dead("invalid handshake", terminate=True)
             raise ProtocolError("bad_handshake", "renderer handshake failed")
+        self.sandbox_report = list(payload.get("sandbox") or [])
         return self
 
     def restart(self):

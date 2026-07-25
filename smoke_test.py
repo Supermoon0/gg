@@ -2721,7 +2721,10 @@ if native.available():
         def set_title(self, title):
             self.title = title
 
-    _native_shell = _NativeShell(_FakeNativeWindow())
+    # local renderer on purpose: this section tests shell UI logic, and
+    # a spawn-based renderer child would re-import this top-level script
+    # as __mp_main__ (process isolation has its own unittest suite)
+    _native_shell = _NativeShell(_FakeNativeWindow(), process_model="local")
     _native_shell.load(_ui_page1).result(timeout=2.0)
     _native_shell.poll_navigation()
     _shell_remember = next(
@@ -2979,5 +2982,705 @@ if native.available():
           repr(dp4.text("#out")))
 else:
     print("[SKIP] driver checks - native ggcore not built")
+
+# --- CSS transitions & @keyframes animations (browser/animation.py) ---
+from browser import animation as anim  # noqa: E402
+
+check("anim: parse_time units",
+      anim.parse_time("0.3s") == 0.3 and anim.parse_time("250ms") == 0.25
+      and anim.parse_time("0s") == 0.0 and anim.parse_time("abc") is None)
+
+_ts = anim.parse_transitions(
+    {"transition": "opacity 0.2s ease-in 0.1s, width 1s"})
+check("anim: transition shorthand normalizes",
+      len(_ts) == 2 and _ts[0].prop == "opacity"
+      and abs(_ts[0].duration - 0.2) < 1e-9
+      and abs(_ts[0].delay - 0.1) < 1e-9
+      and _ts[1].prop == "width" and _ts[1].duration == 1.0
+      and _ts[1].delay == 0.0, repr(_ts))
+_tl = anim.parse_transitions(
+    {"transition-property": "color, width", "transition-duration": "1s",
+     "transition-delay": "0s, 0.5s",
+     "transition-timing-function": "linear"})
+check("anim: transition longhand lists repeat per property",
+      len(_tl) == 2 and _tl[0].prop == "color" and _tl[0].duration == 1.0
+      and _tl[1].duration == 1.0 and _tl[1].delay == 0.5
+      and _tl[0].timing(0.5) == 0.5, repr(_tl))
+check("anim: transition-property none disables",
+      anim.parse_transitions({"transition": "all 1s",
+                              "transition-property": "none"}) == ())
+_all = anim.parse_transitions({"transition": "all 2s, opacity 1s"})
+check("anim: exact property match beats all",
+      anim.transition_for(_all, "opacity").duration == 1.0
+      and anim.transition_for(_all, "width").duration == 2.0)
+
+_as = anim.parse_animations(
+    {"animation": "spin 2s linear 0.5s infinite alternate paused"})
+check("anim: animation shorthand normalizes",
+      len(_as) == 1 and _as[0].name == "spin" and _as[0].duration == 2.0
+      and _as[0].delay == 0.5 and _as[0].iterations == float("inf")
+      and _as[0].direction == "alternate" and _as[0].play_state == "paused"
+      and _as[0].timing(0.25) == 0.25, repr(_as))
+_al = anim.parse_animations(
+    {"animation-name": "a, b", "animation-duration": "1s, 2s",
+     "animation-fill-mode": "both",
+     "animation-iteration-count": "3"})
+check("anim: animation longhands fan out over names",
+      len(_al) == 2 and _al[0].name == "a" and _al[0].duration == 1.0
+      and _al[1].name == "b" and _al[1].duration == 2.0
+      and all(s.fill == "both" and s.iterations == 3.0 for s in _al),
+      repr(_al))
+check("anim: animation none yields nothing",
+      anim.parse_animations({"animation": "none"}) == ())
+
+_kf = anim.parse_keyframes([
+    "@keyframes fade { from { opacity: 0 } 50% { opacity: 0.9 } "
+    "to { opacity: 1 } }"
+    "@-webkit-keyframes slide { 0%, 100% { margin: 4px } "
+    "50% { margin-left: 8px } }"])
+check("anim: @keyframes from/to/% parse",
+      [o for o, _ in _kf["fade"]] == [0.0, 0.5, 1.0]
+      and _kf["fade"][1][1]["opacity"] == "0.9", repr(_kf.get("fade")))
+check("anim: prefixed keyframes + shorthand expansion in frames",
+      _kf["slide"][0][1]["margin-left"] == "4px"
+      and _kf["slide"][1][1]["margin-left"] == "8px"
+      and _kf["slide"][2][1]["margin-top"] == "4px", repr(_kf.get("slide")))
+_kf2 = anim.parse_keyframes(
+    ["@keyframes x { to { opacity: 0 } }",
+     "@keyframes x { to { opacity: 0.5 } }"])
+check("anim: later same-name keyframes win",
+      _kf2["x"][-1][1]["opacity"] == "0.5")
+
+_ease_in = anim.parse_timing("ease-in")
+_steps4 = anim.parse_timing("steps(4)")
+check("anim: timing functions",
+      anim.parse_timing("linear")(0.5) == 0.5
+      and _ease_in(0.5) < 0.5
+      and abs(anim.parse_timing("cubic-bezier(0,0,1,1)")(0.3) - 0.3) < 1e-3
+      and _steps4(0.3) == 0.25 and _steps4(0.99) == 0.75
+      and anim.parse_timing("steps(2, start)")(0.1) == 0.5)
+
+check("anim: length/number interpolation",
+      anim.interpolate("width", "10px", "20px", 0.5) == "15px"
+      and anim.interpolate("opacity", "0", "1", 0.25) == "0.25")
+check("anim: color interpolation",
+      anim.interpolate("color", "#000000", "#ffffff", 0.5) == "#808080"
+      and anim.interpolate("background-color", "rgb(0,0,0)",
+                           "rgba(255,255,255,0)", 0.5)
+      == "rgba(128,128,128,0.5)")
+check("anim: transform interpolation",
+      anim.interpolate("transform", "translate(0px, 0px)",
+                       "translate(10px, 20px)", 0.5)
+      == "translate(5px, 10px)"
+      and anim.interpolate("transform", "none", "translatex(10px)", 0.5)
+      == "translatex(5px)")
+check("anim: non-interpolable values flip at 50%",
+      anim.interpolate("display", "none", "block", 0.25) == "none"
+      and anim.interpolate("display", "none", "block", 0.75) == "block")
+check("anim: damage classification",
+      anim.classify("opacity") == anim.DAMAGE_PAINT
+      and anim.classify("background-color") == anim.DAMAGE_PAINT
+      and anim.classify("transform") == anim.DAMAGE_PAINT
+      and anim.classify("width") == anim.DAMAGE_LAYOUT)
+
+# engine: transition lifecycle against an injected clock
+_clock = [0.0]
+_eng = anim.AnimationEngine(clock=lambda: _clock[0])
+_eng.reset([])
+_aroot = Element("html", {}, None)
+_adiv = Element("div", {}, _aroot)
+_aroot.children.append(_adiv)
+_aroot.style = {}
+_adiv.style = {"opacity": "0", "transition": "opacity 1s linear",
+               "width": "100px"}
+_r = _eng.on_frame(_aroot)
+check("anim: first style never transitions",
+      _r.damage == "none" and not _eng.active
+      and _adiv.style["opacity"] == "0")
+_adiv.style["opacity"] = "1"  # a restyle changed the base value
+_r = _eng.on_frame(_aroot)
+check("anim: transition starts from the old value",
+      _r.damage == "paint" and _eng.active
+      and _adiv.style["opacity"] == "0", repr(_adiv.style))
+_clock[0] = 0.5
+_eng.on_frame(_aroot)
+check("anim: transition samples midway", _adiv.style["opacity"] == "0.5")
+_clock[0] = 2.0
+_r = _eng.on_frame(_aroot)
+check("anim: transition completes to the base value",
+      _adiv.style["opacity"] == "1" and not _eng.active
+      and _r.damage == "paint")
+_adiv.style["opacity"] = "0"  # reverse: new target mid-idle
+_r = _eng.on_frame(_aroot)
+_clock[0] = 2.5
+_eng.on_frame(_aroot)
+check("anim: transition retargets from current value",
+      _adiv.style["opacity"] == "0.5", _adiv.style["opacity"])
+_clock[0] = 4.0
+_eng.on_frame(_aroot)
+_adiv.style["width"] = "200px"  # width transitions are layout damage
+_adiv.style["transition"] = "all 1s linear"
+_r = _eng.on_frame(_aroot)
+check("anim: layout property transition reports layout damage",
+      _r.damage == "layout" and _adiv.style["width"] == "100px")
+_clock[0] = 4.5
+_eng.on_frame(_aroot)
+check("anim: width transition midway", _adiv.style["width"] == "150px")
+_clock[0] = 6.0
+_eng.on_frame(_aroot)
+
+# base change without a matching transition snaps instantly
+_adiv.style["transition"] = "opacity 1s linear"
+_eng.on_frame(_aroot)
+_adiv.style["width"] = "300px"
+_r = _eng.on_frame(_aroot)
+check("anim: uncovered property snaps without animating",
+      _adiv.style["width"] == "300px" and _r.damage == "none")
+
+# engine: @keyframes lifecycle
+_clock[0] = 0.0
+_eng2 = anim.AnimationEngine(clock=lambda: _clock[0])
+_eng2.reset(["@keyframes fade { from { opacity: 0 } to { opacity: 1 } }"])
+_kroot = Element("html", {}, None)
+_kdiv = Element("div", {}, _kroot)
+_kroot.children.append(_kdiv)
+_kroot.style = {}
+_kdiv.style = {"animation": "fade 2s linear"}
+_r = _eng2.on_frame(_kroot)
+check("anim: keyframes start at from-frame",
+      _kdiv.style.get("opacity") == "0" and _eng2.active
+      and _r.damage == "paint")
+_clock[0] = 1.0
+_eng2.on_frame(_kroot)
+check("anim: keyframes sample midway", _kdiv.style["opacity"] == "0.5")
+_clock[0] = 3.0
+_r = _eng2.on_frame(_kroot)
+check("anim: fill:none reverts after the run",
+      "opacity" not in _kdiv.style and not _eng2.active)
+
+_kdiv.style = {"animation": "fade 1s linear 1s both"}
+_clock[0] = 10.0
+_eng2.on_frame(_kroot)
+check("anim: backwards fill applies during the delay",
+      _kdiv.style.get("opacity") == "0")
+_clock[0] = 11.5
+_eng2.on_frame(_kroot)
+check("anim: delayed run samples after its delay",
+      _kdiv.style["opacity"] == "0.5")
+_clock[0] = 13.0
+_r = _eng2.on_frame(_kroot)
+check("anim: forwards fill holds the end value",
+      _kdiv.style["opacity"] == "1" and not _eng2.active)
+
+_kdiv.style = {"animation": "fade 1s linear infinite alternate"}
+_clock[0] = 20.0
+_eng2.on_frame(_kroot)
+_clock[0] = 21.25  # second iteration runs in reverse
+_eng2.on_frame(_kroot)
+check("anim: alternate direction reverses odd iterations",
+      _kdiv.style["opacity"] == "0.75" and _eng2.active,
+      _kdiv.style.get("opacity"))
+_kdiv.style = {"animation": "fade 10s linear paused"}
+_clock[0] = 30.0
+_eng2.on_frame(_kroot)
+_clock[0] = 35.0
+_r = _eng2.on_frame(_kroot)
+check("anim: paused animation holds and wants no frames",
+      _kdiv.style.get("opacity") == "0" and not _eng2.active)
+_kdiv.style = {}
+_r = _eng2.on_frame(_kroot)
+check("anim: removing animation-name cancels and cleans up",
+      "opacity" not in _kdiv.style and not _eng2._nodes)
+_kdiv.style = {"animation": "fade 5s linear"}
+_eng2.on_frame(_kroot)
+_kroot.children.remove(_kdiv)
+_eng2.on_frame(_kroot)
+check("anim: removed DOM nodes drop their animation state",
+      not _eng2._nodes)
+
+# through the real pipeline: an animated height changes layout geometry
+_anim_css = ("div { width: 100px; height: 10px; "
+             "animation: grow 2s linear; } "
+             "@keyframes grow { from { height: 10px } "
+             "to { height: 110px } }")
+_anim_dom = _styled(_anim_css, "<div>x</div>")
+_clock[0] = 0.0
+_eng3 = anim.AnimationEngine(clock=lambda: _clock[0])
+_eng3.reset([_anim_css])
+_eng3.on_frame(_anim_dom)   # first frame starts the animation's clock
+_clock[0] = 1.0             # halfway through the 2s run
+_eng3.on_frame(_anim_dom)
+_anim_doc = DocumentLayout(_anim_dom)
+_anim_doc.layout(800)
+_anim_box = next(o for o in layout_tree_to_list(_anim_doc, [])
+                 if isinstance(o, BlockLayout)
+                 and getattr(o.node, "tag", None) == "div")
+check("anim: sampled keyframe height feeds layout",
+      abs(_anim_box.height - 60.0) < 0.01, _anim_box.height)
+
+# --- iframe: isolated child browsing contexts (browser/frames.py) ---
+from browser import frames as gg_frames  # noqa: E402
+
+check("iframe: schemeful origin model",
+      gg_frames.same_origin(net.URL("https://a.test/x"),
+                            net.URL("https://a.test/y"))
+      and not gg_frames.same_origin(net.URL("https://a.test/"),
+                                    net.URL("http://a.test/"))
+      and not gg_frames.same_origin(net.URL("https://a.test/"),
+                                    net.URL("https://b.test/"))
+      and gg_frames.origin_of(net.URL("about:home")) is None)
+check("iframe: sandbox attribute parses",
+      gg_frames.parse_sandbox(None) is None
+      and gg_frames.parse_sandbox("") == set()
+      and gg_frames.parse_sandbox("allow-scripts ALLOW-SAME-ORIGIN")
+      == {"allow-scripts", "allow-same-origin"})
+check("iframe: X-Frame-Options gates embedding",
+      gg_frames.frame_blocked_reason(
+          {"X-Frame-Options": "DENY"}, net.URL("https://c.test/"),
+          net.URL("https://p.test/")) is not None
+      and gg_frames.frame_blocked_reason(
+          {"x-frame-options": "SAMEORIGIN"}, net.URL("https://p.test/a"),
+          net.URL("https://p.test/")) is None
+      and gg_frames.frame_blocked_reason(
+          {"x-frame-options": "SAMEORIGIN"}, net.URL("https://c.test/"),
+          net.URL("https://p.test/")) is not None)
+check("iframe: CSP frame-ancestors overrides XFO",
+      gg_frames.frame_blocked_reason(
+          {"content-security-policy": "frame-ancestors 'none'",
+           "x-frame-options": "SAMEORIGIN"},
+          net.URL("https://p.test/child"),
+          net.URL("https://p.test/")) is not None
+      and gg_frames.frame_blocked_reason(
+          {"content-security-policy": "frame-ancestors 'self'"},
+          net.URL("https://p.test/child"),
+          net.URL("https://p.test/")) is None
+      and gg_frames.frame_blocked_reason(
+          {"content-security-policy":
+           "default-src 'self'; frame-ancestors https://p.test"},
+          net.URL("https://c.test/"), net.URL("https://p.test/")) is None
+      and gg_frames.frame_blocked_reason(
+          {"content-security-policy": "frame-ancestors *.p.test"},
+          net.URL("https://c.test/"),
+          net.URL("https://sub.p.test/")) is None)
+
+# a tiny fake web the frame loader fetches from
+_FRAME_SITES = {
+    "https://frchild.test/": (
+        {},
+        "<style>body{margin:0} .red{background-color:#ff0000;"
+        "width:50px;height:30px} p{margin:0}</style>"
+        '<div class=red></div><a href="/next">go next</a>'
+        '<div style="height:400px"></div>'),
+    "https://frchild.test/next": (
+        {}, "<p id=second>second page</p>"),
+    "https://frdeny.test/": (
+        {"x-frame-options": "DENY"}, "<p>secret</p>"),
+}
+
+
+def _fake_frame_request_text(url, *args, **kwargs):
+    key = str(url)
+    if key in _FRAME_SITES:
+        headers, body = _FRAME_SITES[key]
+        return dict(headers), body, url
+    raise OSError(f"no fake page for {key}")
+
+
+_real_rt = net.request_text
+net.request_text = _fake_frame_request_text
+try:
+    _fr_parent_url = net.URL("https://frparent.test/")
+    _fr_parent = _styled(
+        "body { margin: 0 }",
+        '<iframe id=fr src="https://frchild.test/" width=200 height=100>'
+        "fallback content</iframe>")
+    _fr_mgr = gg_frames.FrameManager(
+        top_url=_fr_parent_url, use_native=False)
+    _fr_mgr.sync(_fr_parent, _fr_parent_url)
+    _fr_node = _find(_fr_parent, "iframe")
+    _fr = _fr_node._frame
+    check("iframe: fallback child document loads isolated",
+          _fr is not None and _fr.status == "loaded"
+          and str(_fr.url) == "https://frchild.test/"
+          and _fr_node.children == []
+          and _fr_node.style["width"] == "200.0px"
+          and _fr_node.style["height"] == "100.0px",
+          repr((_fr and _fr.status, _fr_node.style.get("width"))))
+
+    _fr_doc = DocumentLayout(_fr_parent)
+    _fr_doc.layout(800)
+    _fr_box = next(o for o in layout_tree_to_list(_fr_doc, [])
+                   if getattr(getattr(o, "node", None), "tag", None)
+                   == "iframe" and getattr(o, "height", 0) > 0
+                   and o.__class__.__name__ == "BlockLayout")
+    _fr_cmds = paint_tree(_fr_doc, [])
+    _fr_clips = [c for c in _fr_cmds
+                 if c.__class__.__name__ == "DrawClipPush"
+                 and abs(c.left - _fr_box.x) < 0.01
+                 and abs(c.right - (_fr_box.x + _fr_box.width)) < 0.01]
+    _fr_red = [c for c in _fr_cmds
+               if getattr(c, "color", "") == "#ff0000"]
+    check("iframe: child paints inside the clipped frame box",
+          _fr_clips and _fr_red
+          and abs(_fr_red[0].left - _fr_box.x) < 0.01
+          and abs(_fr_red[0].top - _fr_box.y) < 0.01
+          and _fr_red[0].right <= _fr_box.x + _fr_box.width + 0.01,
+          repr((_fr_box.x, _fr_box.y,
+                [(c.left, c.top) for c in _fr_red])))
+
+    # nested hit test resolves the child link under parent coordinates
+    def _in_anchor(o):
+        node = getattr(o, "node", None)
+        while node is not None:
+            if getattr(node, "tag", None) == "a":
+                return True
+            node = getattr(node, "parent", None)
+        return False
+
+    _child_doc = _fr._document_layout(_fr_box.width, _fr_box.height)
+    _child_a = next(o for o in layout_tree_to_list(_child_doc, [])
+                    if _in_anchor(o) and getattr(o, "width", 0) > 0
+                    and getattr(o, "height", 0) > 0)
+    _hit = gg_frames.hit_frame(
+        _fr_box, _fr_box.x + _child_a.x + 1, _fr_box.y + _child_a.y + 1)
+    check("iframe: nested hit-test finds the child link",
+          _hit is not None
+          and _fr.find_link(_hit[1].node) == "/next",
+          repr(_hit))
+
+    # frame-internal scrolling: content shifts, page does not
+    _scrolled = _fr.scroll_by(30, _fr_box.width, _fr_box.height)
+    _fr_doc2 = DocumentLayout(_fr_parent)
+    _fr_doc2.layout(800)
+    _fr_red2 = [c for c in paint_tree(_fr_doc2, [])
+                if getattr(c, "color", "") == "#ff0000"]
+    check("iframe: wheel scroll moves only the frame content",
+          _scrolled and _fr_red2
+          and abs(_fr_red2[0].top - (_fr_box.y - 30)) < 0.01,
+          repr([(c.top) for c in _fr_red2]))
+    _fr.scroll = 0.0
+
+    # in-frame navigation replaces the child document only
+    _fr.navigate("/next")
+    check("iframe: link navigation stays inside the frame",
+          str(_fr.url) == "https://frchild.test/next"
+          and any(isinstance(n, Element)
+                  and n.attributes.get("id") == "second"
+                  for n in tree_to_list(_fr.root, []))
+          and _fr.status == "loaded")
+
+    # X-Frame-Options refusal renders a placeholder, not the content
+    _xfo_parent = _styled(
+        "", '<iframe id=x src="https://frdeny.test/"></iframe>')
+    _xfo_mgr = gg_frames.FrameManager(
+        top_url=_fr_parent_url, use_native=False)
+    _xfo_mgr.sync(_xfo_parent, _fr_parent_url)
+    _xfo = _find(_xfo_parent, "iframe")._frame
+    check("iframe: X-Frame-Options DENY blocks the document",
+          _xfo.status == "blocked" and _xfo.root is None
+          and "X-Frame-Options" in _xfo.blocked_reason
+          and len(_xfo.paint_cmds(0, 0, 100, 50)) == 3)
+
+    # srcdoc: inline markup, parent base URL (same-origin content)
+    _sd_parent = _styled(
+        "", "<iframe id=sd srcdoc=\"<p id=inner>hello</p>\"></iframe>")
+    _sd_mgr = gg_frames.FrameManager(
+        top_url=_fr_parent_url, use_native=False)
+    _sd_mgr.sync(_sd_parent, _fr_parent_url)
+    _sd = _find(_sd_parent, "iframe")._frame
+    check("iframe: srcdoc renders with the parent base URL",
+          _sd.status == "loaded" and _sd.url is _fr_parent_url
+          and any(isinstance(n, Element)
+                  and n.attributes.get("id") == "inner"
+                  for n in tree_to_list(_sd.root, [])))
+
+    # removing the element disposes its frame and returns the budget
+    _budget_before = _fr_mgr.budget[0]
+    for n in tree_to_list(_fr_parent, []):
+        if isinstance(n, Element) and n.tag == "body":
+            n.children = []
+    _fr_mgr.sync(_fr_parent, _fr_parent_url)
+    check("iframe: removed elements drop their frame documents",
+          not _fr_mgr.frames and _fr_mgr.budget[0] == _budget_before + 1)
+finally:
+    net.request_text = _real_rt
+
+if native.available():
+    from browser.network_backend import default_network_backend \
+        as _frame_backend_factory
+
+    _FRAME_SITES.update({
+        "https://frparent.test/": (
+            {},
+            '<div id=out>pending</div>'
+            '<iframe id=f src="https://frchild2.test/"></iframe>'
+            "<script>document.getElementById('f').addEventListener("
+            "'load', function () { document.getElementById('out')"
+            ".textContent = 'frame-loaded'; });</script>"),
+        "https://frchild2.test/": (
+            {},
+            '<h1 id=t>child title</h1>'
+            "<script>document.cookie = 'fc=1; path=/';"
+            "document.getElementById('t').textContent = 'scripted';"
+            "</script>"),
+        "https://frsandbox.test/": (
+            {},
+            '<p id=s>static</p>'
+            "<script>document.getElementById('s').textContent="
+            "'scripted';</script>"),
+        "https://frsbparent.test/": (
+            {}, '<iframe id=sb sandbox src="https://frsandbox.test/">'
+                "</iframe>"),
+        "https://frdeep.test/1": (
+            {}, '<p>d1</p><iframe id=d src="https://frdeep.test/2">'
+                "</iframe>"),
+        "https://frdeep.test/2": (
+            {}, '<p>d2</p><iframe id=d src="https://frdeep.test/3">'
+                "</iframe>"),
+        "https://frdeep.test/3": (
+            {}, '<p>d3</p><iframe id=d src="https://frdeep.test/4">'
+                "</iframe>"),
+        "https://frdeep.test/4": ({}, "<p>d4</p>"),
+        "https://frdeepparent.test/": (
+            {}, '<iframe id=d0 src="https://frdeep.test/1"></iframe>'),
+    })
+    net.request_text = _fake_frame_request_text
+    try:
+        _fpage = Page()
+        _fpage.goto("https://frparent.test/", settle=True)
+        _fp = _fpage.frame("#f")
+        check("iframe: driver frame() opens the isolated child",
+              _fp is not None and _fp.status == "loaded"
+              and str(_fp.url) == "https://frchild2.test/"
+              and _fp.text("#t") == "scripted",
+              repr((_fp and _fp.status, _fp and _fp.text("#t"))))
+        check("iframe: load event fires on the parent element",
+              _fpage.text("#out") == "frame-loaded",
+              repr(_fpage.text("#out")))
+        _fbackend = _frame_backend_factory()
+        _child_jar = _fbackend.cookies_for(net.URL("https://frchild2.test/"))
+        _parent_jar = _fbackend.cookies_for(net.URL("https://frparent.test/"))
+        check("iframe: child cookies stay in the child origin's jar",
+              "fc=1" in _child_jar and "fc" not in _parent_jar,
+              repr((_child_jar, _parent_jar)))
+        check("iframe: frame document.title/DOM invisible to parent DOM",
+              not any(isinstance(n, Element)
+                      and n.attributes.get("id") == "t"
+                      for n in tree_to_list(
+                          native.build_tree(_fpage._export()), [])))
+        _fpage.close()
+
+        _spage = Page()
+        _spage.goto("https://frsbparent.test/", settle=True)
+        _sp = _spage.frame("#sb")
+        check("iframe: sandbox without allow-scripts blocks child JS",
+              _sp is not None and _sp.status == "loaded"
+              and _sp.text("#s") == "static",
+              repr(_sp and _sp.text("#s")))
+        _spage.close()
+
+        _dpage = Page()
+        _dpage.goto("https://frdeepparent.test/", settle=True)
+        _d0 = _dpage.frame("#d0")
+        _fd1 = _d0._fd
+        _fd2 = next(iter(_fd1.subframes.frames.values()))
+        _fd3 = next(iter(_fd2.subframes.frames.values()))
+        check("iframe: nesting stops at the depth limit",
+              _fd1.status == "loaded" and _fd2.status == "loaded"
+              and _fd3.status == "loaded"
+              and (_fd3.subframes is None
+                   or not _fd3.subframes.frames),
+              repr((_fd1.status, _fd2.status, _fd3.status)))
+        _dpage.close()
+    finally:
+        net.request_text = _real_rt
+else:
+    print("[SKIP] iframe driver checks - native ggcore not built")
+
+# --- accessibility tree (browser/accessibility.py) ---
+from browser import accessibility as ax  # noqa: E402
+
+_ax_dom = _styled("", """
+<html><head><title>AX Test Page</title></head><body>
+<header><h1>Site</h1></header>
+<nav aria-label="주 메뉴"><a href="/a">첫 링크</a></nav>
+<main>
+  <h2 aria-level="3">Section</h2>
+  <section aria-labelledby="sec-t"><span id="sec-t">Named region</span>
+    <p>body text</p></section>
+  <section><p>anonymous section is no landmark</p></section>
+  <form aria-label="검색"><label for="q">검색어</label>
+    <input id="q" placeholder="type here" value="hello">
+    <input type="checkbox" id="c1" checked aria-describedby="c1help">
+    <span id="c1help">동의 여부</span>
+    <input type="submit" value="찾기">
+  </form>
+  <img src="x.png" alt="로고 이미지">
+  <img src="y.png" alt="">
+  <div role="presentation"><a href="/inner">through presentation</a></div>
+  <div hidden><a href="/gone">hidden link</a></div>
+  <div aria-hidden="true"><button>invisible</button></div>
+  <button disabled aria-expanded="false" title="더보기">More</button>
+  <table><caption>가격표</caption><tr><th>품목</th><td>값</td></tr></table>
+  <ul><li>하나</li><li>둘</li></ul>
+</main>
+<article><header><p>article header is not a banner</p></header></article>
+<footer>bottom</footer>
+</body></html>""")
+_ax_tree = ax.build_tree(_ax_dom)
+_ax_flat = ax.flatten(_ax_tree)
+_ax_roles = [n.role for n, _d in _ax_flat]
+
+
+def _ax_find(role, name=None):
+    for n, _d in _ax_flat:
+        if n.role == role and (name is None or n.name == name):
+            return n
+    return None
+
+
+check("ax: document root carries the page title",
+      _ax_tree.role == "document" and _ax_tree.name == "AX Test Page")
+check("ax: landmark roles with conditional header/footer",
+      _ax_find("banner") is not None
+      and _ax_find("contentinfo") is not None
+      and _ax_find("navigation") is not None
+      and _ax_find("main") is not None
+      and _ax_roles.count("banner") == 1,  # article header excluded
+      repr(_ax_roles))
+check("ax: named form/section become landmarks, anonymous do not",
+      _ax_find("form") is not None and _ax_find("form").name == "검색"
+      and _ax_find("region") is not None
+      and _ax_find("region").name == "Named region"
+      and _ax_roles.count("region") == 1)
+check("ax: aria-label names the navigation",
+      _ax_find("navigation").name == "주 메뉴")
+check("ax: label[for] names the textbox, value exposed",
+      _ax_find("textbox") is not None
+      and _ax_find("textbox").name == "검색어"
+      and _ax_find("textbox").states.get("value") == "hello",
+      repr((_ax_find("textbox").name, _ax_find("textbox").states)))
+check("ax: submit button named from its value",
+      _ax_find("button", "찾기") is not None)
+check("ax: checkbox state + aria-describedby description",
+      _ax_find("checkbox").states.get("checked") is True
+      and _ax_find("checkbox").description == "동의 여부",
+      repr((_ax_find("checkbox").states,
+            _ax_find("checkbox").description)))
+check("ax: img alt names, alt='' is decorative",
+      _ax_find("img") is not None and _ax_find("img").name == "로고 이미지"
+      and sum(1 for r in _ax_roles if r == "img") == 1)
+check("ax: role=presentation drops the node, keeps the subtree",
+      _ax_find("link", "through presentation") is not None)
+check("ax: hidden/aria-hidden subtrees leave the tree",
+      _ax_find("link", "hidden link") is None
+      and _ax_find("button", "invisible") is None)
+check("ax: disabled/expanded states and title fallback name",
+      _ax_find("button", "More") is not None
+      and _ax_find("button", "More").states.get("disabled") is True
+      and _ax_find("button", "More").states.get("expanded") is False)
+check("ax: table caption names the table, th scope splits headers",
+      _ax_find("table").name == "가격표"
+      and _ax_find("columnheader", "품목") is not None
+      and _ax_find("cell", "값") is not None)
+check("ax: list structure and item names",
+      _ax_find("list") is not None
+      and [n.name for n, _d in _ax_flat if n.role == "listitem"]
+      == ["하나", "둘"])
+check("ax: heading levels honor aria-level over the tag",
+      ax.headings(_ax_tree) == [(1, "Site"), (3, "Section")],
+      repr(ax.headings(_ax_tree)))
+check("ax: landmark outline is ordered and typed",
+      [(r, n) for r, n, _d in ax.landmarks(_ax_tree)]
+      == [("banner", "Site"), ("navigation", "주 메뉴"),
+          ("main", ""), ("region", "Named region"), ("form", "검색"),
+          ("contentinfo", "bottom")]
+      or [r for r, _n, _d in ax.landmarks(_ax_tree)]
+      == ["banner", "navigation", "main", "region", "form",
+          "contentinfo"],
+      repr(ax.landmarks(_ax_tree)))
+
+# keyboard focus and the accessibility tree must agree: everything in
+# sequential focus order is either ax-focusable or sits in an
+# aria-hidden subtree (aria-hidden hides from the tree but — like real
+# browsers — does not remove keyboard focusability), and hidden/
+# disabled controls appear in neither
+def _in_aria_hidden(node):
+    cur = node
+    while cur is not None:
+        attrs = getattr(cur, "attributes", None)
+        if attrs and attrs.get("aria-hidden", "").casefold() == "true":
+            return True
+        cur = cur.parent
+    return False
+
+
+_ax_focusables = {id(n.node) for n, _d in _ax_flat if n.focusable}
+_kb_order = keyboard.focus_order(_ax_dom)
+check("ax: keyboard focus order matches ax-focusable nodes",
+      _kb_order and all(
+          id(n) in _ax_focusables or _in_aria_hidden(n)
+          for n in _kb_order)
+      and any(id(n) in _ax_focusables for n in _kb_order),
+      repr([n.tag for n in _kb_order]))
+_ax_disabled_btn = _ax_find("button", "More")
+check("ax: disabled/hidden controls are not focusable",
+      not _ax_disabled_btn.focusable
+      and all("gone" not in (n.name or "") for n, _d in _ax_flat))
+_kb_order[0].is_focused = True
+_ax_tree2 = ax.build_tree(_ax_dom)
+check("ax: focused element is marked in a fresh snapshot",
+      any(n.focused and n.node is _kb_order[0]
+          for n, _d in ax.flatten(_ax_tree2)))
+_kb_order[0].is_focused = False
+
+# activation consistency: toggling the checkbox flips the exposed state
+_ax_cb_node = _ax_find("checkbox").node
+del _ax_cb_node.attributes["checked"]
+check("ax: state toggles flow into the next tree build",
+      ax.build_tree(_ax_dom) is not None
+      and next(n for n, _d in ax.flatten(ax.build_tree(_ax_dom))
+               if n.role == "checkbox").states.get("checked") is False)
+
+if native.available():
+    _axp = Page()
+    _axp.goto("data:text/html," + (
+        "<title>drv-ax</title>"
+        "<nav aria-label=menu><a href='/x'>go</a></nav>"
+        "<label for=i>Name</label><input id=i>"
+        "<div aria-hidden=true><a href='/no'>nope</a></div>"
+        "<img src=z.png alt=Photo>"), settle=False)
+    _axt = _axp.ax_tree()
+
+    def _ax_walk(d, out):
+        out.append(d)
+        for c in d.get("children", []):
+            _ax_walk(c, out)
+        return out
+
+    _axl = _ax_walk(_axt, [])
+    check("ax: driver ax_tree mirrors roles/names/hidden pruning",
+          _axt["role"] == "document" and _axt["name"] == "drv-ax"
+          and any(d["role"] == "navigation" and d["name"] == "menu"
+                  for d in _axl)
+          and any(d["role"] == "textbox" and d["name"] == "Name"
+                  for d in _axl)
+          and any(d["role"] == "img" and d["name"] == "Photo"
+                  for d in _axl)
+          and not any(d.get("name") == "nope" for d in _axl),
+          repr(_axl))
+    _snap = _axp.snapshot()
+    check("ax: native snapshot names use aria-label/label/alt",
+          any(s["role"] == "navigation" and s["name"] == "menu"
+              for s in _snap)
+          and any(s["role"] == "textbox" and s["name"] == "Name"
+                  for s in _snap)
+          and any(s["role"] == "img" and s["name"] == "Photo"
+                  for s in _snap)
+          and not any(s["name"] == "nope" for s in _snap),
+          repr(_snap))
+    _axp.close()
+else:
+    print("[SKIP] ax driver checks - native ggcore not built")
 
 print(f"\n{passed} checks passed - engine pipeline OK")

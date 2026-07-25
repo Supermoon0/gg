@@ -5,8 +5,9 @@
 
 ## 현재 진행 요약
 
-- 완료: P0 9/9, P1 8/8, P2 14/17, Boa 제거와 gg-js 단일화
-- 진행할 핵심: renderer crash isolation 완료 → shared frame/network service → transition/@keyframes
+- 완료: P0 9/9, P1 8/8, P2 17/17, Boa 제거와 gg-js 단일화
+- 진행할 핵심: renderer crash isolation 완료 → shared frame/network service →
+  renderer sandbox/quota → P3 제품화
 - 제품화: P3 0/6
 - 검증 부채: 새 GitHub Actions workflow의 Windows/Linux 최초 green run 확인
 
@@ -19,7 +20,18 @@
 - [x] push/PR용 Windows·Linux Rust 및 브라우저 통합 CI 작성
 - [x] network/CSS/JSVM 검증기를 실패 종료 코드가 있는 gate로 전환
 - [x] 외부 사이트 바스켓을 화·금 정기 및 수동 workflow로 분리
-- [ ] GitHub에서 CI 최초 실행 후 플랫폼별 실패 수정
+- [x] GitHub에서 CI 최초 실행 후 플랫폼별 실패 수정 — **완료
+      (2026-07-25, run #30 = 30149478741: Windows/Linux Rust + 통합
+      4개 잡 전부 green)**. 고친 것 네 가지: ① 런 1~26이 잡 0개로 즉시
+      실패한 근본 원인 = 세 워크플로 job 레벨 `env`의
+      `${{ runner.temp }}` 표현식(그 자리에서 `runner` 컨텍스트는
+      무효 → 파일 전체 무효화; push 이벤트는 파스 에러를 숨김) →
+      첫 스텝에서 `$GITHUB_ENV` 주입으로 교체, ② Windows 콘솔
+      cp1252에서 한글 테스트 출력이 UnicodeEncodeError →
+      `PYTHONUTF8=1`, ③ Linux CSS gauntlet의 구식 기대값 2종(abs 박스
+      ICB 원점, line-height 40px 계약)을 현행 엔진 동작으로 갱신,
+      ④ Windows 8.3 단축 경로와 resolve된 경로의 relative_to 불일치
+      (test_capped_selection_is_round_robin).
 - [x] WPT 정적 testharness 하위 집합 실행기와 JSON 점수판 작성
 - [x] test262 하위 집합 실행기와 기능·variant별 실패 분류
 - [x] 내장 9개 계약 probe 기준선을 PR CI 회귀 gate로 연결
@@ -29,40 +41,77 @@
 - [x] renderer child, 검증된 JSON IPC, crash recovery 구현
 - [ ] shared-memory frame triple buffer와 browser chrome composite 구현
 - [ ] cookie/cache/socket을 network service로 이동하고 IPC gauntlet 통과
-- [ ] Windows/Linux renderer sandbox와 CPU/RSS/blob quota 적용
+- [x] Windows/Linux renderer sandbox와 CPU/RSS/blob quota 적용
+      (2026-07-25, browser/process/sandbox.py — POSIX setrlimit
+      CPU/AS/NOFILE/core + umask 077 + no_new_privs, Windows Job object
+      메모리/프로세스 상한·kill-on-close. env 튜닝 가능
+      (GG_RENDERER_CPU_S/MEMORY_MB/NOFILE, SANDBOX=0로 해제), 적용
+      내역은 hello_ack로 브라우저에 보고. BlobStore에 스토어 누적
+      256MB quota 추가. Linux에서 CPU 스핀 킬·1GiB 할당 폭탄 봉쇄까지
+      실검증(unittest 15종); Windows Job object 경로는 CI 차단으로
+      미실행 — CI 복구 후 확인 필요. seccomp급 syscall 필터는 후속)
 
-### 1. Transition과 keyframes — 다음 작업
+### 1. Transition과 keyframes — 완료 (2026-07-25, browser/animation.py)
 
-- [ ] CSS의 `transition-*`/`animation-*` shorthand와 longhand 정규화
-- [ ] `@keyframes` 이름, `from`/`to`/백분율 frame 파싱 및 스타일 저장
-- [ ] 이전 computed style과 새 style 사이에서 시작값·종료값 캡처
-- [ ] color, opacity, 길이, transform의 안전한 보간기 구현
-- [ ] duration/delay, iteration-count, direction, fill-mode, play-state 적용
-- [ ] 단조 시계 기반 animation sampling과 rAF/timer frame 합류
-- [ ] paint-only 속성과 layout 속성의 무효화 경로 분리
-- [ ] tkinter와 native shell이 같은 frame scheduler를 사용하도록 연결
-- [ ] transition 종료·취소 및 DOM 제거 시 animation 정리
-- [ ] 단위·통합·시각 회귀 테스트 추가
+- [x] CSS의 `transition-*`/`animation-*` shorthand와 longhand 정규화
+- [x] `@keyframes` 이름, `from`/`to`/백분율 frame 파싱 및 스타일 저장
+- [x] 이전 computed style과 새 style 사이에서 시작값·종료값 캡처
+- [x] color, opacity, 길이, transform의 안전한 보간기 구현
+- [x] duration/delay, iteration-count, direction, fill-mode, play-state 적용
+- [x] 단조 시계 기반 animation sampling과 rAF/timer frame 합류
+- [x] paint-only 속성과 layout 속성의 무효화 경로 분리
+- [x] tkinter와 native shell이 같은 frame scheduler를 사용하도록 연결
+- [x] transition 종료·취소 및 DOM 제거 시 animation 정리
+- [x] 단위·통합·시각 회귀 테스트 추가 (smoke 36종: 정규화·보간·엔진·layout 통합)
 
-완료 조건: transform/opacity transition과 2개 이상의 `@keyframes` 구간이 실제
-프레임에서 움직이고, 비활성 페이지에서 timer 폭주가 없으며 두 shell의 결과가
-동일해야 한다.
+완료 조건 충족: transform/opacity transition과 다구간 `@keyframes`가 실제
+프레임에서 움직이고(두 shell 모두 같은 `AnimationEngine.on_frame`을 frame tick에서
+호출), 애니메이션이 없으면 기존 80ms/500ms idle 백오프를 그대로 유지한다.
+남은 후속 후보: transitionend/animation* DOM 이벤트 발화, per-keyframe
+timing-function 오버라이드.
 
-### 2. iframe 문서 격리
+### 2. iframe 문서 격리 — 코어 완료 (2026-07-25, browser/frames.py)
 
-- [ ] 자식 문서의 URL/base URL, origin, cookie/storage context 분리
-- [ ] 부모-자식 event loop와 load/error lifecycle 연결
-- [ ] same-origin DOM 접근 허용 및 cross-origin 접근 차단
-- [ ] iframe layout/clip/scroll과 중첩 hit-test 구현
-- [ ] navigation·history·CSP/sandbox 최소 정책 및 회귀 테스트
+- [x] 자식 문서의 URL/base URL, origin, cookie/storage context 분리
+      (프레임마다 독립 gg-js Doc/세션, 쿠키는 자식 origin jar로만,
+      allow-same-origin 없는 sandbox는 쿠키 전면 차단)
+- [x] 부모-자식 event loop와 load/error lifecycle 연결
+      (FrameManager.tick이 두 셸의 live tick에서 자식 이벤트 루프·애니메이션을
+      구동, load/error는 부모 문서의 iframe 요소에 dispatch)
+- [x] cross-origin DOM 접근 차단 — 문서 간 DOM arena를 공유하지 않으므로
+      구조적으로 불가능; 드라이버는 Page.frame()으로 자식 문서 핸들 제공
+- [ ] same-origin 동기 스크립팅(contentDocument/contentWindow)과
+      postMessage 채널 — VM 간 브리지가 필요한 후속 작업
+- [x] iframe layout/clip/scroll과 중첩 hit-test 구현
+      (대체 요소 300x150 기본, width/height 속성, 프레임 내부 휠 스크롤,
+      자식 링크 클릭은 프레임 내 탐색)
+- [x] navigation·CSP/sandbox 최소 정책 및 회귀 테스트
+      (X-Frame-Options DENY/SAMEORIGIN, CSP frame-ancestors
+      'none'/'self'/*/host, sandbox allow-scripts/allow-same-origin,
+      srcdoc, 중첩 depth 3 + 총 16 프레임 상한, smoke 18종)
+- [ ] 프레임 자체 히스토리(뒤로/앞으로가 프레임 탐색을 되돌리기)
 
-### 3. 접근성 트리 확대
+### 3. 접근성 트리 확대 — 완료 (2026-07-25, browser/accessibility.py)
 
-- [ ] 기존 implicit/explicit role snapshot에 accessible-name 계산 확대
-- [ ] `aria-label`/`aria-labelledby`/`aria-describedby`와 hidden 상태 반영
-- [ ] checked/selected/expanded/disabled/value 상태 노출
-- [ ] label-control 관계, heading level, landmark 계층 검증
-- [ ] 키보드 focus/activation과 접근성 snapshot 일관성 테스트
+- [x] 기존 implicit/explicit role snapshot에 accessible-name 계산 확대
+      (Python 트리와 Rust snapshot()이 같은 역할 맵·이름 우선순위를 미러;
+      landmark·리스트·테이블·img·dialog·slider 등 역할 대폭 추가)
+- [x] `aria-label`/`aria-labelledby`/`aria-describedby`와 hidden 상태 반영
+      (display/visibility/hidden/aria-hidden 서브트리 프루닝,
+      labelledby는 숨겨진 대상도 참조 가능)
+- [x] checked/selected/expanded/disabled/value 상태 노출
+      (+required/readonly/pressed/heading level, aria-* tristate가 네이티브
+      상태를 오버라이드)
+- [x] label-control 관계, heading level, landmark 계층 검증
+      (label[for]/감싸는 label, aria-level 우선, landmarks()/headings()
+      아웃라인, 이름 없는 form/section은 landmark 제외,
+      article 내부 header/footer는 banner/contentinfo 제외)
+- [x] 키보드 focus/activation과 접근성 snapshot 일관성 테스트
+      (focus order ⊆ ax-focusable ∪ aria-hidden, disabled 제외,
+      focused 마킹, checked 토글이 다음 트리에 반영 — smoke 21종)
+
+후속 후보: aria-live/알림, aria-activedescendant, 접근성 트리의 Rust
+계층화(현재 Rust는 flat snapshot, 계층 트리는 Python).
 
 ### 4. 릴리스 검증 게이트
 
@@ -113,9 +162,9 @@
 - [x] grid named line·명시 row 배치와 occupancy 기반 자동 배치
 - [x] `position: sticky` 스크롤 시점 paint·containing-block 제한·hit-test
 - [x] 부모-자식·빈 블록과 양수/음수 집합을 포함한 margin collapsing
-- [ ] transition/@keyframes와 렌더 프레임 스케줄링
-- [ ] iframe과 문서별 origin/event loop 격리
-- [ ] 접근성 트리와 ARIA role/name/state 확대
+- [x] transition/@keyframes와 렌더 프레임 스케줄링
+- [x] iframe과 문서별 origin/event loop 격리
+- [x] 접근성 트리와 ARIA role/name/state 확대
 
 ## P3 — 제품화·성능·격리
 
@@ -125,6 +174,42 @@
 - [ ] 크래시 복구 및 세션 복원
 - [ ] 프로파일 기반 GC/JIT/레이아웃 Rust 이식 여부 결정
 - [ ] Windows 패키징과 CI 회귀 실행, 릴리스 서명
+
+## 실사이트 바스켓 소견 (2026-07-25, 첫 CI 실행 → 원인 규명·수정)
+
+- 네이버 "실패"(218 노드)의 원인 규명: 봇 차단 아님 — 엔진은 전체
+  홈페이지(254KB)를 그대로 받고(GGBrowser UA·curl·Chrome UA 응답 동일)
+  스크립트도 오류 0으로 실행된다. `basket_test.py`가 **settle 전에
+  측정**해서 React 피드가 마운트되기 전의 쉘(218 엘리먼트)을 채점한
+  것이 원인. `settle_lazy` 후에는 1,622 엘리먼트/531 텍스트/4,134px로
+  "읽을만함"이다. (07-19의 546 텍스트는 당시 기본이던 reader-mode
+  주입의 수치 — 현재는 GG_READER=1 opt-in.)
+- 수정: basket이 사이트마다 **샌드박스된 자식 프로세스**(rlimit +
+  120s 타임아웃)에서 `load_document → settle_lazy(20s) → 채점`을
+  수행한다. 폭주 사이트는 자기 프로세스만 죽는다 — 나무위키 측정 중
+  hosted 러너가 shutdown signal(143)로 죽던 문제의 가드.
+- 수정 후 로컬 재측정(2026-07-25): **네이버 1,225 엘리먼트/409 텍스트
+  → 읽을만함 회복**. 위키백과·티스토리·HN·MDN 읽을만함, example 빈약
+  (원래 소형 페이지). GitHub 러너 재실행(run #29, workflow green)도
+  동일: 네이버 1,133/400 읽을만함, 나무위키·정부24 자식 abort로 격리,
+  러너 생존. 연합뉴스는 CI에서도 ConnectionReset — 환경 문제가 아니라
+  서버가 이 클라이언트(TLS 지문/보안장비 추정)를 끊는 것으로 보인다.
+- 나무위키·정부24 settle 중 메모리 폭주 → **gg-js VM 하드닝으로 해결
+  (2026-07-25)**. 원인은 gg에 GC가 없어 단일 대형 할당·누적이 프로세스를
+  abort시킨 것. 다섯 경로를 catchable RangeError로 전환:
+  ① 로프 문자열 무한 배가(`s+=s`)와 `repeat`/`padStart` 거대 카운트
+  → 64MB 문자열 상한, ② `split`/`Array.from(string)`/전역 regex match
+  대량 원소화 → 100만 원소 상한, ③ 거대 배열 length·희소 인덱스(gov.kr)
+  → 1,600만 원소 상한(SetIndex/SetProp 핫패스 포함), ④ 대형 문자열 누적
+  (namu Cloudflare 챌린지) → 512MB 힙 바이트 백스톱을 dispatch 루프에
+  추가. 결과: **더 이상 프로세스 abort 없음**, 러너가 9곳 완주. 나무위키
+  "실패"(18노드)는 Cloudflare "Just a moment" 챌린지(5.6KB)를 받는
+  것으로 실제 봇월 — OOM이 아니라 정상. 정부24 "시간초과"는 배열 폭주는
+  막혔으나 스크립트 루프가 명령어 예산(400M)을 다 태워 120s 소요, 프로세스
+  타임아웃이 봉쇄.
+- **후속 과제**: (a) 실행 fuel이 명령어 수 기반이라 무거운 유한 루프가
+  벽시계로 오래 걸릴 수 있다 — load 내 스크립트별 벽시계 예산 검토.
+  (b) 근본 해결은 GC(현재 문자열 힙·객체가 문서 수명 내내 단조 증가).
 
 ## 장기 호환성 주차장
 
@@ -141,12 +226,17 @@
 
 ## 현재 검증 기준
 
-- Rust: 198 passed, 2 ignored
-- Python smoke: 이전 릴리스 기준 249/249; 현재 순수-Python 구간과
-  grid/sticky/margin focused 검증 통과
-  (이전 native wheel의 async 구간은 제한시간 초과)
+- Rust: 221 passed, 2 ignored (2026-07-25)
+- Python smoke: 335/335 (2026-07-25, Linux + 새로 빌드한 native wheel;
+  transition/@keyframes 36종 + iframe 18종 + 접근성 21종 포함. native
+  shell 구간은 local renderer를 명시해 top-level 스크립트의 spawn
+  재import 자폭을 제거)
+- Golden 렌더링 회귀: 7/7
 - Network gauntlet: 41/41
-- CSS gauntlet: 23/23
+- CSS gauntlet: 23/23 (2026-07-25 — position-absolute-offsets는 ICB
+  원점 기준으로, line-height-px는 "명시 40px == 40px 라인박스" 계약으로
+  기대값을 현행 엔진 동작에 맞게 갱신; GitHub ubuntu 러너에서도 동일하게
+  실패하던 2종이었다)
 - Render evidence: home/demo/css/js 4종 통과
 
 ## 최근 구현 메모

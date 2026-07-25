@@ -21,7 +21,10 @@ cd ggcore && cargo test --lib --no-default-features  # 198 통과 + 진단용 2�
 ```
 
 native shell은 renderer child process를 기본 사용한다. 디버그/테스트에서 로컬
-renderer를 강제하려면 `GG_PROCESS_MODEL=local`을 설정한다. Headless API는 명시적으로
+renderer를 강제하려면 `GG_PROCESS_MODEL=local`을 설정한다. renderer child는
+시작 시 OS 샌드박스를 스스로 적용한다(POSIX setrlimit CPU/메모리/파일 +
+no_new_privs, Windows Job object; `GG_RENDERER_CPU_S`/`GG_RENDERER_MEMORY_MB`
+로 조정, `GG_RENDERER_SANDBOX=0`으로 해제). Headless API는 명시적으로
 선택할 수 있다.
 
 ```python
@@ -127,7 +130,18 @@ Python, 페인트는 Rust 소프트웨어 래스터라이저. 골든 렌더링 �
 `::before`/`::after` + content, background-image(스프라이트 크롭·타일),
 border-radius, box-shadow, gradient 색 폴백, overflow:hidden 클리핑, z-index
 쌓임(컨테이너별 정렬), transform(translate/scale), opacity 게이트, line-height,
-white-space:nowrap, text-overflow:ellipsis
+white-space:nowrap, text-overflow:ellipsis, **transition + @keyframes 애니메이션**
+(shorthand/longhand 정규화, 색·길이·transform 보간, iteration/direction/
+fill-mode/play-state, paint-only와 layout 무효화 분리 — 두 셸이 같은
+`AnimationEngine`을 frame tick에서 샘플링)
+
+**iframe**: 프레임마다 완전히 분리된 자식 문서(자체 URL/base·origin·쿠키
+jar·storage·gg-js 이벤트 루프·스타일·애니메이션). 부모는 자식의 페인트
+출력만 임베드하고(300x150 대체 요소 기본, clip, 프레임 내부 휠 스크롤,
+중첩 hit-test·프레임 내 링크 탐색), load/error를 iframe 요소에 발화한다.
+X-Frame-Options·CSP frame-ancestors·sandbox(allow-scripts/allow-same-origin)·
+srcdoc, 중첩 depth 3 상한. 헤드리스는 `page.frame("#id")`로 자식 문서를
+조회한다.
 
 **레이아웃**: 블록/인라인, 박스 모델, position(absolute/fixed/relative/**sticky**),
 플렉스박스(justify/align/shrink/basis 포함), **float + clear**, table의
@@ -148,6 +162,13 @@ collapse하며 border·padding·overflow formatting context에서는 차단한�
 리스트로 오프셋 전용 프레임), 링크 히트 테스트, EAGER-DATA 리더 모드(네이버
 헤드라인·피드 추출 렌더). 상위 탐색은 UI 스레드 밖에서 실행되며 새 탐색·중지로
 기존 요청을 취소한다. 뒤로/앞으로는 저장한 문서와 폼·스크롤 상태를 복원한다.
+
+**접근성**: 역할/이름/상태의 계층 접근성 트리(`browser/accessibility.py`) —
+WAI-ARIA accessible-name 서브셋(aria-label/labelledby, label[for]·감싸는
+label, alt, caption/legend, placeholder, title), checked/selected/expanded/
+disabled/value 등 상태, landmark·heading 아웃라인, aria-hidden 서브트리
+프루닝. Rust `snapshot()`은 같은 역할 맵·이름 우선순위의 flat 고속 경로이고,
+헤드리스는 `page.ax_tree()`로 전체 트리를 읽는다.
 
 ## 성능
 
@@ -171,7 +192,8 @@ collapse하며 border·padding·overflow formatting context에서는 차단한�
 상세 우선순위와 완료 조건은 [개발 로드맵](docs/roadmap.md)에 체크리스트로 관리한다.
 
 - baseline JIT, GC, 레이아웃 러스트 이식 (React 실측 병목을 기준으로 결정)
-- transition/@keyframes, iframe, HTTP/2, `<video>`/WebGL, 로그인 호환성
+- HTTP/2, `<video>`/WebGL, 로그인 호환성, transition/animation DOM 이벤트
+- iframe same-origin 스크립팅(contentWindow/postMessage), 프레임 히스토리
 - [browser/renderer/network 프로세스 격리와 IPC](docs/process-isolation-ipc.md)
 - process-neutral local seam: `browser/renderer_session.py`, `browser/network_backend.py`
 

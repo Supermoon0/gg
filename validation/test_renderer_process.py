@@ -1,9 +1,12 @@
 import multiprocessing
+import os
 import unittest
 
 from browser import native, net
 from browser.driver import Page
+from browser.ipc.blobs import BlobError, BlobStore
 from browser.ipc.channel import JsonChannel
+from browser.process.sandbox import apply_renderer_sandbox, renderer_limits
 from browser.ipc.protocol import (
     MAX_CONTROL_BYTES,
     ProtocolError,
@@ -169,6 +172,142 @@ class TestRendererProcess(unittest.TestCase):
                 session.query("#ok", first=True)[0][3], "recovered")
         finally:
             session.shutdown()
+
+
+def _sandbox_report_child(queue):
+    """Spawn target: apply the sandbox, report the effective rlimits."""
+    import resource
+
+    report = apply_renderer_sandbox()
+    queue.put({
+        "report": report,
+        "cpu": resource.getrlimit(resource.RLIMIT_CPU),
+        "as": resource.getrlimit(resource.RLIMIT_AS),
+        "core": resource.getrlimit(resource.RLIMIT_CORE),
+    })
+
+
+def _memory_bomb_child(queue):
+    """Spawn target: a renderer-side allocation bomb must be contained."""
+    apply_renderer_sandbox()
+    try:
+        block = bytearray(1024 * 1024 * 1024)  # 1 GiB against a 512MB cap
+        block[-1] = 1
+        queue.put("allocated")
+    except MemoryError:
+        queue.put("contained")
+
+
+def _cpu_spin_child():
+    """Spawn target: an infinite loop must die at the CPU quota."""
+    apply_renderer_sandbox()
+    while True:
+        pass
+
+
+class _EnvPatch:
+    def __init__(self, **values):
+        self.values = values
+        self.saved = {}
+
+    def __enter__(self):
+        for key, value in self.values.items():
+            self.saved[key] = os.environ.get(key)
+            os.environ[key] = value
+
+    def __exit__(self, *exc):
+        for key, old in self.saved.items():
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX rlimit sandbox")
+class TestRendererSandbox(unittest.TestCase):
+    def test_limits_and_report_apply_in_a_child(self):
+        import resource
+
+        ctx = multiprocessing.get_context("spawn")
+        queue = ctx.Queue()
+        process = ctx.Process(target=_sandbox_report_child, args=(queue,))
+        process.start()
+        try:
+            out = queue.get(timeout=30)
+        finally:
+            process.join(timeout=10)
+        limits = renderer_limits()
+        self.assertNotEqual(out["cpu"][0], resource.RLIM_INFINITY)
+        self.assertLessEqual(out["cpu"][0], limits["cpu_seconds"])
+        self.assertNotEqual(out["as"][0], resource.RLIM_INFINITY)
+        self.assertLessEqual(
+            out["as"][0], limits["memory_mb"] * 1024 * 1024)
+        self.assertEqual(out["core"][0], 0)
+        self.assertIn("umask=077", out["report"])
+
+    def test_memory_quota_contains_an_allocation_bomb(self):
+        with _EnvPatch(GG_RENDERER_MEMORY_MB="512"):
+            ctx = multiprocessing.get_context("spawn")
+            queue = ctx.Queue()
+            process = ctx.Process(target=_memory_bomb_child, args=(queue,))
+            process.start()
+            try:
+                outcome = queue.get(timeout=60)
+            finally:
+                process.join(timeout=10)
+        self.assertEqual(outcome, "contained")
+
+    def test_cpu_quota_kills_a_spinning_renderer(self):
+        with _EnvPatch(GG_RENDERER_CPU_S="1"):
+            ctx = multiprocessing.get_context("spawn")
+            process = ctx.Process(target=_cpu_spin_child)
+            process.start()
+            process.join(timeout=90)
+        self.assertIsNotNone(process.exitcode, "spinner outlived its quota")
+        self.assertLess(process.exitcode, 0)  # killed by SIGXCPU/SIGKILL
+
+    def test_sandbox_can_be_disabled_for_debugging(self):
+        with _EnvPatch(GG_RENDERER_SANDBOX="0"):
+            self.assertEqual(apply_renderer_sandbox(), ["disabled"])
+
+    def test_renderer_handshake_reports_its_sandbox(self):
+        session = RemoteRendererSession(RecordingBackend())
+        try:
+            report = session.host.sandbox_report
+            self.assertTrue(report)
+            self.assertTrue(any(item.startswith("cpu_s=")
+                                for item in report), report)
+            self.assertTrue(any(item.startswith("as_mb=")
+                                for item in report), report)
+        finally:
+            session.shutdown()
+
+
+class TestBlobQuota(unittest.TestCase):
+    def test_store_total_quota_bounds_shared_memory(self):
+        store = BlobStore(max_total=150 * 1024)
+        big = b"x" * (100 * 1024)  # above INLINE_LIMIT -> shared memory
+        try:
+            store.pack(big)
+            with self.assertRaises(BlobError):
+                store.pack(big)  # 200KB total vs the 150KB store cap
+        finally:
+            store.release_all()
+        # releasing the leases returns the quota
+        try:
+            store.pack(big)
+        finally:
+            store.release_all()
+
+    def test_single_blob_limit_still_applies(self):
+        from browser.ipc import blobs
+
+        store = BlobStore()
+        try:
+            with self.assertRaises(BlobError):
+                store.pack(b"y" * (blobs.MAX_BLOB_BYTES + 1))
+        finally:
+            store.release_all()
 
 
 if __name__ == "__main__":

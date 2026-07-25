@@ -9,6 +9,9 @@ from multiprocessing import shared_memory
 
 INLINE_LIMIT = 64 * 1024
 MAX_BLOB_BYTES = 64 * 1024 * 1024
+# cumulative shared-memory quota for one store (one request's leases):
+# a page that streams many large payloads cannot pin unbounded RAM
+MAX_STORE_BYTES = 256 * 1024 * 1024
 
 
 class BlobError(RuntimeError):
@@ -16,8 +19,10 @@ class BlobError(RuntimeError):
 
 
 class BlobStore:
-    def __init__(self):
+    def __init__(self, max_total=MAX_STORE_BYTES):
         self._leases = []
+        self._total = 0
+        self._max_total = max_total
 
     def pack(self, data, media_type="application/octet-stream"):
         data = bytes(data)
@@ -30,9 +35,12 @@ class BlobStore:
             }
         if len(data) > MAX_BLOB_BYTES:
             raise BlobError("blob exceeds process quota")
+        if self._total + len(data) > self._max_total:
+            raise BlobError("blob store quota exceeded")
         block = shared_memory.SharedMemory(create=True, size=len(data))
         block.buf[:len(data)] = data
         self._leases.append(block)
+        self._total += len(data)
         return {
             "kind": "shared_memory", "size": len(data),
             "sha256": hashlib.sha256(data).hexdigest(),
@@ -40,6 +48,7 @@ class BlobStore:
         }
 
     def release_all(self):
+        self._total = 0
         while self._leases:
             block = self._leases.pop()
             try:

@@ -512,34 +512,121 @@ fn is_interactive(tag: &str) -> bool {
     matches!(tag, "a" | "button" | "input" | "select" | "textarea" | "option")
 }
 
-/// Implicit ARIA role (explicit role attr wins). None => not surfaced
-/// in the snapshot. Mirrors browser/driver.py::_implicit_role.
-fn implicit_role(node: &dom::Node, tag: &str) -> Option<String> {
+/// Accessibility-hidden: this node (not its ancestors) is removed from
+/// the accessibility projection, subtree included. Mirrors
+/// browser/accessibility.py::is_hidden.
+fn ax_hidden(node: &dom::Node) -> bool {
+    if node.style.get("display").map(String::as_str) == Some("none") {
+        return true;
+    }
+    if matches!(
+        node.style.get("visibility").map(|v| v.trim()),
+        Some("hidden") | Some("collapse")
+    ) {
+        return true;
+    }
+    if node.attr("hidden").is_some() {
+        return true;
+    }
+    if node
+        .attr("aria-hidden")
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+    {
+        return true;
+    }
+    node.tag.as_deref() == Some("input")
+        && node.attr("type").is_some_and(|t| t.eq_ignore_ascii_case("hidden"))
+}
+
+fn in_sectioning_content(doc: &dom::Document, idx: usize) -> bool {
+    let mut cur = doc.nodes[idx].parent;
+    while let Some(p) = cur {
+        if matches!(
+            doc.nodes[p].tag.as_deref(),
+            Some("article" | "aside" | "main" | "nav" | "section")
+        ) {
+            return true;
+        }
+        cur = doc.nodes[p].parent;
+    }
+    false
+}
+
+fn has_accessible_label(node: &dom::Node) -> bool {
+    ["aria-label", "aria-labelledby", "title"]
+        .iter()
+        .any(|a| node.attr(a).is_some_and(|v| !v.trim().is_empty()))
+}
+
+/// Implicit ARIA role (explicit role attr wins; presentation/none drop
+/// the node). None => not surfaced in the snapshot. Mirrors
+/// browser/accessibility.py::role_of.
+fn implicit_role(doc: &dom::Document, idx: usize) -> Option<String> {
+    let node = &doc.nodes[idx];
+    let tag = node.tag.as_deref()?;
     if let Some(r) = node.attr("role") {
-        return Some(r.to_string());
+        let first = r.split_whitespace().next().unwrap_or("");
+        if first.eq_ignore_ascii_case("presentation")
+            || first.eq_ignore_ascii_case("none")
+        {
+            return None;
+        }
+        if !first.is_empty() {
+            return Some(first.to_ascii_lowercase());
+        }
     }
     let role = match tag {
         "a" if node.attr("href").is_some() => "link",
-        "button" => "button",
+        "button" | "summary" => "button",
         "input" => match node.attr("type").unwrap_or("text") {
             "checkbox" => "checkbox",
             "radio" => "radio",
-            "submit" | "button" | "reset" => "button",
+            "submit" | "button" | "reset" | "image" => "button",
+            "range" => "slider",
+            "number" => "spinbutton",
+            "search" => "searchbox",
             "hidden" => return None,
             _ => "textbox",
         },
+        "select" if node.attr("multiple").is_some() => "listbox",
         "select" => "combobox",
+        "option" => "option",
         "textarea" => "textbox",
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => "heading",
         "nav" => "navigation",
+        "main" => "main",
+        "aside" => "complementary",
+        "header" if !in_sectioning_content(doc, idx) => "banner",
+        "footer" if !in_sectioning_content(doc, idx) => "contentinfo",
+        "form" if has_accessible_label(node) => "form",
+        "section" if has_accessible_label(node) => "region",
+        "ul" | "ol" => "list",
+        "li" => "listitem",
+        "table" => "table",
+        "tr" => "row",
+        "td" => "cell",
+        "th" if node.attr("scope").is_some_and(|s| s.eq_ignore_ascii_case("row")) => {
+            "rowheader"
+        }
+        "th" => "columnheader",
+        "caption" => "caption",
+        "img" => match node.attr("alt") {
+            Some(alt) if alt.trim().is_empty() => return None,
+            _ => "img",
+        },
+        "article" => "article",
+        "dialog" => "dialog",
+        "fieldset" => "group",
+        "progress" => "progressbar",
         _ => return None,
     };
     Some(role.to_string())
 }
 
 /// Visible descendant text: like textContent but skips script/style/
-/// template/noscript subtrees and display:none nodes. Iterative so a
-/// pathologically deep tree cannot overflow the stack.
+/// template/noscript subtrees and accessibility-hidden nodes, and
+/// substitutes alt text for images. Iterative so a pathologically deep
+/// tree cannot overflow the stack.
 fn visible_text(doc: &dom::Document, root: usize) -> String {
     let mut out = String::new();
     let mut stack = vec![root];
@@ -547,11 +634,17 @@ fn visible_text(doc: &dom::Document, root: usize) -> String {
         let node = &doc.nodes[idx];
         match node.tag.as_deref() {
             Some(tag) => {
-                if RAW_TEXT_TAGS.contains(&tag) {
+                if RAW_TEXT_TAGS.contains(&tag) || ax_hidden(node) {
                     continue;
                 }
-                if node.style.get("display").map(String::as_str) == Some("none")
-                {
+                if tag == "img" {
+                    if let Some(alt) = node.attr("alt") {
+                        if !alt.trim().is_empty() {
+                            out.push(' ');
+                            out.push_str(alt);
+                            out.push(' ');
+                        }
+                    }
                     continue;
                 }
             }
@@ -562,6 +655,144 @@ fn visible_text(doc: &dom::Document, root: usize) -> String {
         }
     }
     out
+}
+
+/// textContent of a subtree with no visibility filtering — used for
+/// aria-labelledby targets, which may legitimately be hidden.
+fn raw_text(doc: &dom::Document, root: usize) -> String {
+    let mut out = String::new();
+    let mut stack = vec![root];
+    while let Some(idx) = stack.pop() {
+        let node = &doc.nodes[idx];
+        if node.tag.is_none() {
+            out.push_str(&node.text);
+        }
+        for &c in node.children.iter().rev() {
+            stack.push(c);
+        }
+    }
+    out
+}
+
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Roles whose accessible name may come from their contents.
+fn name_from_content(role: &str) -> bool {
+    matches!(
+        role,
+        "button" | "link" | "heading" | "cell" | "columnheader"
+            | "rowheader" | "option" | "listitem" | "checkbox" | "radio"
+            | "menuitem" | "tab" | "caption" | "switch"
+    )
+}
+
+/// WAI-ARIA accessible-name subset: aria-labelledby -> aria-label ->
+/// native markup (alt, label[for]/ancestor label, button value,
+/// caption/legend, placeholder) -> content text (for name-from-content
+/// roles) -> title. Mirrors browser/accessibility.py::accessible_name.
+fn accessible_name(
+    doc: &dom::Document,
+    idx: usize,
+    role: &str,
+    ids: &std::collections::HashMap<String, usize>,
+    labels: &std::collections::HashMap<String, usize>,
+) -> String {
+    let node = &doc.nodes[idx];
+    if let Some(refs) = node.attr("aria-labelledby") {
+        let mut parts: Vec<String> = Vec::new();
+        for r in refs.split_whitespace() {
+            if let Some(&target) = ids.get(r) {
+                let t = &doc.nodes[target];
+                let label = t.attr("aria-label").unwrap_or("").trim();
+                let text = if !label.is_empty() {
+                    label.to_string()
+                } else if ax_hidden(t) {
+                    raw_text(doc, target)
+                } else {
+                    visible_text(doc, target)
+                };
+                let text = collapse_ws(&text);
+                if !text.is_empty() {
+                    parts.push(text);
+                }
+            }
+        }
+        let joined = parts.join(" ");
+        if !joined.is_empty() {
+            return truncate_chars(&joined, 120);
+        }
+    }
+    if let Some(label) = node.attr("aria-label") {
+        let label = collapse_ws(label);
+        if !label.is_empty() {
+            return truncate_chars(&label, 120);
+        }
+    }
+    let tag = node.tag.as_deref().unwrap_or("");
+    if matches!(tag, "img" | "area") {
+        let alt = collapse_ws(node.attr("alt").unwrap_or(""));
+        if !alt.is_empty() {
+            return truncate_chars(&alt, 120);
+        }
+    }
+    if matches!(tag, "input" | "select" | "textarea") {
+        let label_idx = node
+            .attr("id")
+            .and_then(|id| labels.get(id).copied())
+            .or_else(|| {
+                let mut cur = node.parent;
+                while let Some(p) = cur {
+                    if doc.nodes[p].tag.as_deref() == Some("label") {
+                        return Some(p);
+                    }
+                    cur = doc.nodes[p].parent;
+                }
+                None
+            });
+        if let Some(label) = label_idx {
+            let text = collapse_ws(&visible_text(doc, label));
+            if !text.is_empty() {
+                return truncate_chars(&text, 120);
+            }
+        }
+        if tag == "input"
+            && matches!(
+                node.attr("type").unwrap_or("text"),
+                "submit" | "button" | "reset" | "image"
+            )
+        {
+            let value = collapse_ws(node.attr("value").unwrap_or(""));
+            if !value.is_empty() {
+                return truncate_chars(&value, 120);
+            }
+        }
+        let placeholder = collapse_ws(node.attr("placeholder").unwrap_or(""));
+        if !placeholder.is_empty() {
+            return truncate_chars(&placeholder, 120);
+        }
+    }
+    if matches!(tag, "table" | "fieldset") {
+        let want = if tag == "table" { "caption" } else { "legend" };
+        if let Some(&child) = node
+            .children
+            .iter()
+            .find(|&&c| doc.nodes[c].tag.as_deref() == Some(want))
+        {
+            let text = collapse_ws(&visible_text(doc, child));
+            if !text.is_empty() {
+                return truncate_chars(&text, 120);
+            }
+        }
+    }
+    if name_from_content(role) {
+        let text = collapse_ws(&visible_text(doc, idx));
+        if !text.is_empty() {
+            return truncate_chars(&text, 120);
+        }
+    }
+    truncate_chars(&collapse_ws(node.attr("title").unwrap_or("")), 120)
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -1142,17 +1373,45 @@ impl Doc {
     /// into Python (which export() does).
     fn snapshot(&self) -> Vec<SnapNode> {
         let doc = self.doc.borrow();
+        // id -> node and label[for] -> label maps for name computation
+        let mut ids = std::collections::HashMap::new();
+        let mut labels = std::collections::HashMap::new();
+        for (i, node) in doc.nodes.iter().enumerate() {
+            if !node.is_element() {
+                continue;
+            }
+            if let Some(id) = node.attr("id") {
+                ids.entry(id.to_string()).or_insert(i);
+            }
+            if node.tag.as_deref() == Some("label") {
+                if let Some(target) = node.attr("for") {
+                    labels.entry(target.to_string()).or_insert(i);
+                }
+            }
+        }
         let mut out = Vec::new();
         let mut stack = vec![doc.root];
         while let Some(idx) = stack.pop() {
             let node = &doc.nodes[idx];
             if let Some(tag) = node.tag.as_deref() {
-                if let Some(role) = implicit_role(node, tag) {
+                // hidden subtrees leave the accessibility projection
+                if idx != doc.root && ax_hidden(node) {
+                    continue;
+                }
+                if let Some(role) = implicit_role(&doc, idx) {
+                    let mut name =
+                        accessible_name(&doc, idx, &role, &ids, &labels);
+                    if name.is_empty() {
+                        // keep the old subtree-text behavior for
+                        // containers so agent consumers still see
+                        // something useful
+                        name = truncate_chars(&visible_text(&doc, idx), 120);
+                    }
                     out.push((
                         idx as u64,
                         role,
                         tag.to_string(),
-                        truncate_chars(&visible_text(&doc, idx), 120),
+                        name,
                         node.attr("href").map(str::to_string),
                         node.attr("type").map(str::to_string),
                         node.attr("id").map(str::to_string),

@@ -7,7 +7,8 @@ import tkinter.font
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from . import forms, keyboard, native, navigation, net, textengine, webfonts
+from . import (animation, forms, frames, keyboard, native, navigation,
+               net, textengine, webfonts)
 from .html_parser import Element, HTMLParser, Text, tree_to_list
 from .css_parser import CSSParser
 from .draw import DrawStickyPop, DrawStickyPush
@@ -69,6 +70,9 @@ class Browser:
         self.default_rules = default_rules()
         self._layout_width = 0
         self._resize_job = None
+        self.animator = animation.AnimationEngine()
+        self._anim_job = None
+        self.frames = None
 
         self.canvas.bind("<Button-1>", self.on_click)
         self.canvas.bind("<Key>", self.on_key)
@@ -234,6 +238,10 @@ class Browser:
         self.url = url
         self.url_var.set(str(url))
         self._reset_interaction()
+        if self.frames is not None:
+            self.frames.dispose()
+        self.frames = frames.FrameManager(
+            self.network, top_url=url, timeout=self.navigation_timeout)
 
         if native.available():
             # Rust fast path: parse + gg-js + cascade + style in ggcore.
@@ -257,7 +265,9 @@ class Browser:
             self._doc = None
             self.nodes = HTMLParser(body).parse()
             self._drop_focus()
-            rules = self.default_rules + self.collect_styles(self.nodes, url)
+            page_rules, self._css_sources = \
+                self.collect_styles(self.nodes, url)
+            rules = self.default_rules + page_rules
             rules = sorted(rules, key=cascade_priority)
             # Style depends only on the DOM and CSS, not on window size:
             # compute it once per page load, never on resize.
@@ -280,9 +290,13 @@ class Browser:
                 break
         self.window.title(title)
 
+        if self._doc is not None:
+            self.frames.dispatch_event = self._dispatch_frame_event
+
         # First paint must not wait for every async request, image, and web
         # font. The live loop materializes those after this frame is visible.
         self._deferred_resources = textengine.available()
+        self.animator.reset(self._css_sources)
         self.scroll = 0
         self.relayout()
         self._load_timings["first_paint"] = \
@@ -313,23 +327,29 @@ class Browser:
     _LIVE_INTERVAL_MS = 80
     _LIVE_IDLE_AFTER = 150      # ~12s quiet -> back off, don't stop
     _LIVE_IDLE_INTERVAL_MS = 500  # late timers (carousels) still fire
+    _ANIM_INTERVAL_MS = 33      # frame pace while animations run
 
     def _start_live_loop(self):
         self._live_gen = getattr(self, "_live_gen", 0) + 1
         if (self._doc is None or not hasattr(self._doc, "tick")
                 or not native.async_available()):
+            gen = self._live_gen
             if self._deferred_resources:
-                gen = self._live_gen
                 self.window.after(
                     1, lambda: self._finish_deferred_resources(gen))
+            else:
+                # frames still load after the first paint
+                self.window.after(
+                    1, lambda: self._frames_after_first_paint(gen))
+            self._ensure_anim_loop()
             return
         self._dom_version = self.renderer.state().dom_version
         self._live_idle = 0
         import time
         self._live_last = time.monotonic()
         gen = self._live_gen
-        self.window.after(self._LIVE_INTERVAL_MS,
-                          lambda: self._live_tick(gen))
+        self._live_job = self.window.after(self._LIVE_INTERVAL_MS,
+                                           lambda: self._live_tick(gen))
 
     def _finish_deferred_resources(self, gen):
         """Load non-critical resources only after the first frame exists."""
@@ -340,12 +360,44 @@ class Browser:
         self._deferred_resources = False
         self.load_images(self.nodes, self.url, keep_cache=True)
         self._load_web_fonts(self.url)
+        self._load_frames()
         self.relayout()
         self._load_timings["deferred_resources"] = \
             (time.perf_counter() - started) * 1000.0
         self.set_status("완료")
 
+    def _frames_after_first_paint(self, gen):
+        if gen != getattr(self, "_live_gen", 0):
+            return
+        if self._load_frames():
+            self.relayout()
+
+    def _load_frames(self):
+        """Fetch/commit new or changed <iframe> documents. Returns True
+        when any frame content changed."""
+        if self.frames is None or not hasattr(self, "nodes"):
+            return False
+        try:
+            return self.frames.sync(
+                self.nodes, self.url, cancel_token=self._loading_token)
+        except net.RequestCancelled:
+            raise
+        except Exception as exc:
+            print(f"[frames] load error: {exc}")
+            return False
+
+    def _dispatch_frame_event(self, ridx, event_type):
+        """Fire an iframe lifecycle event (load/error) in the parent doc."""
+        try:
+            logs, _handled, _prevented = self.renderer.dispatch_event(
+                ridx, event_type, False, False, None)
+            for line in logs:
+                print(f"[js console] {line}")
+        except Exception:
+            pass
+
     def _live_tick(self, gen):
+        self._live_job = None
         if gen != getattr(self, "_live_gen", 0) or self._doc is None:
             return  # a newer page took over
         import time
@@ -370,6 +422,7 @@ class Browser:
                 self.load_images(self.nodes, self.url, keep_cache=True)
                 if first_resources:
                     self._load_web_fonts(self.url)
+                self._load_frames()
                 self.relayout()
                 if first_resources:
                     self._load_timings["deferred_resources"] = \
@@ -377,13 +430,31 @@ class Browser:
                     self.set_status("완료")
             else:
                 self._live_idle += 1
+                # sample CSS animations/transitions; a full relayout
+                # (above) already sampled inside relayout()
+                result = self.animator.on_frame(self.nodes)
+                # child frames run their own event loops + animations
+                frames_changed = (self.frames.tick(dt)
+                                  if self.frames is not None else False)
+                if result.damage == "layout":
+                    self.relayout()
+                elif result.damage == "paint" or frames_changed:
+                    self.repaint()
         except Exception as e:
             print(f"[live] tick error: {e}")
             return
-        wait = (self._LIVE_IDLE_INTERVAL_MS
-                if self._live_idle >= self._LIVE_IDLE_AFTER
-                else self._LIVE_INTERVAL_MS)
-        self.window.after(wait, lambda: self._live_tick(gen))
+        if self.animator.active or (
+                self.frames is not None
+                and self.frames.animations_active()):
+            # animations want frame pace, but never slower than the
+            # idle backoff would allow — and idle pages keep backing off
+            wait = self._ANIM_INTERVAL_MS
+        else:
+            wait = (self._LIVE_IDLE_INTERVAL_MS
+                    if self._live_idle >= self._LIVE_IDLE_AFTER
+                    else self._LIVE_INTERVAL_MS)
+        self._live_job = self.window.after(
+            wait, lambda: self._live_tick(gen))
 
     def load_images(self, nodes, url, keep_cache=False):
         """Fetch (parallel) and decode (Rust) every <img> on the page."""
@@ -489,7 +560,9 @@ class Browser:
         return fetched
 
     def collect_styles(self, nodes, url):
-        # Gather <style> contents and <link> hrefs in document order
+        """Gather <style> contents and <link> hrefs in document order.
+        Returns (rules, raw_css_texts) — the raw texts feed @keyframes
+        parsing (at-rules never reach the rule cascade)."""
         entries = []
         for node in tree_to_list(nodes, []):
             if not isinstance(node, Element):
@@ -508,15 +581,23 @@ class Browser:
 
         # Parse in document order so the cascade stays correct
         rules = []
+        texts = []
         for kind, val in entries:
             css = val if kind == "inline" else fetched.get(val, "")
             if css:
+                texts.append(css)
                 rules.extend(CSSParser(css).parse())
-        return rules
+        return rules, texts
 
     def relayout(self):
         if not hasattr(self, "nodes"):
             return
+        # re-point iframe boxes at their child documents (tree rebuilds
+        # produce fresh node objects), then sample animations so layout
+        # sees the animated values
+        if self.frames is not None:
+            self.frames.attach(self.nodes)
+        self.animator.on_frame(self.nodes)
         width = max(self.canvas.winfo_width(), 200)
         height = self.canvas.winfo_height()
         self._layout_width = width
@@ -528,6 +609,44 @@ class Browser:
         self._push_layout_rects()
         self.clamp_scroll()
         self.draw()
+        self._ensure_anim_loop()
+
+    def _ensure_anim_loop(self):
+        """Keep animations moving on the pure-Python path (no gg-js
+        live loop). The native path samples from _live_tick instead."""
+        if not self.animator.active:
+            return
+        if (self._doc is not None and hasattr(self._doc, "tick")
+                and native.async_available()):
+            # _live_tick drives the frames — but if it backed off to
+            # the idle interval, pull the next tick forward so a fresh
+            # transition doesn't wait half a second for its first frame
+            job = getattr(self, "_live_job", None)
+            if job is not None:
+                self.window.after_cancel(job)
+                gen = self._live_gen
+                self._live_job = self.window.after(
+                    self._ANIM_INTERVAL_MS,
+                    lambda: self._live_tick(gen))
+            return
+        if self._anim_job is not None:
+            return
+        self._anim_job = self.window.after(
+            self._ANIM_INTERVAL_MS, self._anim_tick)
+
+    def _anim_tick(self):
+        # _anim_job gates scheduling, so at most one loop exists; a
+        # navigation resets the animator, which stops it naturally
+        self._anim_job = None
+        if not hasattr(self, "nodes"):
+            return
+        result = self.animator.on_frame(self.nodes)
+        if result.damage == "layout":
+            self.relayout()  # re-arms the loop itself
+            return
+        if result.damage == "paint":
+            self.repaint()
+        self._ensure_anim_loop()
 
     def reload(self):
         if self.url:
@@ -715,6 +834,15 @@ class Browser:
         self.draw()
 
     def on_mousewheel(self, event):
+        # a wheel over a scrollable iframe scrolls the frame, not the page
+        obj = self.hit_test(event.x, event.y + self.scroll) \
+            if self.document else None
+        frame = frames.frame_of(obj) if obj else None
+        if frame is not None and frame.root is not None:
+            delta = -int(event.delta / 120) * frames.FRAME_SCROLL_STEP
+            if frame.scroll_by(delta, obj.width, obj.height):
+                self.repaint()
+                return
         self.scroll -= int(event.delta / 120) * SCROLL_STEP
         self.clamp_scroll()
         self.draw()
@@ -752,6 +880,7 @@ class Browser:
         self.nodes = self.renderer.frame()
         self._remap_marks()
         self.load_images(self.nodes, self.url, keep_cache=True)
+        self._load_frames()
         for node in tree_to_list(self.nodes, []):
             if isinstance(node, Element) and node.tag == "title":
                 text = " ".join(
@@ -766,6 +895,15 @@ class Browser:
         obj = self.hit_test(event.x, event.y + self.scroll)
         if not obj:
             self.set_focus(None)
+            return
+        # clicks over an <iframe> box route into the child document
+        frame = frames.frame_of(obj)
+        if frame is not None and frame.root is not None:
+            cx, cy = frames.child_coords(
+                obj, event.x, event.y + self.scroll, frame)
+            outcome = frame.click_at(cx, cy, obj.width, obj.height)
+            if outcome:
+                self.repaint()
             return
         clicked_ridx = self._ridx_of(obj.node)
         self.set_focus(keyboard.focus_target(obj.node))
@@ -915,7 +1053,14 @@ class Browser:
             if outcome == "none":
                 return
             if outcome == "paint":
-                self.repaint()
+                # a paint-only restyle can still start a transition
+                # (e.g. a:hover { color } with transition: color)
+                result = self.animator.on_frame(self.nodes)
+                if result.damage == "layout":
+                    self.relayout()
+                else:
+                    self.repaint()
+                    self._ensure_anim_loop()
                 return
             # geometry or structure changed: re-export (styles are
             # already fresh in Rust) and relayout
@@ -1157,10 +1302,15 @@ class Browser:
             el = el.parent
         self.set_hover(el)
         href = self.find_link(obj.node) if obj else None
+        base = self.url
+        frame = frames.frame_of(obj) if obj else None
+        if frame is not None and frame.root is not None:
+            hit = frames.hit_frame(obj, event.x, event.y + self.scroll)
+            href = frame.find_link(hit[1].node) if hit else None
+            base = frame.url
         if href:
             self.canvas.config(cursor="hand2")
-            self.set_status(str(self.url.resolve(href))
-                            if self.url else href)
+            self.set_status(str(base.resolve(href)) if base else href)
         else:
             self.canvas.config(cursor="")
             self.set_status("")
@@ -1177,6 +1327,8 @@ class Browser:
             self.window.mainloop()
         finally:
             self._navigation.shutdown()
+            if self.frames is not None:
+                self.frames.dispose()
             if self.renderer is not None:
                 shutdown = getattr(self.renderer, "shutdown", None)
                 if shutdown is not None:

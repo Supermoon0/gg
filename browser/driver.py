@@ -23,7 +23,7 @@ drift. Requires the native ggcore wheel; raises if it is absent.
 
 import json
 
-from . import forms, native, net
+from . import forms, frames as _frames_mod, native, net
 from .html_parser import tree_to_list
 from .network_backend import default_network_backend
 from .renderer_session import create_renderer_session
@@ -111,6 +111,7 @@ class Page:
         self._form_defaults = {}
         self._ver = 0
         self._navigation_token = None
+        self._frames = None
 
     # ---------- navigation ----------
 
@@ -123,6 +124,9 @@ class Page:
         url = url_or_str if isinstance(url_or_str, net.URL) \
             else net.URL(url_or_str)
         self.cancel()
+        if self._frames is not None:
+            self._frames.dispose()
+            self._frames = None
         self._renderer.close()
         token = self._network.new_cancel_token()
         self._navigation_token = token
@@ -388,7 +392,46 @@ class Page:
     def console(self):
         return list(self._console)
 
+    # ---------- accessibility ----------
+
+    def ax_tree(self):
+        """The page's hierarchical accessibility tree as nested dicts
+        (role/name/description/states/children, focusable/focused) —
+        the full projection; snapshot() stays the flat fast path."""
+        from . import accessibility
+        root = native.build_tree(self._export())
+        return accessibility.build_tree(root).to_dict()
+
+    # ---------- frames ----------
+
+    def frame(self, selector):
+        """A FramePage handle into the first <iframe> matching
+        `selector`, loading the frame's document on demand. The child
+        runs fully isolated (own URL/origin/cookies/JS); this handle is
+        the driver-level equivalent of contentDocument. Returns None
+        when nothing matches or the frame could not load."""
+        el = self.query(selector)
+        if el is None or el.tag != "iframe":
+            return None
+        if self._frames is None:
+            self._frames = _frames_mod.FrameManager(
+                self._network, top_url=self.url, timeout=self.timeout,
+                run_scripts=self.run_scripts,
+                dispatch_event=lambda ridx, event_type:
+                    self._renderer.dispatch_event(
+                        ridx, event_type, False, False, None))
+        tree = native.build_tree(self._renderer.export())
+        self._frames.sync(tree, self.url)
+        for node in tree_to_list(tree, []):
+            if getattr(node, "_ridx", None) == el._ridx:
+                fd = getattr(node, "_frame", None)
+                return FramePage(fd) if fd is not None else None
+        return None
+
     def close(self):
+        if self._frames is not None:
+            self._frames.dispose()
+            self._frames = None
         shutdown = getattr(self._renderer, "shutdown", None)
         if shutdown is not None:
             shutdown()
@@ -442,6 +485,108 @@ class Page:
             if row[2] == "title":
                 return _subtree_text(flat, ei).strip() or None
         return None
+
+
+class FramePage:
+    """Driver access into one iframe's isolated child document."""
+
+    def __init__(self, fd):
+        self._fd = fd
+
+    @property
+    def url(self):
+        return self._fd.url
+
+    @property
+    def status(self):
+        return self._fd.status  # loaded | blocked | error | empty
+
+    @property
+    def blocked_reason(self):
+        return self._fd.blocked_reason
+
+    def console(self):
+        return list(self._fd.console)
+
+    def query_all(self, selector):
+        session = self._fd.session
+        if session is None:
+            return []
+        try:
+            rows = session.query(selector, False)
+        except Exception:
+            return []
+        return [Element(self, ridx, tag, text, dict(attrs))
+                for (ridx, tag, attrs, text) in rows]
+
+    def query(self, selector):
+        session = self._fd.session
+        if session is None:
+            return None
+        try:
+            rows = session.query(selector, True)
+        except Exception:
+            return None
+        for (ridx, tag, attrs, text) in rows:
+            return Element(self, ridx, tag, text, dict(attrs))
+        return None
+
+    def exists(self, selector):
+        return self.query(selector) is not None
+
+    def evaluate(self, expression):
+        session = self._fd.session
+        if session is None:
+            return None
+        code = "console.log(%s + JSON.stringify(%s))" % (
+            json.dumps(_VAL_TAG), expression)
+        for line in session.run([code]):
+            if line.startswith(_VAL_TAG):
+                raw = line[len(_VAL_TAG):]
+                try:
+                    return json.loads(raw)
+                except json.JSONDecodeError:
+                    return raw
+        return None
+
+    def text(self, selector):
+        el = self.query(selector)
+        if el is None:
+            return None
+        return self.evaluate(
+            "(function(){var e=document.querySelector(%s);"
+            "return e?e.textContent:null;})()" % json.dumps(selector))
+
+    def _click_element(self, el):
+        """Frame-internal click: JS dispatch, then default link
+        navigation stays inside the frame."""
+        fd = self._fd
+        handled = prevented = False
+        if fd.session is not None:
+            try:
+                result = fd.session.dispatch_click(el._ridx)
+                logs, handled, prevented = (
+                    result if len(result) == 3
+                    else (result[0], result[1], result[1]))
+                fd.console.extend(logs)
+                if handled:
+                    fd.root = fd.session.frame()
+                    fd._version += 1
+                    fd._layout_cache = None
+            except Exception:
+                pass
+        href = el.href
+        if href and not prevented \
+                and not href.startswith(("javascript:", "mailto:", "#")):
+            fd.navigate(href)
+            return True
+        return handled or bool(href)
+
+    def click(self, selector):
+        el = self.query(selector)
+        if el is None:
+            return False
+        return self._click_element(el)
 
 
 def _subtree_text(flat, target_ei):

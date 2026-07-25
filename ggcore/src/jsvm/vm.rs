@@ -56,6 +56,39 @@ fn ref_err<T>(msg: impl Into<String>) -> Result<T, VmError> {
     Err(VmError { msg: msg.into(), value: None, kind: "ReferenceError" })
 }
 
+/// As `type_err`, for RangeErrors (invalid lengths and counts).
+fn range_err<T>(msg: impl Into<String>) -> Result<T, VmError> {
+    Err(VmError { msg: msg.into(), value: None, kind: "RangeError" })
+}
+
+/// Longest string the VM will build, in bytes. Rope concatenation is
+/// O(1), so a hostile `while(1) s += s` mints multi-gigabyte strings
+/// in ~30 statements (far under the execution fuel) and the process
+/// aborts on the first materialization — Rust cannot recover a failed
+/// allocation. Real engines throw "Invalid string length" instead
+/// (V8 caps around 2^29 code units); namuwiki's Cloudflare challenge
+/// script killed the whole renderer this way.
+const MAX_STR_BYTES: usize = 64 * 1024 * 1024;
+/// Most elements one string-derived materialization (split,
+/// Array.from(string), a global regex match) may produce — each
+/// element is its own heap string, so counts beyond this are memory
+/// bombs, not web content.
+const MAX_MATERIALIZE: usize = 1024 * 1024;
+/// Cap on dense array storage. gg stores elements in a flat Vec, so
+/// `arr.length = 1e8` or `arr[1e8] = x` (real engines keep these
+/// sparse) would force a multi-hundred-MB allocation and abort the
+/// process. Past this, a length set or sparse index write throws a
+/// catchable RangeError — gov.kr's bundle set a giant array length.
+const MAX_ARRAY_ELEMS: usize = 16 * 1024 * 1024;
+/// Cumulative string-heap bytes allowed within one script run. gg has
+/// no GC, so every concat/method result lives until the run ends; an
+/// obfuscation loop minting large strings per iteration (namuwiki's
+/// Cloudflare challenge) stays under the fuel budget but exhausts RAM
+/// and aborts on a failed allocation. The dispatch loop trips a
+/// catchable RangeError past this. Far above any real page (naver
+/// settles well under 256MB of live strings).
+const MAX_HEAP_BYTES: usize = 512 * 1024 * 1024;
+
 const MAX_FRAMES: usize = 4096;
 /// Cap on native re-entry (JS -> sort/callback -> JS ...). Each level
 /// nests several real Rust frames (merge_sort + less + call_value +
@@ -821,6 +854,13 @@ pub(super) struct St {
     /// `while (i < s.length)` is O(n^2). Strings are immutable, so an
     /// entry never goes stale.
     pub(super) ulen_cache: HashMap<u32, u32>,
+    /// Approx. live bytes in the string heap. gg has no GC and `strs`
+    /// never shrinks, so this monotonically tracks the document's real
+    /// string-memory footprint. A loop that mints large strings per
+    /// iteration (namuwiki's Cloudflare challenge) stays under the fuel
+    /// budget but exhausts RAM; the dispatch loop trips a catchable
+    /// RangeError when this crosses MAX_HEAP_BYTES.
+    pub(super) heap_bytes: usize,
 }
 
 /// Default per-turn instruction budget (~a few hundred ms of hot loop).
@@ -916,6 +956,7 @@ impl St {
             profile_samples: HashMap::new(),
             units_cache: None,
             ulen_cache: HashMap::new(),
+            heap_bytes: 0,
         };
         for (i, name) in ["undefined", "boolean", "number", "string",
                           "object", "function"]
@@ -965,6 +1006,7 @@ pub(super) fn intern(st: &mut St, s: &str) -> Value {
 }
 
 pub(super) fn push_str(st: &mut St, s: String) -> Value {
+    st.heap_bytes = st.heap_bytes.saturating_add(s.len() + 16);
     st.strs.push(Str::Flat(s));
     Value::string((st.strs.len() - 1) as u32)
 }
@@ -3083,6 +3125,9 @@ fn method_ref_dispatch(
             let parts: Vec<Value> = if let Some(ri) = regex_index(st, pat)
             {
                 let raw = st.regexes[ri].re.split_vec(&s);
+                if raw.len() > MAX_MATERIALIZE {
+                    return range_err("too many split results");
+                }
                 raw.into_iter()
                     .map(|p| make_string(st, p))
                     .collect()
@@ -3091,6 +3136,9 @@ fn method_ref_dispatch(
             } else {
                 let needle = to_display(st, pat);
                 if needle.is_empty() {
+                    if s.len() > MAX_MATERIALIZE {
+                        return range_err("too many split results");
+                    }
                     s.chars()
                         .map(|c| make_string(st, c.to_string()))
                         .collect()
@@ -4283,8 +4331,11 @@ fn internal_set(
     }
     if st.objects[oi].is_array && name == "length" {
         let len = to_number(st, mods, value)?;
-        if len < 0.0 || len.fract() != 0.0 {
-            return err("invalid array length");
+        if len < 0.0 || len.fract() != 0.0 || len > u32::MAX as f64 {
+            return range_err("Invalid array length");
+        }
+        if len as usize > MAX_ARRAY_ELEMS {
+            return range_err("array length exceeds the engine limit");
         }
         st.objects[oi].elems.resize(len as usize, Value::UNDEFINED);
         return Ok(true);
@@ -4294,6 +4345,9 @@ fn internal_set(
             && st.non_extensible_objects.contains(&target.index())
         {
             return Ok(false);
+        }
+        if index >= MAX_ARRAY_ELEMS {
+            return range_err("array index exceeds the engine limit");
         }
         let elems = &mut st.objects[oi].elems;
         if index >= elems.len() {
@@ -4968,11 +5022,15 @@ fn to_str_idx(st: &mut St, v: Value) -> u32 {
     (st.strs.len() - 1) as u32
 }
 
-fn concat(st: &mut St, x: Value, y: Value) -> Value {
+fn concat(st: &mut St, x: Value, y: Value) -> Result<Value, VmError> {
     let a = to_str_idx(st, x);
     let b = to_str_idx(st, y);
     let len = str_len(st, a) + str_len(st, b);
+    if len > MAX_STR_BYTES {
+        return range_err("Invalid string length");
+    }
     // small results stay flat: rope nodes only pay off on big strings
+    st.heap_bytes = st.heap_bytes.saturating_add(len + 16);
     if len <= 64 {
         let sa = str_ref(st, a).to_string();
         let sb = str_ref(st, b);
@@ -4981,7 +5039,7 @@ fn concat(st: &mut St, x: Value, y: Value) -> Value {
     } else {
         st.strs.push(Str::Cat { a, b, len: len as u32 });
     }
-    Value::string((st.strs.len() - 1) as u32)
+    Ok(Value::string((st.strs.len() - 1) as u32))
 }
 
 fn proxy_call(
@@ -6178,6 +6236,9 @@ fn define_one_prop(
         // would be invisible to o["907"] reads
         if let Some(index) = elem_index(&st.names[key as usize].clone())
         {
+            if index >= MAX_ARRAY_ELEMS {
+                return range_err("array index exceeds the engine limit");
+            }
             let elems = &mut st.objects[oi].elems;
             if index >= elems.len() {
                 elems.resize(index, Value::UNDEFINED);
@@ -6930,6 +6991,9 @@ fn host_fn(
             let mapfn = argv!(1);
             let mut items: Vec<Value> = if v.is_string() {
                 let s = str_ref(st, v.index()).to_string();
+                if s.len() > MAX_MATERIALIZE {
+                    return range_err("string too long to materialize");
+                }
                 s.chars().map(|c| push_str(st, c.to_string())).collect()
             } else if v.is_object() {
                 let oi = v.index();
@@ -9099,6 +9163,15 @@ fn exec_loop(
             }
             return err("script exceeded its instruction budget");
         }
+        // heap backstop: gg has no GC, so string-heap entries live for
+        // the whole script run. A challenge/obfuscation loop that mints
+        // large strings per iteration (namuwiki's Cloudflare
+        // orchestrator) stays under the instruction budget but exhausts
+        // RAM and aborts the process on a failed allocation. Trip a
+        // catchable RangeError first.
+        if st.heap_bytes > MAX_HEAP_BYTES {
+            return range_err("string heap exhausted");
+        }
         st.fuel -= 1;
         // One sample per 16K bytecode instructions keeps the profiler cheap
         // enough to leave compiled in while still producing hundreds of
@@ -9244,7 +9317,7 @@ fn exec_loop(
                         ),
                     }
                 } else if x.is_string() || y.is_string() {
-                    concat(st, x, y)
+                    concat(st, x, y)?
                 } else {
                     Value::number(to_number(st, mods, x)? + to_number(st, mods, y)?)
                 };
@@ -10878,6 +10951,11 @@ fn exec_loop(
                             if n < 0.0 || !n.is_finite() {
                                 return err("invalid repeat count");
                             }
+                            if s.len().saturating_mul(n as usize)
+                                > MAX_STR_BYTES
+                            {
+                                return range_err("Invalid string length");
+                            }
                             push_str(st, s.repeat(n as usize))
                         }
                         "charAt" => {
@@ -10979,6 +11057,10 @@ fn exec_loop(
                             };
                             if st.regexes[ri].global {
                                 let hits = st.regexes[ri].re.find_all(&s);
+                                if hits.len() > MAX_MATERIALIZE {
+                                    return range_err(
+                                        "too many regex matches");
+                                }
                                 if hits.is_empty() {
                                     Value::NULL
                                 } else {
@@ -11028,6 +11110,10 @@ fn exec_loop(
                                 if let Some(ri) = regex_index(st, av0) {
                                     let parts =
                                         st.regexes[ri].re.split_vec(&s);
+                                    if parts.len() > MAX_MATERIALIZE {
+                                        return range_err(
+                                            "too many split results");
+                                    }
                                     parts.into_iter()
                                         .map(|p| push_str(st, p)).collect()
                                 } else if argc == 0 {
@@ -11035,11 +11121,23 @@ fn exec_loop(
                                 } else {
                                     let sep = to_display(st, av0);
                                     if sep.is_empty() {
+                                        if s.len() > MAX_MATERIALIZE {
+                                            return range_err(
+                                                "too many split results");
+                                        }
                                         s.chars()
                                             .map(|c| push_str(st, c.to_string()))
                                             .collect()
                                     } else {
-                                        s.split(&sep)
+                                        let parts: Vec<&str> = s
+                                            .split(&sep)
+                                            .take(MAX_MATERIALIZE + 1)
+                                            .collect();
+                                        if parts.len() > MAX_MATERIALIZE {
+                                            return range_err(
+                                                "too many split results");
+                                        }
+                                        parts.into_iter()
                                             .map(|p| push_str(st, p.to_string()))
                                             .collect::<Vec<_>>()
                                     }
@@ -11183,6 +11281,9 @@ fn exec_loop(
                         }
                         "padStart" | "padEnd" => {
                             let target = num_of(av0)? as i64;
+                            if target > MAX_STR_BYTES as i64 {
+                                return range_err("Invalid string length");
+                            }
                             let pad = if av1.is_undefined() {
                                 " ".to_string()
                             } else {
@@ -11768,8 +11869,14 @@ fn exec_loop(
                         raw_set_prop(st, ov.index() as usize, key_id, v);
                         continue;
                     }
-                    let elems = &mut st.objects[ov.index() as usize].elems;
                     let k = k as usize;
+                    if k >= MAX_ARRAY_ELEMS
+                        && k >= st.objects[ov.index() as usize].elems.len()
+                    {
+                        return range_err(
+                            "array index exceeds the engine limit");
+                    }
+                    let elems = &mut st.objects[ov.index() as usize].elems;
                     if k < elems.len() {
                         elems[k] = v;
                     } else {
@@ -12260,14 +12367,21 @@ fn exec_loop(
                     let oi0 = ov.index() as usize;
                     if st.objects[oi0].is_array && key == st.ids.length {
                         let n = reg!(src).to_number_raw();
-                        if n >= 0.0 && n.fract() == 0.0 && n <= u32::MAX as f64 {
-                            let newlen = n as usize;
-                            let elems = &mut st.objects[oi0].elems;
-                            if newlen < elems.len() {
-                                elems.truncate(newlen);
-                            } else {
-                                elems.resize(newlen, Value::UNDEFINED);
-                            }
+                        if n < 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {
+                            return range_err("Invalid array length");
+                        }
+                        let newlen = n as usize;
+                        if newlen > MAX_ARRAY_ELEMS
+                            && newlen > st.objects[oi0].elems.len()
+                        {
+                            return range_err(
+                                "array length exceeds the engine limit");
+                        }
+                        let elems = &mut st.objects[oi0].elems;
+                        if newlen < elems.len() {
+                            elems.truncate(newlen);
+                        } else {
+                            elems.resize(newlen, Value::UNDEFINED);
                         }
                         continue;
                     }
