@@ -20,16 +20,18 @@
 - [x] push/PR용 Windows·Linux Rust 및 브라우저 통합 CI 작성
 - [x] network/CSS/JSVM 검증기를 실패 종료 코드가 있는 gate로 전환
 - [x] 외부 사이트 바스켓을 화·금 정기 및 수동 workflow로 분리
-- [ ] GitHub에서 CI 최초 실행 후 플랫폼별 실패 수정 — **원인 수정,
-      green run 확인 진행 중 (2026-07-25)**: 런 1~26이 전부 잡 0개로
-      즉시 실패한 원인은 세 워크플로의 job 레벨 `env`에 들어간
-      `${{ runner.temp }}` 표현식이었다. `runner` 컨텍스트는 job 레벨
-      env에서 유효하지 않아 **파일 전체가 무효** 처리되고, push
-      이벤트는 파스 에러를 숨긴 채 즉시 실패로만 기록한다(공개 전환 후
-      workflow_dispatch API가 `Unrecognized named-value: 'runner'`를
-      그대로 반환해 확정). 캐시 디렉토리는 첫 스텝에서 `$GITHUB_ENV`로
-      주입하도록 수정. 이 세션의 게이트는 로컬에서 전부 green이었다
-      (smoke 335, cargo 221, golden 7/7, gauntlet/conformance 통과).
+- [x] GitHub에서 CI 최초 실행 후 플랫폼별 실패 수정 — **완료
+      (2026-07-25, run #30 = 30149478741: Windows/Linux Rust + 통합
+      4개 잡 전부 green)**. 고친 것 네 가지: ① 런 1~26이 잡 0개로 즉시
+      실패한 근본 원인 = 세 워크플로 job 레벨 `env`의
+      `${{ runner.temp }}` 표현식(그 자리에서 `runner` 컨텍스트는
+      무효 → 파일 전체 무효화; push 이벤트는 파스 에러를 숨김) →
+      첫 스텝에서 `$GITHUB_ENV` 주입으로 교체, ② Windows 콘솔
+      cp1252에서 한글 테스트 출력이 UnicodeEncodeError →
+      `PYTHONUTF8=1`, ③ Linux CSS gauntlet의 구식 기대값 2종(abs 박스
+      ICB 원점, line-height 40px 계약)을 현행 엔진 동작으로 갱신,
+      ④ Windows 8.3 단축 경로와 resolve된 경로의 relative_to 불일치
+      (test_capped_selection_is_round_robin).
 - [x] WPT 정적 testharness 하위 집합 실행기와 JSON 점수판 작성
 - [x] test262 하위 집합 실행기와 기능·variant별 실패 분류
 - [x] 내장 9개 계약 probe 기준선을 PR CI 회귀 gate로 연결
