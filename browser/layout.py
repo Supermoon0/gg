@@ -991,6 +991,169 @@ def _sticky_metrics(box):
     return normal, maximum, inset
 
 
+# --- overflow scroll containers ------------------------------------
+#
+# A box with `overflow: auto|scroll` and a definite height becomes its
+# own scroller: it clips its descendants and offsets them by a scroll
+# position kept on the NODE (so it survives relayout, exactly like a
+# frame's own scroll in browser/frames.py). The offset is applied at
+# paint time — inner scrolling is driven by wheel events, which the
+# shells already process, so it costs a repaint rather than the
+# resident-display-list machinery the page scroll needs.
+
+SCROLLABLE_OVERFLOW = ("auto", "scroll")
+
+
+def _definite_size(node, prop):
+    """A specified, non-auto length for the given axis, if any."""
+    for name in (prop, "max-" + prop):
+        raw = (node.style.get(name) or "").strip().casefold()
+        if raw and raw not in ("auto", "none", "inherit", "initial",
+                               "unset", "fit-content", "max-content",
+                               "min-content"):
+            return True
+    return False
+
+
+def scroll_axes(node):
+    """(scrolls_y, scrolls_x) for a node's own box.
+
+    Only a box that is BOTH scrollable and definitely sized can
+    actually overflow: an `overflow:auto` box with content-driven
+    height simply grows, and clipping one would hide readable content
+    (which is why `auto` was historically left unclipped)."""
+    if not isinstance(node, Element):
+        return (False, False)
+    style = node.style
+    generic = (style.get("overflow") or "").strip().casefold()
+    oy = (style.get("overflow-y") or "").strip().casefold() or generic
+    ox = (style.get("overflow-x") or "").strip().casefold() or generic
+    return (oy in SCROLLABLE_OVERFLOW and _definite_size(node, "height"),
+            ox in SCROLLABLE_OVERFLOW and _definite_size(node, "width"))
+
+
+def is_scroll_container(obj):
+    node = getattr(obj, "node", None)
+    return any(scroll_axes(node)) if node is not None else False
+
+
+def _subtree_extent(obj):
+    """(right, bottom) of the deepest painted descendant geometry.
+
+    Memoized on the layout object: hit-testing asks every box for its
+    ancestors' scroll offsets, and re-walking a scroller's subtree each
+    time would make a hit test quadratic in page size. Layout objects
+    are rebuilt from scratch by every relayout, so the cache can never
+    go stale."""
+    cached = getattr(obj, "_extent_cache", None)
+    if cached is not None:
+        return cached
+    right = bottom = 0.0
+    stack = list(getattr(obj, "children", ()) or ())
+    while stack:
+        box = stack.pop()
+        w = getattr(box, "width", None)
+        h = getattr(box, "height", None)
+        if w is not None:
+            right = max(right, box.x + w)
+        if h is not None:
+            bottom = max(bottom, box.y + h)
+        stack.extend(getattr(box, "children", ()) or ())
+    try:
+        obj._extent_cache = (right, bottom)
+    except AttributeError:
+        pass  # __slots__ layout object: recompute each time
+    return right, bottom
+
+
+def scroll_range(obj):
+    """(max_scroll_y, max_scroll_x) for a scroll container's layout box.
+    Zero on an axis whose content fits (or which does not scroll)."""
+    node = getattr(obj, "node", None)
+    scrolls_y, scrolls_x = scroll_axes(node)
+    if not (scrolls_y or scrolls_x):
+        return (0.0, 0.0)
+    right, bottom = _subtree_extent(obj)
+    max_y = max(0.0, bottom - (obj.y + obj.height)) if scrolls_y else 0.0
+    max_x = max(0.0, right - (obj.x + obj.width)) if scrolls_x else 0.0
+    return (max_y, max_x)
+
+
+def scroll_position(obj):
+    """This box's current (y, x) scroll offset, clamped to its range."""
+    node = getattr(obj, "node", None)
+    if node is None:
+        return (0.0, 0.0)
+    max_y, max_x = scroll_range(obj)
+    y = min(max(getattr(node, "_scroll_y", 0.0), 0.0), max_y)
+    x = min(max(getattr(node, "_scroll_x", 0.0), 0.0), max_x)
+    node._scroll_y, node._scroll_x = y, x
+    return (y, x)
+
+
+def scroll_container_by(obj, dy, dx=0.0):
+    """Scroll a container. Returns True when it actually moved — the
+    shells use that to decide whether the wheel event was consumed or
+    should chain to the next scroller out (and finally the page)."""
+    node = getattr(obj, "node", None)
+    if node is None:
+        return False
+    max_y, max_x = scroll_range(obj)
+    if max_y <= 0 and max_x <= 0:
+        return False
+    before = scroll_position(obj)
+    node._scroll_y = min(max(before[0] + dy, 0.0), max_y)
+    node._scroll_x = min(max(before[1] + dx, 0.0), max_x)
+    return (node._scroll_y, node._scroll_x) != before
+
+
+def scrolled_ancestor_offset(layout_obj):
+    """Total (dy, dx) the ancestor scrollers shift this box by — the
+    hit-test counterpart of the paint-time translation."""
+    dy = dx = 0.0
+    cur = getattr(layout_obj, "parent", None)
+    while cur is not None:
+        if is_scroll_container(cur):
+            y, x = scroll_position(cur)
+            dy += y
+            dx += x
+        cur = getattr(cur, "parent", None)
+    return dy, dx
+
+
+def find_scrollable(layout_obj, dy, dx=0.0):
+    """Nearest scroller at or above `layout_obj` that can still move in
+    the requested direction (scroll chaining): a wheel inside a
+    bottomed-out inner box keeps scrolling the page."""
+    cur = layout_obj
+    while cur is not None:
+        if is_scroll_container(cur):
+            max_y, max_x = scroll_range(cur)
+            y, x = scroll_position(cur)
+            if (dy > 0 and y < max_y) or (dy < 0 and y > 0) \
+                    or (dx > 0 and x < max_x) or (dx < 0 and x > 0):
+                return cur
+        cur = getattr(cur, "parent", None)
+    return None
+
+
+def hit_test_at(layout_list, x, y, page_scroll):
+    """Deepest painted box under a point in document coordinates.
+
+    A box paints where layout put it, shifted by its sticky ancestors
+    and by every scroll container it sits inside — hit-testing has to
+    compose the same offsets or clicks inside a scrolled area land on
+    the wrong node."""
+    hit = None
+    for obj in layout_list:
+        dy, dx = scrolled_ancestor_offset(obj)
+        oy = obj.y + sticky_offset(obj, page_scroll) - dy
+        ox = obj.x - dx
+        if ox <= x < ox + obj.width and oy <= y < oy + obj.height:
+            hit = obj
+    return hit
+
+
 def sticky_offset(layout_obj, scroll):
     """Current vertical paint offset for a box inside sticky ancestors."""
     total = 0.0
@@ -3362,16 +3525,52 @@ class BlockLayout:
         if not isinstance(self.node, Element):
             return False
         for axis in ("overflow", "overflow-x", "overflow-y"):
-            # note: overflow:auto is intentionally NOT clipped here — in a
-            # non-scrolling full-page render, clipping an auto scroll
-            # container to a possibly under-computed height would hide
-            # readable content, which is worse than letting it flow.
             if self.node.style.get(axis) in ("hidden", "clip", "scroll"):
                 return True
-        return False
+        # `overflow:auto` clips only once the box is a real scroller
+        # (definitely sized, so its content can actually overflow and
+        # the user can scroll to it). An auto box with content-driven
+        # height simply grows, and clipping that would hide readable
+        # content — the reason auto went unclipped before scrolling
+        # existed.
+        return any(scroll_axes(self.node))
 
     def paint_after(self):
-        return [DrawClipPop()] if self._clips() else []
+        cmds = [DrawClipPop()] if self._clips() else []
+        # the scrollbar paints after (on top of) the scrolled content
+        # and outside the clip, so it always stays visible
+        cmds.extend(self._scrollbar_cmds())
+        return cmds
+
+    _SCROLLBAR_W = 6.0
+    _SCROLLBAR_MIN = 20.0
+    _SCROLLBAR_INK = "#b0b0b0"
+
+    def _scrollbar_cmds(self):
+        """A thin indicator inside an overflowing scroll container —
+        what makes an inner scroll area discoverable at all."""
+        if not is_scroll_container(self):
+            return []
+        max_y, max_x = scroll_range(self)
+        y, x = scroll_position(self)
+        cmds = []
+        w, h = self.width, self.height
+        bar = self._SCROLLBAR_W
+        if max_y > 0 and h > self._SCROLLBAR_MIN:
+            content = h + max_y
+            thumb = max(h * h / content, self._SCROLLBAR_MIN)
+            top = self.y + (y / max_y) * (h - thumb)
+            cmds.append(DrawRect(
+                self.x + w - bar, top, self.x + w, top + thumb,
+                self._SCROLLBAR_INK, radius=bar / 2))
+        if max_x > 0 and w > self._SCROLLBAR_MIN:
+            content = w + max_x
+            thumb = max(w * w / content, self._SCROLLBAR_MIN)
+            left = self.x + (x / max_x) * (w - thumb)
+            cmds.append(DrawRect(
+                left, self.y + h - bar, left + thumb, self.y + h,
+                self._SCROLLBAR_INK, radius=bar / 2))
+        return cmds
 
 
 class InlineBlockLayout:
@@ -3888,9 +4087,17 @@ def _paint_tree_inner(layout_object, display_list):
     # its own stacking context; equal z keeps document order (stable).
     groups = []
     reorder = False
+    # a scroll container offsets its DESCENDANTS (never its own
+    # background/border/scrollbar, which stay put) — the same shape as
+    # an iframe painting its child document at -scroll
+    sdy, sdx = (0.0, 0.0)
+    if is_scroll_container(layout_object):
+        sdy, sdx = scroll_position(layout_object)
     for i, child in enumerate(layout_object.children):
         sub = []
         paint_tree(child, sub)
+        if sdy or sdx:
+            translate_cmds(sub, -sdx, -sdy)
         z = _z_index(child)
         if z != 0:
             reorder = True

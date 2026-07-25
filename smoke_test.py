@@ -3826,4 +3826,173 @@ check("forms: reset restores the original selection",
           gg_forms.reset_form(gg_forms.find_form(_fc_s2), _fc_defaults),
           gg_forms.selected_index(_fc_s2))[1])() == 1)
 
+# --- overflow:auto scroll containers ---
+from browser.layout import (find_scrollable, hit_test_at,  # noqa: E402
+                            scrolled_ancestor_offset,
+                            is_scroll_container, scroll_axes,
+                            scroll_container_by, scroll_position,
+                            scroll_range)
+
+_sc_dom = _styled("body { margin: 0 }", """<body>
+<div id=fixed style="overflow:auto;height:100px;width:200px">
+  <div id=tall style="height:400px;background-color:#ff0000">
+    <p id=deep>deep</p></div></div>
+<div id=grow style="overflow:auto;width:200px">
+  <div style="height:300px">content-sized parent</div></div>
+<div id=fits style="overflow:auto;height:300px;width:200px">
+  <div style="height:50px">short</div></div>
+<div id=hid style="overflow:hidden;height:60px;width:200px">
+  <div style="height:400px">hidden</div></div>
+<p id=tail>tail</p></body>""")
+_sc_doc = DocumentLayout(_sc_dom)
+_sc_doc.layout(600, 300)
+_sc_list = layout_tree_to_list(_sc_doc, [])
+
+
+def _sc_box(name):
+    return next(o for o in _sc_list
+                if isinstance(o, BlockLayout)
+                and getattr(o.node, "attributes", {}).get("id") == name)
+
+
+check("overflow: an axis scrolls only when it is definitely sized",
+      scroll_axes(_sc_box("fixed").node) == (True, True)
+      and scroll_axes(_sc_box("grow").node) == (False, True)
+      and scroll_axes(_sc_box("hid").node) == (False, False)
+      and is_scroll_container(_sc_box("fixed"))
+      and not is_scroll_container(_sc_box("hid")),
+      repr([(n, scroll_axes(_sc_box(n).node))
+            for n in ("fixed", "grow", "hid")]))
+check("overflow: a content-sized auto box cannot scroll that axis",
+      scroll_range(_sc_box("grow"))[0] == 0.0
+      and _sc_box("fixed")._clips())
+check("overflow: scroll range is content minus viewport",
+      abs(scroll_range(_sc_box("fixed"))[0] - 316.0) < 0.5
+      and scroll_range(_sc_box("fits")) == (0.0, 0.0),
+      repr(scroll_range(_sc_box("fixed"))))
+check("overflow: a box whose content fits cannot scroll",
+      not scroll_container_by(_sc_box("fits"), 100))
+
+_sc_target = _sc_box("fixed")
+check("overflow: scrolling moves and clamps at both ends",
+      scroll_container_by(_sc_target, 50)
+      and scroll_position(_sc_target)[0] == 50.0
+      and scroll_container_by(_sc_target, 10 ** 6)
+      and abs(scroll_position(_sc_target)[0] - 316.0) < 0.5
+      and not scroll_container_by(_sc_target, 10)
+      and scroll_container_by(_sc_target, -10 ** 6)
+      and scroll_position(_sc_target)[0] == 0.0,
+      repr(scroll_position(_sc_target)))
+
+# paint: descendants shift, the container's own frame does not
+_sc_before = [c for c in paint_tree(_sc_doc, [])
+              if getattr(c, "color", "") == "#ff0000"]
+scroll_container_by(_sc_target, 60)
+_sc_after_cmds = paint_tree(_sc_doc, [])
+_sc_after = [c for c in _sc_after_cmds
+             if getattr(c, "color", "") == "#ff0000"]
+check("overflow: scrolling offsets the content, not the container",
+      _sc_before and _sc_after
+      and abs((_sc_before[0].top - _sc_after[0].top) - 60.0) < 0.01,
+      repr((_sc_before[0].top, _sc_after[0].top)))
+_sc_clip = [c for c in _sc_after_cmds
+            if c.__class__.__name__ == "DrawClipPush"
+            and abs(c.left - _sc_target.x) < 0.01
+            and abs(c.clip_bottom - (_sc_target.y + _sc_target.height))
+            < 0.01]
+check("overflow: the container clips its scrolled content", bool(_sc_clip),
+      repr([(c.left, c.clip_top, c.right, c.clip_bottom)
+            for c in _sc_after_cmds
+            if c.__class__.__name__ == "DrawClipPush"]))
+_sc_bar = [c for c in _sc_after_cmds
+           if getattr(c, "color", "") == "#b0b0b0"]
+check("overflow: an overflowing container paints a scrollbar inside it",
+      len(_sc_bar) == 1
+      and _sc_bar[0].right <= _sc_target.x + _sc_target.width + 0.01
+      and _sc_bar[0].top >= _sc_target.y - 0.01
+      and _sc_bar[0].bottom <= _sc_target.y + _sc_target.height + 0.01,
+      repr([(c.left, c.top, c.right, c.bottom) for c in _sc_bar]))
+
+# hit-testing composes the scroll offset the paint applied
+_sc_deep = _sc_box("deep")
+scroll_container_by(_sc_target, -10 ** 6)   # back to the top
+_sc_hit_top = hit_test_at(_sc_list, 10, _sc_deep.y + 2, 0)
+scroll_container_by(_sc_target, 40)
+_sc_hit_scrolled = hit_test_at(_sc_list, 10, _sc_deep.y + 2 - 40, 0)
+check("overflow: hit-testing follows the scrolled content",
+      _sc_hit_top is not None and _sc_hit_scrolled is not None
+      and _sc_hit_top is _sc_hit_scrolled,
+      repr((_sc_hit_top, _sc_hit_scrolled)))
+check("overflow: a point the content scrolled away from no longer hits it",
+      hit_test_at(_sc_list, 10, _sc_deep.y + 2, 0) is not _sc_hit_top)
+
+# scroll chaining: the innermost box that can still move wins
+scroll_container_by(_sc_target, -10 ** 6)
+check("overflow: a wheel inside the box targets the box",
+      find_scrollable(_sc_deep, 90) is _sc_target)
+check("overflow: upward at the top chains past it to the page",
+      find_scrollable(_sc_deep, -90) is None)
+scroll_container_by(_sc_target, 10 ** 6)
+check("overflow: downward at the bottom chains past it to the page",
+      find_scrollable(_sc_deep, 90) is None
+      and find_scrollable(_sc_deep, -90) is _sc_target)
+check("overflow: a box outside any scroller never targets one",
+      find_scrollable(_sc_box("tail"), 90) is None)
+
+# nested scrollers: the inner one takes the wheel first
+_sc_nested = _styled("body { margin: 0 }", """<body>
+<div id=outer style="overflow:auto;height:120px;width:200px">
+  <div id=inner style="overflow:auto;height:60px;width:180px">
+    <div id=innermost style="height:400px">x</div></div>
+  <div style="height:300px">filler</div></div></body>""")
+_sc_ndoc = DocumentLayout(_sc_nested)
+_sc_ndoc.layout(600, 300)
+_sc_nlist = layout_tree_to_list(_sc_ndoc, [])
+
+
+def _sc_nbox(name):
+    return next(o for o in _sc_nlist
+                if isinstance(o, BlockLayout)
+                and getattr(o.node, "attributes", {}).get("id") == name)
+
+
+check("overflow: nested scrollers resolve innermost-first",
+      find_scrollable(_sc_nbox("innermost"), 30) is _sc_nbox("inner"))
+scroll_container_by(_sc_nbox("inner"), 10 ** 6)
+check("overflow: a bottomed-out inner scroller chains to the outer one",
+      find_scrollable(_sc_nbox("innermost"), 30) is _sc_nbox("outer"))
+scroll_container_by(_sc_nbox("outer"), 25)
+check("overflow: nested offsets compose in hit-testing",
+      abs(scrolled_ancestor_offset(_sc_nbox("innermost"))[0]
+          - (scroll_position(_sc_nbox("inner"))[0] + 25.0)) < 0.01,
+      repr(scrolled_ancestor_offset(_sc_nbox("innermost"))))
+
+# a clip bracket nested inside a scrolled subtree moves with it
+_sc_tr = _styled("body { margin: 0 }", """<body>
+<div id=s style="overflow:auto;height:80px;width:200px">
+  <div style="overflow:hidden;height:40px;width:100px">
+    <p style="height:200px">clipped</p></div>
+  <div style="height:300px">filler</div></div></body>""")
+_sc_trdoc = DocumentLayout(_sc_tr)
+_sc_trdoc.layout(600, 300)
+_sc_trbox = next(o for o in layout_tree_to_list(_sc_trdoc, [])
+                 if isinstance(o, BlockLayout)
+                 and getattr(o.node, "attributes", {}).get("id") == "s")
+
+
+def _sc_inner_clip(doc):
+    return [c for c in paint_tree(doc, [])
+            if c.__class__.__name__ == "DrawClipPush"
+            and abs(c.clip_bottom - c.clip_top - 40.0) < 0.5]
+
+
+_sc_clip_before = _sc_inner_clip(_sc_trdoc)
+scroll_container_by(_sc_trbox, 30)
+_sc_clip_after = _sc_inner_clip(_sc_trdoc)
+check("overflow: a nested clip rect scrolls with its content",
+      _sc_clip_before and _sc_clip_after
+      and abs((_sc_clip_before[0].clip_top - _sc_clip_after[0].clip_top)
+              - 30.0) < 0.01,
+      repr((_sc_clip_before[0].clip_top, _sc_clip_after[0].clip_top)))
+
 print(f"\n{passed} checks passed - engine pipeline OK")

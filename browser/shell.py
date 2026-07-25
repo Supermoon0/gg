@@ -14,9 +14,9 @@ from . import (animation, forms, frames, keyboard, native, navigation,
                net, textengine)
 from .draw import scale_cmds
 from .html_parser import Element, Text, tree_to_list
-from .layout import (HSTEP, VSTEP, DocumentLayout, get_font,
-                     layout_tree_to_list, measure, paint_tree,
-                     sticky_offset)
+from .layout import (HSTEP, VSTEP, DocumentLayout, find_scrollable,
+                     get_font, hit_test_at, layout_tree_to_list, measure,
+                     paint_tree, scroll_container_by)
 from .pages import error_page
 from .network_backend import default_network_backend
 from .renderer_session import create_renderer_session
@@ -479,8 +479,15 @@ class Shell:
                                  my - TOOLBAR_H + self.scroll)
                    if my >= TOOLBAR_H and self.document else None)
             frame = frames.frame_of(obj) if obj else None
+            scroller = (find_scrollable(obj, -b, -a)
+                        if obj is not None else None)
             if frame is not None and frame.root is not None \
                     and frame.scroll_by(-b, obj.width, obj.height):
+                self.repaint()
+            elif scroller is not None \
+                    and scroll_container_by(scroller, -b, -a):
+                # an inner scroll container consumes the wheel until it
+                # bottoms out, then the page scrolls (scroll chaining)
                 self.repaint()
             else:
                 self.scroll -= b
@@ -679,11 +686,7 @@ class Shell:
         self.dirty = True
 
     def hit_test(self, x, y):
-        objs = [o for o in self.layout_list
-                if o.x <= x < o.x + o.width
-                and o.y + sticky_offset(o, self.scroll) <= y
-                < o.y + sticky_offset(o, self.scroll) + o.height]
-        return objs[-1] if objs else None
+        return hit_test_at(self.layout_list, x, y, self.scroll)
 
     def find_link(self, node):
         while node:

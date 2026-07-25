@@ -165,6 +165,11 @@ collapse하며 border·padding·overflow formatting context에서는 차단한�
 팝업 레이어가 없으므로 select는 클릭/Enter/Space/방향키로 선택을 순환하며
 input·change를 발화한다.
 
+**스크롤 영역**: 명시 크기의 `overflow:auto|scroll` 박스는 자체 스크롤러다 —
+자식 클리핑, 페인트 시점 오프셋, 박스 내부 스크롤바, sticky와 합성되는
+히트테스트, 그리고 안쪽 스크롤러가 끝에 닿으면 바깥·페이지로 넘어가는
+scroll chaining.
+
 **크롬**: 주소창, 히스토리, 세로/가로 스크롤(네이티브 셸은 Rust 상주 디스플레이
 리스트로 오프셋 전용 프레임), 링크 히트 테스트, EAGER-DATA 리더 모드(네이버
 헤드라인·피드 추출 렌더). 상위 탐색은 UI 스레드 밖에서 실행되며 새 탐색·중지로

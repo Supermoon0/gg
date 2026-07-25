@@ -14,8 +14,9 @@ from .css_parser import CSSParser
 from .draw import DrawStickyPop, DrawStickyPush
 from .style import RuleIndex, cascade_priority, default_rules, style
 from .layout import (VSTEP, BlockLayout, DocumentLayout, ImageLayout,
-                     TextLayout, layout_tree_to_list, paint_tree,
-                     sticky_offset)
+                     TextLayout, find_scrollable, hit_test_at,
+                     layout_tree_to_list, paint_tree,
+                     scroll_container_by)
 from .pages import error_page
 from .network_backend import default_network_backend
 from .renderer_session import create_renderer_session
@@ -834,16 +835,25 @@ class Browser:
         self.draw()
 
     def on_mousewheel(self, event):
-        # a wheel over a scrollable iframe scrolls the frame, not the page
+        # a wheel inside an iframe or an overflow scroll container moves
+        # that box; only when it cannot move further does the page take
+        # over (scroll chaining)
         obj = self.hit_test(event.x, event.y + self.scroll) \
             if self.document else None
+        ticks = int(event.delta / 120)
         frame = frames.frame_of(obj) if obj else None
         if frame is not None and frame.root is not None:
-            delta = -int(event.delta / 120) * frames.FRAME_SCROLL_STEP
+            delta = -ticks * frames.FRAME_SCROLL_STEP
             if frame.scroll_by(delta, obj.width, obj.height):
                 self.repaint()
                 return
-        self.scroll -= int(event.delta / 120) * SCROLL_STEP
+        if obj is not None:
+            scroller = find_scrollable(obj, -ticks * SCROLL_STEP)
+            if scroller is not None and scroll_container_by(
+                    scroller, -ticks * SCROLL_STEP):
+                self.repaint()
+                return
+        self.scroll -= ticks * SCROLL_STEP
         self.clamp_scroll()
         self.draw()
 
@@ -858,11 +868,7 @@ class Browser:
     # ---------- interaction ----------
 
     def hit_test(self, x, y):
-        objs = [o for o in self.layout_list
-                if o.x <= x < o.x + o.width
-                and o.y + sticky_offset(o, self.scroll) <= y
-                < o.y + sticky_offset(o, self.scroll) + o.height]
-        return objs[-1] if objs else None
+        return hit_test_at(self.layout_list, x, y, self.scroll)
 
     def find_link(self, node):
         while node:
