@@ -5,8 +5,8 @@
 
 ## 현재 진행 요약
 
-- 완료: P0 9/9, P1 8/8, P2 14/17, Boa 제거와 gg-js 단일화
-- 진행할 핵심: renderer crash isolation 완료 → shared frame/network service → transition/@keyframes
+- 완료: P0 9/9, P1 8/8, P2 15/17, Boa 제거와 gg-js 단일화
+- 진행할 핵심: renderer crash isolation 완료 → shared frame/network service → iframe 문서 격리
 - 제품화: P3 0/6
 - 검증 부채: 새 GitHub Actions workflow의 Windows/Linux 최초 green run 확인
 
@@ -31,24 +31,26 @@
 - [ ] cookie/cache/socket을 network service로 이동하고 IPC gauntlet 통과
 - [ ] Windows/Linux renderer sandbox와 CPU/RSS/blob quota 적용
 
-### 1. Transition과 keyframes — 다음 작업
+### 1. Transition과 keyframes — 완료 (2026-07-25, browser/animation.py)
 
-- [ ] CSS의 `transition-*`/`animation-*` shorthand와 longhand 정규화
-- [ ] `@keyframes` 이름, `from`/`to`/백분율 frame 파싱 및 스타일 저장
-- [ ] 이전 computed style과 새 style 사이에서 시작값·종료값 캡처
-- [ ] color, opacity, 길이, transform의 안전한 보간기 구현
-- [ ] duration/delay, iteration-count, direction, fill-mode, play-state 적용
-- [ ] 단조 시계 기반 animation sampling과 rAF/timer frame 합류
-- [ ] paint-only 속성과 layout 속성의 무효화 경로 분리
-- [ ] tkinter와 native shell이 같은 frame scheduler를 사용하도록 연결
-- [ ] transition 종료·취소 및 DOM 제거 시 animation 정리
-- [ ] 단위·통합·시각 회귀 테스트 추가
+- [x] CSS의 `transition-*`/`animation-*` shorthand와 longhand 정규화
+- [x] `@keyframes` 이름, `from`/`to`/백분율 frame 파싱 및 스타일 저장
+- [x] 이전 computed style과 새 style 사이에서 시작값·종료값 캡처
+- [x] color, opacity, 길이, transform의 안전한 보간기 구현
+- [x] duration/delay, iteration-count, direction, fill-mode, play-state 적용
+- [x] 단조 시계 기반 animation sampling과 rAF/timer frame 합류
+- [x] paint-only 속성과 layout 속성의 무효화 경로 분리
+- [x] tkinter와 native shell이 같은 frame scheduler를 사용하도록 연결
+- [x] transition 종료·취소 및 DOM 제거 시 animation 정리
+- [x] 단위·통합·시각 회귀 테스트 추가 (smoke 36종: 정규화·보간·엔진·layout 통합)
 
-완료 조건: transform/opacity transition과 2개 이상의 `@keyframes` 구간이 실제
-프레임에서 움직이고, 비활성 페이지에서 timer 폭주가 없으며 두 shell의 결과가
-동일해야 한다.
+완료 조건 충족: transform/opacity transition과 다구간 `@keyframes`가 실제
+프레임에서 움직이고(두 shell 모두 같은 `AnimationEngine.on_frame`을 frame tick에서
+호출), 애니메이션이 없으면 기존 80ms/500ms idle 백오프를 그대로 유지한다.
+남은 후속 후보: transitionend/animation* DOM 이벤트 발화, per-keyframe
+timing-function 오버라이드.
 
-### 2. iframe 문서 격리
+### 2. iframe 문서 격리 — 다음 작업
 
 - [ ] 자식 문서의 URL/base URL, origin, cookie/storage context 분리
 - [ ] 부모-자식 event loop와 load/error lifecycle 연결
@@ -113,7 +115,7 @@
 - [x] grid named line·명시 row 배치와 occupancy 기반 자동 배치
 - [x] `position: sticky` 스크롤 시점 paint·containing-block 제한·hit-test
 - [x] 부모-자식·빈 블록과 양수/음수 집합을 포함한 margin collapsing
-- [ ] transition/@keyframes와 렌더 프레임 스케줄링
+- [x] transition/@keyframes와 렌더 프레임 스케줄링
 - [ ] iframe과 문서별 origin/event loop 격리
 - [ ] 접근성 트리와 ARIA role/name/state 확대
 
@@ -142,11 +144,13 @@
 ## 현재 검증 기준
 
 - Rust: 198 passed, 2 ignored
-- Python smoke: 이전 릴리스 기준 249/249; 현재 순수-Python 구간과
-  grid/sticky/margin focused 검증 통과
-  (이전 native wheel의 async 구간은 제한시간 초과)
+- Python smoke: 296/296 (2026-07-25, Linux + 새로 빌드한 native wheel;
+  transition/@keyframes 36종 포함. native shell 구간은 local renderer를
+  명시해 top-level 스크립트의 spawn 재import 자폭을 제거)
+- Golden 렌더링 회귀: 7/7
 - Network gauntlet: 41/41
-- CSS gauntlet: 23/23
+- CSS gauntlet: 23/23 (이 컨테이너에서는 폰트 메트릭 차이로
+  position-absolute-offsets·line-height-px 2종이 환경 실패 — 변경 전후 동일)
 - Render evidence: home/demo/css/js 4종 통과
 
 ## 최근 구현 메모

@@ -127,7 +127,10 @@ Python, 페인트는 Rust 소프트웨어 래스터라이저. 골든 렌더링 �
 `::before`/`::after` + content, background-image(스프라이트 크롭·타일),
 border-radius, box-shadow, gradient 색 폴백, overflow:hidden 클리핑, z-index
 쌓임(컨테이너별 정렬), transform(translate/scale), opacity 게이트, line-height,
-white-space:nowrap, text-overflow:ellipsis
+white-space:nowrap, text-overflow:ellipsis, **transition + @keyframes 애니메이션**
+(shorthand/longhand 정규화, 색·길이·transform 보간, iteration/direction/
+fill-mode/play-state, paint-only와 layout 무효화 분리 — 두 셸이 같은
+`AnimationEngine`을 frame tick에서 샘플링)
 
 **레이아웃**: 블록/인라인, 박스 모델, position(absolute/fixed/relative/**sticky**),
 플렉스박스(justify/align/shrink/basis 포함), **float + clear**, table의
@@ -171,7 +174,7 @@ collapse하며 border·padding·overflow formatting context에서는 차단한�
 상세 우선순위와 완료 조건은 [개발 로드맵](docs/roadmap.md)에 체크리스트로 관리한다.
 
 - baseline JIT, GC, 레이아웃 러스트 이식 (React 실측 병목을 기준으로 결정)
-- transition/@keyframes, iframe, HTTP/2, `<video>`/WebGL, 로그인 호환성
+- iframe, HTTP/2, `<video>`/WebGL, 로그인 호환성, transition/animation DOM 이벤트
 - [browser/renderer/network 프로세스 격리와 IPC](docs/process-isolation-ipc.md)
 - process-neutral local seam: `browser/renderer_session.py`, `browser/network_backend.py`
 

@@ -2721,7 +2721,10 @@ if native.available():
         def set_title(self, title):
             self.title = title
 
-    _native_shell = _NativeShell(_FakeNativeWindow())
+    # local renderer on purpose: this section tests shell UI logic, and
+    # a spawn-based renderer child would re-import this top-level script
+    # as __mp_main__ (process isolation has its own unittest suite)
+    _native_shell = _NativeShell(_FakeNativeWindow(), process_model="local")
     _native_shell.load(_ui_page1).result(timeout=2.0)
     _native_shell.poll_navigation()
     _shell_remember = next(
@@ -2979,5 +2982,240 @@ if native.available():
           repr(dp4.text("#out")))
 else:
     print("[SKIP] driver checks - native ggcore not built")
+
+# --- CSS transitions & @keyframes animations (browser/animation.py) ---
+from browser import animation as anim  # noqa: E402
+
+check("anim: parse_time units",
+      anim.parse_time("0.3s") == 0.3 and anim.parse_time("250ms") == 0.25
+      and anim.parse_time("0s") == 0.0 and anim.parse_time("abc") is None)
+
+_ts = anim.parse_transitions(
+    {"transition": "opacity 0.2s ease-in 0.1s, width 1s"})
+check("anim: transition shorthand normalizes",
+      len(_ts) == 2 and _ts[0].prop == "opacity"
+      and abs(_ts[0].duration - 0.2) < 1e-9
+      and abs(_ts[0].delay - 0.1) < 1e-9
+      and _ts[1].prop == "width" and _ts[1].duration == 1.0
+      and _ts[1].delay == 0.0, repr(_ts))
+_tl = anim.parse_transitions(
+    {"transition-property": "color, width", "transition-duration": "1s",
+     "transition-delay": "0s, 0.5s",
+     "transition-timing-function": "linear"})
+check("anim: transition longhand lists repeat per property",
+      len(_tl) == 2 and _tl[0].prop == "color" and _tl[0].duration == 1.0
+      and _tl[1].duration == 1.0 and _tl[1].delay == 0.5
+      and _tl[0].timing(0.5) == 0.5, repr(_tl))
+check("anim: transition-property none disables",
+      anim.parse_transitions({"transition": "all 1s",
+                              "transition-property": "none"}) == ())
+_all = anim.parse_transitions({"transition": "all 2s, opacity 1s"})
+check("anim: exact property match beats all",
+      anim.transition_for(_all, "opacity").duration == 1.0
+      and anim.transition_for(_all, "width").duration == 2.0)
+
+_as = anim.parse_animations(
+    {"animation": "spin 2s linear 0.5s infinite alternate paused"})
+check("anim: animation shorthand normalizes",
+      len(_as) == 1 and _as[0].name == "spin" and _as[0].duration == 2.0
+      and _as[0].delay == 0.5 and _as[0].iterations == float("inf")
+      and _as[0].direction == "alternate" and _as[0].play_state == "paused"
+      and _as[0].timing(0.25) == 0.25, repr(_as))
+_al = anim.parse_animations(
+    {"animation-name": "a, b", "animation-duration": "1s, 2s",
+     "animation-fill-mode": "both",
+     "animation-iteration-count": "3"})
+check("anim: animation longhands fan out over names",
+      len(_al) == 2 and _al[0].name == "a" and _al[0].duration == 1.0
+      and _al[1].name == "b" and _al[1].duration == 2.0
+      and all(s.fill == "both" and s.iterations == 3.0 for s in _al),
+      repr(_al))
+check("anim: animation none yields nothing",
+      anim.parse_animations({"animation": "none"}) == ())
+
+_kf = anim.parse_keyframes([
+    "@keyframes fade { from { opacity: 0 } 50% { opacity: 0.9 } "
+    "to { opacity: 1 } }"
+    "@-webkit-keyframes slide { 0%, 100% { margin: 4px } "
+    "50% { margin-left: 8px } }"])
+check("anim: @keyframes from/to/% parse",
+      [o for o, _ in _kf["fade"]] == [0.0, 0.5, 1.0]
+      and _kf["fade"][1][1]["opacity"] == "0.9", repr(_kf.get("fade")))
+check("anim: prefixed keyframes + shorthand expansion in frames",
+      _kf["slide"][0][1]["margin-left"] == "4px"
+      and _kf["slide"][1][1]["margin-left"] == "8px"
+      and _kf["slide"][2][1]["margin-top"] == "4px", repr(_kf.get("slide")))
+_kf2 = anim.parse_keyframes(
+    ["@keyframes x { to { opacity: 0 } }",
+     "@keyframes x { to { opacity: 0.5 } }"])
+check("anim: later same-name keyframes win",
+      _kf2["x"][-1][1]["opacity"] == "0.5")
+
+_ease_in = anim.parse_timing("ease-in")
+_steps4 = anim.parse_timing("steps(4)")
+check("anim: timing functions",
+      anim.parse_timing("linear")(0.5) == 0.5
+      and _ease_in(0.5) < 0.5
+      and abs(anim.parse_timing("cubic-bezier(0,0,1,1)")(0.3) - 0.3) < 1e-3
+      and _steps4(0.3) == 0.25 and _steps4(0.99) == 0.75
+      and anim.parse_timing("steps(2, start)")(0.1) == 0.5)
+
+check("anim: length/number interpolation",
+      anim.interpolate("width", "10px", "20px", 0.5) == "15px"
+      and anim.interpolate("opacity", "0", "1", 0.25) == "0.25")
+check("anim: color interpolation",
+      anim.interpolate("color", "#000000", "#ffffff", 0.5) == "#808080"
+      and anim.interpolate("background-color", "rgb(0,0,0)",
+                           "rgba(255,255,255,0)", 0.5)
+      == "rgba(128,128,128,0.5)")
+check("anim: transform interpolation",
+      anim.interpolate("transform", "translate(0px, 0px)",
+                       "translate(10px, 20px)", 0.5)
+      == "translate(5px, 10px)"
+      and anim.interpolate("transform", "none", "translatex(10px)", 0.5)
+      == "translatex(5px)")
+check("anim: non-interpolable values flip at 50%",
+      anim.interpolate("display", "none", "block", 0.25) == "none"
+      and anim.interpolate("display", "none", "block", 0.75) == "block")
+check("anim: damage classification",
+      anim.classify("opacity") == anim.DAMAGE_PAINT
+      and anim.classify("background-color") == anim.DAMAGE_PAINT
+      and anim.classify("transform") == anim.DAMAGE_PAINT
+      and anim.classify("width") == anim.DAMAGE_LAYOUT)
+
+# engine: transition lifecycle against an injected clock
+_clock = [0.0]
+_eng = anim.AnimationEngine(clock=lambda: _clock[0])
+_eng.reset([])
+_aroot = Element("html", {}, None)
+_adiv = Element("div", {}, _aroot)
+_aroot.children.append(_adiv)
+_aroot.style = {}
+_adiv.style = {"opacity": "0", "transition": "opacity 1s linear",
+               "width": "100px"}
+_r = _eng.on_frame(_aroot)
+check("anim: first style never transitions",
+      _r.damage == "none" and not _eng.active
+      and _adiv.style["opacity"] == "0")
+_adiv.style["opacity"] = "1"  # a restyle changed the base value
+_r = _eng.on_frame(_aroot)
+check("anim: transition starts from the old value",
+      _r.damage == "paint" and _eng.active
+      and _adiv.style["opacity"] == "0", repr(_adiv.style))
+_clock[0] = 0.5
+_eng.on_frame(_aroot)
+check("anim: transition samples midway", _adiv.style["opacity"] == "0.5")
+_clock[0] = 2.0
+_r = _eng.on_frame(_aroot)
+check("anim: transition completes to the base value",
+      _adiv.style["opacity"] == "1" and not _eng.active
+      and _r.damage == "paint")
+_adiv.style["opacity"] = "0"  # reverse: new target mid-idle
+_r = _eng.on_frame(_aroot)
+_clock[0] = 2.5
+_eng.on_frame(_aroot)
+check("anim: transition retargets from current value",
+      _adiv.style["opacity"] == "0.5", _adiv.style["opacity"])
+_clock[0] = 4.0
+_eng.on_frame(_aroot)
+_adiv.style["width"] = "200px"  # width transitions are layout damage
+_adiv.style["transition"] = "all 1s linear"
+_r = _eng.on_frame(_aroot)
+check("anim: layout property transition reports layout damage",
+      _r.damage == "layout" and _adiv.style["width"] == "100px")
+_clock[0] = 4.5
+_eng.on_frame(_aroot)
+check("anim: width transition midway", _adiv.style["width"] == "150px")
+_clock[0] = 6.0
+_eng.on_frame(_aroot)
+
+# base change without a matching transition snaps instantly
+_adiv.style["transition"] = "opacity 1s linear"
+_eng.on_frame(_aroot)
+_adiv.style["width"] = "300px"
+_r = _eng.on_frame(_aroot)
+check("anim: uncovered property snaps without animating",
+      _adiv.style["width"] == "300px" and _r.damage == "none")
+
+# engine: @keyframes lifecycle
+_clock[0] = 0.0
+_eng2 = anim.AnimationEngine(clock=lambda: _clock[0])
+_eng2.reset(["@keyframes fade { from { opacity: 0 } to { opacity: 1 } }"])
+_kroot = Element("html", {}, None)
+_kdiv = Element("div", {}, _kroot)
+_kroot.children.append(_kdiv)
+_kroot.style = {}
+_kdiv.style = {"animation": "fade 2s linear"}
+_r = _eng2.on_frame(_kroot)
+check("anim: keyframes start at from-frame",
+      _kdiv.style.get("opacity") == "0" and _eng2.active
+      and _r.damage == "paint")
+_clock[0] = 1.0
+_eng2.on_frame(_kroot)
+check("anim: keyframes sample midway", _kdiv.style["opacity"] == "0.5")
+_clock[0] = 3.0
+_r = _eng2.on_frame(_kroot)
+check("anim: fill:none reverts after the run",
+      "opacity" not in _kdiv.style and not _eng2.active)
+
+_kdiv.style = {"animation": "fade 1s linear 1s both"}
+_clock[0] = 10.0
+_eng2.on_frame(_kroot)
+check("anim: backwards fill applies during the delay",
+      _kdiv.style.get("opacity") == "0")
+_clock[0] = 11.5
+_eng2.on_frame(_kroot)
+check("anim: delayed run samples after its delay",
+      _kdiv.style["opacity"] == "0.5")
+_clock[0] = 13.0
+_r = _eng2.on_frame(_kroot)
+check("anim: forwards fill holds the end value",
+      _kdiv.style["opacity"] == "1" and not _eng2.active)
+
+_kdiv.style = {"animation": "fade 1s linear infinite alternate"}
+_clock[0] = 20.0
+_eng2.on_frame(_kroot)
+_clock[0] = 21.25  # second iteration runs in reverse
+_eng2.on_frame(_kroot)
+check("anim: alternate direction reverses odd iterations",
+      _kdiv.style["opacity"] == "0.75" and _eng2.active,
+      _kdiv.style.get("opacity"))
+_kdiv.style = {"animation": "fade 10s linear paused"}
+_clock[0] = 30.0
+_eng2.on_frame(_kroot)
+_clock[0] = 35.0
+_r = _eng2.on_frame(_kroot)
+check("anim: paused animation holds and wants no frames",
+      _kdiv.style.get("opacity") == "0" and not _eng2.active)
+_kdiv.style = {}
+_r = _eng2.on_frame(_kroot)
+check("anim: removing animation-name cancels and cleans up",
+      "opacity" not in _kdiv.style and not _eng2._nodes)
+_kdiv.style = {"animation": "fade 5s linear"}
+_eng2.on_frame(_kroot)
+_kroot.children.remove(_kdiv)
+_eng2.on_frame(_kroot)
+check("anim: removed DOM nodes drop their animation state",
+      not _eng2._nodes)
+
+# through the real pipeline: an animated height changes layout geometry
+_anim_css = ("div { width: 100px; height: 10px; "
+             "animation: grow 2s linear; } "
+             "@keyframes grow { from { height: 10px } "
+             "to { height: 110px } }")
+_anim_dom = _styled(_anim_css, "<div>x</div>")
+_clock[0] = 0.0
+_eng3 = anim.AnimationEngine(clock=lambda: _clock[0])
+_eng3.reset([_anim_css])
+_eng3.on_frame(_anim_dom)   # first frame starts the animation's clock
+_clock[0] = 1.0             # halfway through the 2s run
+_eng3.on_frame(_anim_dom)
+_anim_doc = DocumentLayout(_anim_dom)
+_anim_doc.layout(800)
+_anim_box = next(o for o in layout_tree_to_list(_anim_doc, [])
+                 if isinstance(o, BlockLayout)
+                 and getattr(o.node, "tag", None) == "div")
+check("anim: sampled keyframe height feeds layout",
+      abs(_anim_box.height - 60.0) < 0.01, _anim_box.height)
 
 print(f"\n{passed} checks passed - engine pipeline OK")

@@ -10,7 +10,8 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from . import forms, keyboard, native, navigation, net, textengine
+from . import (animation, forms, keyboard, native, navigation, net,
+               textengine)
 from .draw import scale_cmds
 from .html_parser import Element, Text, tree_to_list
 from .layout import (HSTEP, VSTEP, DocumentLayout, get_font,
@@ -107,6 +108,7 @@ class Shell:
         self._dom_version = None
         self._live_last = time.monotonic()
         self._live_next = 0.0
+        self.animator = animation.AnimationEngine()
         self.status = ""
         self.ui_font = get_font(15, "normal", "roman", "default")
         self.ui_small = get_font(12, "normal", "roman", "default")
@@ -233,6 +235,7 @@ class Shell:
         self._form_defaults = forms.capture_defaults(self.nodes)
 
         self.apply_title()
+        self.animator.reset(self._css_sources)
         # Paint the DOM committed by parser-time scripts first. Async data,
         # images and lazy cards continue from tick_live after this frame.
         self.engine.clear_images()
@@ -282,6 +285,18 @@ class Shell:
                     self._load_timings["deferred_resources"] = \
                         (time.perf_counter() - started) * 1000.0
                     self.set_status("완료 (native window)")
+            else:
+                # sample CSS animations/transitions (a relayout above
+                # already sampled inside relayout())
+                result = self.animator.on_frame(self.nodes)
+                if result.damage == "layout":
+                    self.relayout()
+                elif result.damage == "paint":
+                    self.repaint()
+            if self.animator.active:
+                # animations want frame pace, not the 80ms page tick;
+                # idle pages keep the slower cadence (no timer runaway)
+                self._live_next = now + 0.016
         except Exception as exc:
             print(f"[live] tick error: {exc}")
 
@@ -337,9 +352,20 @@ class Shell:
         scale = self.win.scale_factor()
         return w / scale, h / scale
 
+    def repaint(self):
+        """Rebuild the display list without relayout — enough for
+        paint-only animation frames (opacity, colors, transform)."""
+        if self.document is None:
+            return
+        self.display_list = paint_tree(self.document, [])
+        self._list_dirty = True
+        self.dirty = True
+
     def relayout(self):
         if self.nodes is None:
             return
+        # sample animations first so layout sees the animated values
+        self.animator.on_frame(self.nodes)
         w, h = self.logical_size()
         # width-dependent @media rules must re-evaluate when the window is
         # resized across a breakpoint (styling is otherwise width-agnostic)
