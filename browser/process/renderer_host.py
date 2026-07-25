@@ -88,10 +88,24 @@ class _BrokerNetworkBackend:
     def _kwargs(kwargs):
         context = kwargs.pop("context", None)
         kwargs.pop("cancel_token", None)
+        # A URL-valued kwarg is not a JSON scalar, so a plain type
+        # filter silently drops it — and dropping `site_for_cookies` is
+        # not a lost hint: `_same_site_allows` reads None as *same
+        # site*, which would send SameSite=Strict cookies on cross-site
+        # subresource loads, and `_mixed_content_blocked` reads it as
+        # nothing to block. They travel as strings and are rebuilt.
+        urls = {}
+        for key in list(kwargs):
+            value = kwargs[key]
+            if value is not None and hasattr(value, "scheme") \
+                    and hasattr(value, "host"):
+                urls[key] = str(kwargs.pop(key))
         clean = {
             key: value for key, value in kwargs.items()
             if value is None or isinstance(value, (str, int, float, bool, dict, list))
         }
+        if urls:
+            clean["url_kwargs"] = urls
         if context is not None:
             clean["context_id"] = context.get("context_id")
         return clean
@@ -515,6 +529,8 @@ class RendererProcessHost:
 
     def _network_kwargs(self, payload):
         kwargs = dict(payload.get("kwargs") or {})
+        for key, value in (kwargs.pop("url_kwargs", None) or {}).items():
+            kwargs[key] = net.URL(value)
         context_id = kwargs.pop("context_id", None)
         if context_id is not None:
             context = self._contexts.get(context_id)

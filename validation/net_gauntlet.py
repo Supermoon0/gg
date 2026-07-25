@@ -263,6 +263,62 @@ def start_server():
     return srv, f"http://127.0.0.1:{srv.server_address[1]}"
 
 
+def _ipc_cookie_policy_cases(base):
+    """Re-run the two policies that depend on the *initiator* over the
+    real renderer-process IPC path.
+
+    Cookie SameSite and mixed-content both key off `site_for_cookies`,
+    which a renderer names but the browser process enforces. If that
+    argument does not survive the hop, `net` reads None as *same site*
+    and stops blocking — so these cases have to run where the argument
+    actually travels, not only in-process.
+    """
+    from browser import native
+    from browser.process.renderer_host import (
+        RendererProcessHost, _BrokerNetworkBackend)
+
+    # the marshalling itself: a URL-valued kwarg is not a JSON scalar,
+    # and a plain type filter drops it silently
+    wire = _BrokerNetworkBackend._kwargs({
+        "site_for_cookies": net.URL("https://top.test/"),
+        "top_level_navigation": False,
+    })
+    host = RendererProcessHost.__new__(RendererProcessHost)
+    host._contexts = {}
+    host._active_cancel_token = None
+    rebuilt = host._network_kwargs({"kwargs": wire})
+    initiator = rebuilt.get("site_for_cookies")
+    record("ipc-initiator-survives-broker",
+           str(initiator) == "https://top.test/"
+           and getattr(initiator, "scheme", None) == "https"
+           and rebuilt.get("top_level_navigation") is False,
+           f"wire={wire}; rebuilt site_for_cookies={initiator!r} "
+           "(None would read as same-site and stop blocking)")
+
+    if not native.available():
+        record("ipc-cookie-samesite-cross-site-block", True,
+               "skipped: native ggcore not built")
+        return
+    from browser.renderer_session import RemoteRendererSession
+
+    # end to end: a cross-site page pulling the cookie echo as a
+    # subresource. The SameSite=Lax cookie must be withheld, which only
+    # happens if the initiator reached the browser process intact.
+    session = RemoteRendererSession()
+    try:
+        _root, _doc, css, _logs = session.commit(
+            net.URL("http://cross-site.test/"),
+            f'<link rel="stylesheet" href="{base}/cookie/echo">')
+        leaked = [c for c in css if "server=secret" in c]
+        record("ipc-cookie-samesite-cross-site-block",
+               not leaked,
+               "cross-site subresource over IPC echoed "
+               f"Cookie={leaked[0][:60]!r}" if leaked
+               else "cross-site subresource over IPC sent no Cookie")
+    finally:
+        session.close()
+
+
 def main():
     with net._COOKIE_LOCK:
         net._COOKIE_JAR.clear()
@@ -791,6 +847,8 @@ def main():
     record("about-scheme",
            "about:blank" in t and t.startswith("<html>"),
            f"about:blank -> {len(t)} chars: {t[:60]!r}")
+
+    _ipc_cookie_policy_cases(base)
 
     srv.shutdown()
     passed = sum(r["ok"] for r in RESULTS)

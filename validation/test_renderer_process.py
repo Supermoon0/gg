@@ -233,6 +233,39 @@ class TestRendererProcess(unittest.TestCase):
         finally:
             session.close()
 
+    @unittest.skipUnless(native.available(), "native ggcore not built")
+    def test_site_for_cookies_survives_the_broker_hop(self):
+        """A URL-valued kwarg is not a JSON scalar, and dropping this
+        one is not a lost hint: net reads `site_for_cookies=None` as
+        *same site*, so SameSite=Strict cookies would ride cross-site
+        subresource loads and mixed content would stop being blocked —
+        in the isolated model only, which is the native shell default.
+        """
+        class Recorder(RecordingBackend):
+            def __init__(self, page):
+                super().__init__(page)
+                self.sites = []
+
+            def request(self, url, **kwargs):
+                self.sites.append(
+                    (str(url), str(kwargs.get("site_for_cookies")),
+                     kwargs.get("top_level_navigation")))
+                return super().request(url, **kwargs)
+
+        backend = Recorder(
+            '<link rel="stylesheet" href="https://cdn.test/s.css">')
+        backend.resources["https://cdn.test/s.css"] = "p { color: red }"
+        session = RemoteRendererSession(backend)
+        try:
+            session.commit(net.URL("https://top.test/"), backend.page)
+            self.assertTrue(backend.sites, "the stylesheet must be fetched")
+            url, site, top_level = backend.sites[0]
+            self.assertEqual(url, "https://cdn.test/s.css")
+            self.assertEqual(site, "https://top.test/")
+            self.assertIs(top_level, False)
+        finally:
+            session.close()
+
     def test_large_commit_uses_blob_and_stale_response_is_discarded(self):
         session = RemoteRendererSession(RecordingBackend())
         try:

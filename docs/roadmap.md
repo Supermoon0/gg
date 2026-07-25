@@ -41,6 +41,19 @@
 - [x] renderer child, 검증된 JSON IPC, crash recovery 구현
 - [ ] shared-memory frame triple buffer와 browser chrome composite 구현
 - [ ] cookie/cache/socket을 network service로 이동하고 IPC gauntlet 통과
+      진행: net gauntlet을 **IPC 경로에서도** 돌리기 시작했고
+      (`ipc-initiator-survives-broker`, `ipc-cookie-samesite-cross-site-block`),
+      그 과정에서 **isolated 모델의 쿠키 유출 결함**을 발견·수정했다
+      (2026-07-25). renderer가 브라우저 프로세스로 넘기는 kwargs를
+      JSON 스칼라만 통과시키는 필터가 걸러내고 있었는데,
+      `site_for_cookies`는 `net.URL`이라 **조용히 사라지고 있었다**.
+      이건 힌트 하나를 잃는 정도가 아니다: `_same_site_allows`는
+      `None`을 **같은 사이트로** 읽고 `_mixed_content_blocked`는 막을
+      게 없다고 읽는다. 실제로 gauntlet에서 cross-site 서브리소스 요청에
+      `Cookie='server=secret; corsid=1'`(HttpOnly·SameSite=Lax)이
+      실려 나가는 것을 확인했다. **네이티브 셸의 기본이 isolated
+      모델이므로 제품 기본 경로의 결함**이었다. URL 값 kwarg는 이제
+      문자열로 실려 반대편에서 `net.URL`로 복원된다.
 - [x] Windows/Linux renderer sandbox와 CPU/RSS/blob quota 적용
       (2026-07-25, browser/process/sandbox.py — POSIX setrlimit
       CPU/AS/NOFILE/core + umask 077 + no_new_privs, Windows Job object
