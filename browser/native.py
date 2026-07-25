@@ -648,10 +648,22 @@ class _ScriptLoader:
             self.module_graph.close()
 
 
+def _mark_framed(doc, framed):
+    """`window.top !== window` has to be true before the page's own
+    inline scripts run — that check and the parent handshake are both
+    parser-time idioms in the widgets that use them."""
+    if not framed:
+        return
+    try:
+        doc.set_framed(True)
+    except Exception:
+        pass  # older wheel without the frame seam
+
+
 def load_document(html, fetch_css, fetch_js=None, js_budget=8.0,
                   page_url=None, viewport_width=1280.0, timings=None,
                   network_backend=None, network_timeout=15.0,
-                  cancel_token=None, network_context=None):
+                  cancel_token=None, network_context=None, framed=False):
     """Full native front half: parse -> scripts -> styles -> tree.
 
     fetch_css(hrefs) / fetch_js(srcs) -> {url: text} keep networking
@@ -712,6 +724,7 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=8.0,
                 doc.set_page_url(str(page_url))
             except Exception:
                 pass
+            _mark_framed(doc, framed)
             try:
                 host = getattr(page_url, "host", None)
                 if host and hasattr(doc, "seed_cookies"):
@@ -746,6 +759,7 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=8.0,
                 doc.set_page_url(str(page_url))
             except Exception:
                 pass  # older wheels have no set_page_url
+            _mark_framed(doc, framed)
             # seed document.cookie from the network jar so page scripts
             # see the server session before they run
             try:

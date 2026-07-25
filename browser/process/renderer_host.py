@@ -216,12 +216,13 @@ def renderer_worker(connection, renderer_id):
                         backend, run_scripts=p.get("run_scripts", True),
                         timeout=float(p.get("timeout", 15.0)),
                         js_budget=float(p.get("js_budget", 3.0)))
+                    framed = bool(p.get("framed", False))
                     timings = {}
                     body = read_blob(p["body_blob"]).decode("utf-8", errors="replace")
                     root, _doc, css, logs = session.commit(
                         net.URL(p["url"]), body,
                         viewport_width=float(p.get("viewport_width", 1280.0)),
-                        timings=timings,
+                        timings=timings, framed=framed,
                         cancel_token=backend.new_cancel_token())
                     _worker_result(channel, request, {
                         "export": session.export(), "css_sources": css,
@@ -295,6 +296,20 @@ def renderer_worker(connection, renderer_id):
                 elif kind == "renderer.take_scroll_into_view":
                     _worker_result(channel, request, {
                         "nodes": session.take_scroll_into_view()})
+                elif kind == "renderer.set_frame_graph":
+                    session.set_frame_graph(
+                        [tuple(r)
+                         for r in request["payload"].get("frames", [])])
+                    _worker_result(channel, request, {"result": None})
+                elif kind == "renderer.take_frame_writes":
+                    _worker_result(channel, request, {
+                        "messages": session.take_frame_writes()})
+                elif kind == "renderer.deliver_message":
+                    p = request["payload"]
+                    _worker_result(channel, request, {
+                        "logs": session.deliver_message(
+                            p.get("data", "null"), p.get("origin", "null"),
+                            int(p.get("source", 0)))})
                 elif kind == "renderer.restyle_diff":
                     outcome, patches = session.doc.restyle_diff(session.css_sources)
                     _worker_result(channel, request, {

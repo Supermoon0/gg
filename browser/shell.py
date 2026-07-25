@@ -10,8 +10,8 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from . import (animation, forms, frames, keyboard, native, navigation,
-               net, textengine)
+from . import (animation, forms, frame_bridge, frames, keyboard, native,
+               navigation, net, textengine)
 from .draw import scale_cmds
 from .html_parser import Element, Text, tree_to_list
 from .layout import (HSTEP, VSTEP, DocumentLayout, apply_scroll_requests,
@@ -242,9 +242,14 @@ class Shell:
         self.apply_title()
         if self.frames is not None:
             self.frames.dispose()
+        self._contexts = frame_bridge.ContextTable()
+        self._contexts.register_top(
+            self.renderer, url_getter=lambda: self.url)
         self.frames = frames.FrameManager(
             self.network, top_url=url, timeout=self.navigation_timeout,
-            dispatch_event=self._dispatch_frame_event)
+            dispatch_event=self._dispatch_frame_event,
+            contexts=self._contexts, session=self.renderer,
+            parent_token=self._contexts.top)
         self._scroll_state = {}
         self.animator.reset(self._css_sources)
         # Paint the DOM committed by parser-time scripts first. Async data,
@@ -290,6 +295,10 @@ class Shell:
             # or loaded deferred resources would otherwise drop the
             # request and then push the stale offset back over it
             scrolled = self._apply_scroll_writes()
+            # cross-document messages route on every tick too, for the
+            # same reason: a busy parent must not starve a frame's
+            # handshake just because this tick took the other branch
+            messaged = self._pump_frame_bridge()
             if changed or self._deferred_resources:
                 first_resources = self._deferred_resources
                 started = time.perf_counter()
@@ -312,7 +321,7 @@ class Shell:
                 if result.damage == "layout":
                     self.relayout()
                 elif result.damage == "paint" or frames_changed \
-                        or scrolled:
+                        or scrolled or messaged:
                     self.repaint()
             if self.animator.active or (
                     self.frames is not None
@@ -466,6 +475,16 @@ class Shell:
                 float(max(self.scroll_extent(), viewport)),
                 float(max(self.content_width + HSTEP, w)))
 
+    def _pump_frame_bridge(self):
+        """Route this turn's postMessage traffic between the page and
+        its frames. Returns True when anything was delivered."""
+        if self._doc is None or self.frames is None:
+            return False
+        try:
+            return self.frames.pump_bridge()
+        except Exception:
+            return False
+
     def _apply_scroll_writes(self):
         """Apply the scrolling page scripts asked for this turn —
         el.scrollTop/scrollTo/scrollBy, window.scrollTo/scrollBy, and
@@ -499,6 +518,9 @@ class Shell:
         self.nodes = self.renderer.frame(self._styled_width)
         self._remap_focus()
         self._load_frames()
+        # a click handler that posted to a frame must reach it inside
+        # the same interaction, not one animation frame later
+        self._pump_frame_bridge()
         self.load_images(keep_cache=True)
         self.apply_title()
         self.relayout()

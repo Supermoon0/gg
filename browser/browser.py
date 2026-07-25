@@ -7,8 +7,8 @@ import tkinter.font
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from . import (animation, forms, frames, keyboard, native, navigation,
-               net, textengine, webfonts)
+from . import (animation, forms, frame_bridge, frames, keyboard, native,
+               navigation, net, textengine, webfonts)
 from .html_parser import Element, HTMLParser, Text, tree_to_list
 from .css_parser import CSSParser
 from .draw import DrawStickyPop, DrawStickyPush
@@ -245,8 +245,13 @@ class Browser:
         self._reset_interaction()
         if self.frames is not None:
             self.frames.dispose()
+        self._contexts = frame_bridge.ContextTable()
+        self._contexts.register_top(
+            self.renderer, url_getter=lambda: self.url)
         self.frames = frames.FrameManager(
-            self.network, top_url=url, timeout=self.navigation_timeout)
+            self.network, top_url=url, timeout=self.navigation_timeout,
+            contexts=self._contexts, session=self.renderer,
+            parent_token=self._contexts.top)
         self._scroll_state = {}
 
         if native.available():
@@ -426,6 +431,10 @@ class Browser:
             # or loaded deferred resources would otherwise drop the
             # request and then push the stale offset back over it
             scrolled = self._apply_scroll_writes()
+            # cross-document messages route on every tick too, for the
+            # same reason: a busy parent must not starve a frame's
+            # handshake just because this tick took the other branch
+            messaged = self._pump_frame_bridge()
             if changed or self._deferred_resources:
                 first_resources = self._deferred_resources
                 started = time.perf_counter()
@@ -450,7 +459,7 @@ class Browser:
                 if result.damage == "layout":
                     self.relayout()
                 elif result.damage == "paint" or frames_changed \
-                        or scrolled:
+                        or scrolled or messaged:
                     self.repaint()
         except Exception as e:
             print(f"[live] tick error: {e}")
@@ -783,6 +792,16 @@ class Browser:
                 float(max(doc_h, height)),
                 float(max(self.canvas.winfo_width(), 1)))
 
+    def _pump_frame_bridge(self):
+        """Route this turn's postMessage traffic between the page and
+        its frames. Returns True when anything was delivered."""
+        if self._doc is None or self.frames is None:
+            return False
+        try:
+            return self.frames.pump_bridge()
+        except Exception:
+            return False
+
     def _apply_scroll_writes(self):
         """Apply the scrolling page scripts asked for this turn —
         el.scrollTop/scrollTo/scrollBy, window.scrollTo/scrollBy, and
@@ -946,6 +965,9 @@ class Browser:
         self._remap_marks()
         self.load_images(self.nodes, self.url, keep_cache=True)
         self._load_frames()
+        # a click handler that posted to a frame must reach it inside
+        # the same interaction, not one animation frame later
+        self._pump_frame_bridge()
         for node in tree_to_list(self.nodes, []):
             if isinstance(node, Element) and node.tag == "title":
                 text = " ".join(

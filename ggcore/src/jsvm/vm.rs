@@ -102,6 +102,15 @@ pub(super) const DOC_NODE: u32 = u32::MAX;
 /// Listener key for `window.addEventListener` (load/resize/...).
 pub(super) const WINDOW_NODE: u32 = u32::MAX - 1;
 
+/// Browsing-context handles used by `postMessage`. A document only
+/// ever names a context it can already reach: itself, its embedder, or
+/// the tab's root. Child frames get host-minted handles (1, 2, 3, ...)
+/// pushed in by `set_frame_graph` — the VM never learns a handle it was
+/// not told about, which is what keeps the graph unguessable.
+pub(super) const FRAME_SELF: u32 = u32::MAX;
+pub(super) const FRAME_PARENT: u32 = u32::MAX - 1;
+pub(super) const FRAME_TOP: u32 = u32::MAX - 2;
+
 /// A compiled script plus its bindings into the shared VM namespace.
 pub(super) struct LoadedModule {
     pub(super) module: Module,
@@ -285,6 +294,15 @@ pub(super) enum Native {
     /// window.dispatchEvent(ev): fire the WINDOW_NODE listeners for
     /// ev.type (React reports errors via window.dispatchEvent)
     WinDispatch,
+    /// `otherWindow.postMessage(data, targetOrigin)`. The payload is
+    /// serialized to JSON here and queued for the host, which decides
+    /// whether the target may receive it. `ctx` is the browsing
+    /// context this function was minted for.
+    PostMessage { ctx: u32 },
+    /// Internal: the macrotask that delivers one queued message. It
+    /// fires the window's "message" listeners *and* `window.onmessage`,
+    /// which plain `dispatchEvent` does not do.
+    WinDeliver,
     /// encodeURI(Component)/decodeURI(Component)
     UriCoder { encode: bool, component: bool },
     /// Map()/WeakMap() constructor (weak = no difference: no GC)
@@ -815,6 +833,26 @@ pub(super) struct St {
     /// `window.scrollBy(0, 10)` lands where the page asked instead of
     /// whichever queue the host happened to drain last.
     pub(super) scroll_seq: u64,
+    /// This document's origin ("https://a.test", or "null" for an
+    /// opaque one). Stamped onto every message this document sends so
+    /// the receiver's `e.origin` is the sender's, not its own.
+    pub(super) page_origin: String,
+    /// `postMessage` calls the host has not routed yet, as
+    /// (target context, JSON payload, targetOrigin, seq). Documents
+    /// never touch each other's arenas — a message is serialized here
+    /// and re-parsed in the receiver, which is the whole isolation
+    /// story: there is no code path from one document's Value to
+    /// another's.
+    pub(super) message_writes: Vec<(u32, String, String, u64)>,
+    /// Ordering counter for `message_writes` (see `scroll_seq`).
+    pub(super) frame_seq: u64,
+    /// context handle -> the one WindowProxy object handed to JS for
+    /// it. Cached so `e.source === iframe.contentWindow` holds.
+    pub(super) ctx_proxies: HashMap<u32, Value>,
+    /// iframe element node index -> (context handle, same-origin).
+    /// Pushed by the host after it decides what this document may
+    /// reach; an entry missing here makes `contentWindow` read null.
+    pub(super) frame_ctx: HashMap<u32, (u32, bool)>,
     /// Map/Set backing stores, keyed by the owning object's index
     /// (entries in insertion order; lookups are linear strict-eq)
     pub(super) map_data: HashMap<u32, Vec<(Value, Value)>>,
@@ -957,6 +995,11 @@ impl St {
             scroll_writes: Vec::new(),
             scroll_into_view: Vec::new(),
             scroll_seq: 0,
+            page_origin: String::new(),
+            message_writes: Vec::new(),
+            frame_seq: 0,
+            ctx_proxies: HashMap::new(),
+            frame_ctx: HashMap::new(),
             map_data: HashMap::new(),
             set_data: HashMap::new(),
             style_nodes: HashMap::new(),
@@ -5954,6 +5997,67 @@ fn do_native(
             }
             Ok(Value::boolean(true))
         }
+        Native::PostMessage { ctx } => {
+            // Serialize through the same path JSON.stringify uses (the
+            // spec's structured clone is richer, but JSON covers the
+            // plain data every handshake actually sends, and it is the
+            // only representation that can cross a document boundary
+            // here). A function or undefined clones as null; a cycle
+            // throws, like DataCloneError.
+            let v = if argc > 0 { st.regs[args_base] } else { Value::UNDEFINED };
+            let target_origin = if argc > 1 {
+                to_display(st, st.regs[args_base + 1])
+            } else {
+                "/".to_string()
+            };
+            let ctx_json = JsonCtx {
+                gap: String::new(),
+                replacer: Value::UNDEFINED,
+                allow: None,
+            };
+            let holder = new_plain_object(st);
+            let empty = st.intern_name("");
+            raw_set_prop(st, holder.index() as usize, empty, v);
+            let json = json_serialize(
+                st, mods, holder, "", v, &mut Vec::new(), &ctx_json, "",
+            )?
+            .unwrap_or_else(|| "null".to_string());
+            if json.len() > MAX_STR_BYTES {
+                return range_err("postMessage payload too large");
+            }
+            st.frame_seq += 1;
+            let seq = st.frame_seq;
+            st.message_writes.push((ctx, json, target_origin, seq));
+            Ok(Value::UNDEFINED)
+        }
+        Native::WinDeliver => {
+            // one queued message, delivered as its own macrotask
+            let ev = if argc > 0 { st.regs[args_base] } else { Value::UNDEFINED };
+            let win = st.known.window;
+            let mut cbs = st
+                .listeners
+                .get(&(WINDOW_NODE, "message".to_string()))
+                .cloned()
+                .unwrap_or_default();
+            // `window.onmessage = fn` is a plain property, so
+            // dispatchEvent never sees it — deliver it here too.
+            let onk = st.intern_name("onmessage");
+            if win.is_object() {
+                if let Some(h) = raw_get_prop(st, win.index() as usize, onk) {
+                    if h.is_function() {
+                        cbs.push(h);
+                    }
+                }
+            }
+            for cb in cbs {
+                // one handler must not be able to starve the next
+                st.fuel = DEFAULT_FUEL;
+                if let Err(e) = call_value_this(st, mods, cb, Some(win), &[ev]) {
+                    st.logs.push(format!("message handler: {}", e.msg));
+                }
+            }
+            Ok(Value::UNDEFINED)
+        }
         Native::UriCoder { encode, component } => {
             let s = if argc > 0 {
                 to_display(st, st.regs[args_base])
@@ -7549,6 +7653,107 @@ fn scroll_args(st: &mut St, a0: Value, a1: Value) -> (Option<f64>, Option<f64>) 
     (left, top)
 }
 
+/// The `Window` object JS sees for another browsing context.
+///
+/// A proxy carries `postMessage` and the handful of properties that
+/// are readable across origins, and nothing else: no `document`, no
+/// `location`. That is not a stub -- it is the cross-origin surface,
+/// and it is all a document ever gets for a context it does not own.
+/// Proxies are cached per handle so `e.source === f.contentWindow`.
+pub(super) fn window_proxy(st: &mut St, ctx: u32) -> Value {
+    if ctx == 0 {
+        return st.known.window;
+    }
+    if let Some(&v) = st.ctx_proxies.get(&ctx) {
+        return v;
+    }
+    let w = new_plain_object(st);
+    let oi = w.index() as usize;
+    let post = make_native(st, Native::PostMessage { ctx });
+    for (name, v) in [
+        ("postMessage", post),
+        ("closed", Value::boolean(false)),
+        ("length", Value::int(0)),
+        ("self", w),
+        ("window", w),
+    ] {
+        let k = st.intern_name(name);
+        raw_set_prop(st, oi, k, v);
+    }
+    let k = st.intern_name("name");
+    let empty = push_str(st, String::new());
+    raw_set_prop(st, oi, k, empty);
+    st.ctx_proxies.insert(ctx, w);
+    w
+}
+
+/// Parse a JSON payload back into a value in *this* document's heap.
+/// Returns None on malformed input rather than throwing: the host
+/// produced this text from a sibling document, so a parse failure is
+/// an engine bug, not something page JS should observe as an
+/// exception mid-delivery.
+pub(super) fn parse_json(st: &mut St, text: &str) -> Option<Value> {
+    let mut p = JsonP {
+        b: text.chars().collect(),
+        i: 0,
+        depth: 0,
+    };
+    json_parse(st, &mut p).ok()
+}
+
+/// Build a MessageEvent and queue its delivery as a macrotask.
+///
+/// postMessage is always asynchronous, even to your own window, so the
+/// sender's remaining statements run first. Reusing the timer queue
+/// (rather than calling handlers inline) is what buys that ordering
+/// for free.
+pub(super) fn queue_message_task(
+    st: &mut St,
+    data_json: &str,
+    origin: &str,
+    source: Value,
+) {
+    let data = parse_json(st, data_json).unwrap_or(Value::NULL);
+    let ev = new_plain_object(st);
+    let oi = ev.index() as usize;
+    let win = st.known.window;
+    let ty = push_str(st, "message".to_string());
+    let org = push_str(st, origin.to_string());
+    let last = push_str(st, String::new());
+    let ports = new_array(st, Vec::new());
+    let noop = make_native(st, Native::Noop);
+    for (name, v) in [
+        ("type", ty),
+        ("data", data),
+        ("origin", org),
+        ("source", source),
+        ("lastEventId", last),
+        ("ports", ports),
+        ("target", win),
+        ("currentTarget", win),
+        ("preventDefault", noop),
+        ("stopPropagation", noop),
+        ("stopImmediatePropagation", noop),
+    ] {
+        let k = st.intern_name(name);
+        raw_set_prop(st, oi, k, v);
+    }
+    let cb = make_native(st, Native::WinDeliver);
+    st.next_timer_id += 1;
+    st.timer_seq += 1;
+    let id = st.next_timer_id;
+    let seq = st.timer_seq;
+    st.timers.push(Timer {
+        id,
+        callback: cb,
+        args: vec![ev],
+        due_ms: st.now_ms,
+        seq,
+        interval: None,
+        is_raf: false,
+    });
+}
+
 /// Queue one scroll request for the host and update the optimistic
 /// scroll state page JS reads back within the same turn.
 ///
@@ -8291,6 +8496,20 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
         return Ok(push_str(st, out));
     }
     match st.names[key as usize].as_str() {
+        "contentWindow" => {
+            // Only a context the host published is reachable, and even
+            // then JS gets a proxy, never the child's real window.
+            return Ok(match st.frame_ctx.get(&node) {
+                Some(&(handle, _)) => window_proxy(st, handle),
+                None => Value::NULL,
+            });
+        }
+        "contentDocument" => {
+            // Same-origin DOM access is a separate, larger seam; until
+            // it lands this reads null rather than a half-real stub a
+            // page would branch on.
+            return Ok(Value::NULL);
+        }
         "classList" => {
             // a fresh object whose methods carry the node id
             let obj = new_plain_object(st);

@@ -3219,6 +3219,7 @@ check("anim: sampled keyframe height feeds layout",
       abs(_anim_box.height - 60.0) < 0.01, _anim_box.height)
 
 # --- iframe: isolated child browsing contexts (browser/frames.py) ---
+from browser import frame_bridge  # noqa: E402
 from browser import frames as gg_frames  # noqa: E402
 
 check("iframe: schemeful origin model",
@@ -3443,6 +3444,36 @@ if native.available():
         "https://frdeep.test/4": ({}, "<p>d4</p>"),
         "https://frdeepparent.test/": (
             {}, '<iframe id=d0 src="https://frdeep.test/1"></iframe>'),
+        # postMessage: a same-origin child, a cross-origin one, and a
+        # sandboxed same-site one (whose origin must read as opaque)
+        "https://frmsg.test/": (
+            {},
+            '<p id=log>-</p>'
+            '<iframe id=same src="https://frmsg.test/child"></iframe>'
+            '<iframe id=cross src="https://frother.test/child"></iframe>'
+            '<iframe id=sb sandbox="allow-scripts"'
+            ' src="https://frmsg.test/child"></iframe>'
+            "<script>var seen = [];"
+            "window.addEventListener('message', function (e) {"
+            "  seen.push(JSON.stringify(e.data) + '@' + e.origin"
+            "    + (e.source === document.getElementById('same')"
+            "       .contentWindow ? '#same' : '#other'));"
+            "  document.getElementById('log').textContent ="
+            "    seen.join(' | ');"
+            "});</script>"),
+        "https://frmsg.test/child": (
+            {},
+            '<p id=c>child</p>'
+            "<script>"
+            "window.addEventListener('message', function (e) {"
+            "  document.getElementById('c').textContent ="
+            "    'got ' + JSON.stringify(e.data) + ' @' + e.origin;"
+            "  e.source.postMessage({pong: e.data.n + 1}, e.origin);"
+            "});"
+            "document.getElementById('c').textContent ="
+            "  'framed=' + (window.top !== window);"
+            "</script>"),
+        "https://frother.test/child": ({}, '<p id=c>cross</p>'),
     })
     net.request_text = _fake_frame_request_text
     try:
@@ -3492,6 +3523,65 @@ if native.available():
                    or not _fd3.subframes.frames),
               repr((_fd1.status, _fd2.status, _fd3.status)))
         _dpage.close()
+
+        # --- cross-document messaging (browser/frame_bridge.py) ---
+        _mpage = Page()
+        _mpage.goto("https://frmsg.test/", settle=True)
+        _msame = _mpage.frame("#same")
+        _mcross = _mpage.frame("#cross")
+        _msb = _mpage.frame("#sb")
+        check("iframe: a framed document sees window.top !== window",
+              _msame is not None and _msame.text("#c") == "framed=true",
+              repr(_msame and _msame.text("#c")))
+        check("iframe: contentWindow resolves only for a published frame",
+              _mpage.evaluate(
+                  "typeof document.getElementById('same').contentWindow")
+              == "object"
+              and _mpage.evaluate(
+                  "document.getElementById('same').contentWindow"
+                  " === document.getElementById('same').contentWindow"),
+              "the proxy must be stable, or e.source comparisons fail")
+        # the isolation proof: a cross-origin frame hands out a proxy
+        # carrying postMessage and nothing else
+        check("iframe: a cross-origin frame exposes no document",
+              _mpage.evaluate(
+                  "document.getElementById('cross').contentDocument"
+                  " === null")
+              and _mpage.evaluate(
+                  "typeof document.getElementById('cross').contentWindow"
+                  ".document") == "undefined"
+              and _mpage.evaluate(
+                  "typeof document.getElementById('cross').contentWindow"
+                  ".location") == "undefined",
+              "postMessage is the only cross-origin channel")
+        # parent -> same-origin child -> parent, in one pump
+        _mpage.evaluate(
+            "document.getElementById('same').contentWindow"
+            ".postMessage({n: 41}, '*')")
+        _mpage.pump_frames()
+        check("iframe: postMessage reaches the child with the sender origin",
+              _msame.text("#c") == 'got {"n":41} @https://frmsg.test',
+              repr(_msame.text("#c")))
+        check("iframe: e.source.postMessage replies to the right window",
+              _mpage.text("#log") == '{"pong":42}@https://frmsg.test#same',
+              repr(_mpage.text("#log")))
+        # a targetOrigin the receiver does not match is dropped silently
+        _mpage.evaluate(
+            "document.getElementById('same').contentWindow"
+            ".postMessage({n: 100}, 'https://wrong.test')")
+        _mpage.pump_frames()
+        check("iframe: a mismatched targetOrigin is dropped silently",
+              _msame.text("#c") == 'got {"n":41} @https://frmsg.test',
+              repr(_msame.text("#c")))
+        # a sandboxed frame has an opaque origin even from its own site
+        check("iframe: a sandboxed frame's origin is opaque, not same-site",
+              frame_bridge.effective_origin(_msb._fd) is None
+              and frame_bridge.origin_string(
+                  frame_bridge.effective_origin(_msb._fd)) == "null"
+              and not frame_bridge.scriptable(
+                  _msb._fd, net.URL("https://frmsg.test/")),
+              "allow-same-origin is what grants the real origin back")
+        _mpage.close()
     finally:
         net.request_text = _real_rt
 else:

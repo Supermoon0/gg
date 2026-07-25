@@ -143,6 +143,17 @@ X-Frame-Options·CSP frame-ancestors·sandbox(allow-scripts/allow-same-origin)·
 srcdoc, 중첩 depth 3 상한. 헤드리스는 `page.frame("#id")`로 자식 문서를
 조회한다.
 
+문서 사이의 유일한 통로는 `postMessage`이고, 그것도 **객체 그래프가 아니라
+바이트의 통로**다: 보내는 VM이 JSON으로 직렬화하고 호스트가 라우팅하며 받는
+VM이 자기 힙으로 파싱한다 — 한 문서의 값에서 다른 문서로 가는 코드 경로가
+아예 없다는 것이 cross-origin 격리가 정책이 아니라 구조인 이유다.
+`iframe.contentWindow`(핸들별 캐시라 `e.source === f.contentWindow`가 성립),
+`window.parent`/`top`/`origin`, 매크로태스크로 전달되는 MessageEvent(따라서
+항상 비동기, `addEventListener`와 `window.onmessage` 양쪽 발화)를 지원한다.
+`targetOrigin` 불일치는 조용히 폐기되고, `allow-same-origin` 없는 sandbox는
+같은 사이트라도 불투명 origin(`e.origin === "null"`)이며, cross-origin
+프레임은 `contentWindow`는 주되 `document`/`location`은 `undefined`다.
+
 **레이아웃**: 블록/인라인, 박스 모델, position(absolute/fixed/relative/**sticky**),
 플렉스박스(justify/align/shrink/basis 포함), **float + clear**, table의
 rowspan/colspan, grid 고정/fr track·named area·named line·양축 span과 충돌 없는
@@ -211,7 +222,7 @@ disabled/value 등 상태, landmark·heading 아웃라인, aria-hidden 서브트
 
 - baseline JIT, GC, 레이아웃 러스트 이식 (React 실측 병목을 기준으로 결정)
 - HTTP/2, `<video>`/WebGL, 로그인 호환성, transition/animation DOM 이벤트
-- iframe same-origin 스크립팅(contentWindow/postMessage), 프레임 히스토리
+- iframe `contentDocument`(부모 VM 안의 자식 DOM 미러), 프레임 히스토리
 - [browser/renderer/network 프로세스 격리와 IPC](docs/process-isolation-ipc.md)
 - process-neutral local seam: `browser/renderer_session.py`, `browser/network_backend.py`
 

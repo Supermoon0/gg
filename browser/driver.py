@@ -23,7 +23,7 @@ drift. Requires the native ggcore wheel; raises if it is absent.
 
 import json
 
-from . import forms, frames as _frames_mod, native, net
+from . import forms, frame_bridge as _bridge, frames as _frames_mod, native, net
 from .html_parser import tree_to_list
 from .network_backend import default_network_backend
 from .renderer_session import create_renderer_session
@@ -195,6 +195,24 @@ class Page:
             self._renderer.refresh()
             self._ver += 1
             self._export_cache = None
+        self.pump_frames()
+
+    def pump_frames(self, rounds=4):
+        """Advance child frames and route cross-document messages.
+
+        The shells do this on their live tick; headless assertions need
+        the same, or a frame's timers and any postMessage handshake
+        stay invisible to the test."""
+        if self._frames is None:
+            return False
+        moved = False
+        for _ in range(rounds):
+            ticked = self._frames.tick(16.0)
+            messaged = self._frames.pump_bridge()
+            moved = moved or ticked or messaged
+            if not (ticked or messaged):
+                break
+        return moved
 
     def _service_fetch(self, request):
         return self._renderer.service_fetch(request)
@@ -414,12 +432,17 @@ class Page:
         if el is None or el.tag != "iframe":
             return None
         if self._frames is None:
+            self._contexts = _bridge.ContextTable()
+            self._contexts.register_top(
+                self._renderer, url_getter=lambda: self.url)
             self._frames = _frames_mod.FrameManager(
                 self._network, top_url=self.url, timeout=self.timeout,
                 run_scripts=self.run_scripts,
                 dispatch_event=lambda ridx, event_type:
                     self._renderer.dispatch_event(
-                        ridx, event_type, False, False, None))
+                        ridx, event_type, False, False, None),
+                contexts=self._contexts, session=self._renderer,
+                parent_token=self._contexts.top)
         tree = native.build_tree(self._renderer.export())
         self._frames.sync(tree, self.url)
         for node in tree_to_list(tree, []):

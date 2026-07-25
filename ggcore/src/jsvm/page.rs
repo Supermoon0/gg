@@ -1197,8 +1197,9 @@ impl PageVm {
         }
         let disp = make_native(&mut vm.st, Native::WinDispatch);
         vm.set_object_prop(window, "dispatchEvent", disp);
-        let noop = make_native(&mut vm.st, Native::Noop);
-        vm.set_object_prop(window, "postMessage", noop);
+        let post = make_native(
+            &mut vm.st, Native::PostMessage { ctx: vm::FRAME_SELF });
+        vm.set_object_prop(window, "postMessage", post);
         // window.scrollTo/scroll are absolute, scrollBy is relative;
         // all three reach the host through the shared scroll queue
         for (m, relative) in
@@ -1208,6 +1209,13 @@ impl PageVm {
             vm.set_object_prop(window, m, f);
         }
         vm.st.known.window = window;
+        // Top-level defaults. Pages framebust on `window.top !==
+        // window`, so these must be the real window until the host
+        // says otherwise (see `set_framed`).
+        for f in ["parent", "top", "self"] {
+            vm.set_object_prop(window, f, window);
+        }
+        vm.set_object_prop(window, "frameElement", Value::NULL);
         let fctor = make_native(&mut vm.st, Native::FunctionCtor);
         vm.set_global("Function", fctor);
         vm.st.known.function = fctor;
@@ -1542,6 +1550,74 @@ impl PageVm {
         for (idx, x, y, w, h) in rects {
             self.st.layout_rects.insert(idx, (x, y, w, h));
         }
+    }
+
+    /// Tell the document it is embedded, so `window.parent` and
+    /// `window.top` stop being itself.
+    ///
+    /// This has to be callable *before* the page's own scripts run:
+    /// the `if (window.top !== window)` framed-check and the
+    /// `window.parent.postMessage(...)` handshake are both parser-time
+    /// inline scripts in the widgets that use them.
+    pub fn set_framed(&mut self, framed: bool) {
+        let window = self.st.known.window;
+        if !window.is_object() {
+            return;
+        }
+        let (parent, top) = if framed {
+            (
+                vm::window_proxy(&mut self.st, vm::FRAME_PARENT),
+                vm::window_proxy(&mut self.st, vm::FRAME_TOP),
+            )
+        } else {
+            (window, window)
+        };
+        self.set_object_prop(window, "parent", parent);
+        self.set_object_prop(window, "top", top);
+    }
+
+    /// Publish which `<iframe>` elements map to which browsing
+    /// context: [(iframe node index, context handle, same_origin)].
+    ///
+    /// The host decides this — the VM has no way to discover a context
+    /// it was not handed, which is what makes the frame graph
+    /// unguessable from page JS.
+    pub fn set_frame_graph(&mut self, frames: Vec<(u32, u32, bool)>) {
+        // rebuilt wholesale: a removed <iframe> must stop resolving
+        self.st.frame_ctx.clear();
+        for (node, handle, same_origin) in frames {
+            vm::window_proxy(&mut self.st, handle);
+            self.st.frame_ctx.insert(node, (handle, same_origin));
+        }
+    }
+
+    /// Drain the `postMessage` calls page scripts made since the last
+    /// call, as (target context, JSON payload, targetOrigin, seq).
+    pub fn take_frame_writes(&mut self) -> Vec<(u32, String, String, u64)> {
+        std::mem::take(&mut self.st.message_writes)
+    }
+
+    /// Queue one message for delivery into this document.
+    ///
+    /// `source_handle` is the sender's context as *this* document
+    /// names it (0 = this window), so `e.source.postMessage(...)`
+    /// replies to the right place. Delivery is a macrotask, so the
+    /// handlers run on the next pump, not here — the returned logs are
+    /// only whatever was already pending.
+    pub fn deliver_message(
+        &mut self,
+        data_json: &str,
+        origin: &str,
+        source_handle: u32,
+    ) -> Vec<String> {
+        let source = vm::window_proxy(&mut self.st, source_handle);
+        vm::queue_message_task(&mut self.st, data_json, origin, source);
+        std::mem::take(&mut self.st.logs)
+    }
+
+    /// This document's origin, as stamped onto messages it sends.
+    pub fn page_origin(&self) -> String {
+        self.st.page_origin.clone()
     }
 
     /// Feed real scroll state back so `el.scrollTop`/`scrollHeight`
@@ -2070,6 +2146,13 @@ impl PageVm {
             _ => (hostport, ""),
         };
         let origin = format!("{scheme}://{hostport}");
+        // every message this document sends is stamped with this
+        self.st.page_origin = origin.clone();
+        let window = self.st.known.window;
+        if window.is_object() {
+            let ov = vm::push_str(&mut self.st, origin.clone());
+            self.set_object_prop(window, "origin", ov);
+        }
         let sets = [
             ("href", url.to_string()),
             ("protocol", format!("{scheme}:")),

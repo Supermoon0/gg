@@ -40,6 +40,7 @@ from .html_parser import Element, HTMLParser, Text, tree_to_list
 from .network_backend import default_network_backend
 from .style import RuleIndex, cascade_priority, default_rules, style
 from . import animation
+from . import frame_bridge
 
 MAX_DEPTH = 3          # top-level document is depth 0
 MAX_FRAMES_TOTAL = 16  # across the whole frame tree
@@ -215,6 +216,11 @@ class FrameDocument:
         self.scroll = 0.0
         self._version = 0
         self._layout_cache = None  # (w, h, version) -> document layout
+        # postMessage routing: the tab's shared table, this frame's own
+        # context handle, and its embedder's
+        self.contexts = None
+        self.parent_token = 0
+        self.handle = 0
 
     # -- loading -------------------------------------------------------
 
@@ -283,7 +289,7 @@ class FrameDocument:
                 network, run_scripts=(self.run_scripts and allow_scripts),
                 timeout=self.timeout)
             root, _doc, css_sources, logs = self.session.commit(
-                self.url, body, cancel_token=cancel_token)
+                self.url, body, cancel_token=cancel_token, framed=True)
             self.root = root
             self.css_sources = list(css_sources)
             self.console = list(logs)
@@ -318,6 +324,13 @@ class FrameDocument:
             self.css_sources = texts
         self.animator.reset(self.css_sources)
         self.animator.on_frame(self.root)
+        # join the tab's messaging graph (a fresh handle per load: the
+        # old document is gone, and a stale handle must not resolve)
+        if self.contexts is not None and self.session is not None:
+            ctx = self.contexts.register(
+                self.session, frame=self, parent=self.parent_token)
+            ctx.console = self.console
+            self.handle = ctx.token
         # nested browsing contexts, one level deeper
         if self.depth + 1 <= MAX_DEPTH:
             self.subframes = FrameManager(
@@ -325,7 +338,9 @@ class FrameDocument:
                 timeout=self.timeout,
                 run_scripts=(self.run_scripts and allow_scripts),
                 use_native=self.use_native, budget=self.budget,
-                dispatch_event=self._dispatch_child_event)
+                dispatch_event=self._dispatch_child_event,
+                contexts=self.contexts, session=self.session,
+                parent_token=self.handle)
             self.subframes.sync(self.root, self.url,
                                 cancel_token=cancel_token)
         self._version += 1
@@ -497,7 +512,13 @@ class FrameDocument:
 
     # -- teardown -------------------------------------------------------
 
+    def _drop_context(self):
+        if self.contexts is not None and self.handle:
+            self.contexts.drop(self.handle)
+        self.handle = 0
+
     def dispose_session(self):
+        self._drop_context()
         if self.subframes is not None:
             self.subframes.dispose()
             self.subframes = None
@@ -519,6 +540,15 @@ class FrameDocument:
 # ---------------------------------------------------------------------
 
 
+def _console_line(ctx, line):
+    """Handler output goes to the console of the document that ran it."""
+    sink = getattr(ctx, "console", None)
+    if sink is None and ctx.frame is not None:
+        sink = ctx.frame.console
+    if sink is not None:
+        sink.append(line)
+
+
 def _frame_key(node):
     ridx = getattr(node, "_ridx", None)
     return ("r", ridx) if ridx is not None else ("p", id(node))
@@ -538,7 +568,8 @@ class FrameManager:
 
     def __init__(self, network=None, *, top_url=None, depth=0,
                  timeout=net.DEFAULT_TIMEOUT, run_scripts=True,
-                 use_native=None, budget=None, dispatch_event=None):
+                 use_native=None, budget=None, dispatch_event=None,
+                 contexts=None, session=None, parent_token=0):
         self.network = network or default_network_backend()
         self.top_url = top_url
         self.depth = depth
@@ -547,6 +578,12 @@ class FrameManager:
         self.use_native = use_native
         self.budget = budget if budget is not None else [MAX_FRAMES_TOTAL]
         self.dispatch_event = dispatch_event
+        # the tab's postMessage routing table, shared down the tree the
+        # same way `budget` is. `session` is the *owning* document's
+        # renderer session — the one that embeds these frames.
+        self.contexts = contexts
+        self.session = session
+        self.parent_token = parent_token
         self.frames = {}
 
     # -- discovery ------------------------------------------------------
@@ -583,6 +620,8 @@ class FrameManager:
                 fd.sandbox = parse_sandbox(
                     node.attributes.get("sandbox"))
                 fd.source_key = want
+                fd.contexts = self.contexts
+                fd.parent_token = self.parent_token
                 self.budget[0] -= 1
                 srcdoc = node.attributes.get("srcdoc") \
                     if "srcdoc" in node.attributes else None
@@ -590,6 +629,11 @@ class FrameManager:
                              page_url, cancel_token=cancel_token)
                 changed = True
                 self.frames[key] = fd
+                # contentWindow must resolve before `load` fires: the
+                # canonical embed idiom is
+                # `iframe.onload = () => iframe.contentWindow.postMessage(...)`
+                self.frames = dict(self.frames)
+                self.publish_frames(root, page_url)
                 self._lifecycle(node, ok)
             seen[key] = fd
             self._attach_one(node, fd)
@@ -599,7 +643,29 @@ class FrameManager:
                 self.budget[0] += 1
                 changed = True
         self.frames = seen
+        self.publish_frames(root, page_url)
         return changed
+
+    def publish_frames(self, root, owner_url):
+        """Tell the owning document which of its <iframe> elements map
+        to which browsing context."""
+        if self.session is None or root is None:
+            return
+        try:
+            self.session.set_frame_graph(
+                frame_bridge.frame_graph(self, root, owner_url))
+        except Exception:
+            pass   # older wheel without the frame seam
+
+    def pump_bridge(self):
+        """Route this turn's postMessage traffic across the whole tab.
+
+        Driven from the shells' live tick rather than from `tick`, so a
+        message is not starved on a turn where the frame tree happened
+        not to need advancing."""
+        if self.contexts is None:
+            return False
+        return frame_bridge.pump(self.contexts, log=_console_line)
 
     def _lifecycle(self, node, ok):
         """Fire load/error on the owning <iframe> element."""
@@ -668,6 +734,9 @@ class FrameManager:
         return False
 
     def dispose(self):
+        # refund the shared budget: without this a page that swaps its
+        # frame tree repeatedly runs out of frames it is not using
+        self.budget[0] += len(self.frames)
         for fd in self.frames.values():
             fd.dispose()
         self.frames = {}

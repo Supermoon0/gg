@@ -1106,6 +1106,35 @@ impl Doc {
         self.ggvm().take_scroll_into_view()
     }
 
+    /// Tell the document it is embedded: `window.parent`/`window.top`
+    /// stop being this window. Call before scripts run.
+    fn set_framed(&mut self, framed: bool) {
+        self.ggvm().set_framed(framed);
+    }
+
+    /// Publish the frame graph as [(iframe node index, host-minted
+    /// context handle, same_origin)]. Node indices are *this*
+    /// document's arena indices; handles are the host's.
+    fn set_frame_graph(&mut self, frames: Vec<(u32, u32, bool)>) {
+        self.ggvm().set_frame_graph(frames);
+    }
+
+    /// Drain `postMessage` calls as (target handle, JSON, targetOrigin,
+    /// seq). u32::MAX / MAX-1 / MAX-2 mean self / parent / top.
+    fn take_frame_writes(&mut self) -> Vec<(u32, String, String, u64)> {
+        self.ggvm().take_frame_writes()
+    }
+
+    /// Deliver one message into this document; returns console output.
+    fn deliver_message(
+        &mut self,
+        data_json: &str,
+        origin: &str,
+        source_handle: u32,
+    ) -> Vec<String> {
+        self.ggvm().deliver_message(data_json, origin, source_handle)
+    }
+
     /// Shell-side hover update: mark the element under the pointer
     /// and its ancestors so `:hover` rules match on the next
     /// compute_styles. Pass None when the pointer leaves the page.

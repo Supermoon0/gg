@@ -76,6 +76,12 @@ class RendererSession(Protocol):
 
     def take_scroll_into_view(self): ...
 
+    def set_frame_graph(self, frames): ...
+
+    def take_frame_writes(self): ...
+
+    def deliver_message(self, data_json, origin, source_handle): ...
+
     def restyle_diff(self): ...
 
     def close(self): ...
@@ -103,7 +109,7 @@ class LocalRendererSession:
         self._dom_version = None
 
     def commit(self, url, body, *, viewport_width=1280.0, timings=None,
-               cancel_token=None, network_context=None):
+               cancel_token=None, network_context=None, framed=False):
         if self.doc is not None or self.network_context is not None:
             self.close()
         self.url = url
@@ -119,7 +125,7 @@ class LocalRendererSession:
             network_backend=self.network,
             network_context=self.network_context,
             network_timeout=self.timeout,
-            cancel_token=cancel_token)
+            cancel_token=cancel_token, framed=framed)
         self.root = root
         self.doc = doc
         self.css_sources = list(css_sources)
@@ -317,6 +323,39 @@ class LocalRendererSession:
             return list(self.doc.take_scroll_into_view())
         return []
 
+    def set_frame_graph(self, frames):
+        if self.doc is not None and hasattr(self.doc, "set_frame_graph"):
+            return self.doc.set_frame_graph([tuple(r) for r in frames])
+        return None
+
+    def take_frame_writes(self):
+        if self.doc is not None and hasattr(self.doc, "take_frame_writes"):
+            return list(self.doc.take_frame_writes())
+        return []
+
+    def deliver_message(self, data_json, origin, source_handle):
+        if self.doc is None or not hasattr(self.doc, "deliver_message"):
+            return []
+        logs = list(self.doc.deliver_message(
+            str(data_json), str(origin), int(source_handle)))
+        # Delivery is a macrotask, so drive one pump here rather than
+        # waiting for the next animation frame. Doing it through the
+        # same path `tick` uses means a handler that calls fetch() (or
+        # replies with postMessage) is serviced in this same turn,
+        # which is what lets a request/response handshake complete
+        # without a repaint in between.
+        if native.async_available():
+            more, requests = native.pump_script_requests(self.doc, None)
+            self.sync_cookie_writes()
+            for request in requests:
+                self.service_fetch(request)
+            logs.extend(more)
+        # `_dom_version` is deliberately NOT advanced here: a handler
+        # that rewrote the DOM has to look like a change to the next
+        # tick, which is what makes the shell re-export and repaint.
+        self.console.extend(logs)
+        return logs
+
     def restyle_diff(self):
         if not hasattr(self.doc, "restyle_diff"):
             return 3, []
@@ -404,6 +443,16 @@ class _RemoteDocProxy:
     def take_scroll_into_view(self):
         return self._session.take_scroll_into_view()
 
+    def set_frame_graph(self, frames):
+        return self._session.set_frame_graph(frames)
+
+    def take_frame_writes(self):
+        return self._session.take_frame_writes()
+
+    def deliver_message(self, data_json, origin, source_handle):
+        return self._session.deliver_message(
+            data_json, origin, source_handle)
+
     def restyle_diff(self, _css_sources=None):
         return self._session.restyle_diff()
 
@@ -453,7 +502,7 @@ class RemoteRendererSession:
         return self.host.alive
 
     def commit(self, url, body, *, viewport_width=1280.0, timings=None,
-               cancel_token=None, network_context=None):
+               cancel_token=None, network_context=None, framed=False):
         from .ipc.blobs import BlobStore
 
         if network_context is not None:
@@ -472,6 +521,7 @@ class RemoteRendererSession:
                     "run_scripts": self.run_scripts,
                     "timeout": self.timeout,
                     "js_budget": self.js_budget,
+                    "framed": bool(framed),
                 }, timeout=max(self.timeout, self.js_budget + 2.0),
                 advance_generation=True, cancel_token=cancel_token)
         finally:
@@ -592,6 +642,23 @@ class RemoteRendererSession:
         return self.host.call(
             "renderer.take_scroll_into_view",
             timeout=self.timeout).get("nodes", [])
+
+    def set_frame_graph(self, frames):
+        return self.host.call(
+            "renderer.set_frame_graph", {"frames": [list(r) for r in frames]},
+            timeout=self.timeout).get("result")
+
+    def take_frame_writes(self):
+        return self.host.call(
+            "renderer.take_frame_writes",
+            timeout=self.timeout).get("messages", [])
+
+    def deliver_message(self, data_json, origin, source_handle):
+        return self.host.call(
+            "renderer.deliver_message", {
+                "data": str(data_json), "origin": str(origin),
+                "source": int(source_handle),
+            }, timeout=self.timeout).get("logs", [])
 
     def restyle_diff(self):
         response = self.host.call("renderer.restyle_diff", timeout=self.timeout)

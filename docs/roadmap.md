@@ -80,8 +80,32 @@ timing-function 오버라이드.
       구동, load/error는 부모 문서의 iframe 요소에 dispatch)
 - [x] cross-origin DOM 접근 차단 — 문서 간 DOM arena를 공유하지 않으므로
       구조적으로 불가능; 드라이버는 Page.frame()으로 자식 문서 핸들 제공
-- [ ] same-origin 동기 스크립팅(contentDocument/contentWindow)과
-      postMessage 채널 — VM 간 브리지가 필요한 후속 작업
+- [~] same-origin 동기 스크립팅(contentDocument/contentWindow)과
+      postMessage 채널 — **메시징 완료(2026-07-25,
+      browser/frame_bridge.py), contentDocument는 후속**.
+      문서마다 독립 VM이므로 `postMessage`는 **객체 그래프가 아니라
+      바이트의 채널**이다: 보내는 쪽 VM에서 JSON으로 직렬화하고, 호스트가
+      라우팅하고, 받는 쪽 VM이 자기 힙으로 파싱한다. 한 문서의 Value에서
+      다른 문서로 가는 코드 경로가 **존재하지 않는 것**이 여기서
+      cross-origin 격리가 정책 검사가 아니라 구조인 이유다. 구현:
+      `window.postMessage`(기존 no-op 스텁 대체), `iframe.contentWindow`
+      프록시(핸들별 캐시 — `e.source === f.contentWindow`가 성립),
+      `window.parent`/`top`/`origin`/`frameElement`, MessageEvent를
+      매크로태스크로 전달(따라서 항상 비동기)하며 `addEventListener`와
+      `window.onmessage`를 **둘 다** 발화한다(dispatchEvent는 후자를
+      부르지 않는다). 호스트 정책: `targetOrigin` 불일치는 조용히 폐기,
+      sandbox에 `allow-same-origin`이 없으면 **같은 사이트라도 불투명
+      origin**(`e.origin === "null"`), 컨텍스트 핸들은 호스트만 발급하므로
+      문서가 받지 못한 컨텍스트는 이름조차 지을 수 없다. 순환 참조는
+      DataCloneError처럼 throw, 함수는 null로 clone, 128KB 상한.
+      cross-origin 프레임은 `contentWindow`는 주되 `document`/`location`은
+      `undefined`, `contentDocument`는 null이다. 양쪽 셸 + 드라이버
+      (`Page.pump_frames`) + isolated 프로세스 모델 전부 연결.
+      함께 고친 것: `FrameManager.dispose()`가 프레임 예산을 반환하지
+      않아 프레임 트리를 갈아끼우는 페이지가 쓰지도 않는 예산을 소진하던
+      누수. smoke 7종 + IPC 경계 unittest.
+      남은 후속: `contentDocument`(부모 VM 안의 자식 DOM 미러),
+      MessageChannel의 문서 간 port 전달, `frameElement` 실제 노드.
 - [x] iframe layout/clip/scroll과 중첩 hit-test 구현
       (대체 요소 300x150 기본, width/height 속성, 프레임 내부 휠 스크롤,
       자식 링크 클릭은 프레임 내 탐색)

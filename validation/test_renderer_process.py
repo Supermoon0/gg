@@ -151,6 +151,46 @@ class TestRendererProcess(unittest.TestCase):
         finally:
             session.close()
 
+    @unittest.skipUnless(native.available(), "native ggcore not built")
+    def test_frame_messaging_seam_crosses_the_json_boundary(self):
+        """postMessage is the only channel between documents, so its
+        four IPC verbs have to work in the isolated model too — and a
+        payload only ever crosses as text, never as an object graph."""
+        body = ("<iframe id='f'></iframe>"
+                "<script>window.addEventListener('message',"
+                " function (e) { console.log('got ' + e.data.n"
+                "   + ' @' + e.origin + ' self=' + (e.source === window));"
+                " });</script>")
+        session = RemoteRendererSession(RecordingBackend(body))
+        try:
+            session.commit(net.URL("https://example.test/"), body,
+                           framed=True)
+            rows = [r for r in session.export() if r[2] == "iframe"]
+            self.assertTrue(rows, "the fixture must contain an iframe")
+            ridx = int(rows[0][1])
+            session.set_frame_graph([(ridx, 5, True)])
+            self.assertEqual(
+                session.run(["console.log("
+                             "typeof document.getElementById('f')"
+                             ".contentWindow)"]),
+                ["object"])
+            # framed=True must have reached the child process
+            self.assertEqual(
+                session.run(["console.log(window.top !== window)"]),
+                ["true"])
+            session.run(["document.getElementById('f').contentWindow"
+                         ".postMessage({n: 7}, '*')"])
+            writes = [tuple(w) for w in session.take_frame_writes()]
+            self.assertEqual(
+                [(int(w[0]), w[1], w[2]) for w in writes],
+                [(5, '{"n":7}', "*")])
+            # ...and a message delivered back in runs its handlers
+            logs = session.deliver_message(
+                '{"n": 9}', "https://sender.test", 0)
+            self.assertIn("got 9 @https://sender.test self=true", logs)
+        finally:
+            session.close()
+
     def test_large_commit_uses_blob_and_stale_response_is_discarded(self):
         session = RemoteRendererSession(RecordingBackend())
         try:
