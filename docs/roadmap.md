@@ -190,8 +190,10 @@ timing-function 오버라이드.
   hosted 러너가 shutdown signal(143)로 죽던 문제의 가드.
 - 수정 후 로컬 재측정(2026-07-25): **네이버 1,225 엘리먼트/409 텍스트
   → 읽을만함 회복**. 위키백과·티스토리·HN·MDN 읽을만함, example 빈약
-  (원래 소형 페이지), 연합뉴스는 이 컨테이너의 프록시 환경에서
-  ConnectionReset(CI에서 재확인 필요).
+  (원래 소형 페이지). GitHub 러너 재실행(run #29, workflow green)도
+  동일: 네이버 1,133/400 읽을만함, 나무위키·정부24 자식 abort로 격리,
+  러너 생존. 연합뉴스는 CI에서도 ConnectionReset — 환경 문제가 아니라
+  서버가 이 클라이언트(TLS 지문/보안장비 추정)를 끊는 것으로 보인다.
 - **새 조사 과제**: 나무위키·정부24가 settle 중 메모리 폭주로 abort
   (`memory allocation of 1855015488 bytes failed` — 단일 1.86GB 할당
   시도, 4GiB RLIMIT_AS에 걸려 Rust abort). 격리는 의도대로 동작하지만
