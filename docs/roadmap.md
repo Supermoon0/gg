@@ -20,16 +20,16 @@
 - [x] push/PR용 Windows·Linux Rust 및 브라우저 통합 CI 작성
 - [x] network/CSS/JSVM 검증기를 실패 종료 코드가 있는 gate로 전환
 - [x] 외부 사이트 바스켓을 화·금 정기 및 수동 workflow로 분리
-- [ ] GitHub에서 CI 최초 실행 후 플랫폼별 실패 수정 — **진단 완료,
-      소유자 조치 대기 (2026-07-25)**: 워크플로 실행 이력 98건 전수 확인
-      결과, 7-23 오전까지 wheels.yml은 정상 성공했고 7-23 15:17부터는
-      ci/conformance/site-basket의 모든 실행(런 1~26)이 **잡 0개로 즉시
-      실패**한다. 세 YAML 모두 로컬 파싱 정상 → 코드/워크플로 문제가
-      아니라 계정 단위 Actions 차단(사설 저장소 무료 분 소진 또는 지출
-      한도/결제 문제)이다. GitHub Settings → Billing → Actions 사용량을
-      확인하거나 저장소를 public으로 전환해야 CI가 다시 돈다. 이 세션의
-      게이트는 로컬에서 전부 실행해 green을 확인했다(smoke 335, cargo
-      221, golden 7/7, gauntlet/conformance/evidence 통과).
+- [ ] GitHub에서 CI 최초 실행 후 플랫폼별 실패 수정 — **원인 수정,
+      green run 확인 진행 중 (2026-07-25)**: 런 1~26이 전부 잡 0개로
+      즉시 실패한 원인은 세 워크플로의 job 레벨 `env`에 들어간
+      `${{ runner.temp }}` 표현식이었다. `runner` 컨텍스트는 job 레벨
+      env에서 유효하지 않아 **파일 전체가 무효** 처리되고, push
+      이벤트는 파스 에러를 숨긴 채 즉시 실패로만 기록한다(공개 전환 후
+      workflow_dispatch API가 `Unrecognized named-value: 'runner'`를
+      그대로 반환해 확정). 캐시 디렉토리는 첫 스텝에서 `$GITHUB_ENV`로
+      주입하도록 수정. 이 세션의 게이트는 로컬에서 전부 green이었다
+      (smoke 335, cargo 221, golden 7/7, gauntlet/conformance 통과).
 - [x] WPT 정적 testharness 하위 집합 실행기와 JSON 점수판 작성
 - [x] test262 하위 집합 실행기와 기능·variant별 실패 분류
 - [x] 내장 9개 계약 probe 기준선을 PR CI 회귀 gate로 연결

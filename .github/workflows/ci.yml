@@ -50,10 +50,16 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       GG_SKIP_LIVE_NETWORK: "1"
-      GG_BROWSER_CACHE_DIR: ${{ runner.temp }}/gg-browser-cache
 
     steps:
       - uses: actions/checkout@v4
+
+      # the runner context is not available in job-level env — an
+      # expression there invalidates the whole workflow file (runs
+      # complete instantly with zero jobs), so set it per-run instead
+      - name: Point the browser cache at the runner temp dir
+        shell: bash
+        run: echo "GG_BROWSER_CACHE_DIR=$RUNNER_TEMP/gg-browser-cache" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v5
         with:
