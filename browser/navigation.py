@@ -23,6 +23,10 @@ class HistoryEntry:
     scroll: float = 0.0
     hscroll: float = 0.0
     form_state: tuple = field(default_factory=tuple)
+    # ((path, url, scroll), ...) for the frames this document embeds;
+    # `path` is the frame's position in document order at each depth,
+    # which survives the arena-index churn a DOM rebuild causes
+    frame_state: tuple = field(default_factory=tuple)
 
 
 @dataclass
@@ -102,6 +106,57 @@ def capture_form_state(root):
         state.append((ordinal, node.tag, attrs))
         ordinal += 1
     return tuple(state)
+
+
+def capture_frame_state(manager, prefix=()):
+    """Snapshot where every frame under `manager` is currently pointed.
+
+    A frame navigation is a session-history entry of its own — pressing
+    back after clicking a link *inside* a frame has to put that frame
+    back, not reload the page — so the entry has to carry one row per
+    frame, at every depth."""
+    state = []
+    if manager is None:
+        return tuple(state)
+    for ordinal, fd in enumerate(manager.ordered_frames()):
+        path = prefix + (ordinal,)
+        if fd.url is not None:
+            state.append((path, str(fd.url), float(fd.scroll)))
+        if fd.subframes is not None:
+            state.extend(capture_frame_state(fd.subframes, path))
+    return tuple(state)
+
+
+def frame_state_with(state, path, url):
+    """`state` with one frame's row repointed at `url`.
+
+    Rows for frames *inside* the one that navigated are dropped: that
+    document is being replaced, so its children no longer exist."""
+    path = tuple(path)
+    rows = [row for row in state or ()
+            if row[0] != path and row[0][:len(path)] != path]
+    rows.append((path, str(url), 0.0))
+    return tuple(sorted(rows, key=lambda r: (len(r[0]), r[0])))
+
+
+def restore_frame_state(manager, state):
+    """Point every frame back where the entry says it was.
+
+    Shallower paths replay first: navigating a parent frame rebuilds
+    its subframes, so a deeper row would otherwise be applied to a
+    frame that is about to be thrown away."""
+    if manager is None or not state:
+        return False
+    moved = False
+    for path, url, scroll in sorted(state, key=lambda r: (len(r[0]), r[0])):
+        fd = manager.frame_at(path)
+        if fd is None:
+            continue
+        if fd.url is None or str(fd.url) != url:
+            fd.navigate(url, record=False)
+            moved = True
+        fd.scroll = float(scroll)
+    return moved
 
 
 def restore_form_state(root, state, *, set_attr=None, remove_attr=None):

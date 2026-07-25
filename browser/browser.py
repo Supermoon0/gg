@@ -75,6 +75,10 @@ class Browser:
         self.animator = animation.AnimationEngine()
         self._anim_job = None
         self.frames = None
+        # frame session history: the state a back/forward is replaying,
+        # and the guard that stops the replay recording itself
+        self._frames_pending = ()
+        self._frames_restoring = False
         # inner scroll offsets by Rust arena index, so they survive the
         # native tree rebuild every DOM-changing tick performs
         self._scroll_state = {}
@@ -220,8 +224,46 @@ class Browser:
         entry.scroll = float(self.scroll)
         entry.form_state = navigation.capture_form_state(
             getattr(self, "nodes", None))
+        entry.frame_state = navigation.capture_frame_state(self.frames)
 
-    def _restore_history_entry(self, entry):
+    def _on_frame_navigated(self, path, url):
+        """A link inside a frame was followed: that is a session-history
+        entry of its own, so back returns the frame rather than
+        reloading the whole page."""
+        if self._frames_restoring:
+            return
+        if not (0 <= self.history_index < len(self.history)):
+            return
+        self._snapshot_history_entry()
+        current = self.history[self.history_index]
+        self.history = self.history[:self.history_index + 1]
+        # same document, new frame position: reuse the url and body so
+        # going back is a frame navigation, not a refetch
+        self.history.append(navigation.HistoryEntry(
+            current.url, current.body, scroll=current.scroll,
+            form_state=current.form_state,
+            frame_state=navigation.frame_state_with(
+                current.frame_state, path, url)))
+        self.history_index = len(self.history) - 1
+        self._update_nav_buttons()
+
+    def _restore_history_entry(self, entry, previous=None):
+        if previous is not None and entry.url is previous.url \
+                and entry.body is previous.body:
+            # a frame-only entry: re-pointing the frames is the whole
+            # restore, and re-rendering the page would throw them away
+            self._frames_restoring = True
+            try:
+                navigation.restore_frame_state(self.frames, entry.frame_state)
+            finally:
+                self._frames_restoring = False
+            self.relayout()
+            self.scroll = entry.scroll
+            self.clamp_scroll()
+            self.draw()
+            self._update_nav_buttons()
+            return
+        self._frames_pending = entry.frame_state
         self.render_page(entry.url, entry.body)
         changed = navigation.restore_form_state(
             self.nodes, entry.form_state,
@@ -251,7 +293,8 @@ class Browser:
         self.frames = frames.FrameManager(
             self.network, top_url=url, timeout=self.navigation_timeout,
             contexts=self._contexts, session=self.renderer,
-            parent_token=self._contexts.top)
+            parent_token=self._contexts.top,
+            on_navigate=self._on_frame_navigated)
         self._scroll_state = {}
 
         if native.available():
@@ -389,8 +432,17 @@ class Browser:
         if self.frames is None or not hasattr(self, "nodes"):
             return False
         try:
-            return self.frames.sync(
+            changed = self.frames.sync(
                 self.nodes, self.url, cancel_token=self._loading_token)
+            if self._frames_pending:
+                pending, self._frames_pending = self._frames_pending, ()
+                self._frames_restoring = True
+                try:
+                    changed = navigation.restore_frame_state(
+                        self.frames, pending) or changed
+                finally:
+                    self._frames_restoring = False
+            return changed
         except net.RequestCancelled:
             raise
         except Exception as exc:
@@ -677,15 +729,19 @@ class Browser:
         if self.history_index > 0:
             self.cancel_navigation()
             self._snapshot_history_entry()
+            leaving = self.history[self.history_index]
             self.history_index -= 1
-            self._restore_history_entry(self.history[self.history_index])
+            self._restore_history_entry(
+                self.history[self.history_index], leaving)
 
     def go_forward(self):
         if self.history_index < len(self.history) - 1:
             self.cancel_navigation()
             self._snapshot_history_entry()
+            leaving = self.history[self.history_index]
             self.history_index += 1
-            self._restore_history_entry(self.history[self.history_index])
+            self._restore_history_entry(
+                self.history[self.history_index], leaving)
 
     def _update_nav_buttons(self):
         self.back_btn.config(

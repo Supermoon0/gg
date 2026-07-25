@@ -531,6 +531,19 @@ class FramePage:
     def console(self):
         return list(self._fd.console)
 
+    def post_message(self, data, target_origin="*"):
+        """Deliver a message into this frame as the embedder would."""
+        session = self._fd.session
+        if session is None:
+            return []
+        return session.deliver_message(
+            json.dumps(data), target_origin, 0)
+
+    def navigate(self, href):
+        """Follow a link inside the frame, recording it in the page's
+        session history the way a click would."""
+        return self._fd.navigate(href)
+
     def query_all(self, selector):
         session = self._fd.session
         if session is None:

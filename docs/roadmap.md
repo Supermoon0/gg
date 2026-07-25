@@ -70,7 +70,7 @@
 남은 후속 후보: transitionend/animation* DOM 이벤트 발화, per-keyframe
 timing-function 오버라이드.
 
-### 2. iframe 문서 격리 — 코어 완료 (2026-07-25, browser/frames.py)
+### 2. iframe 문서 격리 — contentDocument만 남음 (2026-07-25)
 
 - [x] 자식 문서의 URL/base URL, origin, cookie/storage context 분리
       (프레임마다 독립 gg-js Doc/세션, 쿠키는 자식 origin jar로만,
@@ -113,7 +113,21 @@ timing-function 오버라이드.
       (X-Frame-Options DENY/SAMEORIGIN, CSP frame-ancestors
       'none'/'self'/*/host, sandbox allow-scripts/allow-same-origin,
       srcdoc, 중첩 depth 3 + 총 16 프레임 상한, smoke 18종)
-- [ ] 프레임 자체 히스토리(뒤로/앞으로가 프레임 탐색을 되돌리기)
+- [x] 프레임 자체 히스토리(뒤로/앞으로가 프레임 탐색을 되돌리기)
+      (2026-07-25) — 프레임 안의 링크를 따라가는 것은 **그 자체로 세션
+      히스토리 항목**이다. 따라서 뒤로가기는 페이지를 다시 받는 것이
+      아니라 프레임을 되돌려야 한다: `HistoryEntry.frame_state`가 깊이별
+      **문서 순서 경로**(`(0,)`, `(0,1)` ...)로 프레임마다 한 행을 들고
+      있고, 프레임 항목은 앞 항목의 url·body 객체를 **그대로 재사용**하므로
+      복원 시 같은 문서임을 `is` 비교로 알아보고 렌더를 건너뛴다(다시
+      렌더하면 프레임을 버리게 된다). arena index가 아니라 위치 경로를
+      쓰는 이유는 DOM 재구축마다 index가 갈리기 때문이고, 이는 form-state
+      복원이 이미 하고 있는 것과 같은 거래다. 부모 프레임이 탐색하면 그
+      **자식 행들은 폐기**되며(그 문서가 교체되므로 자식이 존재하지 않는다),
+      복원은 얕은 경로부터 재생한다(부모 탐색이 자식 프레임을 다시 만들기
+      때문). `FrameDocument.navigate`는 load **전에** 호스트에 알린다 —
+      스냅샷해야 할 것은 떠나는 상태이기 때문이다. 양쪽 셸 + 드라이버
+      (`FramePage.navigate`/`post_message`). smoke 8종.
 
 ### 3. 접근성 트리 확대 — 완료 (2026-07-25, browser/accessibility.py)
 

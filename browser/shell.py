@@ -112,6 +112,10 @@ class Shell:
         self._live_next = 0.0
         self.animator = animation.AnimationEngine()
         self.frames = None
+        # frame session history: the state a back/forward is replaying,
+        # and the guard that stops the replay recording itself
+        self._frames_pending = ()
+        self._frames_restoring = False
         self._scroll_state = {}
         self._mouse_pos = (0, 0)
         self.status = ""
@@ -199,8 +203,46 @@ class Shell:
         entry.scroll = float(self.scroll)
         entry.hscroll = float(self.hscroll)
         entry.form_state = navigation.capture_form_state(self.nodes)
+        entry.frame_state = navigation.capture_frame_state(self.frames)
 
-    def _restore_history_entry(self, entry):
+    def _on_frame_navigated(self, path, url):
+        """A link inside a frame was followed: that is a session-history
+        entry of its own, so back returns the frame rather than
+        reloading the whole page."""
+        if self._frames_restoring:
+            return
+        if not (0 <= self.history_index < len(self.history)):
+            return
+        self._snapshot_history_entry()
+        current = self.history[self.history_index]
+        self.history = self.history[:self.history_index + 1]
+        # same document, new frame position: reuse the url and body so
+        # going back is a frame navigation, not a refetch
+        self.history.append(navigation.HistoryEntry(
+            current.url, current.body, scroll=current.scroll,
+            hscroll=current.hscroll, form_state=current.form_state,
+            frame_state=navigation.frame_state_with(
+                current.frame_state, path, url)))
+        self.history_index = len(self.history) - 1
+
+    def _restore_history_entry(self, entry, previous=None):
+        if previous is not None and entry.url is previous.url \
+                and entry.body is previous.body:
+            # a frame-only entry: re-pointing the frames is the whole
+            # restore, and re-rendering the page would throw them away
+            self._frames_restoring = True
+            try:
+                navigation.restore_frame_state(self.frames, entry.frame_state)
+            finally:
+                self._frames_restoring = False
+            self.relayout()
+            self.scroll = entry.scroll
+            self.hscroll = entry.hscroll
+            self.clamp_scroll()
+            self.set_status("완료 (history 복원)")
+            self.dirty = True
+            return
+        self._frames_pending = entry.frame_state
         self.render_page(entry.url, entry.body)
         changed = navigation.restore_form_state(
             self.nodes, entry.form_state,
@@ -249,7 +291,8 @@ class Shell:
             self.network, top_url=url, timeout=self.navigation_timeout,
             dispatch_event=self._dispatch_frame_event,
             contexts=self._contexts, session=self.renderer,
-            parent_token=self._contexts.top)
+            parent_token=self._contexts.top,
+            on_navigate=self._on_frame_navigated)
         self._scroll_state = {}
         self.animator.reset(self._css_sources)
         # Paint the DOM committed by parser-time scripts first. Async data,
@@ -336,8 +379,17 @@ class Shell:
         if self.frames is None or self.nodes is None:
             return False
         try:
-            return self.frames.sync(
+            changed = self.frames.sync(
                 self.nodes, self.url, cancel_token=self._loading_token)
+            if self._frames_pending:
+                pending, self._frames_pending = self._frames_pending, ()
+                self._frames_restoring = True
+                try:
+                    changed = navigation.restore_frame_state(
+                        self.frames, pending) or changed
+                finally:
+                    self._frames_restoring = False
+            return changed
         except net.RequestCancelled:
             raise
         except Exception as exc:
@@ -533,15 +585,19 @@ class Shell:
         if self.history_index > 0:
             self.cancel_navigation()
             self._snapshot_history_entry()
+            leaving = self.history[self.history_index]
             self.history_index -= 1
-            self._restore_history_entry(self.history[self.history_index])
+            self._restore_history_entry(
+                self.history[self.history_index], leaving)
 
     def go_forward(self):
         if self.history_index < len(self.history) - 1:
             self.cancel_navigation()
             self._snapshot_history_entry()
+            leaving = self.history[self.history_index]
             self.history_index += 1
-            self._restore_history_entry(self.history[self.history_index])
+            self._restore_history_entry(
+                self.history[self.history_index], leaving)
 
     def go_home(self):
         self.load_url_string(HOME_URL)

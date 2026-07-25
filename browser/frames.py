@@ -221,6 +221,10 @@ class FrameDocument:
         self.contexts = None
         self.parent_token = 0
         self.handle = 0
+        # session history: this frame's positional path under the top
+        # document, and the callback that records a navigation
+        self.path = ()
+        self.on_navigate = None
 
     # -- loading -------------------------------------------------------
 
@@ -340,7 +344,8 @@ class FrameDocument:
                 use_native=self.use_native, budget=self.budget,
                 dispatch_event=self._dispatch_child_event,
                 contexts=self.contexts, session=self.session,
-                parent_token=self.handle)
+                parent_token=self.handle,
+                on_navigate=self.on_navigate, path_prefix=self.path)
             self.subframes.sync(self.root, self.url,
                                 cancel_token=cancel_token)
         self._version += 1
@@ -356,11 +361,22 @@ class FrameDocument:
         except Exception:
             pass
 
-    def navigate(self, href):
-        """In-frame navigation (a link inside the frame was activated)."""
+    def navigate(self, href, *, record=True):
+        """In-frame navigation (a link inside the frame was activated).
+
+        A frame navigation is its own session-history entry, so the
+        host is told *before* the load — it has to snapshot the state
+        being left, not the one being entered. `record=False` is how
+        back/forward replays a navigation without recording it again.
+        """
         if self.url is None:
             return False
         target = self.url.resolve(href)
+        if record and self.on_navigate is not None:
+            try:
+                self.on_navigate(self.path, str(target))
+            except Exception:
+                pass
         ok = self.load(str(target), None, self.url)
         self._version += 1
         self._layout_cache = None
@@ -569,7 +585,8 @@ class FrameManager:
     def __init__(self, network=None, *, top_url=None, depth=0,
                  timeout=net.DEFAULT_TIMEOUT, run_scripts=True,
                  use_native=None, budget=None, dispatch_event=None,
-                 contexts=None, session=None, parent_token=0):
+                 contexts=None, session=None, parent_token=0,
+                 on_navigate=None, path_prefix=()):
         self.network = network or default_network_backend()
         self.top_url = top_url
         self.depth = depth
@@ -584,6 +601,10 @@ class FrameManager:
         self.contexts = contexts
         self.session = session
         self.parent_token = parent_token
+        # session history: where this frame sits in document order at
+        # each depth, and who to tell when it navigates
+        self.on_navigate = on_navigate
+        self.path_prefix = tuple(path_prefix)
         self.frames = {}
 
     # -- discovery ------------------------------------------------------
@@ -635,6 +656,8 @@ class FrameManager:
                 self.frames = dict(self.frames)
                 self.publish_frames(root, page_url)
                 self._lifecycle(node, ok)
+            fd.path = self.path_prefix + (len(seen),)
+            fd.on_navigate = self.on_navigate
             seen[key] = fd
             self._attach_one(node, fd)
         for key, fd in self.frames.items():
@@ -656,6 +679,28 @@ class FrameManager:
                 frame_bridge.frame_graph(self, root, owner_url))
         except Exception:
             pass   # older wheel without the frame seam
+
+    def ordered_frames(self):
+        """The frames this document embeds, in document order — the
+        order `path` ordinals are assigned in."""
+        return list(self.frames.values())
+
+    def frame_at(self, path):
+        """The FrameDocument a history row's path names, or None.
+
+        Paths are positional, so a page that reshuffled its frames
+        resolves to a different frame or to nothing; that is the same
+        bargain form-state restore already makes."""
+        manager, fd = self, None
+        for ordinal in path:
+            if manager is None:
+                return None
+            kids = manager.ordered_frames()
+            if ordinal >= len(kids):
+                return None
+            fd = kids[ordinal]
+            manager = fd.subframes
+        return fd
 
     def pump_bridge(self):
         """Route this turn's postMessage traffic across the whole tab.

@@ -3474,6 +3474,13 @@ if native.available():
             "  'framed=' + (window.top !== window);"
             "</script>"),
         "https://frother.test/child": ({}, '<p id=c>cross</p>'),
+        # per-frame session history
+        "https://frhist.test/": (
+            {}, '<h1>top</h1>'
+                '<iframe id=h src="https://frhist.test/a"></iframe>'),
+        "https://frhist.test/a": ({}, '<p id=c>page-a</p>'),
+        "https://frhist.test/b": ({}, '<p id=c>page-b</p>'),
+        "https://frhist.test/c": ({}, '<p id=c>page-c</p>'),
     })
     net.request_text = _fake_frame_request_text
     try:
@@ -3582,6 +3589,60 @@ if native.available():
                   _msb._fd, net.URL("https://frmsg.test/")),
               "allow-same-origin is what grants the real origin back")
         _mpage.close()
+
+        # --- per-frame session history (browser/navigation.py) ---
+        from browser import navigation as gg_nav  # noqa: E402
+
+        _hpage = Page()
+        _hpage.goto("https://frhist.test/", settle=True)
+        _hframe = _hpage.frame("#h")
+        _hstate0 = gg_nav.capture_frame_state(_hpage._frames)
+        check("iframe: frame state is captured by positional path",
+              _hstate0 == (((0,), "https://frhist.test/a", 0.0),),
+              repr(_hstate0))
+        # a navigation records a new entry against the same document
+        _hnav = []
+        _hpage._frames.on_navigate = lambda p, u: _hnav.append((p, u))
+        for fd in _hpage._frames.ordered_frames():
+            fd.on_navigate = _hpage._frames.on_navigate
+        _hframe.navigate("/b")
+        check("iframe: an in-frame navigation reports its path and target",
+              _hnav == [((0,), "https://frhist.test/b")], repr(_hnav))
+        _hstate1 = gg_nav.frame_state_with(
+            _hstate0, _hnav[0][0], _hnav[0][1])
+        check("iframe: the new entry repoints only that frame",
+              _hstate1 == (((0,), "https://frhist.test/b", 0.0),),
+              repr(_hstate1))
+        check("iframe: frame_at resolves a path to the live frame",
+              _hpage._frames.frame_at((0,)) is _hframe._fd
+              and _hpage._frames.frame_at((5,)) is None
+              and _hpage._frames.frame_at((0, 0)) is None)
+        # replaying the older entry walks the frame back, content and all
+        check("iframe: a navigation moved the frame forward",
+              _hpage.frame("#h").text("#c") == "page-b",
+              repr(_hpage.frame("#h").text("#c")))
+        gg_nav.restore_frame_state(_hpage._frames, _hstate0)
+        check("iframe: restoring an entry navigates the frame back",
+              str(_hpage._frames.frame_at((0,)).url)
+              == "https://frhist.test/a"
+              and _hpage.frame("#h").text("#c") == "page-a",
+              repr((str(_hpage._frames.frame_at((0,)).url),
+                    _hpage.frame("#h").text("#c"))))
+        # a parent-frame navigation invalidates rows for its children
+        _hnested = (((0,), "https://frhist.test/a", 0.0),
+                    ((0, 0), "https://frhist.test/b", 0.0),
+                    ((1,), "https://frhist.test/c", 0.0))
+        check("iframe: repointing a frame drops its childrens' rows",
+              gg_nav.frame_state_with(_hnested, (0,), "https://frhist.test/c")
+              == (((0,), "https://frhist.test/c", 0.0),
+                  ((1,), "https://frhist.test/c", 0.0)),
+              repr(gg_nav.frame_state_with(
+                  _hnested, (0,), "https://frhist.test/c")))
+        check("iframe: restore replays shallower paths first",
+              [len(r[0]) for r in sorted(
+                  _hnested, key=lambda r: (len(r[0]), r[0]))] == [1, 1, 2],
+              "a parent navigation rebuilds the subframes a deeper row needs")
+        _hpage.close()
     finally:
         net.request_text = _real_rt
 else:
