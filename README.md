@@ -160,6 +160,13 @@ collapse하며 border·padding·overflow formatting context에서는 차단한�
 헤드라인·피드 추출 렌더). 상위 탐색은 UI 스레드 밖에서 실행되며 새 탐색·중지로
 기존 요청을 취소한다. 뒤로/앞으로는 저장한 문서와 폼·스크롤 상태를 복원한다.
 
+**접근성**: 역할/이름/상태의 계층 접근성 트리(`browser/accessibility.py`) —
+WAI-ARIA accessible-name 서브셋(aria-label/labelledby, label[for]·감싸는
+label, alt, caption/legend, placeholder, title), checked/selected/expanded/
+disabled/value 등 상태, landmark·heading 아웃라인, aria-hidden 서브트리
+프루닝. Rust `snapshot()`은 같은 역할 맵·이름 우선순위의 flat 고속 경로이고,
+헤드리스는 `page.ax_tree()`로 전체 트리를 읽는다.
+
 ## 성능
 
 위키백과 「Web browser engine」 기준: **엔진 전체(네트워크 제외, 첫 로드)

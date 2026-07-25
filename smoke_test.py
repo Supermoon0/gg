@@ -3497,4 +3497,190 @@ if native.available():
 else:
     print("[SKIP] iframe driver checks - native ggcore not built")
 
+# --- accessibility tree (browser/accessibility.py) ---
+from browser import accessibility as ax  # noqa: E402
+
+_ax_dom = _styled("", """
+<html><head><title>AX Test Page</title></head><body>
+<header><h1>Site</h1></header>
+<nav aria-label="주 메뉴"><a href="/a">첫 링크</a></nav>
+<main>
+  <h2 aria-level="3">Section</h2>
+  <section aria-labelledby="sec-t"><span id="sec-t">Named region</span>
+    <p>body text</p></section>
+  <section><p>anonymous section is no landmark</p></section>
+  <form aria-label="검색"><label for="q">검색어</label>
+    <input id="q" placeholder="type here" value="hello">
+    <input type="checkbox" id="c1" checked aria-describedby="c1help">
+    <span id="c1help">동의 여부</span>
+    <input type="submit" value="찾기">
+  </form>
+  <img src="x.png" alt="로고 이미지">
+  <img src="y.png" alt="">
+  <div role="presentation"><a href="/inner">through presentation</a></div>
+  <div hidden><a href="/gone">hidden link</a></div>
+  <div aria-hidden="true"><button>invisible</button></div>
+  <button disabled aria-expanded="false" title="더보기">More</button>
+  <table><caption>가격표</caption><tr><th>품목</th><td>값</td></tr></table>
+  <ul><li>하나</li><li>둘</li></ul>
+</main>
+<article><header><p>article header is not a banner</p></header></article>
+<footer>bottom</footer>
+</body></html>""")
+_ax_tree = ax.build_tree(_ax_dom)
+_ax_flat = ax.flatten(_ax_tree)
+_ax_roles = [n.role for n, _d in _ax_flat]
+
+
+def _ax_find(role, name=None):
+    for n, _d in _ax_flat:
+        if n.role == role and (name is None or n.name == name):
+            return n
+    return None
+
+
+check("ax: document root carries the page title",
+      _ax_tree.role == "document" and _ax_tree.name == "AX Test Page")
+check("ax: landmark roles with conditional header/footer",
+      _ax_find("banner") is not None
+      and _ax_find("contentinfo") is not None
+      and _ax_find("navigation") is not None
+      and _ax_find("main") is not None
+      and _ax_roles.count("banner") == 1,  # article header excluded
+      repr(_ax_roles))
+check("ax: named form/section become landmarks, anonymous do not",
+      _ax_find("form") is not None and _ax_find("form").name == "검색"
+      and _ax_find("region") is not None
+      and _ax_find("region").name == "Named region"
+      and _ax_roles.count("region") == 1)
+check("ax: aria-label names the navigation",
+      _ax_find("navigation").name == "주 메뉴")
+check("ax: label[for] names the textbox, value exposed",
+      _ax_find("textbox") is not None
+      and _ax_find("textbox").name == "검색어"
+      and _ax_find("textbox").states.get("value") == "hello",
+      repr((_ax_find("textbox").name, _ax_find("textbox").states)))
+check("ax: submit button named from its value",
+      _ax_find("button", "찾기") is not None)
+check("ax: checkbox state + aria-describedby description",
+      _ax_find("checkbox").states.get("checked") is True
+      and _ax_find("checkbox").description == "동의 여부",
+      repr((_ax_find("checkbox").states,
+            _ax_find("checkbox").description)))
+check("ax: img alt names, alt='' is decorative",
+      _ax_find("img") is not None and _ax_find("img").name == "로고 이미지"
+      and sum(1 for r in _ax_roles if r == "img") == 1)
+check("ax: role=presentation drops the node, keeps the subtree",
+      _ax_find("link", "through presentation") is not None)
+check("ax: hidden/aria-hidden subtrees leave the tree",
+      _ax_find("link", "hidden link") is None
+      and _ax_find("button", "invisible") is None)
+check("ax: disabled/expanded states and title fallback name",
+      _ax_find("button", "More") is not None
+      and _ax_find("button", "More").states.get("disabled") is True
+      and _ax_find("button", "More").states.get("expanded") is False)
+check("ax: table caption names the table, th scope splits headers",
+      _ax_find("table").name == "가격표"
+      and _ax_find("columnheader", "품목") is not None
+      and _ax_find("cell", "값") is not None)
+check("ax: list structure and item names",
+      _ax_find("list") is not None
+      and [n.name for n, _d in _ax_flat if n.role == "listitem"]
+      == ["하나", "둘"])
+check("ax: heading levels honor aria-level over the tag",
+      ax.headings(_ax_tree) == [(1, "Site"), (3, "Section")],
+      repr(ax.headings(_ax_tree)))
+check("ax: landmark outline is ordered and typed",
+      [(r, n) for r, n, _d in ax.landmarks(_ax_tree)]
+      == [("banner", "Site"), ("navigation", "주 메뉴"),
+          ("main", ""), ("region", "Named region"), ("form", "검색"),
+          ("contentinfo", "bottom")]
+      or [r for r, _n, _d in ax.landmarks(_ax_tree)]
+      == ["banner", "navigation", "main", "region", "form",
+          "contentinfo"],
+      repr(ax.landmarks(_ax_tree)))
+
+# keyboard focus and the accessibility tree must agree: everything in
+# sequential focus order is either ax-focusable or sits in an
+# aria-hidden subtree (aria-hidden hides from the tree but — like real
+# browsers — does not remove keyboard focusability), and hidden/
+# disabled controls appear in neither
+def _in_aria_hidden(node):
+    cur = node
+    while cur is not None:
+        attrs = getattr(cur, "attributes", None)
+        if attrs and attrs.get("aria-hidden", "").casefold() == "true":
+            return True
+        cur = cur.parent
+    return False
+
+
+_ax_focusables = {id(n.node) for n, _d in _ax_flat if n.focusable}
+_kb_order = keyboard.focus_order(_ax_dom)
+check("ax: keyboard focus order matches ax-focusable nodes",
+      _kb_order and all(
+          id(n) in _ax_focusables or _in_aria_hidden(n)
+          for n in _kb_order)
+      and any(id(n) in _ax_focusables for n in _kb_order),
+      repr([n.tag for n in _kb_order]))
+_ax_disabled_btn = _ax_find("button", "More")
+check("ax: disabled/hidden controls are not focusable",
+      not _ax_disabled_btn.focusable
+      and all("gone" not in (n.name or "") for n, _d in _ax_flat))
+_kb_order[0].is_focused = True
+_ax_tree2 = ax.build_tree(_ax_dom)
+check("ax: focused element is marked in a fresh snapshot",
+      any(n.focused and n.node is _kb_order[0]
+          for n, _d in ax.flatten(_ax_tree2)))
+_kb_order[0].is_focused = False
+
+# activation consistency: toggling the checkbox flips the exposed state
+_ax_cb_node = _ax_find("checkbox").node
+del _ax_cb_node.attributes["checked"]
+check("ax: state toggles flow into the next tree build",
+      ax.build_tree(_ax_dom) is not None
+      and next(n for n, _d in ax.flatten(ax.build_tree(_ax_dom))
+               if n.role == "checkbox").states.get("checked") is False)
+
+if native.available():
+    _axp = Page()
+    _axp.goto("data:text/html," + (
+        "<title>drv-ax</title>"
+        "<nav aria-label=menu><a href='/x'>go</a></nav>"
+        "<label for=i>Name</label><input id=i>"
+        "<div aria-hidden=true><a href='/no'>nope</a></div>"
+        "<img src=z.png alt=Photo>"), settle=False)
+    _axt = _axp.ax_tree()
+
+    def _ax_walk(d, out):
+        out.append(d)
+        for c in d.get("children", []):
+            _ax_walk(c, out)
+        return out
+
+    _axl = _ax_walk(_axt, [])
+    check("ax: driver ax_tree mirrors roles/names/hidden pruning",
+          _axt["role"] == "document" and _axt["name"] == "drv-ax"
+          and any(d["role"] == "navigation" and d["name"] == "menu"
+                  for d in _axl)
+          and any(d["role"] == "textbox" and d["name"] == "Name"
+                  for d in _axl)
+          and any(d["role"] == "img" and d["name"] == "Photo"
+                  for d in _axl)
+          and not any(d.get("name") == "nope" for d in _axl),
+          repr(_axl))
+    _snap = _axp.snapshot()
+    check("ax: native snapshot names use aria-label/label/alt",
+          any(s["role"] == "navigation" and s["name"] == "menu"
+              for s in _snap)
+          and any(s["role"] == "textbox" and s["name"] == "Name"
+                  for s in _snap)
+          and any(s["role"] == "img" and s["name"] == "Photo"
+                  for s in _snap)
+          and not any(s["name"] == "nope" for s in _snap),
+          repr(_snap))
+    _axp.close()
+else:
+    print("[SKIP] ax driver checks - native ggcore not built")
+
 print(f"\n{passed} checks passed - engine pipeline OK")

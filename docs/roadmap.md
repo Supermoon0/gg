@@ -5,8 +5,9 @@
 
 ## 현재 진행 요약
 
-- 완료: P0 9/9, P1 8/8, P2 16/17, Boa 제거와 gg-js 단일화
-- 진행할 핵심: renderer crash isolation 완료 → shared frame/network service → 접근성 트리 확대
+- 완료: P0 9/9, P1 8/8, P2 17/17, Boa 제거와 gg-js 단일화
+- 진행할 핵심: renderer crash isolation 완료 → shared frame/network service →
+  renderer sandbox/quota → P3 제품화
 - 제품화: P3 0/6
 - 검증 부채: 새 GitHub Actions workflow의 Windows/Linux 최초 green run 확인
 
@@ -71,13 +72,27 @@ timing-function 오버라이드.
       srcdoc, 중첩 depth 3 + 총 16 프레임 상한, smoke 18종)
 - [ ] 프레임 자체 히스토리(뒤로/앞으로가 프레임 탐색을 되돌리기)
 
-### 3. 접근성 트리 확대 — 다음 작업
+### 3. 접근성 트리 확대 — 완료 (2026-07-25, browser/accessibility.py)
 
-- [ ] 기존 implicit/explicit role snapshot에 accessible-name 계산 확대
-- [ ] `aria-label`/`aria-labelledby`/`aria-describedby`와 hidden 상태 반영
-- [ ] checked/selected/expanded/disabled/value 상태 노출
-- [ ] label-control 관계, heading level, landmark 계층 검증
-- [ ] 키보드 focus/activation과 접근성 snapshot 일관성 테스트
+- [x] 기존 implicit/explicit role snapshot에 accessible-name 계산 확대
+      (Python 트리와 Rust snapshot()이 같은 역할 맵·이름 우선순위를 미러;
+      landmark·리스트·테이블·img·dialog·slider 등 역할 대폭 추가)
+- [x] `aria-label`/`aria-labelledby`/`aria-describedby`와 hidden 상태 반영
+      (display/visibility/hidden/aria-hidden 서브트리 프루닝,
+      labelledby는 숨겨진 대상도 참조 가능)
+- [x] checked/selected/expanded/disabled/value 상태 노출
+      (+required/readonly/pressed/heading level, aria-* tristate가 네이티브
+      상태를 오버라이드)
+- [x] label-control 관계, heading level, landmark 계층 검증
+      (label[for]/감싸는 label, aria-level 우선, landmarks()/headings()
+      아웃라인, 이름 없는 form/section은 landmark 제외,
+      article 내부 header/footer는 banner/contentinfo 제외)
+- [x] 키보드 focus/activation과 접근성 snapshot 일관성 테스트
+      (focus order ⊆ ax-focusable ∪ aria-hidden, disabled 제외,
+      focused 마킹, checked 토글이 다음 트리에 반영 — smoke 21종)
+
+후속 후보: aria-live/알림, aria-activedescendant, 접근성 트리의 Rust
+계층화(현재 Rust는 flat snapshot, 계층 트리는 Python).
 
 ### 4. 릴리스 검증 게이트
 
@@ -130,7 +145,7 @@ timing-function 오버라이드.
 - [x] 부모-자식·빈 블록과 양수/음수 집합을 포함한 margin collapsing
 - [x] transition/@keyframes와 렌더 프레임 스케줄링
 - [x] iframe과 문서별 origin/event loop 격리
-- [ ] 접근성 트리와 ARIA role/name/state 확대
+- [x] 접근성 트리와 ARIA role/name/state 확대
 
 ## P3 — 제품화·성능·격리
 
@@ -156,10 +171,11 @@ timing-function 오버라이드.
 
 ## 현재 검증 기준
 
-- Rust: 198 passed, 2 ignored
-- Python smoke: 314/314 (2026-07-25, Linux + 새로 빌드한 native wheel;
-  transition/@keyframes 36종 + iframe 18종 포함. native shell 구간은
-  local renderer를 명시해 top-level 스크립트의 spawn 재import 자폭을 제거)
+- Rust: 221 passed, 2 ignored (2026-07-25)
+- Python smoke: 335/335 (2026-07-25, Linux + 새로 빌드한 native wheel;
+  transition/@keyframes 36종 + iframe 18종 + 접근성 21종 포함. native
+  shell 구간은 local renderer를 명시해 top-level 스크립트의 spawn
+  재import 자폭을 제거)
 - Golden 렌더링 회귀: 7/7
 - Network gauntlet: 41/41
 - CSS gauntlet: 23/23 (이 컨테이너에서는 폰트 메트릭 차이로

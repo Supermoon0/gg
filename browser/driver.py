@@ -392,6 +392,16 @@ class Page:
     def console(self):
         return list(self._console)
 
+    # ---------- accessibility ----------
+
+    def ax_tree(self):
+        """The page's hierarchical accessibility tree as nested dicts
+        (role/name/description/states/children, focusable/focused) —
+        the full projection; snapshot() stays the flat fast path."""
+        from . import accessibility
+        root = native.build_tree(self._export())
+        return accessibility.build_tree(root).to_dict()
+
     # ---------- frames ----------
 
     def frame(self, selector):
