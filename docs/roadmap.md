@@ -241,7 +241,29 @@ timing-function 오버라이드.
       적용·클램프한다(채팅 로그 자동 스크롤 관용구가 동작). 또한 노드에
       두던 스크롤 오프셋이 **네이티브 트리 재구축마다 초기화되던 결함**을
       수정 — arena index 기준 스냅샷을 focus/hover와 같은 지점에서 복원.
-      남은 후속: 스크롤바 드래그, 키보드 스크롤, `scrollTo`/`scrollIntoView`.
+      스크롤 메서드 완료(2026-07-25): `el.scrollTo/scroll/scrollBy`,
+      `el.scrollIntoView()`, `window.scrollTo/scroll/scrollBy`,
+      그리고 라이브 `window.scrollY`/`pageYOffset`/`scrollX`/
+      `pageXOffset`. 두 가지가 설계상 중요했다.
+      (1) **상대 스크롤은 위치가 아니라 델타로 전달**한다 — VM은
+      레이아웃을 볼 수 없어 같은 턴에 먼저 일어난 `scrollIntoView()`가
+      스크롤러를 어디로 옮겼는지 모르기 때문이다. 호스트가 실제 위치에
+      대해 델타를 적용하므로 `scrollIntoView(); window.scrollBy(0,-80)`
+      (sticky 헤더 보정 관용구)가 의도대로 동작한다.
+      (2) 두 큐(`take_scroll_writes` / `take_scroll_into_view`)에 공유
+      **시퀀스 번호**를 찍어 호스트가 **페이지가 호출한 순서 그대로**
+      한 번에 재생한다(`apply_scroll_requests`). 어느 큐를 나중에
+      비우느냐가 결과를 바꾸지 않는다. 또한 `window.scrollTo`는 실제
+      브라우저처럼 동기적이어야 하므로 VM이 window 프로퍼티를 즉시
+      갱신하고, 호스트가 아직 적용하지 않은 쓰기가 남아 있는 노드는
+      `set_scroll_state`가 **덮어쓰지 않는다**(호스트의 보고가 stale).
+      함께 고친 프로세스 격리 결함 2건: JSON IPC가 모든 행을 list로
+      디코드해 pyo3의 tuple 추출이 거부하면서 `set_layout_rects`가
+      isolated 모델에서 **첫 레이아웃마다 페이지 로드를 죽이고 있었고**,
+      스크롤 시맨틱 3종이 프로토콜 allowlist에 없어 조용히 무시되고
+      있었다. 이제 local/isolated 결과가 일치한다. smoke 18종 추가.
+      남은 후속: 스크롤바 드래그, 포커스된 스크롤러의 키보드 스크롤,
+      `scroll-behavior: smooth`, `scrollIntoView({block, inline})`.
 - [x] `<select>`·체크박스·라디오의 네이티브 수준 렌더링 (2026-07-25)
       — 엔진이 위젯 페이스를 직접 그린다: 체크박스(테두리 상자 + 체크
       상태의 체크마크 2획), 라디오(원 + 선택 시 점), select(닫힌 컨트롤

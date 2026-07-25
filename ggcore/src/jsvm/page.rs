@@ -1197,9 +1197,15 @@ impl PageVm {
         }
         let disp = make_native(&mut vm.st, Native::WinDispatch);
         vm.set_object_prop(window, "dispatchEvent", disp);
-        for m in ["postMessage", "scrollTo"] {
-            let noop = make_native(&mut vm.st, Native::Noop);
-            vm.set_object_prop(window, m, noop);
+        let noop = make_native(&mut vm.st, Native::Noop);
+        vm.set_object_prop(window, "postMessage", noop);
+        // window.scrollTo/scroll are absolute, scrollBy is relative;
+        // all three reach the host through the shared scroll queue
+        for (m, relative) in
+            [("scrollTo", false), ("scroll", false), ("scrollBy", true)]
+        {
+            let f = make_native(&mut vm.st, Native::WinScroll { relative });
+            vm.set_object_prop(window, m, f);
         }
         vm.st.known.window = window;
         let fctor = make_native(&mut vm.st, Native::FunctionCtor);
@@ -1545,16 +1551,57 @@ impl PageVm {
         &mut self,
         state: Vec<(u32, f64, f64, f64, f64)>,
     ) {
+        // A node the page has scrolled but the host has not applied
+        // yet is reported at its *old* position: the host's report was
+        // taken before it drained the write. Keep the optimistic
+        // offset for those and adopt only the fresh content size, so a
+        // synchronous `window.scrollTo(0, 400); window.scrollY` read
+        // does not snap back to 0 mid-turn.
+        let pending: std::collections::HashSet<u32> =
+            self.st.scroll_writes.iter().map(|w| w.0).collect();
+        let held: Vec<(u32, (f64, f64))> = pending.iter()
+            .filter_map(|n| self.st.scroll_state.get(n)
+                .map(|s| (*n, (s.0, s.1))))
+            .collect();
         self.st.scroll_state.clear();
         for (idx, top, left, sh, sw) in state {
             self.st.scroll_state.insert(idx, (top, left, sh, sw));
         }
+        for (idx, (top, left)) in held {
+            let e = self.st.scroll_state.entry(idx)
+                .or_insert((0.0, 0.0, 0.0, 0.0));
+            e.0 = top;
+            e.1 = left;
+        }
+        // The page's own scroller arrives under the DOC_NODE sentinel.
+        // window.scrollY and friends are plain data properties (the VM
+        // has no accessors), so refresh them here — otherwise a
+        // "scroll down one screen" button reads 0 forever and
+        // window.scrollBy stacks relative to the wrong origin.
+        if let Some(&(top, left, _, _)) =
+            self.st.scroll_state.get(&DOC_NODE)
+        {
+            let window = self.st.known.window;
+            for (f, v) in [("scrollY", top), ("pageYOffset", top),
+                           ("scrollX", left), ("pageXOffset", left)] {
+                self.set_object_prop(window, f, Value::number(v));
+            }
+        }
     }
 
-    /// Drain the `el.scrollTop = n` writes page scripts have made
-    /// since the last call, so the host can move the real scroller.
-    pub fn take_scroll_writes(&mut self) -> Vec<(u32, f64, f64)> {
+    /// Drain the scroll writes page scripts have made since the last
+    /// call as (node, top, left, seq, relative), so the host can move
+    /// the real scroller. `seq` orders them against
+    /// `take_scroll_into_view`; a relative entry carries a delta.
+    pub fn take_scroll_writes(
+        &mut self,
+    ) -> Vec<(u32, f64, f64, u64, bool)> {
         std::mem::take(&mut self.st.scroll_writes)
+    }
+
+    /// Drain pending `el.scrollIntoView()` requests as (node, seq).
+    pub fn take_scroll_into_view(&mut self) -> Vec<(u32, u64)> {
+        std::mem::take(&mut self.st.scroll_into_view)
     }
 
     pub fn run_source(&mut self, src: &str) -> Result<Value, String> {

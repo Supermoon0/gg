@@ -278,15 +278,23 @@ def renderer_worker(connection, renderer_id):
                     session.doc.set_hover(request["payload"].get("node_idx"))
                     _worker_result(channel, request, {"result": None})
                 elif kind == "renderer.set_layout_rects":
-                    session.doc.set_layout_rects(request["payload"].get("rects", []))
+                    # JSON decodes every row as a list; the native
+                    # binding only extracts real tuples
+                    session.doc.set_layout_rects(
+                        [tuple(r)
+                         for r in request["payload"].get("rects", [])])
                     _worker_result(channel, request, {"result": None})
                 elif kind == "renderer.set_scroll_state":
                     session.set_scroll_state(
-                        request["payload"].get("state", []))
+                        [tuple(r)
+                         for r in request["payload"].get("state", [])])
                     _worker_result(channel, request, {"result": None})
                 elif kind == "renderer.take_scroll_writes":
                     _worker_result(channel, request, {
                         "writes": session.take_scroll_writes()})
+                elif kind == "renderer.take_scroll_into_view":
+                    _worker_result(channel, request, {
+                        "nodes": session.take_scroll_into_view()})
                 elif kind == "renderer.restyle_diff":
                     outcome, patches = session.doc.restyle_diff(session.css_sources)
                     _worker_result(channel, request, {

@@ -25,6 +25,8 @@ MESSAGE_TYPES = {
     "renderer.event", "renderer.set_attr", "renderer.remove_attr",
     "renderer.state", "renderer.has_pending", "renderer.set_focus",
     "renderer.set_hover", "renderer.set_layout_rects",
+    "renderer.set_scroll_state", "renderer.take_scroll_writes",
+    "renderer.take_scroll_into_view",
     "renderer.restyle_diff", "renderer.close", "renderer.shutdown",
     "renderer.test_crash", "renderer.test_hang", "renderer.test_stale",
     "renderer.response", "renderer.error",

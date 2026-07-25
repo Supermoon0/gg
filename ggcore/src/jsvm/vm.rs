@@ -262,6 +262,10 @@ pub(super) enum Native {
     /// accepts anything, returns undefined (window.addEventListener
     /// and friends — enough for feature-detecting bundles to proceed)
     Noop,
+    /// window.scrollTo / scrollBy / scroll: routed through the same
+    /// host queue as element scrolling, with the DOC_NODE sentinel
+    /// standing for the page's own scroller.
+    WinScroll { relative: bool },
     /// Web Storage op on localStorage (session=false) or sessionStorage
     /// (session=true). op: 0=getItem 1=setItem 2=removeItem 3=clear
     /// 4=key
@@ -796,10 +800,21 @@ pub(super) struct St {
     /// (scrollTop, scrollLeft, scrollHeight, scrollWidth). Mirrors
     /// `layout_rects` — the engine owns scrolling, JS only observes it.
     pub(super) scroll_state: HashMap<u32, (f64, f64, f64, f64)>,
-    /// `el.scrollTop = n` writes the host has not applied yet, in
-    /// order. The shell drains this each turn and moves the real
-    /// scroller (page scripts scroll chat logs and carousels this way).
-    pub(super) scroll_writes: Vec<(u32, f64, f64)>,
+    /// Scroll requests the host has not applied yet, as
+    /// (node, top, left, seq, relative). The shell drains this each
+    /// turn and moves the real scroller (page scripts scroll chat
+    /// logs and carousels this way). A `relative` entry carries a
+    /// delta, not a position — see `queue_scroll`.
+    pub(super) scroll_writes: Vec<(u32, f64, f64, u64, bool)>,
+    /// `el.scrollIntoView()` requests as (node, seq): resolving them
+    /// needs layout, so the host drains this and scrolls the
+    /// element's ancestors.
+    pub(super) scroll_into_view: Vec<(u32, u64)>,
+    /// Shared counter stamped onto both queues above. The host replays
+    /// them in one merged order, so `el.scrollIntoView()` followed by
+    /// `window.scrollBy(0, 10)` lands where the page asked instead of
+    /// whichever queue the host happened to drain last.
+    pub(super) scroll_seq: u64,
     /// Map/Set backing stores, keyed by the owning object's index
     /// (entries in insertion order; lookups are linear strict-eq)
     pub(super) map_data: HashMap<u32, Vec<(Value, Value)>>,
@@ -940,6 +955,8 @@ impl St {
             layout_rects: HashMap::new(),
             scroll_state: HashMap::new(),
             scroll_writes: Vec::new(),
+            scroll_into_view: Vec::new(),
+            scroll_seq: 0,
             map_data: HashMap::new(),
             set_data: HashMap::new(),
             style_nodes: HashMap::new(),
@@ -5276,6 +5293,14 @@ fn do_native(
             Ok(Value::UNDEFINED)
         }
         Native::Noop => Ok(Value::UNDEFINED),
+        Native::WinScroll { relative } => {
+            // (x, y) or ({left, top, behavior})
+            let a0 = if argc > 0 { st.regs[args_base] } else { Value::UNDEFINED };
+            let a1 = if argc > 1 { st.regs[args_base + 1] } else { Value::UNDEFINED };
+            let (left, top) = scroll_args(st, a0, a1);
+            queue_scroll(st, DOC_NODE, left, top, relative);
+            Ok(Value::UNDEFINED)
+        }
         Native::ProxyCtor => {
             let target = if argc > 0 {
                 st.regs[args_base]
@@ -7501,6 +7526,77 @@ fn need_doc(st: &St) -> Result<Rc<RefCell<dom::Document>>, VmError> {
 }
 
 /// DOM method dispatch (`document.x(...)` and element methods).
+/// Decode scrollTo/scrollBy arguments: `(x, y)` or an options object
+/// `{left, top, behavior}`. Returns (left, top), each None when the
+/// caller did not specify that axis.
+fn scroll_args(st: &mut St, a0: Value, a1: Value) -> (Option<f64>, Option<f64>) {
+    if a0.is_object() {
+        let oi = a0.index() as usize;
+        let mut out = (None, None);
+        for (field, is_left) in [("left", true), ("top", false)] {
+            let fk = st.intern_name(field);
+            if let Some(v) = raw_get_prop(st, oi, fk) {
+                if !v.is_undefined() {
+                    let n = Some(v.to_number_raw());
+                    if is_left { out.0 = n } else { out.1 = n }
+                }
+            }
+        }
+        return out;
+    }
+    let left = if a0.is_undefined() { None } else { Some(a0.to_number_raw()) };
+    let top = if a1.is_undefined() { None } else { Some(a1.to_number_raw()) };
+    (left, top)
+}
+
+/// Queue one scroll request for the host and update the optimistic
+/// scroll state page JS reads back within the same turn.
+///
+/// A relative request travels as a *delta* (kind 1) rather than a
+/// resolved absolute position: the host replays it against wherever
+/// the scroller actually sits, so `el.scrollIntoView(); window
+/// .scrollBy(0, -80)` — the sticky-header idiom — still offsets the
+/// reveal the engine performed, which the VM cannot see until layout.
+fn queue_scroll(
+    st: &mut St,
+    node: u32,
+    left: Option<f64>,
+    top: Option<f64>,
+    relative: bool,
+) {
+    let fin = |v: Option<f64>| v.filter(|n| n.is_finite());
+    let (left, top) = (fin(left), fin(top));
+    let cur = st.scroll_state.get(&node).copied()
+        .unwrap_or((0.0, 0.0, 0.0, 0.0));
+    st.scroll_seq += 1;
+    let seq = st.scroll_seq;
+    let (want_top, want_left) = if relative {
+        let (dt, dl) = (top.unwrap_or(0.0), left.unwrap_or(0.0));
+        st.scroll_writes.push((node, dt, dl, seq, true));
+        ((cur.0 + dt).max(0.0), (cur.1 + dl).max(0.0))
+    } else {
+        let t = top.unwrap_or(cur.0).max(0.0);
+        let l = left.unwrap_or(cur.1).max(0.0);
+        st.scroll_writes.push((node, t, l, seq, false));
+        (t, l)
+    };
+    let entry = st.scroll_state.entry(node)
+        .or_insert((0.0, 0.0, 0.0, 0.0));
+    entry.0 = want_top;
+    entry.1 = want_left;
+    if node == DOC_NODE {
+        // window.scrollTo is synchronous in a real browser, so
+        // window.scrollY has to answer the new position now — the
+        // host's own push does not land until the next turn.
+        let wi = st.known.window.index() as usize;
+        for (f, v) in [("scrollY", want_top), ("pageYOffset", want_top),
+                       ("scrollX", want_left), ("pageXOffset", want_left)] {
+            let k = st.intern_name(f);
+            raw_set_prop(st, wi, k, Value::number(v));
+        }
+    }
+}
+
 fn dom_method(
     st: &mut St,
     mods: &ModStore,
@@ -7821,8 +7917,26 @@ fn dom_method(
             }
             return Ok(rect);
         }
-        "scrollIntoView" | "focus" | "blur" | "scrollTo" | "scrollBy"
-        | "scroll" | "setAttributeNS" | "closest" => {
+        "scrollTo" | "scrollBy" | "scroll" => {
+            // scrollTo(x, y) | scrollTo({left, top, behavior}); scroll
+            // is an alias of scrollTo, scrollBy is relative. The host
+            // applies and clamps these against the real scroller.
+            let name = st.names[key as usize].clone();
+            let a0 = if argc > 0 { st.regs[args_base] } else { Value::UNDEFINED };
+            let a1 = if argc > 1 { st.regs[args_base + 1] } else { Value::UNDEFINED };
+            let (left, top) = scroll_args(st, a0, a1);
+            queue_scroll(st, node, left, top, name == "scrollBy");
+            return Ok(Value::UNDEFINED);
+        }
+        "scrollIntoView" => {
+            // resolving this needs layout (which ancestors scroll, and
+            // by how much), so it becomes a host request
+            st.scroll_seq += 1;
+            let seq = st.scroll_seq;
+            st.scroll_into_view.push((node, seq));
+            return Ok(Value::UNDEFINED);
+        }
+        "focus" | "blur" | "setAttributeNS" | "closest" => {
             return Ok(Value::UNDEFINED);
         }
         "getContext" => {
@@ -8676,7 +8790,9 @@ fn dom_set_prop(
                 entry.1 = want.max(0.0);
             }
             let (t, l) = (entry.0, entry.1);
-            st.scroll_writes.push((node, t, l));
+            st.scroll_seq += 1;
+            let seq = st.scroll_seq;
+            st.scroll_writes.push((node, t, l, seq, false));
             Ok(())
         }
         "selected" | "checked"

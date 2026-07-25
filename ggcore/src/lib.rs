@@ -1092,10 +1092,18 @@ impl Doc {
         self.ggvm().set_scroll_state(state);
     }
 
-    /// Drain `el.scrollTop = n` writes page scripts made this turn:
-    /// [(node, scrollTop, scrollLeft)] for the host to apply.
-    fn take_scroll_writes(&mut self) -> Vec<(u32, f64, f64)> {
+    /// Drain `el.scrollTop = n` / scrollTo / scrollBy writes page
+    /// scripts made this turn: [(node, top, left, seq, relative)] for
+    /// the host to apply. u32::MAX means the page's own scroller;
+    /// `seq` orders these against take_scroll_into_view, and a
+    /// relative entry is a delta rather than a position.
+    fn take_scroll_writes(&mut self) -> Vec<(u32, f64, f64, u64, bool)> {
         self.ggvm().take_scroll_writes()
+    }
+
+    /// Drain pending `el.scrollIntoView()` requests as (node, seq).
+    fn take_scroll_into_view(&mut self) -> Vec<(u32, u64)> {
+        self.ggvm().take_scroll_into_view()
     }
 
     /// Shell-side hover update: mark the element under the pointer

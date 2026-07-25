@@ -4025,8 +4025,14 @@ check("overflow: restoring re-applies the offset after a tree rebuild",
       repr(scroll_position(_sc_fkeep)))
 
 # JS observes and drives the engine's scrollers (scrollTop/scrollHeight)
-from browser.layout import (apply_scroll_writes,  # noqa: E402
-                            collect_scroll_state)
+from browser.layout import (PAGE_SCROLL_NODE,  # noqa: E402
+                            apply_scroll_requests, collect_scroll_state)
+
+
+def _sc_apply(layout_list, writes, into_view=(), viewport=300, page=0.0):
+    """(element_moved, page_target) for one turn of scroll requests."""
+    return apply_scroll_requests(layout_list, writes, into_view,
+                                 viewport, page)
 
 _sc_js = _styled("body { margin: 0 }", """<body>
 <div id=j style="overflow:auto;height:100px;width:200px">
@@ -4042,16 +4048,92 @@ _sc_report = collect_scroll_state(_sc_jlist)
 check("overflow: scroll state reported to JS is (top, left, sh, sw)",
       _sc_report == [(7, 0.0, 0.0, 500.0, 200.0)], repr(_sc_report))
 check("overflow: a JS scrollTop write moves the real scroller",
-      apply_scroll_writes(_sc_jlist, [(7, 120.0, 0.0)])
+      _sc_apply(_sc_jlist, [(7, 120.0, 0.0)])[0]
       and scroll_position(_sc_jbox)[0] == 120.0,
       repr(scroll_position(_sc_jbox)))
 check("overflow: an out-of-range JS write clamps like a browser",
-      apply_scroll_writes(_sc_jlist, [(7, 10 ** 6, 0.0)])
+      _sc_apply(_sc_jlist, [(7, 10 ** 6, 0.0)])[0]
       and scroll_position(_sc_jbox)[0] == 400.0
       and collect_scroll_state(_sc_jlist)[0][1] == 400.0,
       repr(scroll_position(_sc_jbox)))
 check("overflow: a write to a non-scroller is ignored",
-      not apply_scroll_writes(_sc_jlist, [(999, 50.0, 0.0)]))
+      _sc_apply(_sc_jlist, [(999, 50.0, 0.0)]) == (False, None))
+
+# scrollTo / scrollBy / scrollIntoView / window.scrollTo: the VM queues
+# them, the host replays them in the order the page asked
+_sc_mk = _styled("body { margin: 0 }", """<body>
+<div id=m style="overflow:auto;height:100px;width:200px">
+  <div style="height:500px">
+    <p id=far style="margin-top:300px">far</p></div></div>
+<div style="height:2000px">pad</div>
+<p id=below>below the fold</p></body>""")
+_sc_mdoc = DocumentLayout(_sc_mk)
+_sc_mdoc.layout(600, 300)
+_sc_mlist = layout_tree_to_list(_sc_mdoc, [])
+_sc_mbox = next(o for o in _sc_mlist
+                if isinstance(o, BlockLayout)
+                and getattr(o.node, "attributes", {}).get("id") == "m")
+_sc_far = next(o for o in _sc_mlist
+               if getattr(getattr(o, "node", None), "attributes", {})
+               .get("id") == "far")
+_sc_below = next(o for o in _sc_mlist
+                 if getattr(getattr(o, "node", None), "attributes", {})
+                 .get("id") == "below")
+_sc_mbox.node._ridx = 11
+_sc_far.node._ridx = 12
+_sc_below.node._ridx = 13
+
+check("overflow: window state is reported under the page sentinel",
+      collect_scroll_state(_sc_mlist, (40.0, 0.0, 3000.0, 600.0))[0]
+      == (PAGE_SCROLL_NODE, 40.0, 0.0, 3000.0, 600.0),
+      repr(collect_scroll_state(_sc_mlist, (40.0, 0.0, 3000.0, 600.0))[0]))
+check("overflow: an absolute scrollTo write lands at that position",
+      apply_scroll_requests(
+          _sc_mlist, [(11, 60.0, 0.0, 1, False)], [], 300, 0.0)[0]
+      and scroll_position(_sc_mbox)[0] == 60.0,
+      repr(scroll_position(_sc_mbox)))
+check("overflow: a relative scrollBy write is applied as a delta",
+      apply_scroll_requests(
+          _sc_mlist, [(11, 25.0, 0.0, 2, True)], [], 300, 0.0)[0]
+      and scroll_position(_sc_mbox)[0] == 85.0,
+      repr(scroll_position(_sc_mbox)))
+# scrollIntoView reveals through the ancestor scroller, not the page
+_sc_iv = apply_scroll_requests(_sc_mlist, [], [(12, 3)], 300, 0.0)
+check("overflow: scrollIntoView scrolls the element's own container",
+      _sc_iv[0] and scroll_position(_sc_mbox)[0] > 200.0,
+      repr((_sc_iv, scroll_position(_sc_mbox))))
+# a window request rides the same queue and is handed back, not applied
+check("overflow: a window write is reported to the caller, not applied",
+      apply_scroll_requests(
+          _sc_mlist, [(PAGE_SCROLL_NODE, 500.0, 0.0, 4, False)],
+          [], 300, 0.0)[1] == (500.0, 0.0))
+check("overflow: window.scrollBy is relative to the live page scroll",
+      apply_scroll_requests(
+          _sc_mlist, [(PAGE_SCROLL_NODE, 10.0, 0.0, 5, True)],
+          [], 300, 500.0)[1] == (510.0, 0.0))
+check("overflow: a window scroll never goes negative",
+      apply_scroll_requests(
+          _sc_mlist, [(PAGE_SCROLL_NODE, -900.0, 0.0, 6, True)],
+          [], 300, 20.0)[1] == (0.0, 0.0))
+# a below-the-fold reveal moves the page scroller the caller owns
+_sc_rev = apply_scroll_requests(_sc_mlist, [], [(13, 9)], 300, 0.0)[1]
+check("overflow: revealing a below-the-fold element moves the page",
+      _sc_rev is not None and _sc_rev[0] > 1800.0, repr(_sc_rev))
+# the sticky-header idiom: reveal, then nudge back up by the header
+_sc_ord = apply_scroll_requests(
+    _sc_mlist, [(PAGE_SCROLL_NODE, -80.0, 0.0, 8, True)], [(13, 7)],
+    300, 0.0)
+check("overflow: a scrollBy after scrollIntoView offsets the reveal",
+      _sc_ord[1] is not None
+      and abs(_sc_ord[1][0] - (_sc_rev[0] - 80.0)) < 0.01,
+      repr((_sc_ord[1], _sc_rev)))
+# ...and the reverse order: the reveal is later, so the reveal wins
+_sc_rev2 = apply_scroll_requests(
+    _sc_mlist, [(PAGE_SCROLL_NODE, 0.0, 0.0, 10, False)], [(13, 11)],
+    300, 0.0)
+check("overflow: an earlier window write does not override a later reveal",
+      _sc_rev2[1] is not None and abs(_sc_rev2[1][0] - _sc_rev[0]) < 0.01,
+      repr((_sc_rev2[1], _sc_rev)))
 
 if native.available():
     _sjp = Page()
@@ -4068,6 +4150,37 @@ if native.available():
           any(int(w[0]) >= 0 and w[1] == 42
               for w in _sjp._renderer.take_scroll_writes()),
           "the host must see the write it has to apply")
+    # scrollTo/scrollBy/scrollIntoView queue for the host and stay
+    # readable within the turn; scrollBy travels as a delta
+    _sjp.evaluate(
+        "(function(){var e=document.getElementById('sc');"
+        "e.scrollTo(0, 60); e.scrollBy({top: 25}); return 0;})()")
+    _sj_w = [tuple(w) for w in _sjp._renderer.take_scroll_writes()]
+    check("overflow: scrollTo is absolute and scrollBy is a delta",
+          [(w[1], w[4]) for w in _sj_w] == [(60.0, False), (25.0, True)],
+          repr(_sj_w))
+    check("overflow: scrollBy still reads back as the summed position",
+          _sjp.evaluate(
+              "document.getElementById('sc').scrollTop") == 85,
+          "the optimistic read must include the delta")
+    check("overflow: queued writes carry a rising sequence",
+          len(_sj_w) == 2 and _sj_w[1][3] > _sj_w[0][3], repr(_sj_w))
+    _sjp.evaluate(
+        "(function(){document.getElementById('sc').scrollIntoView();"
+        "return 0;})()")
+    check("overflow: scrollIntoView reaches the host as (node, seq)",
+          [len(tuple(v)) for v in _sjp._renderer.take_scroll_into_view()]
+          == [2],
+          "resolving it needs layout, so it is a host request")
+    _sjp.evaluate("window.scrollTo(0, 400)")
+    check("overflow: window.scrollTo updates scrollY synchronously",
+          _sjp.evaluate("window.scrollY") == 400
+          and _sjp.evaluate("window.pageYOffset") == 400,
+          "window scrolling is synchronous in a real browser")
+    check("overflow: a window scroll queues under the page sentinel",
+          [(int(w[0]), w[1]) for w in _sjp._renderer.take_scroll_writes()]
+          == [(PAGE_SCROLL_NODE, 400.0)],
+          "the shell owns the page scroller")
     _sjp.close()
 else:
     print("[SKIP] scrollTop driver checks - native ggcore not built")

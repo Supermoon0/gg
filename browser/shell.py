@@ -14,7 +14,7 @@ from . import (animation, forms, frames, keyboard, native, navigation,
                net, textengine)
 from .draw import scale_cmds
 from .html_parser import Element, Text, tree_to_list
-from .layout import (HSTEP, VSTEP, DocumentLayout, apply_scroll_writes,
+from .layout import (HSTEP, VSTEP, DocumentLayout, apply_scroll_requests,
                      capture_scroll_state, collect_scroll_state,
                      find_scrollable, get_font, hit_test_at,
                      layout_tree_to_list, measure, paint_tree,
@@ -285,6 +285,11 @@ class Shell:
                 if changed:
                     self.nodes = self.renderer.frame(self._styled_width)
                     self._remap_focus()
+            # scrolling the page scripts asked for this turn must be
+            # applied on EVERY tick — a tick that also rebuilt the DOM
+            # or loaded deferred resources would otherwise drop the
+            # request and then push the stale offset back over it
+            scrolled = self._apply_scroll_writes()
             if changed or self._deferred_resources:
                 first_resources = self._deferred_resources
                 started = time.perf_counter()
@@ -301,8 +306,6 @@ class Shell:
                 # sample CSS animations/transitions (a relayout above
                 # already sampled inside relayout())
                 result = self.animator.on_frame(self.nodes)
-                # page scripts may have set el.scrollTop this turn
-                scrolled = self._apply_scroll_writes()
                 # child frames run their own event loops + animations
                 frames_changed = (self.frames.tick(dt)
                                   if self.frames is not None else False)
@@ -450,21 +453,41 @@ class Shell:
             return
         try:
             self.renderer.set_scroll_state(
-                collect_scroll_state(self.layout_list))
+                collect_scroll_state(self.layout_list, self._page_scroller()))
         except Exception:
             pass  # older wheel without the scroll seam
 
+    def _page_scroller(self):
+        """The page's own scroller as (top, left, height, width) —
+        what window.scrollY and a relative window.scrollBy read."""
+        w, h = self.logical_size()
+        viewport = max(h - TOOLBAR_H - STATUS_H, 1)
+        return (float(self.scroll), float(self.hscroll),
+                float(max(self.scroll_extent(), viewport)),
+                float(max(self.content_width + HSTEP, w)))
+
     def _apply_scroll_writes(self):
-        """Apply `el.scrollTop = n` writes page scripts made this turn."""
+        """Apply the scrolling page scripts asked for this turn —
+        el.scrollTop/scrollTo/scrollBy, window.scrollTo/scrollBy, and
+        el.scrollIntoView()."""
         if self._doc is None:
             return False
         try:
             writes = self.renderer.take_scroll_writes()
+            into_view = self.renderer.take_scroll_into_view()
         except Exception:
             return False
-        if not writes:
+        if not writes and not into_view:
             return False
-        moved = apply_scroll_writes(self.layout_list, writes)
+        _w, h = self.logical_size()
+        moved, page_target = apply_scroll_requests(
+            self.layout_list, writes, into_view,
+            max(h - TOOLBAR_H - STATUS_H, 1), self.scroll, self.hscroll)
+        if page_target is not None:
+            self.scroll = page_target[0]
+            self.hscroll = page_target[1]
+            self.clamp_scroll()
+            moved = True
         if moved:
             self._scroll_state = capture_scroll_state(self.nodes)
             self._push_scroll_state()

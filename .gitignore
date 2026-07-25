@@ -7,3 +7,4 @@ ggcore/dist/
 validation/out/
 validation/file_scheme_probe.txt
 upstream/
+dist/

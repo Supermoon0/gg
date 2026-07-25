@@ -120,6 +120,37 @@ class TestRendererProcess(unittest.TestCase):
         finally:
             page.close()
 
+    @unittest.skipUnless(native.available(), "native ggcore not built")
+    def test_layout_and_scroll_seams_survive_the_json_boundary(self):
+        """JSON decodes every row as a list, and the native bindings
+        only extract real tuples — so both seams have to re-tuple in
+        the worker or an isolated page load dies on its first layout."""
+        body = ("<div id='sc' style='overflow:auto;height:100px'>"
+                "<div style='height:500px'>x</div></div>"
+                "<script>var e=document.getElementById('sc');"
+                "e.scrollTo(0, 60); e.scrollBy({top: 25});"
+                "window.scrollTo(0, 500); e.scrollIntoView();</script>")
+        session = RemoteRendererSession(RecordingBackend(body))
+        try:
+            session.commit(net.URL("https://example.test/"), body)
+            # the two host->renderer pushes must not raise
+            session.set_layout_rects([(2, 0.0, 0.0, 200.0, 100.0)])
+            session.set_scroll_state(
+                [(2, 0.0, 0.0, 500.0, 200.0),
+                 (0xFFFFFFFF, 500.0, 0.0, 3000.0, 800.0)])
+            writes = [tuple(w) for w in session.take_scroll_writes()]
+            self.assertEqual([(w[1], w[4]) for w in writes],
+                             [(60.0, False), (25.0, True), (500.0, False)])
+            self.assertEqual(int(writes[2][0]), 0xFFFFFFFF)
+            self.assertEqual([w[3] for w in writes], sorted(w[3] for w in writes))
+            self.assertEqual(
+                [len(tuple(v)) for v in session.take_scroll_into_view()], [2])
+            # and the page's own offset reaches window.scrollY
+            self.assertEqual(session.run(["console.log(window.scrollY)"]),
+                             ["500"])
+        finally:
+            session.close()
+
     def test_large_commit_uses_blob_and_stale_response_is_discarded(self):
         session = RemoteRendererSession(RecordingBackend())
         try:

@@ -168,7 +168,13 @@ input·change를 발화한다.
 **스크롤 영역**: 명시 크기의 `overflow:auto|scroll` 박스는 자체 스크롤러다 —
 자식 클리핑, 페인트 시점 오프셋, 박스 내부 스크롤바, sticky와 합성되는
 히트테스트, 그리고 안쪽 스크롤러가 끝에 닿으면 바깥·페이지로 넘어가는
-scroll chaining.
+scroll chaining. 페이지 JS도 같은 스크롤러를 읽고 움직인다 —
+`scrollTop`/`scrollLeft`/`scrollHeight`/`scrollWidth`,
+`el.scrollTo`/`scrollBy`/`scrollIntoView()`,
+`window.scrollTo`/`scrollBy`와 라이브 `window.scrollY`. 엔진이 스크롤을
+소유하므로 요청은 큐에 쌓였다가 호스트가 **페이지가 호출한 순서대로**
+재생하고, 상대 스크롤(`scrollBy`)은 위치가 아니라 델타로 전달되어 같은
+턴의 `scrollIntoView()` 결과 위에 정확히 얹힌다.
 
 **크롬**: 주소창, 히스토리, 세로/가로 스크롤(네이티브 셸은 Rust 상주 디스플레이
 리스트로 오프셋 전용 프레임), 링크 히트 테스트, EAGER-DATA 리더 모드(네이버

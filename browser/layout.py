@@ -1107,10 +1107,21 @@ def scroll_container_by(obj, dy, dx=0.0):
     return (node._scroll_y, node._scroll_x) != before
 
 
-def collect_scroll_state(layout_list):
+# `window.scrollTo(...)` arrives with this sentinel node index (the VM's
+# DOC_NODE): it targets the page's own scroller, not an element.
+PAGE_SCROLL_NODE = 0xFFFFFFFF
+
+
+def collect_scroll_state(layout_list, page=None):
     """[(ridx, scrollTop, scrollLeft, scrollHeight, scrollWidth)] for
-    every scroll container — what page JS observes on the element."""
+    every scroll container — what page JS observes on the element.
+
+    `page` is the shell's own scroller as (top, left, height, width);
+    it is reported under PAGE_SCROLL_NODE so `window.scrollY` and a
+    relative `window.scrollBy` see where the page actually sits."""
     out = []
+    if page is not None:
+        out.append((PAGE_SCROLL_NODE,) + tuple(float(v) for v in page))
     for obj in layout_list:
         if not is_scroll_container(obj):
             continue
@@ -1124,26 +1135,131 @@ def collect_scroll_state(layout_list):
     return out
 
 
-def apply_scroll_writes(layout_list, writes):
-    """Apply `el.scrollTop = n` requests from page JS to the real
-    scrollers. Returns True when any of them moved."""
-    if not writes:
-        return False
-    wanted = {int(ridx): (float(top), float(left))
-              for ridx, top, left in writes}
-    moved = False
+def _scrollers_by_ridx(layout_list):
+    out = {}
     for obj in layout_list:
         if not is_scroll_container(obj):
             continue
         ridx = getattr(getattr(obj, "node", None), "_ridx", None)
-        target = wanted.get(int(ridx)) if ridx is not None else None
-        if target is None:
+        if ridx is not None:
+            out[int(ridx)] = obj
+    return out
+
+
+def _reveal(obj, viewport_height, page_scroll):
+    """Scroll `obj`'s scrolling ancestors so it sits inside them, then
+    report the page scroll that puts it on screen (None if it already
+    is). Returns (containers_moved, page_scroll_or_None)."""
+    moved = False
+    # walk out through the scrollers, innermost first
+    cur = getattr(obj, "parent", None)
+    while cur is not None:
+        if is_scroll_container(cur):
+            # where the target sits inside this container right now
+            dy, _dx = scrolled_ancestor_offset(obj)
+            top = obj.y - dy
+            delta = 0.0
+            if top < cur.y:
+                delta = top - cur.y
+            elif top + obj.height > cur.y + cur.height:
+                delta = (top + obj.height) - (cur.y + cur.height)
+            if delta and scroll_container_by(cur, delta):
+                moved = True
+        cur = getattr(cur, "parent", None)
+    dy, _dx = scrolled_ancestor_offset(obj)
+    doc_top = obj.y - dy
+    if doc_top < page_scroll:
+        return (moved, doc_top)
+    if doc_top + obj.height > page_scroll + viewport_height:
+        return (moved, doc_top + obj.height - viewport_height)
+    return (moved, None)
+
+
+def scroll_into_view(layout_list, ridxs, viewport_height, page_scroll):
+    """Bring elements into view for `el.scrollIntoView()`.
+
+    Scrolls every scroll-container ancestor so the element's box sits
+    inside it, then reports the page scroll the caller should adopt so
+    the (now positioned) element is on screen. Returns
+    (containers_moved, new_page_scroll_or_None)."""
+    targets = {int(r[0]) if isinstance(r, (tuple, list)) else int(r)
+               for r in ridxs}
+    if not targets:
+        return (False, None)
+    moved = False
+    page_scroll_out = None
+    for obj in layout_list:
+        ridx = getattr(getattr(obj, "node", None), "_ridx", None)
+        if ridx is None or int(ridx) not in targets:
             continue
-        cur_y, cur_x = scroll_position(obj)
-        if scroll_container_by(obj, target[0] - cur_y,
-                               target[1] - cur_x):
-            moved = True
-    return moved
+        want = page_scroll if page_scroll_out is None else page_scroll_out
+        hit, new_page = _reveal(obj, viewport_height, want)
+        moved = moved or hit
+        if new_page is not None:
+            page_scroll_out = new_page
+    return (moved, page_scroll_out)
+
+
+def apply_scroll_requests(layout_list, writes, into_view,
+                          viewport_height, page_scroll, page_left=0.0):
+    """Replay one turn's scroll requests in the order page JS made them.
+
+    `writes` are (ridx, top, left, seq) and `into_view` are
+    (ridx, seq) as drained from the VM; replaying them merged keeps
+    `el.scrollIntoView(); window.scrollBy(0, -80)` (a sticky-header
+    offset, the common idiom) landing where the page asked instead of
+    letting whichever queue the host drains last win. Returns
+    (element_moved, page_target_or_None) where the page target is
+    (top, left) for the caller's own scroller."""
+    ordered = [(w[3] if len(w) > 3 else 0, 0, w) for w in writes]
+    ordered += [(r[1] if isinstance(r, (tuple, list)) and len(r) > 1 else 0,
+                 1, r) for r in into_view]
+    if not ordered:
+        return (False, None)
+    ordered.sort(key=lambda e: (e[0], e[1]))
+
+    scrollers = _scrollers_by_ridx(layout_list)
+    by_ridx = {}
+    for obj in layout_list:
+        ridx = getattr(getattr(obj, "node", None), "_ridx", None)
+        if ridx is not None:
+            by_ridx.setdefault(int(ridx), obj)
+
+    moved = False
+    page, page_x = float(page_scroll), float(page_left)
+    page_moved = False
+    for _seq, kind, req in ordered:
+        if kind == 0:
+            ridx, top, left = int(req[0]), float(req[1]), float(req[2])
+            # a relative request (scrollBy) carries a delta: the VM
+            # cannot know where the scroller ended up after an earlier
+            # scrollIntoView this same turn, so it is resolved here
+            relative = len(req) > 4 and bool(req[4])
+            if ridx == PAGE_SCROLL_NODE:
+                page = max((page + top) if relative else top, 0.0)
+                page_x = max((page_x + left) if relative else left, 0.0)
+                page_moved = True
+                continue
+            obj = scrollers.get(ridx)
+            if obj is None:
+                continue
+            if relative:
+                dy, dx = top, left
+            else:
+                cur_y, cur_x = scroll_position(obj)
+                dy, dx = top - cur_y, left - cur_x
+            if scroll_container_by(obj, dy, dx):
+                moved = True
+            continue
+        ridx = int(req[0]) if isinstance(req, (tuple, list)) else int(req)
+        obj = by_ridx.get(ridx)
+        if obj is None:
+            continue
+        hit, new_page = _reveal(obj, viewport_height, page)
+        moved = moved or hit
+        if new_page is not None:
+            page, page_moved = new_page, True
+    return (moved, (page, page_x) if page_moved else None)
 
 
 def capture_scroll_state(root):
