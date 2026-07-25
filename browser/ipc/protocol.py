@@ -41,6 +41,7 @@ MESSAGE_TYPES = {
     "network.request_text", "network.request", "network.request_raw",
     "network.script_fetch", "network.cookies_for", "network.cookie_set",
     "network.cancel", "network.cancel_new", "network.shutdown",
+    "network.test_crash",
     "network.response", "network.error",
 }
 

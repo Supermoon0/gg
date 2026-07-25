@@ -373,6 +373,21 @@ def _network_service_cases(base):
                outcome.get("r") == "cancelled",
                f"in-flight request through the service ended as "
                f"{outcome.get('r')!r}")
+
+        # a crashed service must not leave the browser unusable: the
+        # next request brings it back, and the grants the browser had
+        # already issued are re-issued with it
+        context = backend.bind_context(base + "/")
+        before = backend.host.pid
+        backend.host.test_crash()
+        _h, revived, _f = backend.request_text(
+            net.URL(base + "/plain"), context=context, no_cache=True)
+        record("service-crash-restarts-and-restores-grants",
+               revived == "hello plain" and backend.host.pid != before
+               and backend.host.restarts == 1
+               and backend.drop_context(context),
+               f"pid {before} -> {backend.host.pid}, "
+               f"body={revived!r}, context still valid")
     finally:
         backend.close()
 

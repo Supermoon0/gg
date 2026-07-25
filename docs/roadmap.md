@@ -60,12 +60,20 @@
       취소된 탐색과 실패한 탐색을 타입으로 가르기 때문이다.
       kwargs 마샬링은 `browser/ipc/wire.py` 하나로 합쳤다(중복이 바로
       직전 쿠키 유출 버그의 원인이었다).
-      게이트: net gauntlet 46/46 — 서비스 경로에서 **jar가 브라우저
-      프로세스에 없음**·SameSite cross-site 차단·in-flight cancel 3종
-      추가, unittest 8종, 두 renderer 모델 모두에서 실제 페이지 로드
-      (탐색+서브리소스 CSS+쿠키) 확인.
+      게이트: net gauntlet 47/47 — 서비스 경로에서 **jar가 브라우저
+      프로세스에 없음**·SameSite cross-site 차단·in-flight cancel·
+      crash 복구 4종 추가, unittest 9종, 두 renderer 모델 모두에서
+      실제 페이지 로드(탐색+서브리소스 CSS+쿠키) 확인.
+      **crash 복구(2026-07-25)**: 죽은 서비스가 브라우저를 영구히
+      못 쓰게 만들면 안 된다. 다음 요청이 서비스를 되살리고 그 요청을
+      처리한다. 메모리 jar·캐시는 사라지는데 **그게 crash의 비용**이고,
+      그러나 **capability는 브라우저가 준 것**이므로 이미 발급한
+      context를 새 서비스에 같은 id로 재발급한다 — context를 들고 있던
+      호출자는 서비스가 죽은 줄 모른다. 죽는 순간 in-flight였던 요청은
+      정직하게 `NetworkCrashed`로 실패한다. gauntlet
+      `service-crash-restarts-and-restores-grants` + unittest.
       남은 후속: HttpOnly 제거 replica push(현재 `document.cookie`는
-      매번 서비스 왕복), 서비스 프로세스 crash 복구·재시작, OS 샌드박스.
+      매번 서비스 왕복), OS 샌드박스.
       이전 진행 기록: net gauntlet을 **IPC 경로에서도** 돌리기 시작했고
       (`ipc-initiator-survives-broker`, `ipc-cookie-samesite-cross-site-block`),
       그 과정에서 **isolated 모델의 쿠키 유출 결함**을 발견·수정했다

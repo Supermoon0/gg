@@ -171,6 +171,46 @@ class TestNetworkService(unittest.TestCase):
         self.assertTrue(self.backend.drop_context(context))
         self.assertFalse(self.backend.drop_context(context))
 
+    def test_a_crashed_service_is_restarted_and_keeps_its_grants(self):
+        """A dead service must not make the browser permanently
+        unusable. The in-memory jar is gone — that is what a crash
+        costs — but the capabilities are the browser's to re-grant, so
+        a caller holding a context id keeps working."""
+        from browser.process.network_host import NetworkCrashed
+
+        backend = create_network_backend("service")
+        try:
+            context = backend.bind_context(self.base + "/")
+            first_pid = backend.host.pid
+            backend.request_text(net.URL(self.base + "/cookie/set"),
+                                 context=context)
+            self.assertIn("sid=abc",
+                          backend.cookies_for(net.URL(self.base + "/")))
+
+            backend.host.test_crash()
+            self.assertFalse(backend.host.alive)
+
+            # the very next call brings it back and is served
+            _h, body, _f = backend.request_text(
+                net.URL(self.base + "/after"), context=context)
+            self.assertEqual(body, "hello/after")
+            self.assertNotEqual(backend.host.pid, first_pid)
+            self.assertEqual(backend.host.restarts, 1)
+
+            # the context the caller still holds resolves in the new
+            # service; the jar legitimately did not survive
+            self.assertTrue(backend.drop_context(context))
+            self.assertNotIn(
+                "sid=abc", backend.cookies_for(net.URL(self.base + "/")))
+
+            # ...and a request in flight when it died fails honestly
+            backend.host.test_crash()
+            backend.host._closing = True
+            with self.assertRaises(NetworkCrashed):
+                backend.request_text(net.URL(self.base + "/x"))
+        finally:
+            backend.close()
+
     def test_unknown_model_is_refused(self):
         with self.assertRaises(ValueError):
             create_network_backend("telepathy")

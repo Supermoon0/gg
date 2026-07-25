@@ -107,8 +107,12 @@ def _serve(channel, request, state):
             raise TimeoutError("network request deadline expired")
 
         if kind == "network.bind_context":
+            # the browser may name the id: after a service restart it
+            # replays the contexts it already handed out, so callers
+            # holding one do not have to know the service died
             context = NetworkContext(
-                uuid.uuid4().hex, str(payload.get("profile_id", "default")),
+                str(payload.get("context_id") or uuid.uuid4().hex),
+                str(payload.get("profile_id", "default")),
                 str(payload.get("document_url", "")))
             state["contexts"][context.context_id] = context
             _reply(channel, request, {"context": {
@@ -210,6 +214,8 @@ def network_worker(connection, service_id):
             kind = request["type"]
             if kind == "network.shutdown":
                 break
+            if kind == "network.test_crash":
+                os._exit(93)
             if kind == "network.cancel":
                 # handled inline, never queued: a cancel that waits
                 # behind the request it is stopping is not a cancel
@@ -259,6 +265,11 @@ class NetworkProcessHost:
         self._waiters = {}
         self._lock = threading.Lock()
         self._reader = None
+        self._closing = False
+        self.restarts = 0
+        # contexts the browser has handed out, replayed after a crash so
+        # a caller holding one never learns the service died
+        self._live_contexts = {}
         self.start()
 
     @property
@@ -329,9 +340,42 @@ class NetworkProcessHost:
             waiter.message = None
             waiter.event.set()
 
+    def remember_context(self, context):
+        if isinstance(context, dict) and context.get("context_id"):
+            self._live_contexts[context["context_id"]] = dict(context)
+
+    def forget_context(self, context_id):
+        self._live_contexts.pop(context_id, None)
+
+    def recover(self):
+        """Bring the service back after a crash and restore what the
+        browser had already granted.
+
+        The in-memory jar and cache are gone — that is what a crash
+        costs — but the *capabilities* are the browser's to re-grant,
+        so a caller holding a context id keeps working.
+        """
+        if self._closing:
+            raise NetworkCrashed(self.dead_reason or "service is shutting down")
+        self.restarts += 1
+        self.service_id = "n-" + uuid.uuid4().hex
+        self.start()
+        for context in list(self._live_contexts.values()):
+            try:
+                self.call("network.bind_context", {
+                    "context_id": context["context_id"],
+                    "document_url": context.get("document_url", ""),
+                    "profile_id": context.get("profile_id", "default"),
+                }, timeout=self.startup_timeout)
+            except Exception:
+                break
+        return self
+
     def call(self, message_type, payload=None, *, timeout=None):
         if not self.alive:
-            raise NetworkCrashed(self.dead_reason or "network service is down")
+            # a dead service must not make the browser permanently
+            # unusable: bring it back and serve this call
+            self.recover()
         limit = self.request_timeout if timeout is None else float(timeout)
         body = dict(payload or {})
         body["deadline_ms"] = int((time.monotonic() + limit) * 1000)
@@ -387,7 +431,14 @@ class NetworkProcessHost:
             self.process.join(timeout=2.0)
         self.process = None
 
+    def test_crash(self):
+        """Kill the service the way a real fault would."""
+        self.post("network.test_crash")
+        if self.process is not None:
+            self.process.join(timeout=3.0)
+
     def shutdown(self):
+        self._closing = True
         if self.alive:
             self.post("network.shutdown")
             self.process.join(timeout=2.0)
@@ -431,14 +482,17 @@ class RemoteNetworkBackend:
     # -- capability lifetime -------------------------------------------
 
     def bind_context(self, document_url, *, profile_id="default"):
-        return self.host.call("network.bind_context", {
+        context = self.host.call("network.bind_context", {
             "document_url": str(document_url),
             "profile_id": str(profile_id)}, timeout=self.timeout)["context"]
+        self.host.remember_context(context)
+        return context
 
     def drop_context(self, context):
+        context_id = (context or {}).get("context_id")
+        self.host.forget_context(context_id)
         return self.host.call("network.drop_context", {
-            "context_id": (context or {}).get("context_id"),
-        }, timeout=self.timeout)["dropped"]
+            "context_id": context_id}, timeout=self.timeout)["dropped"]
 
     def new_cancel_token(self):
         return _RemoteCancelToken(self.host)
