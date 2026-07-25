@@ -195,8 +195,10 @@ timing-function 오버라이드.
   재import 자폭을 제거)
 - Golden 렌더링 회귀: 7/7
 - Network gauntlet: 41/41
-- CSS gauntlet: 23/23 (이 컨테이너에서는 폰트 메트릭 차이로
-  position-absolute-offsets·line-height-px 2종이 환경 실패 — 변경 전후 동일)
+- CSS gauntlet: 23/23 (2026-07-25 — position-absolute-offsets는 ICB
+  원점 기준으로, line-height-px는 "명시 40px == 40px 라인박스" 계약으로
+  기대값을 현행 엔진 동작에 맞게 갱신; GitHub ubuntu 러너에서도 동일하게
+  실패하던 2종이었다)
 - Render evidence: home/demo/css/js 4종 통과
 
 ## 최근 구현 메모

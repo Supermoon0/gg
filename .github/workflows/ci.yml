@@ -49,6 +49,8 @@ jobs:
             display: "xvfb-run -a"
     env:
       PYTHONUNBUFFERED: "1"
+      # the Windows runner console is cp1252; the suites print Korean
+      PYTHONUTF8: "1"
       GG_SKIP_LIVE_NETWORK: "1"
 
     steps:

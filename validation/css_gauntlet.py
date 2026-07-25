@@ -357,7 +357,11 @@ def t_position_abs_fixed():
     nodes, d, cmds = pipeline(html)
     ia, ra = rect_of(cmds, "#00fefe")
     if_, rf = rect_of(cmds, "#00fdfd")
-    ax, ay = HSTEP + 100, VSTEP + 50
+    # An absolutely positioned box with no positioned ancestor resolves
+    # left/top against the initial containing block at the viewport
+    # origin — the same rule the fixed case below asserts. The engine's
+    # internal HSTEP/VSTEP content gutter must NOT leak into it.
+    ax, ay = 100, 50
     abs_ok = (ra is not None and abs(ra.left - ax) < 1 and
               abs(ra.top - ay) < 1 and abs(ra.right - (ax + 120)) < 1 and
               abs(ra.bottom - (ay + 40)) < 1)
@@ -439,11 +443,15 @@ def t_line_height():
     nodes, d, cmds = pipeline(html)
     b1 = box_for(d, by_id(nodes, "lh1"))
     b2 = box_for(d, by_id(nodes, "lh2"))
-    ratio = b1.height / b2.height if b2.height else 0
-    # 40px on a 16px font = factor 2.5 vs default 1.25 -> ratio 2.0
-    report("line-height-px", abs(ratio - 2.0) < 0.05 and b1.height > b2.height,
+    # The contract is that an explicit line-height is used exactly:
+    # line-height:40px must yield a 40px line box. The default line
+    # comes from REAL font metrics (`normal`), which vary per platform
+    # font (DejaVu's 16px linespace is ~23px, not 16*1.25) — so assert
+    # the explicit value, not a ratio against the font-derived default.
+    report("line-height-px",
+           abs(b1.height - 40.0) < 0.5 and b1.height > b2.height,
            f"lh40_height={b1.height} default_height={b2.height} "
-           f"ratio={ratio:.3f} expected_ratio=2.0")
+           "expected lh40=40px and taller than the default line")
 
 
 def t_before_after():
