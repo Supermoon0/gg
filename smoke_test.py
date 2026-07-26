@@ -2561,6 +2561,47 @@ if native.available():
 else:
     print("[SKIP] cookie replica checks - native ggcore not built")
 
+# document.currentScript and the *ElementChild traversals: loaders find
+# their own tag through the first, and both must answer null (not
+# undefined) when there is nothing there
+if native.available():
+    _cs_doc = native.ggcore.parse_html(
+        "<html><body><div id=a><span>s</span>text</div>"
+        "<div id=empty></div>"
+        "<script id=me src='/loader.js' data-key='K'></script>"
+        "</body></html>")
+    _cs_doc.set_page_url("https://cs.test/")
+    _cs_node = [r[1] for r in _cs_doc.export() if r[2] == "script"][0]
+    check("dom: currentScript is null while nothing is executing",
+          _cs_doc.run_scripts([
+              "console.log(document.currentScript === null)"]) == ["true"],
+          "a page's `currentScript || fallback` depends on null")
+    _cs_doc.set_current_script(_cs_node)
+    check("dom: currentScript names the running script element",
+          _cs_doc.run_scripts([
+              "var c = document.currentScript;"
+              "console.log(c.tagName + ' ' + c.getAttribute('src')"
+              " + ' ' + c.getAttribute('data-key'))"])
+          == ["SCRIPT /loader.js K"],
+          "loaders read their own src/data-* to find their config")
+    _cs_doc.set_current_script(None)
+    check("dom: firstElementChild/lastElementChild skip text nodes",
+          _cs_doc.run_scripts([
+              "var a = document.getElementById('a');"
+              "console.log(a.firstElementChild.tagName + ' '"
+              " + a.lastElementChild.tagName + ' '"
+              " + (a.firstChild.tagName || 'text'))"])
+          == ["SPAN SPAN SPAN"],
+          "an element-only traversal must not stop on the text node")
+    check("dom: an empty element's element-children are null",
+          _cs_doc.run_scripts([
+              "var e = document.getElementById('empty');"
+              "console.log((e.firstElementChild === null) + ' '"
+              " + (e.lastElementChild === null))"]) == ["true true"],
+          "undefined would break `if (el.firstElementChild)` chains")
+else:
+    print("[SKIP] currentScript checks - native ggcore not built")
+
 from concurrent.futures import ThreadPoolExecutor as _CookiePool
 _cookie_errors = []
 def _cookie_worker(i):

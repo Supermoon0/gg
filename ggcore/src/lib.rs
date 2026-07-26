@@ -1106,6 +1106,19 @@ impl Doc {
         self.ggvm().take_scroll_into_view()
     }
 
+    /// Bytes of string heap this document has retained. gg has no GC,
+    /// so this only grows — it is what the heap backstop trips on.
+    fn heap_bytes(&mut self) -> usize {
+        self.ggvm().heap_bytes()
+    }
+
+    /// Mark which `<script>` node is executing so
+    /// `document.currentScript` answers it; pass None to clear.
+    #[pyo3(signature = (node=None))]
+    fn set_current_script(&mut self, node: Option<u32>) {
+        self.ggvm().set_current_script(node);
+    }
+
     /// Tell the document it is embedded: `window.parent`/`window.top`
     /// stop being this window. Call before scripts run.
     fn set_framed(&mut self, framed: bool) {

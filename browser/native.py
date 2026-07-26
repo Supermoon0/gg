@@ -507,11 +507,25 @@ class _ScriptLoader:
                 self._dispatch(node, "error")
                 external = False
         elif code:
-            self.logs.extend(self.doc.run_scripts([code]))
+            # loaders find their own tag through
+            # `document.currentScript`, so it has to name this element
+            # while — and only while — this script runs
+            self._with_current_script(node, lambda: self.logs.extend(
+                self.doc.run_scripts([code])))
         if external:
             self._dispatch(node, "load")
         self._discover_dynamic()
         self._run_dynamic_inline()
+
+    def _with_current_script(self, node, run):
+        setter = getattr(self.doc, "set_current_script", None)
+        if setter is None:
+            return run()          # older wheel without the seam
+        setter(int(node))
+        try:
+            return run()
+        finally:
+            setter(None)
 
     def _settle_fetch(self, record, future):
         found, code = future.result()

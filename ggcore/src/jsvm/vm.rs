@@ -87,7 +87,21 @@ const MAX_ARRAY_ELEMS: usize = 16 * 1024 * 1024;
 /// and aborts on a failed allocation. The dispatch loop trips a
 /// catchable RangeError past this. Far above any real page (naver
 /// settles well under 256MB of live strings).
-const MAX_HEAP_BYTES: usize = 512 * 1024 * 1024;
+/// String-heap backstop. gg has no GC, so `st.strs` is append-only and
+/// this really is the retained size, not a cumulative-allocation
+/// proxy. Tunable so the ceiling can be measured against real pages
+/// (`GG_JS_HEAP_MB`) instead of guessed at.
+fn max_heap_bytes() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("GG_JS_HEAP_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|mb| *mb > 0)
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or(512 * 1024 * 1024)
+    })
+}
 
 const MAX_FRAMES: usize = 4096;
 /// Cap on native re-entry (JS -> sort/callback -> JS ...). Each level
@@ -837,6 +851,11 @@ pub(super) struct St {
     /// `window.scrollBy(0, 10)` lands where the page asked instead of
     /// whichever queue the host happened to drain last.
     pub(super) scroll_seq: u64,
+    /// The `<script>` element the host is executing right now, as an
+    /// arena index. Loaders find their own tag with
+    /// `document.currentScript.getAttribute('src')` / `.dataset`, so
+    /// leaving this undefined makes them throw on their first line.
+    pub(super) current_script: Option<u32>,
     /// This document's origin ("https://a.test", or "null" for an
     /// opaque one). Stamped onto every message this document sends so
     /// the receiver's `e.origin` is the sender's, not its own.
@@ -933,7 +952,7 @@ pub(super) struct St {
     /// string-memory footprint. A loop that mints large strings per
     /// iteration (namuwiki's Cloudflare challenge) stays under the fuel
     /// budget but exhausts RAM; the dispatch loop trips a catchable
-    /// RangeError when this crosses MAX_HEAP_BYTES.
+    /// RangeError when this crosses `max_heap_bytes()`.
     pub(super) heap_bytes: usize,
 }
 
@@ -1008,6 +1027,7 @@ impl St {
             scroll_writes: Vec::new(),
             scroll_into_view: Vec::new(),
             scroll_seq: 0,
+            current_script: None,
             page_origin: String::new(),
             message_writes: Vec::new(),
             frame_seq: 0,
@@ -8718,6 +8738,14 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
             return Ok(push_str(st, rs.to_string()));
         }
         match st.names[key as usize].as_str() {
+            // null (not undefined) when nothing is executing, which
+            // is what a page's `currentScript || fallback` relies on
+            "currentScript" => {
+                return Ok(match st.current_script {
+                    Some(i) => Value::dom_node(i),
+                    None => Value::NULL,
+                });
+            }
             "documentElement" | "head" => {
                 let tag = if st.names[key as usize] == "head" {
                     "head"
@@ -8867,11 +8895,20 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
                 .to_uppercase();
             return Ok(push_str(st, tag));
         }
-        "firstChild" | "lastChild" => {
-            let first = st.names[key as usize] == "firstChild";
+        "firstChild" | "lastChild"
+        | "firstElementChild" | "lastElementChild" => {
+            let nm = st.names[key as usize].as_str();
+            let first = nm.starts_with("first");
+            // the *Element* pair skips text nodes, and like every other
+            // DOM traversal answers null -- not undefined -- when there
+            // is nothing there
+            let el_only = nm.ends_with("ElementChild");
             let d = doc.borrow();
             let kids = &d.nodes[node_us].children;
-            let pick = if first { kids.first() } else { kids.last() };
+            let mut it = kids.iter().filter(|&&c| {
+                !el_only || d.nodes[c].is_element()
+            });
+            let pick = if first { it.next() } else { it.last() };
             return Ok(match pick {
                 Some(&c) => Value::dom_node(c as u32),
                 None => Value::NULL,
@@ -9863,7 +9900,7 @@ fn exec_loop(
         // orchestrator) stays under the instruction budget but exhausts
         // RAM and aborts the process on a failed allocation. Trip a
         // catchable RangeError first.
-        if st.heap_bytes > MAX_HEAP_BYTES {
+        if st.heap_bytes > max_heap_bytes() {
             return range_err("string heap exhausted");
         }
         st.fuel -= 1;

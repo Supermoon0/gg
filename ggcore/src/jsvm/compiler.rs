@@ -2540,7 +2540,20 @@ impl Compiler {
                 Ok(())
             }
             Stmt::VarDecl { kind: DeclKind::Var, decls } => {
+                // Each declarator's initializer is dead once its value
+                // is stored, so its temps go back. Without this a
+                // minified `var a={},b={},...` — core-js ships a
+                // 129-declarator one — walks the register file to its
+                // 250 limit and fails to compile at all.
                 for (name, init) in decls {
+                    let checkpoint = {
+                        let f = self.fx();
+                        f.tmp_top.max(f.locals_end)
+                    };
+                    let restore = |c: &mut Self| {
+                        let f = c.fx();
+                        f.tmp_top = checkpoint.max(f.locals_end);
+                    };
                     let Some(init) = init else {
                         // `var u;` at script level: mark the global
                         // defined (reads yield undefined, not a
@@ -2559,11 +2572,13 @@ impl Compiler {
                                 atom: a,
                                 src: r,
                             });
+                            restore(self);
                         }
                         continue;
                     };
                     let r = self.expr(init)?;
                     self.store_name(name, r);
+                    restore(self);
                 }
                 Ok(())
             }
@@ -2574,7 +2589,18 @@ impl Compiler {
                 // declare_lexical.
                 let top_of_script =
                     self.fx().is_main && self.fx().scopes.len() == 1;
+                // same as the `var` arm: an initializer's temps are
+                // dead once the value is bound, and minified bundles
+                // put a hundred-plus declarators in one statement
                 for (name, init) in decls {
+                    let checkpoint = {
+                        let f = self.fx();
+                        f.tmp_top.max(f.locals_end)
+                    };
+                    let restore = |c: &mut Self| {
+                        let f = c.fx();
+                        f.tmp_top = checkpoint.max(f.locals_end);
+                    };
                     if *kind == DeclKind::Const && init.is_none() {
                         return self.err(format!(
                             "missing initializer in const \
@@ -2595,6 +2621,7 @@ impl Compiler {
                         if *kind == DeclKind::Const {
                             self.const_globals.insert(name.clone());
                         }
+                        restore(self);
                         continue;
                     }
                     if self
@@ -2624,6 +2651,7 @@ impl Compiler {
                             }
                         };
                         self.store_name(name, rv);
+                        restore(self);
                         continue;
                     };
                     let rv = match init {
@@ -2645,6 +2673,7 @@ impl Compiler {
                     }
                     self.fx().lookup_mut(name).unwrap().initialized =
                         true;
+                    restore(self);
                 }
                 Ok(())
             }

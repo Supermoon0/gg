@@ -1729,6 +1729,18 @@ impl PageVm {
         std::mem::take(&mut self.st.logs)
     }
 
+    /// Retained string-heap bytes (see the backstop in vm.rs).
+    pub fn heap_bytes(&self) -> usize {
+        self.st.heap_bytes
+    }
+
+    /// Tell the VM which `<script>` element is executing, so
+    /// `document.currentScript` answers it. `None` clears it (nothing
+    /// is running, or the code came from a timer/event).
+    pub fn set_current_script(&mut self, node: Option<u32>) {
+        self.st.current_script = node;
+    }
+
     /// This document's origin, as stamped onto messages it sends.
     pub fn page_origin(&self) -> String {
         self.st.page_origin.clone()
@@ -6650,6 +6662,34 @@ console.log('B typeof it: ' + typeof it);
             5.0
         );
         assert_eq!(n("var o = {0: 'a', 1: 'b'}; o[0] === 'a' ? 1 : 0"), 1.0);
+    }
+
+    #[test]
+    fn a_long_declarator_list_does_not_exhaust_the_register_file() {
+        // Registers are u8, so a function has 250 of them. An
+        // initializer is dead once its value is bound, but the temps
+        // used to be kept until the whole statement ended -- and
+        // minifiers emit `var a={},b={},...` with a hundred-plus
+        // declarators (core-js ships one), which made the bundle fail
+        // to compile at all rather than merely run slowly.
+        for kw in ["var", "let", "const"] {
+            let decls = (0..400)
+                .map(|i| format!("a{i}={{}}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let src = format!("function f(){{ {kw} {decls}; return a399; }}\
+                               console.log(typeof f());");
+            let mut vm = PageVm::new(None);
+            let out = vm.run_scripts(&[src]);
+            assert_eq!(out, vec!["object".to_string()], "{kw} declarators");
+        }
+        // ...and the values still chain through the list correctly
+        let mut vm = PageVm::new(None);
+        assert_eq!(
+            vm.run_scripts(&["var a=1,b=a+1,c=b+1,d={v:c};\
+                             console.log(a,b,c,d.v);".to_string()]),
+            vec!["1 2 3 3".to_string()]
+        );
     }
 
     #[test]
