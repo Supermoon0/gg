@@ -450,24 +450,270 @@ function URL(u, base) {
   this.searchParams = new URLSearchParams(this.search);
 }
 URL.prototype.toString = function () { return this.href; };
-function TextEncoder() {}
+// Byte buffers. Bytes live in a plain array shared with the backing
+// ArrayBuffer, and the view carries its own index properties -- a real
+// engine aliases them, so a write *through a view* is not seen by
+// another view of the same buffer unless it goes through `set()`,
+// which does write through. Byte-stream code (React's flight parser,
+// TextDecoder) builds with `set` and reads through views, which this
+// serves exactly; it is not a substitute for shared mutable memory.
+function ArrayBuffer(len) {
+  len = len > 0 ? Math.floor(len) : 0;
+  this.byteLength = len;
+  this._b = [];
+  for (var i = 0; i < len; i++) this._b.push(0);
+}
+ArrayBuffer.prototype.slice = function (a, b) {
+  var out = new ArrayBuffer(0);
+  out._b = this._b.slice(a, b === undefined ? this.byteLength : b);
+  out.byteLength = out._b.length;
+  return out;
+};
+ArrayBuffer.isView = function (v) { return !!(v && v.__typed); };
+function __ggBytes(src) {
+  var out = [], i;
+  if (src === undefined || src === null) return out;
+  if (typeof src === 'number') {
+    for (i = 0; i < Math.floor(src); i++) out.push(0);
+    return out;
+  }
+  if (typeof src.length === 'number') {
+    for (i = 0; i < src.length; i++) out.push(src[i] & 255);
+    return out;
+  }
+  return out;
+}
+function Uint8Array(src, off, len) {
+  var bytes;
+  if (src instanceof ArrayBuffer) {
+    off = off === undefined ? 0 : Math.floor(off);
+    len = len === undefined ? src.byteLength - off : Math.floor(len);
+    if (len < 0) len = 0;
+    bytes = src._b.slice(off, off + len);
+    this.buffer = src;
+    this.byteOffset = off;
+  } else {
+    bytes = __ggBytes(src);
+    var buf = new ArrayBuffer(0);
+    buf._b = bytes;
+    buf.byteLength = bytes.length;
+    this.buffer = buf;
+    this.byteOffset = 0;
+  }
+  for (var i = 0; i < bytes.length; i++) this[i] = bytes[i] & 255;
+  this.length = bytes.length;
+  this.byteLength = bytes.length;
+  this.BYTES_PER_ELEMENT = 1;
+  this.__typed = true;
+}
+Uint8Array.prototype.set = function (src, offset) {
+  offset = offset === undefined ? 0 : Math.floor(offset);
+  var b = __ggBytes(src);
+  for (var i = 0; i < b.length; i++) {
+    this[offset + i] = b[i];
+    this.buffer._b[this.byteOffset + offset + i] = b[i];
+  }
+};
+Uint8Array.prototype.subarray = function (a, b) {
+  a = a === undefined ? 0 : (a < 0 ? this.length + a : a);
+  b = b === undefined ? this.length : (b < 0 ? this.length + b : b);
+  var out = [];
+  for (var i = a; i < b && i < this.length; i++) out.push(this[i]);
+  var view = new Uint8Array(out);
+  view.buffer = this.buffer;
+  view.byteOffset = this.byteOffset + a;
+  return view;
+};
+Uint8Array.prototype.slice = function (a, b) {
+  return new Uint8Array(this.subarray(a, b));
+};
+Uint8Array.prototype.fill = function (v, a, b) {
+  a = a === undefined ? 0 : a;
+  b = b === undefined ? this.length : b;
+  for (var i = a; i < b; i++) this[i] = v & 255;
+  return this;
+};
+Uint8Array.prototype.indexOf = function (v, from) {
+  // the fromIndex is not optional in practice: React's flight parser
+  // scans for the next row terminator with `chunk.indexOf(10, at)`,
+  // and ignoring it re-finds the first one forever
+  var i = from === undefined ? 0 : Math.floor(from);
+  if (i < 0) i = Math.max(this.length + i, 0);
+  for (; i < this.length; i++) if (this[i] === v) return i;
+  return -1;
+};
+Uint8Array.prototype.lastIndexOf = function (v, from) {
+  var i = from === undefined ? this.length - 1 : Math.floor(from);
+  if (i < 0) i = this.length + i;
+  if (i > this.length - 1) i = this.length - 1;
+  for (; i >= 0; i--) if (this[i] === v) return i;
+  return -1;
+};
+Uint8Array.prototype.includes = function (v, from) {
+  return this.indexOf(v, from) !== -1;
+};
+Uint8Array.prototype.join = function (sep) {
+  var out = [];
+  for (var i = 0; i < this.length; i++) out.push(this[i]);
+  return out.join(sep === undefined ? ',' : sep);
+};
+Uint8Array.prototype.forEach = function (fn, thisArg) {
+  for (var i = 0; i < this.length; i++) fn.call(thisArg, this[i], i, this);
+};
+Uint8Array.prototype.toString = function () { return this.join(','); };
+Uint8Array.prototype[Symbol.iterator] = function () {
+  var i = 0, self = this;
+  return { next: function () {
+    return i < self.length
+      ? { value: self[i++], done: false }
+      : { value: undefined, done: true };
+  } };
+};
+Uint8Array.from = function (src) { return new Uint8Array(src); };
+Uint8Array.of = function () { return new Uint8Array(arguments); };
+Uint8Array.BYTES_PER_ELEMENT = 1;
+var Uint8ClampedArray = Uint8Array;
+var Int8Array = Uint8Array;
+function TextEncoder() { this.encoding = 'utf-8'; }
 TextEncoder.prototype.encode = function (s) {
-  s = '' + s;
+  s = s === undefined ? '' : '' + s;
   var out = [];
   for (var i = 0; i < s.length; i++) {
     var c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+      var lo = s.charCodeAt(i + 1);
+      if (lo >= 0xdc00 && lo <= 0xdfff) {
+        c = 0x10000 + ((c - 0xd800) << 10) + (lo - 0xdc00);
+        i++;
+      }
+    }
     if (c < 128) { out.push(c); }
     else if (c < 2048) {
       out.push(192 | (c >> 6), 128 | (c & 63));
+    } else if (c < 65536) {
+      out.push(224 | (c >> 12), 128 | ((c >> 6) & 63), 128 | (c & 63));
     } else {
-      out.push(224 | (c >> 12), 128 | ((c >> 6) & 63),
-               128 | (c & 63));
+      out.push(240 | (c >> 18), 128 | ((c >> 12) & 63),
+               128 | ((c >> 6) & 63), 128 | (c & 63));
+    }
+  }
+  return new Uint8Array(out);
+};
+// A real decoder, not a stub returning ''. `{stream: true}` holds a
+// truncated multi-byte sequence back for the next chunk, which is the
+// whole point when the bytes arrive from a stream.
+function TextDecoder(label) {
+  this.encoding = label ? ('' + label).toLowerCase() : 'utf-8';
+  this._tail = [];
+}
+TextDecoder.prototype.decode = function (input, opts) {
+  var b = this._tail.concat(__ggBytes(input));
+  this._tail = [];
+  var stream = !!(opts && opts.stream);
+  var out = '', i = 0;
+  while (i < b.length) {
+    var c = b[i], need = 0, cp = 0;
+    if (c < 128) { out += String.fromCharCode(c); i++; continue; }
+    else if ((c & 224) === 192) { need = 1; cp = c & 31; }
+    else if ((c & 240) === 224) { need = 2; cp = c & 15; }
+    else if ((c & 248) === 240) { need = 3; cp = c & 7; }
+    else { out += '�'; i++; continue; }
+    if (i + need >= b.length + (stream ? 0 : 1) && i + need >= b.length) {
+      if (stream) { this._tail = b.slice(i); return out; }
+      out += '�';
+      i++;
+      continue;
+    }
+    for (var k = 1; k <= need; k++) cp = (cp << 6) | (b[i + k] & 63);
+    i += need + 1;
+    if (cp >= 65536) {
+      cp -= 65536;
+      out += String.fromCharCode(0xd800 + (cp >> 10),
+                                 0xdc00 + (cp & 1023));
+    } else {
+      out += String.fromCharCode(cp);
     }
   }
   return out;
 };
-function TextDecoder() {}
-TextDecoder.prototype.decode = function () { return ''; };
+// A ReadableStream the way byte-stream consumers use one: a source
+// with `start(controller)` that enqueues, and a reader whose `read()`
+// resolves as chunks arrive. React's RSC client hands its flight data
+// in exactly this shape.
+function ReadableStream(source, strategy) {
+  var self = this;
+  this.locked = false;
+  this._chunks = [];
+  this._done = false;
+  this._err = null;
+  this._waiting = [];
+  this._source = source || {};
+  var controller = {
+    enqueue: function (chunk) {
+      if (self._done) return;
+      self._chunks.push(chunk);
+      self._wake();
+    },
+    close: function () { self._done = true; self._wake(); },
+    error: function (e) { self._err = e; self._done = true; self._wake(); },
+    get desiredSize() { return 1; }
+  };
+  this._controller = controller;
+  if (typeof this._source.start === 'function') {
+    try { this._source.start(controller); }
+    catch (e) { controller.error(e); }
+  }
+}
+ReadableStream.prototype._wake = function () {
+  var waiting = this._waiting;
+  this._waiting = [];
+  for (var i = 0; i < waiting.length; i++) waiting[i]();
+};
+ReadableStream.prototype._pull = function () {
+  var self = this;
+  return new Promise(function (resolve, reject) {
+    function step() {
+      if (self._chunks.length) {
+        resolve({ value: self._chunks.shift(), done: false });
+        return;
+      }
+      if (self._err) { reject(self._err); return; }
+      if (self._done) { resolve({ value: undefined, done: true }); return; }
+      if (typeof self._source.pull === 'function') {
+        try { self._source.pull(self._controller); }
+        catch (e) { reject(e); return; }
+        if (self._chunks.length || self._done) { step(); return; }
+      }
+      self._waiting.push(step);
+    }
+    step();
+  });
+};
+ReadableStream.prototype.getReader = function () {
+  var self = this;
+  this.locked = true;
+  return {
+    read: function () { return self._pull(); },
+    cancel: function (reason) {
+      self._done = true;
+      self._chunks = [];
+      self._wake();
+      if (typeof self._source.cancel === 'function') {
+        try { self._source.cancel(reason); } catch (e) {}
+      }
+      return Promise.resolve();
+    },
+    releaseLock: function () { self.locked = false; },
+    closed: new Promise(function () {})
+  };
+};
+ReadableStream.prototype.cancel = function (reason) {
+  return this.getReader().cancel(reason);
+};
+ReadableStream.prototype[Symbol.iterator] = function () {
+  var self = this;
+  return { next: function () { return self._pull(); } };
+};
 function Worker() {}
 Worker.prototype.postMessage = function () {};
 Worker.prototype.terminate = function () {};
@@ -6919,6 +7165,113 @@ console.log('B typeof it: ' + typeof it);
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn byte_streams_round_trip_through_typed_arrays() {
+        // React's flight client decodes its payload with
+        // TextDecoder over Uint8Array views of a ReadableStream, and
+        // scans for row terminators with `chunk.indexOf(10, at)`. None
+        // of that existed: no Uint8Array at all, TextEncoder returned
+        // a plain array, and TextDecoder returned the empty string.
+        let mut vm = PageVm::new(None);
+        assert_eq!(
+            vm.run_scripts(&["var enc = new TextEncoder();\
+                var u = enc.encode('{\"k\":\"\\uc548\\ub155\"}');\
+                console.log(new TextDecoder().decode(u));\
+                console.log(u.length, u.byteLength, u.byteOffset);\
+                var v = new Uint8Array(u.buffer, 1, 3);\
+                console.log(v.length, new TextDecoder().decode(v));\
+                console.log(u.indexOf(107), u.indexOf(107, 3));\
+                var parts = enc.encode('ab\\ncd');\
+                console.log(parts.indexOf(10), parts.indexOf(10, 3));\
+                var joined = new Uint8Array(4);\
+                joined.set(enc.encode('ab'), 0);\
+                joined.set(enc.encode('cd'), 2);\
+                console.log(new TextDecoder().decode(joined));\
+                var d = new TextDecoder();\
+                var k = enc.encode('\\uac00\\ub098');\
+                console.log(d.decode(k.subarray(0, 4), { stream: true })\
+                            + d.decode(k.subarray(4), { stream: true }));"
+                .to_string()]),
+            vec![
+                "{\"k\":\"안녕\"}".to_string(),
+                // {"k":"안녕"} -- 8 ASCII bytes plus 3 each for 안녕
+                "14 14 0".to_string(),
+                "3 \"k\"".to_string(),
+                // indexOf honours its fromIndex
+                "2 -1".to_string(),
+                "2 -1".to_string(),
+                "abcd".to_string(),
+                // a multi-byte char split across chunks survives
+                "가나".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_readable_stream_delivers_its_chunks() {
+        let mut vm = PageVm::new(None);
+        assert_eq!(
+            vm.run_scripts(&["var s = new ReadableStream({ start: function (c) {\
+                    c.enqueue('one'); c.enqueue('two'); c.close(); } });\
+                var r = s.getReader(), got = [];\
+                function step(x) {\
+                    if (x.done) { console.log(got.join(',')); return; }\
+                    got.push(x.value);\
+                    r.read().then(step);\
+                }\
+                r.read().then(step);\
+                var late = new ReadableStream({ start: function (c) {\
+                    setTimeout(function () { c.enqueue('late'); c.close(); }, 0);\
+                } });\
+                late.getReader().read().then(function (x) {\
+                    console.log('late=' + x.value); });"
+                .to_string()]),
+            Vec::<String>::new(),
+        );
+        let (logs, _) = vm.pump();
+        let mut logs = logs;
+        logs.sort();
+        assert_eq!(
+            logs,
+            vec!["late=late".to_string(), "one,two".to_string()],
+        );
+    }
+
+    #[test]
+    fn json_parse_runs_its_reviver() {
+        // React's flight rows arrive as plain arrays and the reviver
+        // turns the `"$"`-tagged ones into elements. Ignoring it hands
+        // React raw objects, which it refuses to render (error #31).
+        let mut vm = PageVm::new(None);
+        assert_eq!(
+            vm.run_scripts(&["var seen = [];\
+                var out = JSON.parse('{\"a\":1,\"b\":[2,3],\"c\":{\"d\":\"x\"}}',\
+                    function (k, v) { seen.push(k); return v; });\
+                console.log(seen.join('|'));\
+                console.log(JSON.stringify(out));\
+                console.log(JSON.stringify(JSON.parse('{\"n\":1}',\
+                    function (k, v) {\
+                        return typeof v === 'number' ? v * 10 : v; })));\
+                console.log(JSON.stringify(JSON.parse('{\"k\":1,\"d\":2}',\
+                    function (k, v) { return k === 'd' ? undefined : v; })));\
+                console.log(JSON.stringify(JSON.parse(\
+                    '[\"$\",\"link\",0,{\"rel\":\"x\"}]',\
+                    function (k, v) {\
+                        return Array.isArray(v) && v[0] === '$'\
+                            ? { tag: v[1] } : v; })));"
+                .to_string()]),
+            vec![
+                // depth-first, children before their holder, root last
+                "a|0|1|b|d|c|".to_string(),
+                r#"{"a":1,"b":[2,3],"c":{"d":"x"}}"#.to_string(),
+                r#"{"n":10}"#.to_string(),
+                // returning undefined deletes the property
+                r#"{"k":1}"#.to_string(),
+                r#"{"tag":"link"}"#.to_string(),
+            ],
         );
     }
 

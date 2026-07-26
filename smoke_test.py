@@ -3495,6 +3495,25 @@ try:
                       and n.attributes.get("id") == "written"
                       for n in tree_to_list(_dw2.root, [])))
 
+    # React's hydration diff drops server-only attributes through the
+    # Attr node, and asks its mount container for its root -- and the
+    # app-router mounts on `document`, whose ownerDocument is null
+    if native.available():
+        _dn_root, _dn_doc, _dn_css, _dn_logs = native.load_document(
+            "<html><body><div id=a class=x data-s=1></div><script>"
+            "var e = document.getElementById('a');"
+            "console.log(e.getRootNode() === document,"
+            " document.getRootNode() === document);"
+            "var at = e.getAttributeNode('data-s');"
+            "console.log(at.name + '=' + at.value);"
+            "e.removeAttributeNode(at);"
+            "console.log(e.getAttribute('data-s'), e.hasAttributes());"
+            "</script></body></html>",
+            lambda hrefs: {}, lambda srcs: {}, page_url=_fr_parent_url)
+        check("dom: getRootNode/Attr nodes answer for hydration",
+              _dn_logs == ["true true", "data-s=1", "null true"],
+              str(_dn_logs))
+
     # `window.name` is the classic way to hand parameters into a
     # frame -- a SafeFrame creative reads its whole init blob out of
     # it -- and the only moment it is observable is before the child's

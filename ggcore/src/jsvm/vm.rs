@@ -6691,11 +6691,67 @@ fn do_native(
             let v = json_parse(st, &mut p)?;
             p.ws();
             if p.i != p.b.len() {
-                return err("Unexpected token in JSON");
+                return err(p.bad());
             }
-            Ok(v)
+            let reviver =
+                if argc > 1 { st.regs[args_base + 1] } else { Value::UNDEFINED };
+            if !reviver.is_function() {
+                return Ok(v);
+            }
+            // InternalizeJSONProperty: walk bottom-up through a root
+            // holder whose single key is "". React's flight format is
+            // built on this -- rows arrive as plain arrays and the
+            // reviver turns the `"$"`-tagged ones into elements, so
+            // ignoring it hands React raw objects and it refuses to
+            // render them (its error #31).
+            let root = new_plain_object(st);
+            let empty = st.intern_name("");
+            raw_set_prop(st, root.index() as usize, empty, v);
+            json_revive(st, mods, root, "", v, reviver)
         }
     }
+}
+
+fn json_revive(
+    st: &mut St,
+    mods: &ModStore,
+    holder: Value,
+    key: &str,
+    val: Value,
+    reviver: Value,
+) -> Result<Value, VmError> {
+    if val.is_object() {
+        let oi = val.index() as usize;
+        let is_array = st.objects[oi].is_array;
+        let nelems = st.objects[oi].elems.len();
+        for i in 0..nelems {
+            let child = st.objects[oi].elems[i];
+            if !is_array && child.is_undefined() {
+                continue;
+            }
+            let name = i.to_string();
+            let out = json_revive(st, mods, val, &name, child, reviver)?;
+            if i < st.objects[oi].elems.len() {
+                st.objects[oi].elems[i] = out;
+            }
+        }
+        if !is_array {
+            for atom in own_keys_ordered(st, oi, true) {
+                let name = st.names[atom as usize].clone();
+                let child =
+                    raw_get_prop(st, oi, atom).unwrap_or(Value::UNDEFINED);
+                let out = json_revive(st, mods, val, &name, child, reviver)?;
+                if out.is_undefined() {
+                    let k = push_str(st, name);
+                    delete_property(st, val, k);
+                } else {
+                    raw_set_prop(st, oi, atom, out);
+                }
+            }
+        }
+    }
+    let k = push_str(st, key.to_string());
+    call_value_this(st, mods, reviver, Some(holder), &[k, val])
 }
 
 /// Math/Object/Array/Number/String static methods (Native::HostFn).
@@ -7862,6 +7918,20 @@ struct JsonP {
 }
 
 impl JsonP {
+    /// "Unexpected token in JSON" on its own names nothing anybody can
+    /// act on when the text came off a stream. Quote the neighbourhood.
+    fn bad(&self) -> String {
+        let from = self.i.saturating_sub(24);
+        let to = (self.i + 24).min(self.b.len());
+        let near: String = self.b[from..to].iter().collect();
+        format!(
+            "Unexpected token in JSON at {} of {} near {:?}",
+            self.i,
+            self.b.len(),
+            near,
+        )
+    }
+
     fn ws(&mut self) {
         while self.i < self.b.len() && self.b[self.i].is_whitespace() {
             self.i += 1;
@@ -7903,14 +7973,14 @@ fn json_parse(st: &mut St, p: &mut JsonP) -> Result<Value, VmError> {
         Some('f') => json_parse_lit(p, "false", Value::FALSE),
         Some('n') => json_parse_lit(p, "null", Value::NULL),
         Some(c) if c == '-' || c.is_ascii_digit() => json_parse_number(p),
-        _ => err("Unexpected token in JSON"),
+        _ => err(p.bad()),
     }
 }
 
 fn json_parse_lit(p: &mut JsonP, word: &str, v: Value) -> Result<Value, VmError> {
     for want in word.chars() {
         if p.bump() != Some(want) {
-            return err("Unexpected token in JSON");
+            return err(p.bad());
         }
     }
     Ok(v)
@@ -8822,6 +8892,57 @@ fn dom_method(
             }
             return Ok(oldn);
         }
+        // No shadow DOM here, so a node's root is always the
+        // document. React's float/resource layer asks the mount
+        // container for its root -- and Next.js's app router mounts
+        // *on* `document`, whose `ownerDocument` is null by spec, so
+        // the missing method left it with no resource root at all
+        // ("resourceRoot was expected to exist", its error #446).
+        "getRootNode" => return Ok(Value::dom_node(DOC_NODE)),
+        // React's hydration diff walks `element.attributes` and drops
+        // the ones the server sent that the client did not, through
+        // the Attr node -- not by name.
+        "getAttributeNode" => {
+            let name = arg_string(st, args_base, argc, 0)?.to_lowercase();
+            let found = doc.borrow().nodes[node as usize]
+                .attr(&name)
+                .map(|v| v.to_string());
+            return Ok(match found {
+                Some(v) => {
+                    let obj = new_plain_object(st);
+                    let oi = obj.index() as usize;
+                    let nk = st.intern_name("name");
+                    let nv = push_str(st, name);
+                    raw_set_prop(st, oi, nk, nv);
+                    let vk = st.intern_name("value");
+                    let vv = push_str(st, v);
+                    raw_set_prop(st, oi, vk, vv);
+                    let ok = st.intern_name("ownerElement");
+                    raw_set_prop(st, oi, ok, Value::dom_node(node));
+                    obj
+                }
+                None => Value::NULL,
+            });
+        }
+        "removeAttributeNode" => {
+            let attr = st.regs[args_base];
+            let name = if attr.is_object() {
+                let nk = st.intern_name("name");
+                raw_get_prop(st, attr.index() as usize, nk)
+                    .map(|v| to_display(st, v))
+                    .unwrap_or_default()
+            } else {
+                to_display(st, attr)
+            };
+            doc.borrow_mut().nodes[node as usize]
+                .attrs
+                .retain(|(k, _)| !k.eq_ignore_ascii_case(&name));
+            return Ok(attr);
+        }
+        "hasAttributes" => {
+            let any = !doc.borrow().nodes[node as usize].attrs.is_empty();
+            return Ok(Value::boolean(any));
+        }
         "contains" => {
             let other = st.regs[args_base];
             if !other.is_dom_node() {
@@ -9436,6 +9557,10 @@ fn is_dom_method_name(name: &str) -> bool {
             | "replaceChild"
             | "cloneNode"
             | "contains"
+            | "getRootNode"
+            | "getAttributeNode"
+            | "removeAttributeNode"
+            | "hasAttributes"
             | "closest"
             | "focus"
             | "blur"
