@@ -3741,6 +3741,13 @@ impl Compiler {
                     let rf = self.fx().alloc()?;
                     let cv = self.chain_into(callee, bails)?;
                     self.fx().emit(Instr::Move { dst: rf, src: cv });
+                    // Call reads its arguments at func+1, contiguous.
+                    // chain_into leaves its own scratch allocated, so
+                    // without releasing it here the first argument
+                    // landed at rf+2 and the callee value at rf+1 was
+                    // passed as argument one -- `Q(e)?.top` called
+                    // `Q(Q)`.
+                    self.fx().tmp_top = rf + 1;
                     for a in args {
                         let ra = self.fx().alloc()?;
                         self.expr_to(a, ra)?;

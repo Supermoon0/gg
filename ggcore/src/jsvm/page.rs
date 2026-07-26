@@ -6777,6 +6777,41 @@ console.log('B typeof it: ' + typeof it);
     }
 
     #[test]
+    fn an_optional_chain_off_a_call_passes_its_arguments() {
+        // Call reads its arguments at func+1. Inside an optional
+        // chain the callee was compiled through chain_into, which
+        // leaves its scratch register allocated, so the first argument
+        // landed one slot too high and the callee itself was passed as
+        // argument one: `f(x)?.y` called `f(f)`.
+        let mut vm = PageVm::new(None);
+        assert_eq!(
+            vm.run_scripts(&["function id(v) { return { got: v }; }\
+                var e = 'ELEM';\
+                console.log(id(e).got);\
+                console.log(id(e)?.got);\
+                console.log(id(e)?.got ?? 'none');\
+                console.log(JSON.stringify({ a: id(e)?.got,\
+                                             b: id(e)?.got }));\
+                function two(a, b) { return { got: a + '/' + b }; }\
+                console.log(two('x', 'y')?.got);\
+                var maybe = null;\
+                console.log(String(maybe?.(e)));\
+                var f = id;\
+                console.log(f?.(e).got);"
+                .to_string()]),
+            vec![
+                "ELEM".to_string(),
+                "ELEM".to_string(),
+                "ELEM".to_string(),
+                r#"{"a":"ELEM","b":"ELEM"}"#.to_string(),
+                "x/y".to_string(),
+                "undefined".to_string(),
+                "ELEM".to_string(),
+            ],
+        );
+    }
+
+    #[test]
     fn try_catch_finally_survive_an_await() {
         // A `try` holding an await is wrapped in an IIFE, and a
         // `return` cannot escape one -- so a try that returned, with
