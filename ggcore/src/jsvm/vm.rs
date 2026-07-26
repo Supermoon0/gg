@@ -2466,6 +2466,15 @@ fn has_own_property(
             .map(|c| c.is_ascii_alphabetic())
             .unwrap_or(false));
     }
+    if obj.is_string() {
+        // a string's own properties are its indices plus `length`
+        let name = to_display(st, key);
+        if name == "length" {
+            return Ok(true);
+        }
+        let n = str_ref(st, obj.index()).chars().count();
+        return Ok(elem_index(&name).is_some_and(|i| i < n));
+    }
     if !obj.is_object() {
         return type_err("'in' right-hand side is not an object");
     }
@@ -3317,6 +3326,11 @@ fn method_ref_dispatch(
         }
         "hasOwnProperty" => {
             let k = args.first().copied().unwrap_or(Value::UNDEFINED);
+            if recv.is_string() {
+                return Ok(Value::boolean(
+                    has_own_property(st, mods, recv, k)?,
+                ));
+            }
             if !is_js_object(recv) {
                 return Ok(Value::boolean(false));
             }
@@ -4596,6 +4610,17 @@ fn internal_has(
     }
     if target.is_dom_node() {
         return Ok(!dom_get_prop(st, key, target.index())?.is_undefined());
+    }
+    if target.is_string() {
+        // `Object('abc')` yields the primitive here (no wrapper
+        // object), so `'0' in Object(s)` has to answer for the string
+        let name = st.names[key as usize].clone();
+        if matches!(name.as_str(), "length" | "constructor" | "toString"
+                                   | "valueOf" | "hasOwnProperty") {
+            return Ok(true);
+        }
+        let n = str_ref(st, target.index()).chars().count();
+        return Ok(elem_index(&name).is_some_and(|i| i < n));
     }
     if !target.is_object() {
         return type_err("'in' right-hand side is not an object");
@@ -6849,6 +6874,21 @@ fn host_fn(
                     }
                     let value = internal_get(st, mods, v, key, v)?;
                     out.push(host_entry(st, id, key_value, value));
+                }
+                return Ok(new_array(st, out));
+            }
+            if v.is_string() {
+                // Object.keys('abc') is ['0','1','2'] -- a string's own
+                // enumerable properties are its character indices
+                let chars: Vec<String> = str_ref(st, v.index())
+                    .chars()
+                    .map(|c| c.to_string())
+                    .collect();
+                let mut out = Vec::with_capacity(chars.len());
+                for (k, ch) in chars.into_iter().enumerate() {
+                    let key = intern(st, &k.to_string());
+                    let val = push_str(st, ch);
+                    out.push(host_entry(st, id, key, val));
                 }
                 return Ok(new_array(st, out));
             }
@@ -12417,6 +12457,17 @@ fn exec_loop(
                         let name = st.names[atom as usize].clone();
                         let sv = intern(st, &name);
                         keys.push(sv);
+                    }
+                } else if ov.is_string() {
+                    // A string's own enumerable properties are its
+                    // character indices. Emptiness checks in the wild
+                    // are written as `for (k in v) return false`, and
+                    // reporting a string as empty silently dropped
+                    // every string parameter of an ad request.
+                    let n = str_ref(st, ov.index()).chars().count();
+                    for k in 0..n {
+                        let s = intern(st, &k.to_string());
+                        keys.push(s);
                     }
                 }
                 reg!(dst) = new_array(st, keys);

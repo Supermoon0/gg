@@ -25,7 +25,15 @@ import urllib.parse
 
 from . import psl
 
-USER_AGENT = "GGBrowser/0.1 (educational engine)"
+# The same string `navigator.userAgent` reports to scripts (ggcore's
+# prelude). They have to agree: a server that reads the header and a
+# script that reads navigator were describing two different browsers,
+# and the bare product token carried no platform, so naver's ad server
+# rejected every request with "empty deviceOS". Still identifies as
+# GGBrowser -- the Mozilla/AppleWebKit prefix is the compatibility
+# boilerplate every engine sends.
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) GGBrowser/0.1")
 MAX_REDIRECTS = 8
 DEFAULT_TIMEOUT = 15.0
 

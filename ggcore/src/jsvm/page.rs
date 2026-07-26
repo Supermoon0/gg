@@ -6777,6 +6777,41 @@ console.log('B typeof it: ' + typeof it);
     }
 
     #[test]
+    fn a_string_owns_its_character_indices() {
+        // `for (k in v) return false` is how bundles write "is this
+        // empty?", so a string that enumerates nothing reads as empty.
+        // gfp-display-sdk filters its ad request that way and dropped
+        // every string parameter -- including the ad unit id, which
+        // the ad server then rejected with `invalid inventory(adUnit)`.
+        let mut vm = PageVm::new(None);
+        assert_eq!(
+            vm.run_scripts(&["var ks = [];\
+                for (var k in 'abc') ks.push(k);\
+                console.log(ks.join(','));\
+                console.log(Object.keys('abc').join(','));\
+                console.log(Object.values('ab').join(','));\
+                console.log(JSON.stringify(Object.entries('ab')));\
+                var h = Object.prototype.hasOwnProperty;\
+                console.log(h.call('abc', '0'), h.call('abc', '9'),\
+                            h.call('abc', 'length'), h.call('', '0'));\
+                console.log('0' in Object('abc'));\
+                var empty = [];\
+                for (var e in '') empty.push(e);\
+                console.log(empty.length);"
+                .to_string()]),
+            vec![
+                "0,1,2".to_string(),
+                "0,1,2".to_string(),
+                "a,b".to_string(),
+                r#"[["0","a"],["1","b"]]"#.to_string(),
+                "true false true false".to_string(),
+                "true".to_string(),
+                "0".to_string(),
+            ],
+        );
+    }
+
+    #[test]
     fn an_await_does_not_jump_ahead_of_its_siblings() {
         // `await` is desugared by hoisting it into a preceding
         // statement, which lifted it *above* the operands to its left.
