@@ -3456,6 +3456,45 @@ try:
                   and n.attributes.get("id") == "inner"
                   for n in tree_to_list(_sd.root, [])))
 
+    # a script-created iframe filled with contentDocument.write():
+    # the VM has no child arena, so it buffers the markup and the
+    # frame machinery turns it into a real child document
+    class _WriteSession:
+        def __init__(self, writes):
+            self._writes = writes
+
+        def take_document_writes(self):
+            out, self._writes = self._writes, []
+            return out
+
+        def set_frame_graph(self, frames):
+            return None
+
+    _dw_parent = _styled("", "<iframe id=dw></iframe>")
+    _dw_node = _find(_dw_parent, "iframe")
+    _dw_node._ridx = 4242
+    _dw_mgr = gg_frames.FrameManager(
+        top_url=_fr_parent_url, use_native=False,
+        session=_WriteSession([(4242, "<p id=written>CREATIVE</p>")]))
+    _dw_mgr.sync(_dw_parent, _fr_parent_url)
+    _dw = _dw_node._frame
+    check("iframe: contentDocument.write() becomes the child document",
+          _dw.status == "loaded"
+          and any(isinstance(n, Element)
+                  and n.attributes.get("id") == "written"
+                  for n in tree_to_list(_dw.root, [])))
+    # ...and a later write replaces it, the way a real reload would
+    _dw_mgr.session._writes = [(4242, "<p id=second>AGAIN</p>")]
+    _dw_mgr.sync(_dw_parent, _fr_parent_url)
+    _dw2 = _dw_node._frame
+    check("iframe: a second write reloads the child document",
+          any(isinstance(n, Element)
+              and n.attributes.get("id") == "second"
+              for n in tree_to_list(_dw2.root, []))
+          and not any(isinstance(n, Element)
+                      and n.attributes.get("id") == "written"
+                      for n in tree_to_list(_dw2.root, [])))
+
     # removing the element disposes its frame and returns the budget
     _budget_before = _fr_mgr.budget[0]
     for n in tree_to_list(_fr_parent, []):

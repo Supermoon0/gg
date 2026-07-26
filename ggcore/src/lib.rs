@@ -1154,6 +1154,10 @@ impl Doc {
 
     /// Drain mutations page JS made through a child's mirror, as
     /// (handle, child node index, op, a, b, seq).
+    fn take_document_writes(&mut self) -> Vec<(u32, String)> {
+        self.ggvm().take_document_writes()
+    }
+
     fn take_frame_dom_writes(
         &mut self,
     ) -> Vec<(u32, u32, u8, String, String, u64)> {

@@ -363,6 +363,9 @@ pub(super) enum Native {
     Boolean,
     ParseInt,
     ParseFloat,
+    /// document.open/write/writeln/close on a script-created iframe's
+    /// document (0 = open, 1 = write, 2 = writeln, 3 = close).
+    DocWrite { node: u32, op: u8 },
     /// `__ggStack()`: the live call stack as V8-ish "    at name" lines.
     /// The prelude's Error constructor hangs it off `.stack`, which is
     /// what every minified bundle reports when something goes wrong.
@@ -885,6 +888,17 @@ pub(super) struct St {
     pub(super) frame_mirrors: HashMap<u32, FrameMirror>,
     /// iframe element node index -> its `contentDocument` object
     pub(super) frame_docs: HashMap<u32, Value>,
+    /// A script-created iframe has no document yet, but the canonical
+    /// way to fill one is `f.contentDocument.write(html)`. Buffer the
+    /// markup per iframe node; `close()` hands it to the host, which
+    /// loads it into the real child document.
+    pub(super) doc_write_buf: HashMap<u32, String>,
+    /// (iframe node, markup) for documents whose `close()` has run.
+    pub(super) doc_writes: Vec<(u32, String)>,
+    /// iframe nodes the host has spoken about (pushed *or* dropped a
+    /// document for). Those are the host's to answer for -- a dropped
+    /// mirror means "no document", not "write your own".
+    pub(super) frame_host_owned: std::collections::HashSet<u32>,
     /// mutations page JS made through a mirror, as
     /// (handle, child node index, op, arg a, arg b, seq). Applied to
     /// the mirror immediately and to the real child by the host.
@@ -1044,6 +1058,9 @@ impl St {
             frame_ctx: HashMap::new(),
             frame_mirrors: HashMap::new(),
             frame_docs: HashMap::new(),
+            doc_write_buf: HashMap::new(),
+            doc_writes: Vec::new(),
+            frame_host_owned: std::collections::HashSet::new(),
             frame_dom_writes: Vec::new(),
             map_data: HashMap::new(),
             set_data: HashMap::new(),
@@ -5986,6 +6003,29 @@ fn do_native(
             }
             Ok(Value::boolean(truthy(st, st.regs[args_base])))
         }
+        Native::DocWrite { node, op } => {
+            match op {
+                0 => {
+                    st.doc_write_buf.insert(node, String::new());
+                }
+                1 | 2 => {
+                    let mut piece = (0..argc as usize)
+                        .map(|k| to_display(st, st.regs[args_base + k]))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    if op == 2 {
+                        piece.push('\n');
+                    }
+                    st.doc_write_buf.entry(node).or_default().push_str(&piece);
+                }
+                _ => {
+                    let html =
+                        st.doc_write_buf.remove(&node).unwrap_or_default();
+                    st.doc_writes.push((node, html));
+                }
+            }
+            Ok(Value::UNDEFINED)
+        }
         Native::StackTrace => {
             let out = stack_string(st, mods, None);
             Ok(make_string(st, out))
@@ -8990,10 +9030,51 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
         "contentDocument" | "contentWindowDocument" => {
             // Only frames the host judged same-origin ever get a
             // mirror pushed, so this is null for everything else.
-            return Ok(match st.frame_docs.get(&node) {
-                Some(&d) => d,
-                None => Value::NULL,
-            });
+            if let Some(&d) = st.frame_docs.get(&node) {
+                return Ok(d);
+            }
+            // ...but a *script-created* iframe has no child document
+            // at all yet, and `contentDocument.write(html)` is how ad
+            // SDKs (and every "render into a frame" helper) fill one.
+            // Hand back something writable; the host turns a closed
+            // buffer into the real child document.
+            // ...but only for a frame that has no source of its own.
+            // A frame with a `src` is the host's to judge: if it were
+            // same-origin a mirror would already be here, so handing
+            // back a writable document would be a cross-origin leak.
+            if st.frame_host_owned.contains(&node) {
+                return Ok(Value::NULL);
+            }
+            let writable = {
+                let d = doc.borrow();
+                let n = &d.nodes[node as usize];
+                let is_frame = n
+                    .tag
+                    .as_deref()
+                    .is_some_and(|t| t == "iframe" || t == "frame");
+                let src = n.attr("src").unwrap_or("").trim().to_lowercase();
+                is_frame
+                    && (src.is_empty() || src == "about:blank")
+                    && n.attr("srcdoc").is_none()
+            };
+            if !writable {
+                return Ok(Value::NULL);
+            }
+            let obj = new_plain_object(st);
+            let oi = obj.index() as usize;
+            for (m, op) in [("open", 0u8), ("write", 1), ("writeln", 2),
+                            ("close", 3)] {
+                let k = st.intern_name(m);
+                let f = make_native(st, Native::DocWrite { node, op });
+                raw_set_prop(st, oi, k, f);
+            }
+            let k = st.intern_name("nodeType");
+            raw_set_prop(st, oi, k, Value::int(9));
+            for name in ["documentElement", "body", "head", "defaultView"] {
+                let k = st.intern_name(name);
+                raw_set_prop(st, oi, k, Value::NULL);
+            }
+            return Ok(obj);
         }
         "classList" => {
             // a fresh object whose methods carry the node id

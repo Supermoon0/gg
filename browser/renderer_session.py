@@ -81,6 +81,8 @@ class RendererSession(Protocol):
 
     def take_frame_writes(self): ...
 
+    def take_document_writes(self): ...
+
     def deliver_message(self, data_json, origin, source_handle): ...
 
     def set_frame_document(self, node, handle, url, rows): ...
@@ -344,6 +346,11 @@ class LocalRendererSession:
     def take_frame_writes(self):
         if self.doc is not None and hasattr(self.doc, "take_frame_writes"):
             return list(self.doc.take_frame_writes())
+        return []
+
+    def take_document_writes(self):
+        if self.doc is not None and hasattr(self.doc, "take_document_writes"):
+            return list(self.doc.take_document_writes())
         return []
 
     def set_frame_document(self, node, handle, url, rows):

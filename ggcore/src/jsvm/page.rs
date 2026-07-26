@@ -1699,6 +1699,10 @@ impl PageVm {
         rows: Vec<(i64, u64, Option<String>, Option<String>,
                    Vec<(String, String)>)>,
     ) {
+        // Either way the host has taken responsibility for this
+        // frame's document, so the script-created-iframe fallback
+        // stops applying to it.
+        self.st.frame_host_owned.insert(node);
         if rows.is_empty() {
             self.st.frame_mirrors.remove(&handle);
             self.st.frame_docs.remove(&node);
@@ -1783,6 +1787,14 @@ impl PageVm {
 
     /// Drain the mutations page JS made through a child's mirror, as
     /// (handle, child node index, op, a, b, seq).
+    /// Drain the markup scripts wrote into script-created iframes
+    /// via `contentDocument.open()/write()/close()`, as
+    /// (iframe node index, markup). The host loads each into the real
+    /// child document -- the VM has no child arena of its own.
+    pub fn take_document_writes(&mut self) -> Vec<(u32, String)> {
+        std::mem::take(&mut self.st.doc_writes)
+    }
+
     pub fn take_frame_dom_writes(
         &mut self,
     ) -> Vec<(u32, u32, u8, String, String, u64)> {

@@ -570,8 +570,15 @@ def _frame_key(node):
     return ("r", ridx) if ridx is not None else ("p", id(node))
 
 
-def _source_key(node):
-    """Identity of the content an iframe element asks for."""
+def _source_key(node, written=None):
+    """Identity of the content an iframe element asks for.
+
+    A document a script wrote into the frame wins over the element's
+    own attributes: `f.contentDocument.write(html)` replaces whatever
+    `src` said, exactly as it does in a real browser."""
+    ridx = getattr(node, "_ridx", None)
+    if written and ridx is not None and ridx in written:
+        return ("written", written[ridx], node.attributes.get("sandbox"))
     if "srcdoc" in node.attributes:
         return ("srcdoc", node.attributes.get("srcdoc", ""),
                 node.attributes.get("sandbox"))
@@ -606,6 +613,10 @@ class FrameManager:
         self.on_navigate = on_navigate
         self.path_prefix = tuple(path_prefix)
         self.frames = {}
+        # iframe node index -> markup a script wrote into it with
+        # contentDocument.write(). Sticky: the frame keeps showing it
+        # until another write replaces it.
+        self.written = {}
 
     # -- discovery ------------------------------------------------------
 
@@ -619,11 +630,12 @@ class FrameManager:
         Returns True when any frame content changed."""
         if self.top_url is None:
             self.top_url = page_url
+        self._drain_document_writes()
         changed = False
         seen = {}
         for node in self._iframe_nodes(root):
             key = _frame_key(node)
-            want = _source_key(node)
+            want = _source_key(node, self.written)
             fd = self.frames.get(key)
             if fd is not None and fd.source_key != want:
                 fd.dispose()
@@ -644,10 +656,15 @@ class FrameManager:
                 fd.contexts = self.contexts
                 fd.parent_token = self.parent_token
                 self.budget[0] -= 1
-                srcdoc = node.attributes.get("srcdoc") \
-                    if "srcdoc" in node.attributes else None
-                ok = fd.load(node.attributes.get("src"), srcdoc,
-                             page_url, cancel_token=cancel_token)
+                if want[0] == "written":
+                    src, srcdoc = None, want[1]
+                elif "srcdoc" in node.attributes:
+                    src = node.attributes.get("src")
+                    srcdoc = node.attributes.get("srcdoc")
+                else:
+                    src, srcdoc = node.attributes.get("src"), None
+                ok = fd.load(src, srcdoc, page_url,
+                             cancel_token=cancel_token)
                 changed = True
                 self.frames[key] = fd
                 # contentWindow must resolve before `load` fires: the
@@ -668,6 +685,19 @@ class FrameManager:
         self.frames = seen
         self.publish_frames(root, page_url)
         return changed
+
+    def _drain_document_writes(self):
+        """Collect `contentDocument.write()` markup from the owning
+        document. The VM has no child arena, so it buffers the markup
+        and the frame machinery here turns it into a real document."""
+        if self.session is None:
+            return
+        try:
+            writes = self.session.take_document_writes()
+        except Exception:
+            return           # older wheel without the seam
+        for node_idx, html in writes or []:
+            self.written[int(node_idx)] = html
 
     def publish_frames(self, root, owner_url):
         """Tell the owning document which of its <iframe> elements map
