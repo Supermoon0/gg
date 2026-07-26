@@ -4076,6 +4076,28 @@ fn primitive_prop_read(st: &mut St, recv: Value, key: u32) -> Value {
     Value::UNDEFINED
 }
 
+/// A function's own enumerable property names, in a stable order.
+///
+/// Statics live in the `fn_props` side table, which `Object.keys` and
+/// `for-in` used to skip entirely -- so a function carrying data
+/// enumerated as empty. webpack's chunk gate is
+/// `Object.keys(__webpack_require__.O).every(check)`, and an empty key
+/// list makes `every` vacuously true: every entry module starts before
+/// the chunks it needs are registered, and the page dies on
+/// `__webpack_modules__[id].call` of undefined. `prototype` is left
+/// out on purpose -- it is non-enumerable.
+fn fn_own_enumerable_keys(st: &St, fidx: u32) -> Vec<u32> {
+    let mut keys: Vec<u32> = st
+        .fn_props
+        .keys()
+        .filter(|&&(f, _)| f == fidx)
+        .map(|&(_, k)| k)
+        .filter(|k| !st.non_enum.contains(&(fidx, *k)))
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
 /// Object.prototype.toString brand of a value ("[object Array]" ...).
 fn brand_string(st: &St, v: Value) -> String {
     let mut v = v;
@@ -6914,6 +6936,21 @@ fn host_fn(
                     }
                     let value = internal_get(st, mods, v, key, v)?;
                     out.push(host_entry(st, id, key_value, value));
+                }
+                return Ok(new_array(st, out));
+            }
+            if v.is_function() {
+                let fidx = v.index();
+                let mut out = Vec::new();
+                for k in fn_own_enumerable_keys(st, fidx) {
+                    let name = st.names[k as usize].clone();
+                    let key = intern(st, &name);
+                    let val = st
+                        .fn_props
+                        .get(&(fidx, k))
+                        .copied()
+                        .unwrap_or(Value::UNDEFINED);
+                    out.push(host_entry(st, id, key, val));
                 }
                 return Ok(new_array(st, out));
             }
@@ -10016,7 +10053,23 @@ fn throw_msg(st: &mut St, v: Value) -> String {
         {
             let n = to_display(st, n);
             let m = to_display(st, m);
-            return format!("uncaught {n}: {m}");
+            // An uncaught error in a third-party bundle is the one
+            // report anyone gets; without the frames it names nothing
+            // anybody can act on.
+            let stack_id = st.intern_name("stack");
+            let frames = match raw_get_prop(st, oi, stack_id) {
+                Some(sv) if sv.is_string() => {
+                    let text = to_display(st, sv);
+                    match text.split_once('\n') {
+                        Some((_, rest)) if !rest.trim().is_empty() => {
+                            format!("\n{rest}")
+                        }
+                        _ => String::new(),
+                    }
+                }
+                _ => String::new(),
+            };
+            return format!("uncaught {n}: {m}{frames}");
         }
     }
     let d = to_display(st, v);
@@ -12536,6 +12589,12 @@ fn exec_loop(
                     // string keys (skips enumerable:false props)
                     for atom in own_keys_ordered(st, oi, true) {
                         let name = st.names[atom as usize].clone();
+                        let sv = intern(st, &name);
+                        keys.push(sv);
+                    }
+                } else if ov.is_function() {
+                    for k in fn_own_enumerable_keys(st, ov.index()) {
+                        let name = st.names[k as usize].clone();
                         let sv = intern(st, &name);
                         keys.push(sv);
                     }

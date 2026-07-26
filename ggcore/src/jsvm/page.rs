@@ -74,6 +74,12 @@ Promise.race = function (arr) {
 // Error hierarchy in JS itself — real prototype chains (07-12) make
 // `new TypeError(m) instanceof Error` just work.
 function Error(m, o) {
+  // `Error(m)` without `new` is legal and webpack's chunk loader does
+  // exactly that (`var u = Error()`), with no receiver at all. It has
+  // to build an error rather than write to nothing.
+  if (this === undefined || this === null || typeof this !== 'object') {
+    return new Error(m, o);
+  }
   if (m !== undefined) this.message = '' + m;
   if (o && typeof o === 'object' && 'cause' in o) this.cause = o.cause;
   // Every minified bundle reports `e.stack` and nothing else when it
@@ -91,16 +97,32 @@ Error.prototype.message = '';
 Error.prototype.toString = function () {
   return this.message ? this.name + ': ' + this.message : this.name;
 };
-function TypeError(m, o) { Error.call(this, m, o); }
+function TypeError(m, o) {
+  if (this === undefined || this === null
+      || typeof this !== 'object') return new TypeError(m, o);
+  Error.call(this, m, o);
+}
 TypeError.prototype = new Error();
 TypeError.prototype.name = 'TypeError';
-function RangeError(m, o) { Error.call(this, m, o); }
+function RangeError(m, o) {
+  if (this === undefined || this === null
+      || typeof this !== 'object') return new RangeError(m, o);
+  Error.call(this, m, o);
+}
 RangeError.prototype = new Error();
 RangeError.prototype.name = 'RangeError';
-function SyntaxError(m, o) { Error.call(this, m, o); }
+function SyntaxError(m, o) {
+  if (this === undefined || this === null
+      || typeof this !== 'object') return new SyntaxError(m, o);
+  Error.call(this, m, o);
+}
 SyntaxError.prototype = new Error();
 SyntaxError.prototype.name = 'SyntaxError';
-function ReferenceError(m, o) { Error.call(this, m, o); }
+function ReferenceError(m, o) {
+  if (this === undefined || this === null
+      || typeof this !== 'object') return new ReferenceError(m, o);
+  Error.call(this, m, o);
+}
 ReferenceError.prototype = new Error();
 ReferenceError.prototype.name = 'ReferenceError';
 // Symbol: a string-based stand-in. Unique enough for property keys and
@@ -6897,6 +6919,72 @@ console.log('B typeof it: ' + typeof it);
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn a_function_enumerates_its_own_properties() {
+        // Statics live in a side table that Object.keys and for-in
+        // skipped, so a function carrying data enumerated as empty.
+        // webpack gates every entry module on
+        // `Object.keys(__webpack_require__.O).every(check)`, and an
+        // empty key list makes `every` vacuously true -- entry modules
+        // start before their chunks are registered and the page dies
+        // on `__webpack_modules__[id].call` of undefined. That is what
+        // left naver's shopping boxes empty.
+        let mut vm = PageVm::new(None);
+        assert_eq!(
+            vm.run_scripts(&["function O() {}\
+                O.j = function (id) { return id === 'ready'; };\
+                O.k = 7;\
+                console.log(Object.keys(O).sort().join(','));\
+                console.log(Object.values(O).length,\
+                            Object.entries(O).length);\
+                var ks = []; for (var k in O) ks.push(k);\
+                console.log(ks.sort().join(','));\
+                console.log(Object.keys(O).every(function (n) {\
+                    return n === 'j' || n === 'k'; }));\
+                function bare() {}\
+                console.log(Object.keys(bare).length,\
+                            'prototype' in bare);\
+                var gate = function () {};\
+                gate.a = function (id) { return id === 1; };\
+                console.log(Object.keys(gate).every(\
+                    function (n) { return gate[n](2); }));"
+                .to_string()]),
+            vec![
+                "j,k".to_string(),
+                "2 2".to_string(),
+                "j,k".to_string(),
+                "true".to_string(),
+                // `prototype` exists but is not enumerable
+                "0 true".to_string(),
+                // the gate now actually runs its check
+                "false".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn error_called_without_new_still_builds_an_error() {
+        // `Error(m)` as a plain call is legal, and webpack's chunk
+        // loader does exactly that (`var u = Error()`), with no
+        // receiver -- so the constructor must not assume `this`.
+        let mut vm = PageVm::new(None);
+        assert_eq!(
+            vm.run_scripts(&["var e = Error('boom');\
+                console.log(e instanceof Error, e.message);\
+                console.log(typeof Error().stack);\
+                var f = Error;\
+                console.log(f('x').message);\
+                console.log(TypeError('t').message);"
+                .to_string()]),
+            vec![
+                "true boom".to_string(),
+                "string".to_string(),
+                "x".to_string(),
+                "t".to_string(),
+            ],
         );
     }
 
