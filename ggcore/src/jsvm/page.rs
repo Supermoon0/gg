@@ -7355,6 +7355,31 @@ console.log('B typeof it: ' + typeof it);
     }
 
     #[test]
+    fn building_a_string_by_appending_is_charged_once_not_squared() {
+        // The heap backstop measures retained bytes. A rope Cat node
+        // retains ~32 bytes, but concat used to charge the combined
+        // length per node, billing an appended string as the sum of
+        // every prefix -- O(n^2) phantom bytes. 200 x 4KB appends is
+        // ~800KB of real text; the old accounting called it ~82MB and
+        // pages died of "string heap exhausted" depending on which ad
+        // script built a payload this way.
+        let mut vm = PageVm::new(None);
+        assert_eq!(
+            vm.run_scripts(&["var chunk = 'x'.repeat(4096);\
+                var s = '';\
+                for (var i = 0; i < 200; i++) s = s + chunk;\
+                console.log(s.length, s.indexOf('y'));"
+                .to_string()]),
+            vec!["819200 -1".to_string()],
+        );
+        let used = vm.heap_bytes();
+        assert!(
+            used < 8 * 1024 * 1024,
+            "heap accounting ballooned: {used} bytes for ~800KB of text",
+        );
+    }
+
+    #[test]
     fn a_missing_argument_is_undefined_even_with_arguments() {
         // A function that reads `arguments` keeps the args past its
         // parameter list -- but blanking the activation from

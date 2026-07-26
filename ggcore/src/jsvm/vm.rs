@@ -2327,6 +2327,9 @@ fn flatten(st: &mut St, i: u32) {
             }
         }
     }
+    // this buffer is the rope's bytes becoming real -- the node itself
+    // was charged at concat, the text is charged exactly once, here
+    st.heap_bytes = st.heap_bytes.saturating_add(out.len());
     st.strs[i as usize] = Str::Flat(out);
 }
 
@@ -5579,6 +5582,7 @@ fn to_str_idx(st: &mut St, v: Value) -> u32 {
         return v.index();
     }
     let s = to_display(st, v);
+    st.heap_bytes = st.heap_bytes.saturating_add(s.len() + 16);
     st.strs.push(Str::Flat(s));
     (st.strs.len() - 1) as u32
 }
@@ -5591,13 +5595,24 @@ fn concat(st: &mut St, x: Value, y: Value) -> Result<Value, VmError> {
         return range_err("Invalid string length");
     }
     // small results stay flat: rope nodes only pay off on big strings
-    st.heap_bytes = st.heap_bytes.saturating_add(len + 16);
     if len <= 64 {
+        st.heap_bytes = st.heap_bytes.saturating_add(len + 16);
         let sa = str_ref(st, a).to_string();
         let sb = str_ref(st, b);
         let s = format!("{sa}{sb}");
         st.strs.push(Str::Flat(s));
     } else {
+        // A Cat retains only its own node: the leaves were charged
+        // when they were made, and the combined text is charged
+        // if/when the rope flattens. Charging `len` per node here
+        // billed a string built by appending as the *sum of every
+        // prefix* -- O(n^2) phantom bytes -- so whether naver hit the
+        // backstop depended on which ad creative's script happened to
+        // build its payload that way. Retained size, not allocation
+        // traffic, is what the backstop is documented to measure.
+        st.heap_bytes = st
+            .heap_bytes
+            .saturating_add(std::mem::size_of::<Str>() + 8);
         st.strs.push(Str::Cat { a, b, len: len as u32 });
     }
     Ok(Value::string((st.strs.len() - 1) as u32))
