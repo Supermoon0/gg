@@ -1797,6 +1797,17 @@ fn new_response(
 
 /// Drain the microtask queue to empty, running each reaction/callback.
 /// Callback errors reject the derived promise (never escape the pump).
+/// Drain the microtask queue without collecting the fetches it
+/// issued -- those stay queued for the next real pump. Used to run a
+/// script's microtask checkpoint while it is still the current script.
+pub(super) fn drain_microtasks_now(
+    st: &mut St, mods: &ModStore, budget_max: usize,
+) {
+    let mut budget = budget_max;
+    drain_microtasks(st, mods, &mut budget);
+    report_unhandled_rejections(st);
+}
+
 fn drain_microtasks(st: &mut St, mods: &ModStore, budget: &mut usize) {
     while let Some(job) = st.microtasks.pop_front() {
         if *budget == 0 {
@@ -3149,6 +3160,116 @@ fn method_ref_dispatch(
         v as usize
     };
     match name.as_str() {
+        // The plain string transforms, reached through the extracted
+        // form (`var f = "".toLowerCase; f.call(s)` -- core-js's
+        // uncurryThis does this to every String.prototype method, and
+        // bundles then call them everywhere).
+        "toLowerCase" | "toLocaleLowerCase" => {
+            Ok(make_string(st, s.to_lowercase()))
+        }
+        "toUpperCase" | "toLocaleUpperCase" => {
+            Ok(make_string(st, s.to_uppercase()))
+        }
+        "trim" => Ok(make_string(st, s.trim().to_string())),
+        "trimStart" | "trimLeft" => {
+            Ok(make_string(st, s.trim_start().to_string()))
+        }
+        "trimEnd" | "trimRight" => {
+            Ok(make_string(st, s.trim_end().to_string()))
+        }
+        "startsWith" => {
+            let needle = args
+                .first()
+                .map(|&v| to_display(st, v))
+                .unwrap_or_default();
+            let from = clamp(idx_arg(1), len);
+            let rest = String::from_utf16_lossy(&units[from.min(units.len())..]);
+            Ok(Value::boolean(rest.starts_with(&needle)))
+        }
+        "endsWith" => {
+            let needle = args
+                .first()
+                .map(|&v| to_display(st, v))
+                .unwrap_or_default();
+            let end = if args.len() > 1 {
+                clamp(idx_arg(1), len)
+            } else {
+                units.len()
+            };
+            let head = String::from_utf16_lossy(&units[..end.min(units.len())]);
+            Ok(Value::boolean(head.ends_with(&needle)))
+        }
+        "includes" => {
+            let needle = args
+                .first()
+                .map(|&v| to_display(st, v))
+                .unwrap_or_default();
+            Ok(Value::boolean(s.contains(&needle)))
+        }
+        "lastIndexOf" => {
+            let needle = args
+                .first()
+                .map(|&v| to_display(st, v))
+                .unwrap_or_default();
+            let nu: Vec<u16> = needle.encode_utf16().collect();
+            let mut found: f64 = -1.0;
+            if nu.len() <= units.len() {
+                for i in 0..=(units.len() - nu.len()) {
+                    if units[i..i + nu.len()] == nu[..] {
+                        found = i as f64;
+                    }
+                }
+            }
+            Ok(Value::number(found))
+        }
+        "substring" | "substr" => {
+            let a = clamp(idx_arg(0), len);
+            let b = if args.len() > 1 {
+                if name == "substr" {
+                    (a + clamp(idx_arg(1), len)).min(units.len())
+                } else {
+                    clamp(idx_arg(1), len)
+                }
+            } else {
+                units.len()
+            };
+            let (a, b) = if a <= b { (a, b) } else { (b, a) };
+            Ok(make_string(
+                st,
+                String::from_utf16_lossy(&units[a.min(units.len())..b.min(units.len())]),
+            ))
+        }
+        "padStart" | "padEnd" => {
+            let want = idx_arg(0);
+            let want = if want.is_nan() { 0.0 } else { want } as usize;
+            let fill = if args.len() > 1 {
+                to_display(st, args[1])
+            } else {
+                " ".to_string()
+            };
+            let mut out = s.clone();
+            if fill.is_empty() || units.len() >= want {
+                return Ok(make_string(st, out));
+            }
+            let mut pad = String::new();
+            while pad.encode_utf16().count() + units.len() < want {
+                pad.push_str(&fill);
+            }
+            let keep = want - units.len();
+            let pu: Vec<u16> = pad.encode_utf16().collect();
+            let pad = String::from_utf16_lossy(&pu[..keep.min(pu.len())]);
+            if name == "padStart" {
+                out = pad + &out;
+            } else {
+                out.push_str(&pad);
+            }
+            Ok(make_string(st, out))
+        }
+        "repeat" => {
+            let n = idx_arg(0);
+            let n = if n.is_nan() || n < 0.0 { 0.0 } else { n } as usize;
+            Ok(make_string(st, s.repeat(n.min(10_000))))
+        }
         "concat" => {
             // String.prototype.concat: recv then each arg coerced to
             // string. Reached via the extracted form (`"".concat.call(s,
@@ -5197,6 +5318,41 @@ fn internal_prevent_extensions(
 /// `x instanceof Ctor` — built-ins matched by constructor identity.
 /// User functions yield false: `new` is lowered to a plain object +
 /// `Ctor.call`, so instances carry no link back to their constructor.
+/// The IDL interfaces a node answers `instanceof` for, most specific
+/// first. Not the whole platform -- the ones code actually tests.
+fn dom_interface_chain(tag: &str) -> Vec<&'static str> {
+    let specific = match tag {
+        "script" => Some("HTMLScriptElement"),
+        "div" => Some("HTMLDivElement"),
+        "a" => Some("HTMLAnchorElement"),
+        "img" => Some("HTMLImageElement"),
+        "input" => Some("HTMLInputElement"),
+        "form" => Some("HTMLFormElement"),
+        "iframe" => Some("HTMLIFrameElement"),
+        "link" => Some("HTMLLinkElement"),
+        "style" => Some("HTMLStyleElement"),
+        "canvas" => Some("HTMLCanvasElement"),
+        "template" => Some("HTMLTemplateElement"),
+        "textarea" => Some("HTMLTextAreaElement"),
+        "select" => Some("HTMLSelectElement"),
+        "option" => Some("HTMLOptionElement"),
+        "button" => Some("HTMLButtonElement"),
+        "video" => Some("HTMLVideoElement"),
+        "audio" => Some("HTMLAudioElement"),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(6);
+    if tag == "#document" {
+        out.extend_from_slice(&["Document", "Node", "EventTarget"]);
+        return out;
+    }
+    if let Some(s) = specific {
+        out.push(s);
+    }
+    out.extend_from_slice(&["HTMLElement", "Element", "Node", "EventTarget"]);
+    out
+}
+
 fn instance_of(st: &St, x: Value, ctor: Value) -> Result<bool, VmError> {
     let mut ctor = ctor;
     for _ in 0..16 {
@@ -5227,6 +5383,32 @@ fn instance_of(st: &St, x: Value, ctor: Value) -> Result<bool, VmError> {
     }
     if ctor == k.string || ctor == k.number || ctor == k.boolean {
         return Ok(false); // primitives are never instances
+    }
+    if x.is_dom_node() && ctor.is_function() {
+        // DOM nodes are not JS objects here, so they have no prototype
+        // chain to walk -- but `el instanceof HTMLScriptElement` is a
+        // real check real code makes (Next.js refuses to start without
+        // it). Answer from the node's own interface chain.
+        let tag = if x.index() == DOC_NODE {
+            "#document".to_string()
+        } else {
+            st.doc
+                .as_ref()
+                .map(|d| {
+                    d.borrow().nodes[x.index() as usize]
+                        .tag
+                        .clone()
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default()
+        };
+        for iface in dom_interface_chain(&tag) {
+            let Some(&id) = st.name_ids.get(iface) else { continue };
+            if st.globals.get(id as usize) == Some(&ctor) {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
     }
     if ctor.is_function() {
         // walk x's prototype chain looking for ctor.prototype

@@ -2225,7 +2225,19 @@ impl PageVm {
                 self.st.logs.push(format!("[gg-js error] {e}"));
             }
         }
-        std::mem::take(&mut self.st.logs)
+        // HTML runs the microtask checkpoint inside "clean up after
+        // running script", *before* `document.currentScript` is
+        // restored -- so a promise continuation queued by a script
+        // still sees it. Next.js's asset-prefix lookup depends on
+        // exactly that, and draining only in the later pump made
+        // currentScript null there.
+        //
+        // What those continuations log stays queued for the pump, so
+        // the caller still sees script output and scheduled output as
+        // two separate batches.
+        let out = std::mem::take(&mut self.st.logs);
+        vm::drain_microtasks_now(&mut self.st, &self.mods, PUMP_BUDGET);
+        out
     }
 
     /// Bubble a click from a node to the root: run onclick attributes
@@ -7165,6 +7177,43 @@ console.log('B typeof it: ' + typeof it);
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn extracted_string_builtins_cover_the_plain_transforms() {
+        // core-js uncurries every String.prototype method
+        // (`var f = "".toLowerCase; f.call(s)`) and bundles then call
+        // them everywhere; anything missing from this path threw
+        // "extracted builtin ... is not supported yet" mid-render.
+        let mut vm = PageVm::new(None);
+        assert_eq!(
+            vm.run_scripts(&["var u = function (m) { return m.call; };\
+                var s = '  MiXeD  ';\
+                var lower = ''.toLowerCase, upper = ''.toUpperCase;\
+                var trim = ''.trim;\
+                console.log(lower.call(s) + '|' + upper.call(s));\
+                console.log('[' + trim.call(s) + ']');\
+                console.log(''.trimStart.call(s) + '|' + ''.trimEnd.call(s));\
+                console.log(''.startsWith.call('abcdef', 'cd', 2),\
+                            ''.endsWith.call('abcdef', 'cd', 4),\
+                            ''.includes.call('abcdef', 'cde'));\
+                console.log(''.lastIndexOf.call('abcabc', 'b'));\
+                console.log(''.substring.call('abcdef', 4, 1),\
+                            ''.substr.call('abcdef', 1, 2));\
+                console.log(''.padStart.call('7', 3, '0'),\
+                            ''.padEnd.call('7', 3, '.'),\
+                            ''.repeat.call('ab', 3));"
+                .to_string()]),
+            vec![
+                "  mixed  |  MIXED  ".to_string(),
+                "[MiXeD]".to_string(),
+                "MiXeD  |  MiXeD".to_string(),
+                "true true true".to_string(),
+                "4".to_string(),
+                "bcd bc".to_string(),
+                "007 7.. ababab".to_string(),
+            ],
         );
     }
 
