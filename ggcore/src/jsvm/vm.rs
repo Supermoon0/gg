@@ -8983,11 +8983,15 @@ fn dom_method(
             return Ok(Value::dom_node(node));
         }
     }
-    // shared by document and elements: descendant collection by tag
-    // or class (jQuery fast paths)
+    // shared by document and elements: descendant collection by tag,
+    // class (jQuery fast paths) or name (React 19 dedupes hoistable
+    // resources through document.getElementsByName)
     {
         let by_tag = st.names[key as usize] == "getElementsByTagName";
-        if by_tag || st.names[key as usize] == "getElementsByClassName"
+        let by_name = st.names[key as usize] == "getElementsByName";
+        if by_tag
+            || by_name
+            || st.names[key as usize] == "getElementsByClassName"
         {
             let needle = arg_string(st, args_base, argc, 0)?;
             let tag = needle.to_ascii_lowercase();
@@ -9011,6 +9015,9 @@ fn dom_method(
                 let hit = if by_tag {
                     (tag == "*" && d.nodes[i].is_element())
                         || d.nodes[i].tag.as_deref() == Some(tag.as_str())
+                } else if by_name {
+                    // name matches case-sensitively, per spec
+                    d.nodes[i].attr("name") == Some(needle.as_str())
                 } else {
                     d.nodes[i]
                         .attr("class")
@@ -9444,6 +9451,22 @@ fn dom_method(
         "hasAttributes" => {
             let any = !doc.borrow().nodes[node as usize].attrs.is_empty();
             return Ok(Value::boolean(any));
+        }
+        // Shadow-less shadow DOM: the "root" is the host element
+        // itself, so whatever the component mounts lands in the light
+        // tree and renders. Style scoping is lost -- acceptable
+        // degradation next to not rendering at all (recoshopping's
+        // design-system web component died here mid-hydration).
+        "attachShadow" => {
+            let host = Value::dom_node(node);
+            let hk = st.intern_name("host");
+            st.dom_expando.insert((node, hk), host);
+            let mk = st.intern_name("mode");
+            let mv = push_str(st, "open".to_string());
+            st.dom_expando.insert((node, mk), mv);
+            let sk = st.intern_name("shadowRoot");
+            st.dom_expando.insert((node, sk), host);
+            return Ok(host);
         }
         "contains" => {
             let other = st.regs[args_base];
@@ -10028,6 +10051,7 @@ fn is_doc_only_method(name: &str) -> bool {
             | "createComment"
             | "createDocumentFragment"
             | "getElementById"
+            | "getElementsByName"
     )
 }
 
@@ -10052,6 +10076,7 @@ fn is_dom_method_name(name: &str) -> bool {
             | "querySelectorAll"
             | "getElementsByTagName"
             | "getElementsByClassName"
+            | "getElementsByName"
             | "getAttribute"
             | "setAttribute"
             | "setAttributeNS"
@@ -10063,6 +10088,7 @@ fn is_dom_method_name(name: &str) -> bool {
             | "cloneNode"
             | "contains"
             | "getRootNode"
+            | "attachShadow"
             | "getAttributeNode"
             | "removeAttributeNode"
             | "hasAttributes"

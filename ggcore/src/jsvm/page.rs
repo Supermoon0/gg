@@ -279,6 +279,31 @@ function __ggFlushResizeObservers() {
     if (entries.length) { try { o._cb(entries, o); } catch (e) {} }
   }
 }
+// Enough WebCrypto for the id-minting libraries (uuid v4 checks for
+// getRandomValues and refuses to run without it). Not cryptographic
+// -- nothing rendered depends on that, only on the call existing.
+var crypto = {
+  getRandomValues: function (arr) {
+    if (!arr || typeof arr.length !== 'number') {
+      throw new TypeError('crypto.getRandomValues: not an array view');
+    }
+    for (var i = 0; i < arr.length; i++) {
+      arr[i] = (Math.random() * 256) | 0;
+    }
+    return arr;
+  },
+  randomUUID: function () {
+    var h = '0123456789abcdef', out = '';
+    for (var i = 0; i < 36; i++) {
+      if (i === 8 || i === 13 || i === 18 || i === 23) { out += '-'; }
+      else if (i === 14) { out += '4'; }
+      else if (i === 19) { out += h[(Math.random() * 4 | 0) + 8]; }
+      else { out += h[Math.random() * 16 | 0]; }
+    }
+    return out;
+  },
+  subtle: undefined
+};
 function matchMedia(q) {
   return { matches: false, media: '' + q,
     onchange: null,
@@ -7352,6 +7377,64 @@ console.log('B typeof it: ' + typeof it);
             vm.run_scripts(&["console.log(log.join('|'));".to_string()]),
             vec!["300x40|300x90".to_string()],
         );
+    }
+
+    #[test]
+    fn get_elements_by_name_answers_on_the_document() {
+        // React 19 dedupes hoistable resources through
+        // document.getElementsByName; recoshopping's hydration died on
+        // the missing method before it could commit anything.
+        let doc = Rc::new(RefCell::new(crate::html::parse(
+            "<form name=f1></form><input name=q><meta name=q>",
+        )));
+        let mut vm = PageVm::new(Some(doc));
+        assert_eq!(
+            vm.run_scripts(&["var q = document.getElementsByName('q');\
+                console.log(q.length, q[0].tagName, q[1].tagName,\
+                            document.getElementsByName('f1').length,\
+                            document.getElementsByName('zz').length,\
+                            typeof document.body.getElementsByName);"
+                .to_string()]),
+            vec!["2 INPUT META 1 0 undefined".to_string()],
+        );
+    }
+
+    #[test]
+    fn attach_shadow_degrades_to_the_light_tree() {
+        // No shadow DOM here: the returned "root" is the host itself,
+        // so a web component's content mounts where it can render.
+        let doc = Rc::new(RefCell::new(crate::html::parse(
+            "<div id=host></div>",
+        )));
+        let mut vm = PageVm::new(Some(doc));
+        assert_eq!(
+            vm.run_scripts(&["var el = document.getElementById('host');\
+                var root = el.attachShadow({ mode: 'open' });\
+                var p = document.createElement('p');\
+                p.id = 'inner';\
+                root.appendChild(p);\
+                console.log(root === el, el.shadowRoot === root,\
+                            root.host === el,\
+                            document.getElementById('inner') !== null,\
+                            el.children.length);"
+                .to_string()]),
+            vec!["true true true true 1".to_string()],
+        );
+    }
+
+    #[test]
+    fn crypto_mints_random_bytes_and_uuids() {
+        // uuid v4 refuses to run without crypto.getRandomValues; the
+        // shopping modules mint ids through it during hydration.
+        let mut vm = PageVm::new(None);
+        let out = vm.run_scripts(&["var a = new Uint8Array(16);\
+            var r = crypto.getRandomValues(a);\
+            var u = crypto.randomUUID();\
+            console.log(r === a, a.length,\
+                        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab]\
+[0-9a-f]{3}-[0-9a-f]{12}$/.test(u));"
+            .to_string()]);
+        assert_eq!(out, vec!["true 16 true".to_string()]);
     }
 
     #[test]
