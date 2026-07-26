@@ -64,6 +64,7 @@ pub fn compile_lazy(src: &LazySrc) -> Result<Module, CompileError> {
         let body = super::parser::parse_lazy_body(lz)
             .map_err(|e| CompileError { msg: format!("{e:?}") })?;
         Rc::new(FuncLit {
+            display_name: src.lit.display_name.clone(),
             name: src.lit.name.clone(),
             params: src.lit.params.clone(),
             body,
@@ -841,7 +842,7 @@ fn lower_new_expr(e: &mut Expr, n: &mut usize) {
         }),
         Stmt::Return(Some(Expr::Ident(o))),
     ];
-    let iife = Expr::Func(Rc::new(FuncLit {
+    let iife = Expr::Func(Rc::new(FuncLit { display_name: None,
         name: None, params: Vec::new(), body, is_async: false,
         lazy_body: None,
     }));
@@ -955,9 +956,36 @@ fn ast_call(callee: Expr, args: Vec<Expr>) -> Expr {
 }
 fn ast_arrow(params: Vec<String>, body: Vec<Stmt>) -> Expr {
     Expr::Arrow(Rc::new(FuncLit {
+        display_name: async_fn_name(),
         name: None, params, body, is_async: false,
         lazy_body: None,
     }))
+}
+
+thread_local! {
+    /// Name `desugar_async` gives the continuation arrows it
+    /// synthesizes. An `await` splits its function into `.then(...)`
+    /// callbacks, so without this every frame of a stack trace through
+    /// post-await code -- which in a modern bundle is most of it --
+    /// reads `<anon>`.
+    static ASYNC_FN_NAME: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+}
+
+fn async_fn_name() -> Option<String> {
+    ASYNC_FN_NAME.with(|c| {
+        let n = c.borrow();
+        if n.is_empty() { None } else { Some(n.clone()) }
+    })
+}
+
+/// Run `f` with the continuation name set, restoring the previous one
+/// (a nested async literal desugars inside its parent's pass).
+fn with_async_fn_name<T>(name: &str, f: impl FnOnce() -> T) -> T {
+    let prev = ASYNC_FN_NAME.with(|c| c.replace(name.to_string()));
+    let out = f();
+    ASYNC_FN_NAME.with(|c| *c.borrow_mut() = prev);
+    out
 }
 
 // --- await normalization ------------------------------------------------
@@ -1051,6 +1079,77 @@ fn stmt_has_await(s: &Stmt) -> bool {
     }
 }
 
+/// Evaluation order across siblings. Hoisting an await out of one
+/// operand lifts it *above* the operands to its left, so those have to
+/// be spilled into temps too or they run after it. The minified shape
+/// `this.x = new T(...), await this.x.load()` -- what every transpiled
+/// `this.x = new T(); await this.x.load()` compiles to -- ran the
+/// await first and blew up on `undefined.load()`.
+fn hoist_ordered(
+    items: Vec<Expr>,
+    pre: &mut Vec<Stmt>,
+    n: &mut usize,
+) -> Vec<Expr> {
+    let awaits: Vec<bool> = items.iter().map(expr_has_await).collect();
+    let mut out = Vec::with_capacity(items.len());
+    for (i, e) in items.into_iter().enumerate() {
+        let pinned = awaits[i + 1..].iter().any(|&b| b);
+        let e = hoist_expr(e, pre, n);
+        out.push(if pinned && !order_free(&e) {
+            spill_temp(e, pre, n)
+        } else {
+            e
+        });
+    }
+    out
+}
+
+/// Re-evaluating this later observes nothing: no calls, no assignments,
+/// no property reads (a getter is a call).
+fn order_free(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null
+            | Expr::This | Expr::Ident(_) | Expr::Regex { .. }
+            | Expr::Func(_) | Expr::Arrow(_)
+    )
+}
+
+/// Pin a callee ahead of an awaited argument without losing the
+/// receiver: spilling `obj.m` whole would turn `obj.m(await x)` into an
+/// unbound call, so only the object (and a computed key) move.
+fn hoist_callee(c: Expr, pre: &mut Vec<Stmt>, n: &mut usize) -> Expr {
+    let c = hoist_expr(c, pre, n);
+    match c {
+        Expr::Member { obj, prop, optional } => {
+            let obj = if order_free(&obj) {
+                *obj
+            } else {
+                spill_temp(*obj, pre, n)
+            };
+            let prop = match prop {
+                MemberProp::Computed(k) if !order_free(&k) => {
+                    MemberProp::Computed(Box::new(spill_temp(*k, pre, n)))
+                }
+                p => p,
+            };
+            Expr::Member { obj: Box::new(obj), prop, optional }
+        }
+        other if order_free(&other) => other,
+        other => spill_temp(other, pre, n),
+    }
+}
+
+fn spill_temp(e: Expr, pre: &mut Vec<Stmt>, n: &mut usize) -> Expr {
+    *n += 1;
+    let name = format!("__ord{n}");
+    pre.push(Stmt::VarDecl {
+        kind: DeclKind::Var,
+        decls: vec![(name.clone(), Some(e))],
+    });
+    Expr::Ident(name)
+}
+
 /// Rewrite `e`, hoisting every await into `pre` as
 /// `var __awN = await X;` (evaluation order), leaving temp reads.
 fn hoist_expr(e: Expr, pre: &mut Vec<Stmt>, n: &mut usize) -> Expr {
@@ -1080,8 +1179,9 @@ fn hoist_expr(e: Expr, pre: &mut Vec<Stmt>, n: &mut usize) -> Expr {
             target: Box::new(hoist_expr(*target, pre, n)),
         },
         Expr::Binary(op, a, b) => {
-            let a = hoist_expr(*a, pre, n);
-            let b = hoist_expr(*b, pre, n);
+            let mut both = hoist_ordered(vec![*a, *b], pre, n).into_iter();
+            let a = both.next().unwrap();
+            let b = both.next().unwrap();
             Expr::Binary(op, Box::new(a), Box::new(b))
         }
         Expr::Logical(op, a, b) => {
@@ -1110,27 +1210,31 @@ fn hoist_expr(e: Expr, pre: &mut Vec<Stmt>, n: &mut usize) -> Expr {
             },
             optional,
         },
-        Expr::Call { callee, args, optional } => Expr::Call {
-            callee: Box::new(hoist_expr(*callee, pre, n)),
-            args: args
-                .into_iter()
-                .map(|a| hoist_expr(a, pre, n))
-                .collect(),
-            optional,
-        },
-        Expr::New { callee, args } => Expr::New {
-            callee: Box::new(hoist_expr(*callee, pre, n)),
-            args: args
-                .into_iter()
-                .map(|a| hoist_expr(a, pre, n))
-                .collect(),
-        },
-        Expr::Array(v) => Expr::Array(
-            v.into_iter().map(|a| hoist_expr(a, pre, n)).collect(),
-        ),
-        Expr::Seq(v) => Expr::Seq(
-            v.into_iter().map(|a| hoist_expr(a, pre, n)).collect(),
-        ),
+        Expr::Call { callee, args, optional } => {
+            let callee = if args.iter().any(expr_has_await) {
+                hoist_callee(*callee, pre, n)
+            } else {
+                hoist_expr(*callee, pre, n)
+            };
+            Expr::Call {
+                callee: Box::new(callee),
+                args: hoist_ordered(args, pre, n),
+                optional,
+            }
+        }
+        Expr::New { callee, args } => {
+            let callee = if args.iter().any(expr_has_await) {
+                hoist_callee(*callee, pre, n)
+            } else {
+                hoist_expr(*callee, pre, n)
+            };
+            Expr::New {
+                callee: Box::new(callee),
+                args: hoist_ordered(args, pre, n),
+            }
+        }
+        Expr::Array(v) => Expr::Array(hoist_ordered(v, pre, n)),
+        Expr::Seq(v) => Expr::Seq(hoist_ordered(v, pre, n)),
         Expr::Object(props) => Expr::Object(
             props
                 .into_iter()
@@ -1681,6 +1785,7 @@ fn chain_async(stmts: &[Stmt], n: &mut usize) -> Vec<Stmt> {
                     // enclosing method's receiver (naver: `for (…) await
                     // this.displayAd(e)`); a regular fn would rebind it
                     Some(Expr::Arrow(Rc::new(FuncLit {
+                        display_name: async_fn_name(),
                         name: None,
                         params: Vec::new(),
                         body: lf,
@@ -1755,6 +1860,7 @@ fn chain_async(stmts: &[Stmt], n: &mut usize) -> Vec<Stmt> {
                     // enclosing method's receiver (naver: `for (…) await
                     // this.displayAd(e)`); a regular fn would rebind it
                     Some(Expr::Arrow(Rc::new(FuncLit {
+                        display_name: async_fn_name(),
                         name: None,
                         params: Vec::new(),
                         body: lf,
@@ -2278,10 +2384,18 @@ impl Compiler {
     ) -> Result<u32, CompileError> {
         // async fn -> a plain fn whose body returns a promise chain
         if lit.is_async {
+            let own = lit
+                .name
+                .clone()
+                .or_else(|| lit.display_name.clone())
+                .unwrap_or_default();
+            let body =
+                with_async_fn_name(&own, || desugar_async(&lit.body));
             let desugared = Rc::new(FuncLit {
+                display_name: lit.display_name.clone(),
                 name: lit.name.clone(),
                 params: lit.params.clone(),
-                body: desugar_async(&lit.body),
+                body,
                 is_async: false,
                 lazy_body: None,
             });
@@ -2311,8 +2425,11 @@ impl Compiler {
         lit: &Rc<FuncLit>,
         is_arrow: bool,
     ) -> Result<u32, CompileError> {
-        let name =
-            lit.name.clone().unwrap_or_else(|| "<anon>".to_string());
+        let name = lit
+            .name
+            .clone()
+            .or_else(|| lit.display_name.clone())
+            .unwrap_or_else(|| "<anon>".to_string());
         let mut free: Vec<String> = free_vars(lit).into_iter().collect();
         free.sort(); // deterministic capture order
         self.fns.push(FnCtx::new(name.clone(),
@@ -2371,7 +2488,11 @@ impl Compiler {
         is_arrow: bool,
         seed: Option<&LazySrc>,
     ) -> Result<u32, CompileError> {
-        let name = lit.name.clone().unwrap_or_else(|| "<anon>".to_string());
+        let name = lit
+            .name
+            .clone()
+            .or_else(|| lit.display_name.clone())
+            .unwrap_or_else(|| "<anon>".to_string());
         let mut f = FnCtx::new(name, lit.params.len() as u8, false);
         f.is_arrow = is_arrow;
         if let Some(sd) = seed {

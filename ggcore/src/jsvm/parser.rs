@@ -54,6 +54,34 @@ fn prop_name_hint(p: &MemberProp) -> Option<String> {
     }
 }
 
+/// NamedEvaluation: an anonymous function expression assigned to a
+/// binding takes that binding's name. Pages observe it directly
+/// (`fn.name`, and React's displayName falls back to it), and without
+/// it every frame of a stack trace through a modern bundle -- where
+/// nearly every function is an arrow or an anonymous method value --
+/// reads `<anon>`.
+///
+/// Only `display_name` is filled: `name` additionally binds the
+/// function to itself inside its own body, which is correct for
+/// `function f() {}` but not for `var f = function () {}`.
+fn name_anon(e: &mut Expr, hint: &str) {
+    if hint.is_empty() {
+        return;
+    }
+    let lit = match e {
+        Expr::Func(l) | Expr::Arrow(l) => l,
+        _ => return,
+    };
+    if lit.name.is_some() || lit.display_name.is_some() {
+        return;
+    }
+    // freshly parsed, so uniquely owned; a shared literal keeps <anon>
+    // rather than being renamed out from under another reference
+    if let Some(l) = Rc::get_mut(lit) {
+        l.display_name = Some(hint.to_string());
+    }
+}
+
 /// Compare two member keys for accessor get/set pairing. Computed keys
 /// never pair (each becomes its own defineProperty).
 fn prop_key_eq(a: &MemberProp, b: &MemberProp) -> bool {
@@ -254,7 +282,7 @@ impl Parser {
             _ => (Vec::new(), Vec::new()),
         };
         Ok(Expr::Call {
-            callee: Box::new(Expr::Func(Rc::new(FuncLit {
+            callee: Box::new(Expr::Func(Rc::new(FuncLit { display_name: None,
                 name: None,
                 params,
                 body,
@@ -405,7 +433,7 @@ impl Parser {
                 full.append(&mut body);
                 body = full;
             }
-            let f = FuncLit {
+            let f = FuncLit { display_name: None,
                 name: prop_name_hint(&key),
                 params,
                 body,
@@ -463,7 +491,7 @@ impl Parser {
             cbody = field_stmts;
         }
         Ok((
-            FuncLit { name, params, body: cbody, is_async: false,
+            FuncLit { display_name: None, name, params, body: cbody, is_async: false,
                       lazy_body: None },
             methods,
             accessors,
@@ -762,7 +790,9 @@ impl Parser {
             } else {
                 let name = self.expect_ident()?;
                 let init = if self.eat_punct(P::Assign) {
-                    Some(self.assign_expr()?)
+                    let mut e = self.assign_expr()?;
+                    name_anon(&mut e, &name);
+                    Some(e)
                 } else {
                     None
                 };
@@ -1285,7 +1315,7 @@ impl Parser {
                         tmp.clone(),
                     ))));
                     return Ok(Expr::Call {
-                        callee: Box::new(Expr::Arrow(Rc::new(FuncLit {
+                        callee: Box::new(Expr::Arrow(Rc::new(FuncLit { display_name: None,
                             name: None,
                             params: vec![tmp],
                             body: stmts,
@@ -1498,7 +1528,7 @@ impl Parser {
             && self.class_super.is_none() && self.at_punct(P::LBrace)
         {
             if let Some(lz) = self.try_lazy_body()? {
-                return Ok(Expr::Arrow(Rc::new(FuncLit {
+                return Ok(Expr::Arrow(Rc::new(FuncLit { display_name: None,
                     name: None,
                     params,
                     body: Vec::new(),
@@ -1521,7 +1551,7 @@ impl Parser {
             full.append(&mut body);
             body = full;
         }
-        Ok(Expr::Arrow(Rc::new(FuncLit {
+        Ok(Expr::Arrow(Rc::new(FuncLit { display_name: None,
             name: None,
             params,
             body,
@@ -1809,7 +1839,7 @@ impl Parser {
                     }
                     // strings = (function(s){ s.raw = s; return s; })([...])
                     let strings = Expr::Call {
-                        callee: Box::new(Expr::Func(Rc::new(FuncLit {
+                        callee: Box::new(Expr::Func(Rc::new(FuncLit { display_name: None,
                             name: None,
                             params: vec!["s".to_string()],
                             body: vec![
@@ -2227,6 +2257,11 @@ impl Parser {
     /// `{` already consumed.
     fn object_lit(&mut self) -> Result<Expr, ParseError> {
         let mut props = Vec::new();
+        // `{ key: "loadAd", value: function () {...} }` is what every
+        // transpiled class method looks like. Naming that function
+        // `value` is technically what NamedEvaluation says, and
+        // useless; carry the sibling `key` over instead.
+        let mut method_key: Option<String> = None;
         // spread segments: `{a, ...b, c}` desugars to
         // Object.assign({}, {a}, b, {c})
         let mut segs: Vec<Expr> = Vec::new();
@@ -2347,10 +2382,18 @@ impl Parser {
                             value: Expr::Func(Rc::new(f)),
                         }
                     } else if self.eat_punct(P::Colon) {
-                        Prop {
-                            key: PropKey::Ident(name),
-                            value: self.assign_expr()?,
+                        let mut v = self.assign_expr()?;
+                        if name == "key" {
+                            if let Expr::Str(k) = &v {
+                                method_key = Some(k.clone());
+                            }
                         }
+                        let hint = match (name.as_str(), &method_key) {
+                            ("value", Some(k)) => k.clone(),
+                            _ => name.clone(),
+                        };
+                        name_anon(&mut v, &hint);
+                        Prop { key: PropKey::Ident(name), value: v }
                     } else if self.eat_punct(P::Assign) {
                         // shorthand default `{ a = 1 }` — meaningful as
                         // a destructuring pattern; as a plain literal it
@@ -2382,10 +2425,9 @@ impl Parser {
                         }
                     } else {
                         self.expect_punct(P::Colon)?;
-                        Prop {
-                            key: PropKey::Str(s),
-                            value: self.assign_expr()?,
-                        }
+                        let mut v = self.assign_expr()?;
+                        name_anon(&mut v, &s);
+                        Prop { key: PropKey::Str(s), value: v }
                     }
                 }
                 Tok::Num(n) => {
@@ -2504,7 +2546,7 @@ impl Parser {
         }
         body.push(Stmt::Return(Some(Expr::Ident(tmp))));
         Ok(Expr::Call {
-            callee: Box::new(Expr::Func(Rc::new(FuncLit {
+            callee: Box::new(Expr::Func(Rc::new(FuncLit { display_name: None,
                 name: None,
                 params: Vec::new(),
                 body,
@@ -2853,7 +2895,7 @@ impl Parser {
                 (done.clone(), Some(Expr::Bool(false))),
             ],
         });
-        out.push(Stmt::FuncDecl(Rc::new(FuncLit {
+        out.push(Stmt::FuncDecl(Rc::new(FuncLit { display_name: None,
             name: Some(step.clone()),
             params: Vec::new(),
             body: vec![Stmt::Switch {
@@ -2863,7 +2905,7 @@ impl Parser {
             is_async: false,
                 lazy_body: None,
         })));
-        let next_fn = FuncLit {
+        let next_fn = FuncLit { display_name: None,
             name: None,
             params: vec!["__v".to_string()],
             body: vec![
@@ -2908,7 +2950,7 @@ impl Parser {
             is_async: false,
                 lazy_body: None,
         };
-        let ret_fn = FuncLit {
+        let ret_fn = FuncLit { display_name: None,
             name: None,
             params: vec!["__v".to_string()],
             body: vec![
@@ -2925,7 +2967,7 @@ impl Parser {
             is_async: false,
                 lazy_body: None,
         };
-        let throw_fn = FuncLit {
+        let throw_fn = FuncLit { display_name: None,
             name: None,
             params: vec!["__e".to_string()],
             body: vec![
@@ -2967,7 +3009,7 @@ impl Parser {
                 prop: MemberProp::Static("@@iterator".to_string()),
                 optional: false,
             }),
-            Box::new(Expr::Func(Rc::new(FuncLit {
+            Box::new(Expr::Func(Rc::new(FuncLit { display_name: None,
                 name: None,
                 params: Vec::new(),
                 body: vec![Stmt::Return(Some(Expr::Ident(it.clone())))],
@@ -3072,7 +3114,7 @@ impl Parser {
             && self.class_super.is_none() && self.at_punct(P::LBrace)
         {
             if let Some(lz) = self.try_lazy_body()? {
-                return Ok(FuncLit {
+                return Ok(FuncLit { display_name: None,
                     name,
                     params,
                     body: Vec::new(),
@@ -3102,7 +3144,7 @@ impl Parser {
         if is_gen {
             body = self.generator_transform(body)?;
         }
-        Ok(FuncLit { name, params, body, is_async, lazy_body: None })
+        Ok(FuncLit { display_name: None, name, params, body, is_async, lazy_body: None })
     }
 }
 
@@ -3269,7 +3311,7 @@ mod tests {
     fn arrows() {
         assert_eq!(
             expr("x => x + 1"),
-            Expr::Arrow(Rc::new(FuncLit {
+            Expr::Arrow(Rc::new(FuncLit { display_name: None,
                 name: None,
                 params: vec!["x".to_string()],
                 body: vec![Stmt::Return(Some(Expr::Binary(

@@ -59,6 +59,11 @@ pub enum PropKey {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FuncLit {
     pub name: Option<String>,
+    /// NamedEvaluation's result: the binding a function *expression*
+    /// was assigned to. Kept apart from `name` because only a named
+    /// function expression binds itself inside its own body -- this is
+    /// purely what `fn.name` and a stack frame report.
+    pub display_name: Option<String>,
     pub params: Vec<String>,
     pub body: Vec<Stmt>,
     /// `async function` — the compiler desugars the body to a promise

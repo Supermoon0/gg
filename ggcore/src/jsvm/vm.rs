@@ -939,6 +939,11 @@ pub(super) struct St {
     /// cannot identify the JavaScript function responsible.  Sampling is
     /// completely disabled unless GG_JS_PROFILE is set.
     profile_enabled: bool,
+    /// (module, proto) of the function whose instruction is executing.
+    /// The frame itself lives in `exec`'s locals rather than in
+    /// `frames`, so without this the innermost -- and most useful --
+    /// name is missing from every stack trace.
+    cur_site: (u32, u32),
     profile_samples: HashMap<(u32, u32), u64>,
     /// Single-entry memo of a string's UTF-16 units, keyed by its `strs`
     /// index. Indexed char reads (charAt/charCodeAt) otherwise rebuild the
@@ -1063,6 +1068,7 @@ impl St {
             rng_state: 0x2545_F491_4F6C_DD1D,
             fuel: DEFAULT_FUEL,
             profile_enabled: std::env::var_os("GG_JS_PROFILE").is_some(),
+            cur_site: (0, 0),
             profile_samples: HashMap::new(),
             units_cache: None,
             ulen_cache: HashMap::new(),
@@ -8379,6 +8385,10 @@ fn dom_method(
             return Ok(Value::dom_node(idx as u32));
         }
         match st.names[key as usize].as_str() {
+            // a headless render is always the focused document as far
+            // as scripts are concerned; ad SDKs gate their viewability
+            // beacons on this and throw when it is missing
+            "hasFocus" => return Ok(Value::TRUE),
             "createTextNode" | "createComment" => {
                 let text = if argc > 0 {
                     arg_string(st, args_base, argc, 0)?
@@ -9808,7 +9818,7 @@ pub(super) fn exec(
         // that threw are gone. `e.value` set means the page threw its
         // own object, which already carries whatever stack it wants.
         let trace = if e.value.is_none() {
-            Some(stack_string(st, mods, None))
+            Some(stack_string(st, mods, Some(st.cur_site)))
         } else {
             None
         };
@@ -10023,6 +10033,7 @@ fn exec_loop(
             return range_err("string heap exhausted");
         }
         st.fuel -= 1;
+        st.cur_site = (mi, pi);
         // One sample per 16K bytecode instructions keeps the profiler cheap
         // enough to leave compiled in while still producing hundreds of
         // samples for a multi-second application callback.

@@ -6777,6 +6777,47 @@ console.log('B typeof it: ' + typeof it);
     }
 
     #[test]
+    fn an_await_does_not_jump_ahead_of_its_siblings() {
+        // `await` is desugared by hoisting it into a preceding
+        // statement, which lifted it *above* the operands to its left.
+        // Minifiers emit the whole body as one comma sequence, so
+        // `this.x = new T(), await this.x.load()` ran the await first
+        // and called .load() on undefined -- that is what broke every
+        // ad slot on naver.com.
+        let mut vm = PageVm::new(None);
+        let out = vm.run_scripts(&[
+            "var log = [];\
+             function a() { log.push('a'); return 1; }\
+             function b() { log.push('b'); return Promise.resolve(2); }\
+             async function seq() { return (a(), await b()); }\
+             async function assign(o) {\
+                 return o.m = { load: function () {\
+                     return Promise.resolve('LOADED'); } },\
+                     await o.m.load(); }\
+             async function args(o) {\
+                 return o.tag = 'T',\
+                     o.join('-', await Promise.resolve(2)); }\
+             seq().then(function (v) { console.log(log.join(',') + '|' + v); });\
+             assign({}).then(function (v) { console.log(v); });\
+             args({ join: function (s, n) { return this.tag + s + n; } })\
+                 .then(function (v) { console.log(v); });"
+                .to_string(),
+        ]);
+        // nothing resolves until the microtask queue is drained
+        assert!(out.is_empty(), "{out:?}");
+        let (logs, _) = vm.pump();
+        assert_eq!(
+            logs,
+            vec![
+                "a,b|2".to_string(),  // left-to-right, not b,a
+                "LOADED".to_string(), // the assignment happened first
+                // an awaited argument must not unbind the receiver
+                "T-2".to_string(),
+            ],
+        );
+    }
+
+    #[test]
     fn errors_carry_a_call_stack() {
         // Bundles report `e.stack` and nothing else when they swallow
         // an error; undefined there makes a shipped minified failure
