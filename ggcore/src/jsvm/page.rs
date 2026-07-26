@@ -76,7 +76,16 @@ Promise.race = function (arr) {
 function Error(m, o) {
   if (m !== undefined) this.message = '' + m;
   if (o && typeof o === 'object' && 'cause' in o) this.cause = o.cause;
+  // Every minified bundle reports `e.stack` and nothing else when it
+  // swallows an error; undefined there turns a one-line diagnosis into
+  // an afternoon of bisecting someone else's dist file.
+  this.stack = (this.name || 'Error')
+    + (m !== undefined && m !== '' ? ': ' + m : '')
+    + '\n' + __ggStack();
 }
+Error.captureStackTrace = function (target) {
+  if (target) target.stack = '\n' + __ggStack();
+};
 Error.prototype.name = 'Error';
 Error.prototype.message = '';
 Error.prototype.toString = function () {
@@ -225,13 +234,86 @@ var customElements = {
   define: function () {}, get: function () {},
   whenDefined: function () { return Promise.resolve(); }
 };
-function AbortController() {
-  this.signal = { aborted: false,
-    addEventListener: function () {},
-    removeEventListener: function () {} };
+// gg has no GC, so a weak reference that never clears is not a
+// shortcut -- it is the whole truth. The SDK on naver.com keeps its
+// picked ad adapter in a WeakRef and reads it back through .deref()
+// on every call, so a missing global left `pickedAdapter` undefined.
+function WeakRef(target) { this._t = target; }
+WeakRef.prototype.deref = function () { return this._t; };
+function FinalizationRegistry(cb) { this._cb = cb; }
+FinalizationRegistry.prototype.register = function () {};
+FinalizationRegistry.prototype.unregister = function () { return false; };
+// A real AbortSignal, not a bag with `aborted: false`. Ad SDKs and
+// fetch wrappers reference the *global* to build their request
+// timeouts (`AbortSignal.timeout(n)`, `AbortSignal.any([...])`), so a
+// missing constructor took down every ad slot on naver.com with
+// "AbortSignal is not defined" long before any request was made.
+function AbortSignal() {
+  this.aborted = false;
+  this.reason = undefined;
+  this.onabort = null;
+  this._ls = [];
 }
-AbortController.prototype.abort = function () {
-  this.signal.aborted = true;
+AbortSignal.prototype.addEventListener = function (type, fn) {
+  if (type === 'abort' && fn) this._ls.push(fn);
+};
+AbortSignal.prototype.removeEventListener = function (type, fn) {
+  for (var i = 0; i < this._ls.length; i++) {
+    if (this._ls[i] === fn) { this._ls.splice(i, 1); return; }
+  }
+};
+AbortSignal.prototype.dispatchEvent = function (ev) {
+  this._fire(ev);
+  return true;
+};
+AbortSignal.prototype.throwIfAborted = function () {
+  if (this.aborted) throw this.reason;
+};
+AbortSignal.prototype._fire = function (ev) {
+  var ls = this._ls.slice();
+  if (typeof this.onabort === 'function') ls.unshift(this.onabort);
+  for (var i = 0; i < ls.length; i++) {
+    try { ls[i].call(this, ev); } catch (e) {}
+  }
+};
+AbortSignal.prototype._abort = function (reason) {
+  if (this.aborted) return;
+  this.aborted = true;
+  this.reason = reason === undefined
+    ? new DOMException('signal is aborted without reason', 'AbortError')
+    : reason;
+  this._fire({ type: 'abort', target: this, currentTarget: this });
+};
+AbortSignal.abort = function (reason) {
+  var s = new AbortSignal();
+  s._abort(reason);
+  return s;
+};
+AbortSignal.timeout = function (ms) {
+  var s = new AbortSignal();
+  setTimeout(function () {
+    s._abort(new DOMException('signal timed out', 'TimeoutError'));
+  }, ms);
+  return s;
+};
+AbortSignal.any = function (list) {
+  var s = new AbortSignal();
+  var arr = list || [];
+  for (var i = 0; i < arr.length; i++) {
+    var one = arr[i];
+    if (!one) continue;
+    if (one.aborted) { s._abort(one.reason); return s; }
+    (function (o) {
+      o.addEventListener('abort', function () { s._abort(o.reason); });
+    })(one);
+  }
+  return s;
+};
+function AbortController() {
+  this.signal = new AbortSignal();
+}
+AbortController.prototype.abort = function (reason) {
+  this.signal._abort(reason);
 };
 function URLSearchParams(init) {
   this._p = [];
@@ -939,6 +1021,8 @@ impl PageVm {
         // the prelude builds a real Date class over this native tick
         let dn = make_native(&mut vm.st, Native::DateNow);
         vm.set_global("__ggDateNow", dn);
+        let stk = make_native(&mut vm.st, Native::StackTrace);
+        vm.set_global("__ggStack", stk);
         vm.set_global("NaN", Value::number(f64::NAN));
         vm.set_global("Infinity", Value::number(f64::INFINITY));
         vm.install_object(
@@ -6689,6 +6773,102 @@ console.log('B typeof it: ' + typeof it);
             vm.run_scripts(&["var a=1,b=a+1,c=b+1,d={v:c};\
                              console.log(a,b,c,d.v);".to_string()]),
             vec!["1 2 3 3".to_string()]
+        );
+    }
+
+    #[test]
+    fn errors_carry_a_call_stack() {
+        // Bundles report `e.stack` and nothing else when they swallow
+        // an error; undefined there makes a shipped minified failure
+        // undiagnosable. Both a constructed Error and an engine-raised
+        // TypeError have to carry one.
+        let mut vm = PageVm::new(None);
+        let out = vm.run_scripts(&[
+            "function inner() { return new Error('boom'); }\
+             function middle() { return inner(); }\
+             function outer() { return middle(); }\
+             console.log(outer().stack);\
+             function bad() { return null.x; }\
+             function wrapper() { return bad(); }\
+             try { wrapper(); } catch (e) { console.log(e.stack); }"
+                .to_string(),
+        ]);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out[0].starts_with("Error: boom\n    at "), "{:?}", out[0]);
+        // the chain above the throw is reported, in order
+        assert!(out[0].contains("at middle\n    at outer"), "{:?}", out[0]);
+        assert!(
+            out[1].starts_with("TypeError: cannot read .x of null\n"),
+            "{:?}", out[1],
+        );
+        assert!(out[1].contains("at wrapper"), "{:?}", out[1]);
+    }
+
+    #[test]
+    fn abort_signal_is_a_global_with_working_listeners() {
+        // gfp-display-sdk builds every ad request's timeout out of the
+        // AbortSignal *global*; without it each slot failed with
+        // "AbortSignal is not defined" and naver removed the container.
+        let mut vm = PageVm::new(None);
+        assert_eq!(
+            vm.run_scripts(&["console.log(typeof AbortSignal);\
+                var c = new AbortController();\
+                console.log(c.signal instanceof AbortSignal, c.signal.aborted);\
+                var seen = [];\
+                c.signal.addEventListener('abort', function (e) {\
+                    seen.push(e.type); });\
+                c.signal.onabort = function () { seen.push('onabort'); };\
+                c.abort('stop');\
+                console.log(c.signal.aborted, c.signal.reason, seen.join(','));\
+                c.abort('again');\
+                console.log(seen.length);\
+                console.log(AbortSignal.abort().aborted,\
+                            AbortSignal.abort().reason.name);\
+                var any = AbortSignal.any([new AbortController().signal,\
+                                           c.signal]);\
+                console.log(any.aborted, any.reason);\
+                try { c.signal.throwIfAborted(); }\
+                catch (e) { console.log('threw ' + e); }"
+                .to_string()]),
+            vec![
+                "function".to_string(),
+                "true false".to_string(),
+                "true stop onabort,abort".to_string(),
+                "2".to_string(),
+                "true AbortError".to_string(),
+                "true stop".to_string(),
+                "threw stop".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn string_coercion_of_an_object_runs_its_tostring() {
+        // `String(x)` and `''.concat(x)` both dumped the raw object
+        // instead of performing ToString, so a page that logged
+        // `'[Ad] '.concat(err)` printed `[object Object]` and threw
+        // away the only description of what had failed.
+        let mut vm = PageVm::new(None);
+        assert_eq!(
+            vm.run_scripts(&["console.log(String(new Error('boom')));\
+                              console.log('X: '.concat(new Error('boom')));\
+                              console.log(''.concat({toString:function(){\
+                                  return 'CUSTOM';}}));\
+                              console.log(''.concat({valueOf:function(){\
+                                  return 42;}}));\
+                              console.log('a'.concat(1, [2,3], null));\
+                              try { null.x } catch (e) {\
+                                  console.log(''.concat(e)); }"
+                .to_string()]),
+            vec![
+                "Error: boom".to_string(),
+                "X: Error: boom".to_string(),
+                "CUSTOM".to_string(),
+                // no toString, so ToPrimitive falls through to valueOf
+                "42".to_string(),
+                "a12,3null".to_string(),
+                "TypeError: cannot read .x of null".to_string(),
+            ],
         );
     }
 

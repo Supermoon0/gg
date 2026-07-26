@@ -363,6 +363,10 @@ pub(super) enum Native {
     Boolean,
     ParseInt,
     ParseFloat,
+    /// `__ggStack()`: the live call stack as V8-ish "    at name" lines.
+    /// The prelude's Error constructor hangs it off `.stack`, which is
+    /// what every minified bundle reports when something goes wrong.
+    StackTrace,
     JsonStringify,
     JsonParse,
     /// event.preventDefault(): flags the current dispatch (page.rs).
@@ -3077,7 +3081,9 @@ fn method_ref_dispatch(
             // fell through to the unsupported-builtin error.
             let mut out = s.clone();
             for &a in args {
-                let piece = to_display(st, a);
+                // an object argument converts through its own toString,
+                // so `"msg: ".concat(err)` carries the error's message
+                let piece = to_js_string(st, mods, a)?;
                 out.push_str(&piece);
             }
             Ok(make_string(st, out))
@@ -3613,6 +3619,44 @@ fn fn_arity(st: &St, mods: &ModStore, func: Value) -> i32 {
 }
 
 /// A function's `.name` (empty for native/bound functions).
+/// The live call stack as V8-ish "    at name" lines, innermost first.
+///
+/// `top` optionally names a function to report ahead of `st.frames`.
+/// Known gap: the frame currently executing lives in `exec`'s locals
+/// rather than in `st.frames`, and a re-entrant `exec` (a construct,
+/// `.call`, a native calling back into JS) keeps its caller's state
+/// there too -- so the innermost name, and one name per re-entry, are
+/// missing. Every name that *is* reported is a real ancestor, in
+/// order, which is what makes a minified bundle's error locatable.
+///
+/// Bounded at 24 frames: gg has no GC, so an unbounded string per
+/// constructed Error is real retained memory.
+fn stack_string(
+    st: &St, mods: &ModStore, top: Option<(u32, u32)>,
+) -> String {
+    let mut out = String::new();
+    let mut n = 0usize;
+    if let Some((m, p)) = top {
+        let name = &mods.rc(m).module.protos[p as usize].name;
+        out.push_str("    at ");
+        out.push_str(if name.is_empty() { "<anonymous>" } else { name });
+        out.push('\n');
+        n += 1;
+    }
+    for f in st.frames.iter().rev() {
+        if n >= 24 {
+            out.push_str("    at ...\n");
+            break;
+        }
+        let name = &mods.rc(f.module).module.protos[f.proto as usize].name;
+        out.push_str("    at ");
+        out.push_str(if name.is_empty() { "<anonymous>" } else { name });
+        out.push('\n');
+        n += 1;
+    }
+    out
+}
+
 fn fn_name(st: &St, mods: &ModStore, func: Value) -> String {
     if let ClosureRec::Proxy(id) = st.closures[func.index() as usize] {
         if let Some(rec) = st.proxies.get(id as usize) {
@@ -4014,6 +4058,12 @@ fn brand_string(st: &St, v: Value) -> String {
             "RegExp"
         } else if o.promise != PROMISE_NONE {
             "Promise"
+        } else if st.map_data.contains_key(&v.index()) {
+            // core-js's classof keys its iterator registry off this
+            // brand, so a Map that reports "Object" is not iterable
+            "Map"
+        } else if st.set_data.contains_key(&v.index()) {
+            "Set"
         } else {
             "Object"
         }
@@ -5138,6 +5188,27 @@ fn to_display_rec(st: &mut St, v: Value, seen: &mut Vec<u32>) -> String {
     }
 }
 
+/// ToString(v) as the spec means it: an object converts through
+/// ToPrimitive first, so its own `toString` runs.
+///
+/// `to_display` cannot do this — it has no `mods` and so cannot call
+/// back into JS — which is why `String(err)` and `"".concat(err)` used
+/// to render every object as "[object Object]", swallowing the message
+/// of every error a page logs. `+` was already correct because the Add
+/// opcode primitivizes before concatenating.
+pub(super) fn to_js_string(
+    st: &mut St,
+    mods: &ModStore,
+    v: Value,
+) -> Result<String, VmError> {
+    let v = if v.is_object() {
+        to_primitive(st, mods, v, false)?
+    } else {
+        v
+    };
+    Ok(to_display(st, v))
+}
+
 fn to_str_idx(st: &mut St, v: Value) -> u32 {
     if v.is_string() {
         return v.index();
@@ -5551,9 +5622,37 @@ fn do_native(
             }
             let szk = st.intern_name("size");
             raw_set_prop(st, oi as usize, szk, Value::int(0));
-            // optional iterable seed: array of pairs (Map) / values
+            // A Map is an *object* to the page, not just something our
+            // for-of understands natively: without @@iterator on the
+            // instance, core-js's getIterator (`getMethod(o, @@iterator)
+            // || getMethod(o, '@@iterator') || Iterators[classof(o)]`)
+            // finds nothing and throws "[object Object] is not
+            // iterable" -- which is what broke every ad slot on naver.
+            let iter_op = if is_map { 8u8 } else { 5u8 };
+            let itk = st.intern_name("@@iterator");
+            let f = if is_map {
+                make_native(st, Native::MapOp { obj: oi, op: iter_op })
+            } else {
+                make_native(st, Native::SetOp { obj: oi, op: iter_op })
+            };
+            raw_set_prop(st, oi as usize, itk, f);
+            let tagk = st.intern_name("@@toStringTag");
+            let tag = make_string(st, if is_map { "Map" } else { "Set" }
+                .to_string());
+            raw_set_prop(st, oi as usize, tagk, tag);
+            let ctork = st.intern_name("constructor");
+            let ctor = make_native(st, n);
+            raw_set_prop(st, oi as usize, ctork, ctor);
+            // ...and the methods live on the prototype in a real engine,
+            // so none of this may show up in Object.keys/for-in/JSON.
+            for k in own_keys_ordered(st, oi as usize, false) {
+                st.non_enum.insert((oi, k));
+            }
+            // optional iterable seed: anything iterable, not only an
+            // array literal -- `new Map(otherMap)` silently produced an
+            // empty map before.
             if argc > 0 {
-                let seed = st.regs[args_base];
+                let seed = materialize_iterable(st, mods, st.regs[args_base])?;
                 if seed.is_object()
                     && st.objects[seed.index() as usize].is_array
                 {
@@ -5829,7 +5928,7 @@ fn do_native(
             if argc == 0 {
                 return Ok(intern(st, ""));
             }
-            let s = to_display(st, st.regs[args_base]);
+            let s = to_js_string(st, mods, st.regs[args_base])?;
             Ok(push_str(st, s))
         }
         Native::Number => {
@@ -5855,6 +5954,10 @@ fn do_native(
                 return Ok(Value::FALSE);
             }
             Ok(Value::boolean(truthy(st, st.regs[args_base])))
+        }
+        Native::StackTrace => {
+            let out = stack_string(st, mods, None);
+            Ok(make_string(st, out))
         }
         Native::ParseInt => {
             if argc == 0 {
@@ -9700,6 +9803,15 @@ pub(super) fn exec(
             }
             Err(e) => e,
         };
+        // Snapshot before unwinding: an engine-raised TypeError is
+        // materialized at the catch site, by which point the frames
+        // that threw are gone. `e.value` set means the page threw its
+        // own object, which already carries whatever stack it wants.
+        let trace = if e.value.is_none() {
+            Some(stack_string(st, mods, None))
+        } else {
+            None
+        };
         if st.handlers.len() <= hfloor {
             // Uncaught here. Unwind frames pushed by this activation: a
             // thrown error must not leak frames into the persistent VM
@@ -9715,7 +9827,7 @@ pub(super) fn exec(
         st.frames.truncate(h.depth);
         st.with_stack.truncate(h.with_len);
         with_base = h.with_base;
-        let exc = exception_value(st, e);
+        let exc = exception_value(st, e, trace);
         st.regs[h.base + h.exc_reg as usize] = exc;
         mi = h.module;
         pi = h.proto;
@@ -9732,7 +9844,9 @@ pub(super) fn exec(
 /// object's [[Prototype]] is wired to the global constructor of the
 /// error's kind (TypeError etc.) so `instanceof` and inherited methods
 /// behave like a real thrown error.
-fn exception_value(st: &mut St, e: VmError) -> Value {
+fn exception_value(
+    st: &mut St, e: VmError, trace: Option<String>,
+) -> Value {
     if let Some(v) = e.value {
         return v;
     }
@@ -9742,8 +9856,13 @@ fn exception_value(st: &mut St, e: VmError) -> Value {
     let msg_id = st.intern_name("message");
     let n = intern(st, e.kind);
     raw_set_prop(st, oi, name_id, n);
-    let m = push_str(st, e.msg);
+    let m = push_str(st, e.msg.clone());
     raw_set_prop(st, oi, msg_id, m);
+    if let Some(trace) = trace {
+        let stack_id = st.intern_name("stack");
+        let s = push_str(st, format!("{}: {}\n{trace}", e.kind, e.msg));
+        raw_set_prop(st, oi, stack_id, s);
+    }
     let ctor_id = st.intern_name(e.kind);
     if let Some(&ctor) = st.globals.get(ctor_id as usize) {
         if ctor.is_function() {
@@ -11967,7 +12086,9 @@ fn exec_loop(
                             let mut out = s.clone();
                             for k in 0..argc as usize {
                                 let v = st.regs[a0 + k];
-                                let piece = to_display(st, v);
+                                // ToString, not a raw dump: an object
+                                // with a toString() must get to run it
+                                let piece = to_js_string(st, mods, v)?;
                                 out.push_str(&piece);
                             }
                             push_str(st, out)
