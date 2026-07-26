@@ -1668,6 +1668,86 @@ fn ast_iife(body: Vec<Stmt>) -> Expr {
     ast_call(ast_arrow(Vec::new(), body), vec![])
 }
 
+/// `return X` -> `return { <tag>: 1, v: X }`, not descending into
+/// nested function literals (their returns are their own).
+///
+/// An IIFE-wrapped block cannot `return` from the function that
+/// contains it, which is why a `try` holding a `return await` used to
+/// be left alone -- and then failed to compile at all if anything
+/// followed it. Tagging lets the continuation tell "the body
+/// returned" from "the body fell through" and re-return the value.
+fn mark_returns(stmts: &mut [Stmt], tag: &str) {
+    for s in stmts {
+        mark_returns_stmt(s, tag);
+    }
+}
+
+fn mark_returns_stmt(s: &mut Stmt, tag: &str) {
+    match s {
+        Stmt::Return(e) => {
+            let v = e.take().unwrap_or(Expr::Unary(
+                UnOp::Void,
+                Box::new(Expr::Num(0.0)),
+            ));
+            *e = Some(Expr::Object(vec![
+                Prop {
+                    key: PropKey::Ident(tag.to_string()),
+                    value: Expr::Num(1.0),
+                },
+                Prop { key: PropKey::Ident("v".to_string()), value: v },
+            ]));
+        }
+        Stmt::If { cons, alt, .. } => {
+            mark_returns_stmt(cons, tag);
+            if let Some(a) = alt {
+                mark_returns_stmt(a, tag);
+            }
+        }
+        Stmt::Block(v) => mark_returns(v, tag),
+        Stmt::Labeled { body, .. } => mark_returns_stmt(body, tag),
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::ForIn { body, .. } => mark_returns_stmt(body, tag),
+        Stmt::Try { block, catch, finally } => {
+            mark_returns(block, tag);
+            if let Some(c) = catch {
+                mark_returns(&mut c.body, tag);
+            }
+            if let Some(f) = finally {
+                mark_returns(f, tag);
+            }
+        }
+        Stmt::Switch { cases, .. } => {
+            for c in cases {
+                mark_returns(&mut c.body, tag);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `if (P && P.<tag> === 1) return P.v;`
+fn ret_guard(tag: &str, param: &str) -> Stmt {
+    let hit = Expr::Binary(
+        BinOp::StrictEq,
+        Box::new(ast_member(ast_ident(param), tag)),
+        Box::new(Expr::Num(1.0)),
+    );
+    Stmt::If {
+        test: Expr::Logical(
+            LogOp::And,
+            Box::new(ast_ident(param)),
+            Box::new(hit),
+        ),
+        cons: Box::new(Stmt::Return(Some(ast_member(
+            ast_ident(param),
+            "v",
+        )))),
+        alt: None,
+    }
+}
+
 fn chain_async(stmts: &[Stmt], n: &mut usize) -> Vec<Stmt> {
     let j = stmts.iter().position(|s| {
         stmt_await(s).is_some() || chainable_await_inside(s)
@@ -1897,14 +1977,49 @@ fn chain_async(stmts: &[Stmt], n: &mut usize) -> Vec<Stmt> {
                 }
                 (r, b)
             };
-            if brk || (ret && !rest_stmts.is_empty()) {
+            if brk {
                 out.push(stmts[j].clone());
                 out.extend(chain_async(rest_stmts, n));
                 return out;
             }
-            let mut chain =
-                ast_presolve(ast_iife(chain_async(block, n)));
-            if let Some(c) = catch {
+            // The wrap is an IIFE, so a `return` inside it cannot
+            // return from this function -- tag those returns and let
+            // the continuation re-return the value. Without this a
+            // `try { return await f() } catch {}` followed by any
+            // statement did not compile at all.
+            let tag = if ret && !rest_stmts.is_empty() {
+                *n += 1;
+                Some(format!("__ggret{n}"))
+            } else {
+                None
+            };
+            let mut block_v = block.clone();
+            let mut catch_v = catch.clone();
+            let mut finally_v = finally.clone();
+            if let Some(t) = &tag {
+                mark_returns(&mut block_v, t);
+                if let Some(c) = catch_v.as_mut() {
+                    mark_returns(&mut c.body, t);
+                }
+                if let Some(f) = finally_v.as_mut() {
+                    mark_returns(f, t);
+                }
+            }
+            // `Promise.resolve(iife())` runs the block *before* the
+            // chain exists, so a synchronous `throw` in the try
+            // escaped past its own catch. Defer the body into the
+            // chain instead.
+            let mut chain = ast_call(
+                ast_member(
+                    ast_call(
+                        ast_member(ast_ident("Promise"), "resolve"),
+                        Vec::new(),
+                    ),
+                    "then",
+                ),
+                vec![ast_arrow(Vec::new(), chain_async(&block_v, n))],
+            );
+            if let Some(c) = &catch_v {
                 let param = c
                     .param
                     .clone()
@@ -1917,21 +2032,42 @@ fn chain_async(stmts: &[Stmt], n: &mut usize) -> Vec<Stmt> {
                     )],
                 );
             }
-            if let Some(f) = finally {
-                // run on both paths (value/handled-error alike)
-                let fin = ast_arrow(Vec::new(), chain_async(f, n));
+            if let Some(f) = &finally_v {
+                // `then(fin, fin)` with no parameters dropped the
+                // value on the success path and, worse, turned a
+                // rejection into a normal resolution. Carry both.
+                *n += 1;
+                let vname = format!("__ggfv{n}");
+                let ename = format!("__ggfe{n}");
+                let fin_body = chain_async(f, n);
+                let mut ok = fin_body.clone();
+                ok.push(Stmt::Return(Some(ast_ident(&vname))));
+                let mut bad = fin_body;
+                bad.push(Stmt::Throw(ast_ident(&ename)));
                 chain = ast_call(
                     ast_member(chain, "then"),
-                    vec![fin.clone(), fin],
+                    vec![
+                        ast_arrow(vec![vname], ok),
+                        ast_arrow(vec![ename], bad),
+                    ],
                 );
             }
             if rest_stmts.is_empty() {
                 out.push(Stmt::Return(Some(chain)));
             } else {
                 let rest = chain_async(rest_stmts, n);
+                let (params, body) = match &tag {
+                    Some(t) => {
+                        let param = format!("{t}v");
+                        let mut b = vec![ret_guard(t, &param)];
+                        b.extend(rest);
+                        (vec![param], b)
+                    }
+                    None => (Vec::new(), rest),
+                };
                 out.push(Stmt::Return(Some(ast_call(
                     ast_member(chain, "then"),
-                    vec![ast_arrow(Vec::new(), rest)],
+                    vec![ast_arrow(params, body)],
                 ))));
             }
         }
@@ -2042,7 +2178,22 @@ impl Compiler {
     }
 
     fn err<T>(&self, msg: impl Into<String>) -> Result<T, CompileError> {
-        Err(CompileError { msg: msg.into() })
+        // Name the function: a bundle that fails to compile one of ten
+        // thousand minified methods is otherwise a bisect.
+        let where_ = self
+            .fns
+            .last()
+            .map(|f| f.name.as_str())
+            .filter(|n| !n.is_empty() && *n != "<main>")
+            .unwrap_or("");
+        let msg = msg.into();
+        Err(CompileError {
+            msg: if where_.is_empty() {
+                msg
+            } else {
+                format!("{msg} [in {where_}]")
+            },
+        })
     }
 
     fn atom(&mut self, name: &str) -> u16 {

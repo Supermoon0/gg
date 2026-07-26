@@ -6777,6 +6777,66 @@ console.log('B typeof it: ' + typeof it);
     }
 
     #[test]
+    fn try_catch_finally_survive_an_await() {
+        // A `try` holding an await is wrapped in an IIFE, and a
+        // `return` cannot escape one -- so a try that returned, with
+        // anything after it, refused to compile ("await only supported
+        // at statement level"). gfp-display-sdk's adapter picker is
+        // exactly that shape, and every ad slot on naver hung on it.
+        let mut vm = PageVm::new(None);
+        let out = vm.run_scripts(&[
+            "function p(v) { return Promise.resolve(v); }\
+             function say(v) { console.log(v); }\
+             async function ret() {\
+                 try { return await p('ok'); } catch (e) { return 'C'; }\
+                 throw new Error('unreachable');\
+             }\
+             async function caught() {\
+                 try { throw 1; } catch (e) { return await p('caught'); }\
+                 throw new Error('unreachable');\
+             }\
+             async function fall() {\
+                 var s = '';\
+                 try { s = await p('a'); } catch (e) {}\
+                 return s + 'b';\
+             }\
+             async function fin() {\
+                 var log = [];\
+                 try { log.push(await p('t')); } finally { log.push('f'); }\
+                 return log.join(',');\
+             }\
+             async function rethrow() {\
+                 try { await p(1); throw 'BOOM'; } finally { var z = 1; }\
+             }\
+             ret().then(say); caught().then(say); fall().then(say);\
+             fin().then(say);\
+             rethrow().then(function () { say('NOT REACHED'); },\
+                            function (e) { say('rejected ' + e); });"
+                .to_string(),
+        ]);
+        assert!(out.is_empty(), "{out:?}");
+        let (logs, _) = vm.pump();
+        let mut logs = logs;
+        logs.sort();
+        assert_eq!(
+            logs,
+            vec![
+                "ab".to_string(),
+                "caught".to_string(),
+                "ok".to_string(),
+                // finally runs, and does not swallow the value...
+                "t,f".to_string(),
+                // ...nor turn a rejection into a resolution
+                "rejected BOOM".to_string(),
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
     fn a_string_owns_its_character_indices() {
         // `for (k in v) return false` is how bundles write "is this
         // empty?", so a string that enumerates nothing reads as empty.
