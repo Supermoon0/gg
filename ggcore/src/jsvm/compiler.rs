@@ -1760,30 +1760,59 @@ fn chain_async(stmts: &[Stmt], n: &mut usize) -> Vec<Stmt> {
         match aw {
             // return await E == return E (the outer .then adopts it)
             AwaitStmt::Ret(e) => out.push(Stmt::Return(Some(e))),
+            // `Promise.resolve(e).then(...)`, not `e.then(...)`:
+            // awaiting a plain value is ordinary code and calling
+            // `.then` straight on it blew up on anything that was not
+            // already a promise.
             AwaitStmt::Bind(name, e) => {
                 let rest = chain_async(&stmts[j + 1..], n);
                 let cont = ast_arrow(vec![name], rest);
-                out.push(Stmt::Return(Some(
-                    ast_call(ast_member(e, "then"), vec![cont]),
-                )));
+                out.push(Stmt::Return(Some(ast_call(
+                    ast_member(ast_presolve(e), "then"),
+                    vec![cont],
+                ))));
             }
             AwaitStmt::Discard(e) => {
                 let rest = chain_async(&stmts[j + 1..], n);
                 let cont = ast_arrow(vec!["__await".to_string()], rest);
-                out.push(Stmt::Return(Some(
-                    ast_call(ast_member(e, "then"), vec![cont]),
-                )));
+                out.push(Stmt::Return(Some(ast_call(
+                    ast_member(ast_presolve(e), "then"),
+                    vec![cont],
+                ))));
             }
         }
         return out;
     }
     // control flow containing awaits (post-normalization)
     match &stmts[j] {
-        // a bare block: splice its statements into the stream
+        // A bare block: splice its statements into the stream --
+        // unless it declares lexicals. Splicing merges its scope into
+        // the enclosing one, and two sibling blocks that each declare
+        // `let a` (perfectly legal, and what minifiers emit) would
+        // then collide. Those go through the `if (true) {...}` path
+        // instead, which keeps the block a scope of its own.
         Stmt::Block(v) => {
-            let mut merged = v.clone();
-            merged.extend_from_slice(&stmts[j + 1..]);
-            out.extend(chain_async(&merged, n));
+            if v.iter().any(|s| {
+                matches!(
+                    s,
+                    Stmt::VarDecl {
+                        kind: DeclKind::Let | DeclKind::Const,
+                        ..
+                    }
+                )
+            }) {
+                let mut merged = vec![Stmt::If {
+                    test: Expr::Bool(true),
+                    cons: Box::new(Stmt::Block(v.clone())),
+                    alt: None,
+                }];
+                merged.extend_from_slice(&stmts[j + 1..]);
+                out.extend(chain_async(&merged, n));
+            } else {
+                let mut merged = v.clone();
+                merged.extend_from_slice(&stmts[j + 1..]);
+                out.extend(chain_async(&merged, n));
+            }
         }
         // if with awaited branch(es): each branch becomes an async
         // IIFE; rest continues after whichever promise it returns.
@@ -1802,12 +1831,29 @@ fn chain_async(stmts: &[Stmt], n: &mut usize) -> Vec<Stmt> {
                     .unwrap_or((false, false));
                 (r1 || r2, b1 || b2)
             };
-            // returns are fine when nothing follows: the branch value
-            // becomes the function's promise result
-            if brk || (ret && !rest_stmts.is_empty()) {
+            if brk {
                 out.push(stmts[j].clone());
                 out.extend(chain_async(rest_stmts, n));
                 return out;
+            }
+            // A branch that returns is wrapped in an IIFE like any
+            // other, with its returns tagged so the continuation can
+            // re-return the value. `if (c) return void await f();`
+            // followed by anything -- turbopack's chunk loader is
+            // exactly that -- did not compile at all before.
+            let tag = if ret && !rest_stmts.is_empty() {
+                *n += 1;
+                Some(format!("__ggret{n}"))
+            } else {
+                None
+            };
+            let mut cons_v = cons_v;
+            let mut alt_v = alt_v;
+            if let Some(t) = &tag {
+                mark_returns(&mut cons_v, t);
+                if let Some(av) = alt_v.as_mut() {
+                    mark_returns(av, t);
+                }
             }
             let a = ast_iife(chain_async(&cons_v, n));
             let b = match alt_v {
@@ -1820,9 +1866,18 @@ fn chain_async(stmts: &[Stmt], n: &mut usize) -> Vec<Stmt> {
                 out.push(Stmt::Return(Some(ast_presolve(sel))));
             } else {
                 let rest = chain_async(rest_stmts, n);
+                let (params, body) = match &tag {
+                    Some(t) => {
+                        let param = format!("{t}v");
+                        let mut b = vec![ret_guard(t, &param)];
+                        b.extend(rest);
+                        (vec![param], b)
+                    }
+                    None => (Vec::new(), rest),
+                };
                 out.push(Stmt::Return(Some(ast_call(
                     ast_member(ast_presolve(sel), "then"),
-                    vec![ast_arrow(Vec::new(), rest)],
+                    vec![ast_arrow(params, body)],
                 ))));
             }
         }
@@ -2149,13 +2204,27 @@ fn desugar_async(body: &[Stmt]) -> Vec<Stmt> {
     let mut aw_n = 0usize;
     let body = normalize_body(body.to_vec(), &mut aw_n);
     let inner = chain_async(&body, &mut aw_n);
-    let presolve =
-        ast_call(ast_member(ast_ident("Promise"), "resolve"), vec![]);
-    let wrapper = ast_call(
-        ast_member(presolve, "then"),
-        vec![ast_arrow(Vec::new(), inner)],
-    );
-    vec![Stmt::Return(Some(wrapper))]
+    // An async function runs *synchronously* up to its first await --
+    // deferring the whole body behind `Promise.resolve().then(...)`
+    // moved everything before the first await a tick later than the
+    // spec puts it, which is observable: turbopack registers a chunk
+    // in that prologue and its module factories read
+    // `document.currentScript`, which is null once the script ends.
+    // `chain_async` already keeps the prologue inline; wrap in
+    // try/catch so a synchronous throw still becomes a rejection.
+    let body = ast_iife(inner);
+    let caught = Stmt::Try {
+        block: vec![Stmt::Return(Some(ast_presolve(body)))],
+        catch: Some(CatchClause {
+            param: Some("__ggthrow".to_string()),
+            body: vec![Stmt::Return(Some(ast_call(
+                ast_member(ast_ident("Promise"), "reject"),
+                vec![ast_ident("__ggthrow")],
+            )))],
+        }),
+        finally: None,
+    };
+    vec![caught]
 }
 
 /// Does this member/call spine contain any `?.` link? If so the whole
@@ -2180,12 +2249,15 @@ impl Compiler {
     fn err<T>(&self, msg: impl Into<String>) -> Result<T, CompileError> {
         // Name the function: a bundle that fails to compile one of ten
         // thousand minified methods is otherwise a bisect.
-        let where_ = self
+        let chain: Vec<&str> = self
             .fns
-            .last()
+            .iter()
+            .rev()
             .map(|f| f.name.as_str())
-            .filter(|n| !n.is_empty() && *n != "<main>")
-            .unwrap_or("");
+            .filter(|n| !n.is_empty())
+            .take(4)
+            .collect();
+        let where_ = chain.join(" < ");
         let msg = msg.into();
         Err(CompileError {
             msg: if where_.is_empty() {
@@ -2417,11 +2489,8 @@ impl Compiler {
         }
         let f = self.fns.last_mut().unwrap();
         if f.scopes.last().unwrap().bindings.contains_key(name) {
-            return Err(CompileError {
-                msg: format!(
-                    "identifier '{name}' has already been declared"
-                ),
-            });
+            return self
+                .err(format!("identifier '{name}' has already been declared"));
         }
         let is_cell = f.captured.contains(name);
         let r = f.declare(name, bind_kind, false)?;
@@ -2695,12 +2764,25 @@ impl Compiler {
         // ES named-function-expression semantics: the function's own
         // name binds to itself inside the body (Babel _classCallCheck
         // guards do `this instanceof t` from within `function t()`),
-        // unless a param or hoisted var shadows it
+        // unless a param, a hoisted var, or a top-level `let`/`const`
+        // shadows it. That last one is legal and minifiers emit it
+        // constantly with single-letter names -- `function a() { let a
+        // = ...; }` refused to compile at all.
+        let shadows_self = |name: &str| {
+            lit.body.iter().any(|s| match s {
+                Stmt::VarDecl {
+                    kind: DeclKind::Let | DeclKind::Const,
+                    decls,
+                } => decls.iter().any(|(d, _)| d == name),
+                _ => false,
+            })
+        };
         if !is_arrow {
             if let Some(n) = &lit.name {
                 if !n.is_empty()
                     && !lit.params.iter().any(|p| p == n)
                     && !names.iter().any(|m| m == n)
+                    && !shadows_self(n)
                 {
                     let r = f.declare(n, BindKind::Var, true)?;
                     f.emit(Instr::LoadSelf { dst: r });

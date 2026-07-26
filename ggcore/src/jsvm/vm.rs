@@ -923,6 +923,9 @@ pub(super) struct St {
     // --- async runtime (P3) ---
     /// Promise records; an Obj.promise indexes here.
     pub(super) promises: Vec<PromiseRec>,
+    /// promises that rejected since the last drain, checked for a
+    /// handler once the microtask queue empties
+    pub(super) rejected: Vec<u32>,
     /// FIFO microtask queue (promise reactions + queueMicrotask jobs).
     pub(super) microtasks: std::collections::VecDeque<Job>,
     /// pending timers, fired in (due_ms, seq) order by the pump.
@@ -1071,6 +1074,7 @@ impl St {
             ty_names: [Value::UNDEFINED; 6],
             regexes: Vec::new(),
             promises: Vec::new(),
+            rejected: Vec::new(),
             microtasks: std::collections::VecDeque::new(),
             timers: Vec::new(),
             next_timer_id: 0,
@@ -1531,6 +1535,11 @@ pub(super) struct PromiseRec {
     state: PromiseState,
     on_fulfill: Vec<Reaction>,
     on_reject: Vec<Reaction>,
+    /// someone attached a rejection handler at some point. A rejected
+    /// promise nobody ever asks about is reported once the microtask
+    /// queue drains -- an error swallowed by a promise is otherwise
+    /// completely silent, which is the worst way for a bundle to fail.
+    handled: bool,
 }
 
 /// A microtask: either a bare callback (queueMicrotask) or a promise
@@ -1603,6 +1612,7 @@ fn new_promise(st: &mut St) -> (Value, u32) {
         state: PromiseState::Pending,
         on_fulfill: Vec::new(),
         on_reject: Vec::new(),
+        handled: false,
     });
     let pid = (st.promises.len() - 1) as u32;
     st.objects[v.index() as usize].promise = pid;
@@ -1620,6 +1630,9 @@ fn promise_id_of(st: &St, v: Value) -> u32 {
 /// Register a reaction on promise `pid`. If already settled, the reaction
 /// is scheduled as a microtask immediately (Promises/A+ ordering).
 fn add_reaction(st: &mut St, pid: u32, reject_side: bool, rx: Reaction) {
+    if reject_side {
+        st.promises[pid as usize].handled = true;
+    }
     match st.promises[pid as usize].state {
         PromiseState::Pending => {
             if reject_side {
@@ -1696,6 +1709,9 @@ pub(super) fn promise_settle(st: &mut St, pid: u32, value: Value, is_reject: boo
     } else {
         PromiseState::Fulfilled(value)
     };
+    if is_reject {
+        st.rejected.push(pid);
+    }
     // schedule the matching reaction set (the other set never runs)
     let reactions = if is_reject {
         std::mem::take(&mut st.promises[pid as usize].on_reject)
@@ -1855,11 +1871,36 @@ pub(super) fn pump_microtasks(
     if budget == 0 && !st.microtasks.is_empty() {
         st.logs.push("[gg-js] microtask budget exceeded".to_string());
     }
+    report_unhandled_rejections(st);
     let issued = std::mem::take(&mut st.pending_fetches);
     for request in &issued {
         st.awaiting.insert(request.fetch_id, request.promise);
     }
     issued
+}
+
+/// Report promises that rejected and were never asked about. Only
+/// once the queue is empty: a handler attached later in the same drain
+/// is not a swallowed error.
+fn report_unhandled_rejections(st: &mut St) {
+    if st.rejected.is_empty() {
+        return;
+    }
+    if !st.microtasks.is_empty() {
+        return; // still settling; ask again next drain
+    }
+    let pending = std::mem::take(&mut st.rejected);
+    for pid in pending {
+        let rec = &st.promises[pid as usize];
+        if rec.handled {
+            continue;
+        }
+        let PromiseState::Rejected(v) = rec.state else { continue };
+        st.promises[pid as usize].handled = true; // report once
+        let msg = throw_msg(st, v);
+        let msg = msg.strip_prefix("uncaught ").unwrap_or(&msg).to_string();
+        st.logs.push(format!("[gg-js error] unhandled rejection: {msg}"));
+    }
 }
 
 fn next_due_timer(st: &St) -> Option<usize> {
@@ -1970,6 +2011,7 @@ pub(super) fn pump(
             }
         }
     }
+    report_unhandled_rejections(st);
     let issued = std::mem::take(&mut st.pending_fetches);
     for p in &issued {
         st.awaiting.insert(p.fetch_id, p.promise);
@@ -2034,6 +2076,7 @@ pub(super) fn pump_step(
         }
         drain_microtasks(st, mods, &mut budget);
     }
+    report_unhandled_rejections(st);
     let issued = std::mem::take(&mut st.pending_fetches);
     for p in &issued {
         st.awaiting.insert(p.fetch_id, p.promise);

@@ -7169,6 +7169,101 @@ console.log('B typeof it: ' + typeof it);
     }
 
     #[test]
+    fn an_async_body_runs_up_to_its_first_await() {
+        // The whole body used to be deferred behind
+        // `Promise.resolve().then(...)`, putting everything before the
+        // first await one tick later than the spec does. Observable:
+        // turbopack registers a chunk in that prologue, and its module
+        // factories read `document.currentScript`.
+        let mut vm = PageVm::new(None);
+        assert_eq!(
+            vm.run_scripts(&["var order = [];\
+                async function f() { order.push('body'); await 0;\
+                                     order.push('after'); }\
+                order.push('before');\
+                f();\
+                order.push('caller');\
+                console.log(order.join(','));\
+                async function boom() { throw new Error('sync'); }\
+                boom().then(function () { console.log('NOT REACHED'); },\
+                            function (e) { console.log('rejected ' + e.message); });\
+                async function val() { return 7; }\
+                val().then(function (v) { console.log('value ' + v); });\
+                async function plain() { return await 42; }\
+                plain().then(function (v) { console.log('awaited ' + v); });"
+                .to_string()]),
+            vec!["before,body,caller".to_string()],
+        );
+        let (logs, _) = vm.pump();
+        let mut logs = logs;
+        logs.sort();
+        assert_eq!(
+            logs,
+            vec![
+                // `await 42` must not call .then on a number
+                "awaited 42".to_string(),
+                "rejected sync".to_string(),
+                "value 7".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn an_if_branch_can_return_across_an_await() {
+        // `if (c) return void await f();` followed by anything -- the
+        // shape of turbopack's chunk loader -- did not compile at all.
+        let mut vm = PageVm::new(None);
+        let out = vm.run_scripts(&[
+            "function p(v) { return Promise.resolve(v); }\
+             async function loader(hit) {\
+                 if (hit) return void await p('early');\
+                 var tail = await p('tail');\
+                 return tail;\
+             }\
+             loader(true).then(function (v) { console.log('hit=' + v); });\
+             loader(false).then(function (v) { console.log('miss=' + v); });\
+             async function shadow() { let shadow = 'inner'; await 0;\
+                                       return shadow; }\
+             shadow().then(function (v) { console.log('shadow=' + v); });"
+                .to_string(),
+        ]);
+        assert!(out.is_empty(), "{out:?}");
+        let (logs, _) = vm.pump();
+        let mut logs = logs;
+        logs.sort();
+        assert_eq!(
+            logs,
+            vec![
+                "hit=undefined".to_string(),
+                "miss=tail".to_string(),
+                // a function body may shadow the function's own name
+                "shadow=inner".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_rejection_nobody_handles_is_reported() {
+        // An error swallowed by a promise was completely silent, which
+        // is the worst way for a bundle to fail: the turbopack loader
+        // failed to compile and nothing said so.
+        let mut vm = PageVm::new(None);
+        assert!(vm
+            .run_scripts(&["Promise.reject(new Error('nobody catches me'));\
+                Promise.reject(new Error('but this one is')).catch(\
+                    function () {});"
+                .to_string()])
+            .is_empty());
+        let (logs, _) = vm.pump();
+        assert_eq!(
+            logs,
+            vec!["[gg-js error] unhandled rejection: \
+                  Error: nobody catches me"
+                .to_string()],
+        );
+    }
+
+    #[test]
     fn byte_streams_round_trip_through_typed_arrays() {
         // React's flight client decodes its payload with
         // TextDecoder over Uint8Array views of a ReadableStream, and
