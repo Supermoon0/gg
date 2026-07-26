@@ -954,6 +954,13 @@ pub(super) struct St {
     pub(super) doc_write_buf: HashMap<u32, String>,
     /// (iframe node, markup) for documents whose `close()` has run.
     pub(super) doc_writes: Vec<(u32, String)>,
+    /// Parser insertion point for `document.write` into the *running*
+    /// document: (owning script node, parent node, next child index).
+    /// A script that writes twice must see its second chunk land after
+    /// the first, not between the script tag and the first -- so the
+    /// point advances past everything already inserted, and resets
+    /// when a different script takes over.
+    pub(super) doc_write_at: Option<(u32, usize, usize)>,
     /// iframe nodes the host has spoken about (pushed *or* dropped a
     /// document for). Those are the host's to answer for -- a dropped
     /// mirror means "no document", not "write your own".
@@ -1122,6 +1129,7 @@ impl St {
             frame_docs: HashMap::new(),
             doc_write_buf: HashMap::new(),
             doc_writes: Vec::new(),
+            doc_write_at: None,
             frame_host_owned: std::collections::HashSet::new(),
             frame_dom_writes: Vec::new(),
             map_data: HashMap::new(),
@@ -6495,7 +6503,7 @@ fn do_native(
                 Value::UNDEFINED
             };
             if add {
-                if handler.is_function() {
+                if is_event_listener(handler) {
                     st.listeners
                         .entry((WINDOW_NODE, ty))
                         .or_default()
@@ -6531,7 +6539,7 @@ fn do_native(
             let win = st.known.window;
             for cb in cbs {
                 // a throwing error-listener must not abort the caller
-                let _ = call_value_this(st, mods, cb, Some(win), &[ev]);
+                let _ = call_listener(st, mods, cb, Some(win), &[ev]);
             }
             Ok(Value::boolean(true))
         }
@@ -6590,7 +6598,9 @@ fn do_native(
             for cb in cbs {
                 // one handler must not be able to starve the next
                 st.fuel = DEFAULT_FUEL;
-                if let Err(e) = call_value_this(st, mods, cb, Some(win), &[ev]) {
+                if let Err(e) =
+                    call_listener(st, mods, cb, Some(win), &[ev])
+                {
                     st.logs.push(format!("message handler: {}", e.msg));
                 }
             }
@@ -8707,6 +8717,95 @@ fn queue_scroll(
     }
 }
 
+/// `document.write(markup)` into the document that is running: parse
+/// the markup and splice it in at the parser insertion point.
+///
+/// A real parser inserts right where the `<script>` sits, because the
+/// script is running mid-parse. We run scripts after the parse, but
+/// `document.currentScript` still names the script whose turn it is,
+/// and "immediately after that element" is the same position. Ad
+/// SafeFrames are built entirely on this: the shell document is a
+/// `<script>` inside a wrapper div, and it writes the creative markup
+/// next to itself. Without it every ad slot laid out at its reserved
+/// size and painted nothing.
+fn doc_write_into(
+    st: &mut St, doc: &Rc<RefCell<dom::Document>>, markup: &str,
+) {
+    let owner = st.current_script.unwrap_or(u32::MAX);
+    let mut d = doc.borrow_mut();
+    let at = match st.doc_write_at {
+        // same script writing again: continue where it left off
+        Some((who, parent, next)) if who == owner
+            && parent < d.nodes.len()
+            && next <= d.nodes[parent].children.len() => Some((parent, next)),
+        _ => st
+            .current_script
+            .map(|s| s as usize)
+            .filter(|&s| s < d.nodes.len())
+            .and_then(|s| d.nodes[s].parent.map(|p| (p, s)))
+            .and_then(|(p, s)| {
+                d.nodes[p].children.iter().position(|&c| c == s)
+                    .map(|i| (p, i + 1))
+            })
+            .or_else(|| {
+                find_tag(&d, "body").map(|b| (b, d.nodes[b].children.len()))
+            }),
+    };
+    let Some((parent, at)) = at else { return };
+    let frag = html::parse(markup);
+    let before = d.nodes[parent].children.len();
+    for section in ["head", "body"] {
+        if let Some(s) = find_tag(&frag, section) {
+            for child in frag.nodes[s].children.clone() {
+                d.graft(&frag, child, parent);
+            }
+        }
+    }
+    // graft appends; rotate the new run back to the insertion point
+    let kids = &mut d.nodes[parent].children;
+    let added = kids.len() - before;
+    kids[at..].rotate_right(added);
+    st.doc_write_at = Some((owner, parent, at + added));
+}
+
+/// Can this value be registered as an event listener?
+///
+/// The EventListener interface is a *callback interface*: a plain
+/// object with a `handleEvent` method is as valid as a function, and
+/// class-based SDKs use it constantly (`window.addEventListener(
+/// 'message', this)` with a `handleEvent(e)` method). Dropping those
+/// silently cost naver its entire ad pipeline -- the SafeFrame host
+/// listens exactly that way, so every `sf-loaded` and `sf-resized` the
+/// child posted arrived at a window with no listener on it, and every
+/// ad slot stayed at the zero height it was created with.
+fn is_event_listener(v: Value) -> bool {
+    v.is_function() || v.is_object()
+}
+
+/// Invoke a registered listener. Per spec the `handleEvent` lookup
+/// happens at dispatch time, not registration, and the object itself
+/// is the `this` for that call.
+pub(super) fn call_listener(
+    st: &mut St,
+    mods: &ModStore,
+    cb: Value,
+    this: Option<Value>,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    if cb.is_function() {
+        return call_value_this(st, mods, cb, this, args);
+    }
+    if cb.is_object() {
+        let k = st.intern_name("handleEvent");
+        if let Some(h) = raw_get_prop(st, cb.index() as usize, k) {
+            if h.is_function() {
+                return call_value_this(st, mods, h, Some(cb), args);
+            }
+        }
+    }
+    Ok(Value::UNDEFINED)
+}
+
 fn dom_method(
     st: &mut St,
     mods: &ModStore,
@@ -8718,6 +8817,36 @@ fn dom_method(
     let _ = mods; // only event dispatch re-enters JS
     let ids = st.ids;
     let doc = need_doc(st)?;
+    if node == DOC_NODE {
+        match st.names[key as usize].clone().as_str() {
+            // A document still parsing is only "reopened" in the sense
+            // that the write below continues it; wiping it here would
+            // throw away the very script that called open(). After
+            // load, open() really does clear the document.
+            "open" => {
+                if st.ready_state == "complete" {
+                    if let Some(body) = find_tag(&doc.borrow(), "body") {
+                        doc.borrow_mut().set_text_content(body, "");
+                    }
+                    st.doc_write_at = None;
+                }
+                return Ok(Value::dom_node(DOC_NODE));
+            }
+            "close" => return Ok(Value::UNDEFINED),
+            m @ ("write" | "writeln") => {
+                let mut markup = (0..argc as usize)
+                    .map(|k| to_display(st, st.regs[args_base + k]))
+                    .collect::<Vec<_>>()
+                    .join("");
+                if m == "writeln" {
+                    markup.push('\n');
+                }
+                doc_write_into(st, &doc, &markup);
+                return Ok(Value::UNDEFINED);
+            }
+            _ => {}
+        }
+    }
     // addEventListener works on document too (listeners are keyed by
     // (node, type); DOC_NODE is just another key)
     if key == ids.add_event_listener {
@@ -8727,7 +8856,7 @@ fn dom_method(
         } else {
             Value::UNDEFINED
         };
-        if handler.is_function() {
+        if is_event_listener(handler) {
             st.listeners.entry((node, ty)).or_default().push(handler);
         }
         return Ok(Value::UNDEFINED);
@@ -8995,7 +9124,7 @@ fn dom_method(
             } else {
                 Value::UNDEFINED
             };
-            if handler.is_function() {
+            if is_event_listener(handler) {
                 st.listeners.entry((node, ty)).or_default().push(handler);
             }
             return Ok(Value::UNDEFINED);
@@ -9308,7 +9437,7 @@ fn dom_method(
                     .cloned()
                     .unwrap_or_default();
                 for cb in cbs {
-                    call_value_this(
+                    call_listener(
                         st, mods, cb,
                         Some(Value::dom_node(c as u32)), &[evt],
                     )?;
@@ -9765,8 +9894,18 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
             // value collapsed the viewport so nothing ever intersected and
             // lazy content (naver's feed) never rendered.
             let tag = doc.borrow().nodes[node_us].tag.clone();
+            // ...except offsetWidth/offsetHeight, which are the border
+            // box even on the body. A SafeFrame ad measures itself with
+            // `document.body.offsetHeight` and posts that out as the
+            // height the host should give the <iframe>; answering the
+            // viewport there asks for a 5000px ad slot.
+            let is_offset_size =
+                !want_pos && matches!(name, "offsetWidth" | "offsetHeight");
             if !want_pos
                 && matches!(tag.as_deref(), Some("html") | Some("body"))
+                && !(is_offset_size
+                    && tag.as_deref() == Some("body")
+                    && st.layout_rects.contains_key(&node))
             {
                 return Ok(Value::int(if want_h {
                     VIEWPORT_H

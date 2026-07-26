@@ -14,7 +14,8 @@ use super::compiler;
 use super::parser;
 use super::value::Value;
 use super::vm::{
-    self, call_value, call_value_this, exec, has_pending_work, host,
+    self, call_listener, call_value, call_value_this, exec,
+    has_pending_work, host,
     make_native, new_plain_object, pump, pump_microtasks, pump_step,
     raw_get_prop, raw_set_prop,
     reject_fetch, resolve_fetch, resolve_fetch_full, Ids, ModStore, Native,
@@ -236,10 +237,48 @@ IntersectionObserver.prototype.observe = function (t) {
 };
 IntersectionObserver.prototype.unobserve = function () {};
 IntersectionObserver.prototype.disconnect = function () {};
-function ResizeObserver(cb) { this._cb = cb; }
-ResizeObserver.prototype.observe = function () {};
-ResizeObserver.prototype.unobserve = function () {};
-ResizeObserver.prototype.disconnect = function () {};
+// Driven by the host: every time real layout rects are pushed in, the
+// engine calls __ggFlushResizeObservers and anything whose box moved
+// gets its callback. A stub that never fired left SafeFrame ads at
+// height 0 forever -- the creative markup is written into the child
+// document, and the *only* thing that gives the frame a height is the
+// child observing its own body and posting the measurement out.
+var __ggResizeObservers = [];
+function ResizeObserver(cb) {
+  this._cb = cb; this._t = []; this._last = [];
+  __ggResizeObservers.push(this);
+}
+ResizeObserver.prototype.observe = function (el) {
+  if (el && this._t.indexOf(el) < 0) { this._t.push(el); this._last.push(null); }
+};
+ResizeObserver.prototype.unobserve = function (el) {
+  var i = this._t.indexOf(el);
+  if (i >= 0) { this._t.splice(i, 1); this._last.splice(i, 1); }
+};
+ResizeObserver.prototype.disconnect = function () {
+  this._t = []; this._last = [];
+};
+function __ggFlushResizeObservers() {
+  for (var k = 0; k < __ggResizeObservers.length; k++) {
+    var o = __ggResizeObservers[k];
+    if (!o._cb || !o._t.length) continue;
+    var entries = [];
+    for (var i = 0; i < o._t.length; i++) {
+      var r;
+      try { r = o._t[i].getBoundingClientRect(); } catch (e) { continue; }
+      var key = r.width + 'x' + r.height;
+      // the spec delivers one notification when observation starts,
+      // whatever the size is -- _last === null covers that
+      if (o._last[i] === key) continue;
+      o._last[i] = key;
+      var box = [{ inlineSize: r.width, blockSize: r.height }];
+      entries.push({ target: o._t[i], contentRect: r,
+                     borderBoxSize: box, contentBoxSize: box,
+                     devicePixelContentBoxSize: box });
+    }
+    if (entries.length) { try { o._cb(entries, o); } catch (e) {} }
+  }
+}
 function matchMedia(q) {
   return { matches: false, media: '' + q,
     onchange: null,
@@ -1908,6 +1947,15 @@ impl PageVm {
         for (idx, x, y, w, h) in rects {
             self.st.layout_rects.insert(idx, (x, y, w, h));
         }
+        // Real layout landing is the only moment a size can be said to
+        // have changed, so this is where ResizeObserver fires. The JS
+        // side early-outs when nothing is observed.
+        let id = self.st.intern_name("__ggFlushResizeObservers");
+        if let Some(&f) = self.st.globals.get(id as usize) {
+            if f.is_function() {
+                let _ = call_value(&mut self.st, &self.mods, f, &[]);
+            }
+        }
     }
 
     /// Tell the document it is embedded, so `window.parent` and
@@ -2404,7 +2452,7 @@ impl PageVm {
                 self.st.fuel = vm::DEFAULT_FUEL; // fresh budget per handler
                 // this = the node whose listener is running (the
                 // currentTarget), matching dispatchEvent's behavior
-                if let Err(e) = call_value_this(
+                if let Err(e) = call_listener(
                     &mut self.st,
                     &self.mods,
                     h,
@@ -2541,7 +2589,7 @@ impl PageVm {
         let trace = std::env::var("GG_JS_TRACE").is_ok();
         let n = cbs.len();
         for (i, cb) in cbs.into_iter().enumerate() {
-            if let Err(e) = call_value_this(
+            if let Err(e) = call_listener(
                 &mut self.st,
                 &self.mods,
                 cb,
@@ -7214,6 +7262,95 @@ console.log('B typeof it: ' + typeof it);
                 "bcd bc".to_string(),
                 "007 7.. ababab".to_string(),
             ],
+        );
+    }
+
+    #[test]
+    fn document_write_lands_next_to_the_script_that_wrote_it() {
+        // The whole SafeFrame ad mechanism is this: a shell document
+        // whose only content is a <script>, which writes the creative
+        // markup next to itself. document.write on the running
+        // document was unsupported, so every ad slot laid out at its
+        // reserved size and painted nothing.
+        let doc = Rc::new(RefCell::new(crate::html::parse(
+            "<div id=box><script id=s></script></div><div id=tail></div>",
+        )));
+        let mut vm = PageVm::new(Some(doc.clone()));
+        let script =
+            crate::dom_api::query(&doc.borrow(), "#s", true)[0] as u32;
+        vm.set_current_script(Some(script));
+        vm.run_scripts(&["document.write('<b id=one>1</b>');\
+             document.write('<i id=two>2</i>');"
+            .to_string()]);
+        vm.set_current_script(None);
+        // both chunks inside the script's parent, in write order, after
+        // the script and before anything that followed it
+        assert_eq!(
+            vm.run_scripts(&["var box = document.getElementById('box');\
+                var out = [];\
+                for (var i = 0; i < box.childNodes.length; i++) {\
+                  var c = box.childNodes[i];\
+                  if (c.tagName) out.push(c.tagName + '#' + c.id);\
+                }\
+                console.log(out.join(',') + '|'\
+                  + document.getElementById('tail').id);"
+                .to_string()]),
+            vec!["SCRIPT#s,B#one,I#two|tail".to_string()],
+        );
+    }
+
+    #[test]
+    fn an_object_with_handle_event_is_a_listener() {
+        // EventListener is a callback interface: an object with a
+        // handleEvent method is as valid as a function, and every
+        // class-based SDK registers `this`. Dropping those silently
+        // cost naver's ad host every message its frames sent it.
+        let mut vm = PageVm::new(None);
+        assert_eq!(
+            vm.run_scripts(&["var seen = [];\
+                var sink = {\
+                  tag: 'sink',\
+                  handleEvent: function (e) {\
+                    seen.push(this.tag + ':' + e.type);\
+                  }\
+                };\
+                window.addEventListener('ping', sink);\
+                window.addEventListener('ping', function (e) {\
+                  seen.push('fn:' + e.type);\
+                });\
+                window.addEventListener('ping', { nope: 1 });\
+                window.dispatchEvent({ type: 'ping' });\
+                console.log(seen.join('|'));"
+                .to_string()]),
+            vec!["sink:ping|fn:ping".to_string()],
+        );
+    }
+
+    #[test]
+    fn a_resize_observer_reports_when_layout_lands() {
+        // Driven by the host pushing real geometry, which is the only
+        // moment a size can be said to have changed. The spec also
+        // delivers one notification when observation starts.
+        let doc = Rc::new(RefCell::new(crate::html::parse(
+            "<div id=a></div><div id=b></div>",
+        )));
+        let mut vm = PageVm::new(Some(doc.clone()));
+        let a = crate::dom_api::query(&doc.borrow(), "#a", true)[0] as u32;
+        vm.run_scripts(&["var log = [];\
+            var ro = new ResizeObserver(function (es) {\
+              for (var i = 0; i < es.length; i++) {\
+                log.push(es[i].contentRect.width + 'x'\
+                         + es[i].contentRect.height);\
+              }\
+            });\
+            ro.observe(document.getElementById('a'));"
+            .to_string()]);
+        vm.set_layout_rects(vec![(a, 0.0, 0.0, 300.0, 40.0)]);
+        vm.set_layout_rects(vec![(a, 0.0, 0.0, 300.0, 40.0)]); // no change
+        vm.set_layout_rects(vec![(a, 0.0, 0.0, 300.0, 90.0)]);
+        assert_eq!(
+            vm.run_scripts(&["console.log(log.join('|'));".to_string()]),
+            vec!["300x40|300x90".to_string()],
         );
     }
 

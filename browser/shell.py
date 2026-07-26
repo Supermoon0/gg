@@ -343,6 +343,15 @@ class Shell:
             # same reason: a busy parent must not starve a frame's
             # handshake just because this tick took the other branch
             messaged = self._pump_frame_bridge()
+            # ...and so do the child event loops, for exactly the same
+            # reason: a parent that rebuilds its DOM most turns would
+            # otherwise freeze every frame it hosts. On naver.com that
+            # is every ad slot and every shopping module -- their JS ran
+            # a handful of times across a 25s settle, so a SafeFrame ad
+            # never got the animation frame it measures itself in and
+            # every slot stayed at its initial zero height.
+            frames_changed = (self.frames.tick(dt)
+                              if self.frames is not None else False)
             if changed or self._deferred_resources:
                 first_resources = self._deferred_resources
                 started = time.perf_counter()
@@ -359,9 +368,6 @@ class Shell:
                 # sample CSS animations/transitions (a relayout above
                 # already sampled inside relayout())
                 result = self.animator.on_frame(self.nodes)
-                # child frames run their own event loops + animations
-                frames_changed = (self.frames.tick(dt)
-                                  if self.frames is not None else False)
                 if result.damage == "layout":
                     self.relayout()
                 elif result.damage == "paint" or frames_changed \

@@ -225,6 +225,7 @@ class FrameDocument:
         # document, and the callback that records a navigation
         self.path = ()
         self.on_navigate = None
+        self._img_by_src = {}      # this frame's decoded images
 
     # -- loading -------------------------------------------------------
 
@@ -284,6 +285,12 @@ class FrameDocument:
             self.blocked_reason = f"{type(exc).__name__}: {exc}"
             self.root = None
             return False
+        try:
+            self.load_images()
+        except net.RequestCancelled:
+            raise
+        except Exception:
+            pass
         self.status = "loaded"
         self.blocked_reason = ""
         return True
@@ -402,6 +409,12 @@ class FrameDocument:
                     if self.subframes is not None:
                         self.subframes.sync(self.root, self.url)
                     self.animator.on_frame(self.root)
+                    # new markup can carry new images -- an ad creative
+                    # arrives this way, written in after the document
+                    try:
+                        self.load_images()
+                    except Exception:
+                        pass
                     changed = True
             except Exception:
                 pass
@@ -427,7 +440,77 @@ class FrameDocument:
         doc = DocumentLayout(self.root)
         doc.layout(max(width, 10.0), max(height, 10.0))
         self._layout_cache = (key, doc)
+        self._push_layout_rects(doc)
         return doc
+
+    def load_images(self):
+        """Decode this frame's own <img> sources.
+
+        The shell only ever loaded the *top* document's images, so
+        every image inside an iframe painted as a broken-image box —
+        and an ad creative is nothing but one image inside a frame.
+        Sources are cached per frame, so a re-render costs nothing and
+        a document that swaps its creative fetches only the new one."""
+        if self.root is None or self.url is None:
+            return False
+        from . import textengine
+        if not textengine.available():
+            return False
+        nodes = [n for n in tree_to_list(self.root, [])
+                 if isinstance(n, Element) and n.tag == "img"
+                 and n.attributes.get("src")]
+        if not nodes:
+            return False
+        engine = textengine.engine()
+        loaded = False
+        for src in {n.attributes["src"] for n in nodes}:
+            if src in self._img_by_src:
+                continue
+            data = b""
+            try:
+                data = self.network.request_raw(
+                    self.url.resolve(src), site_for_cookies=self.top_url,
+                    top_level_navigation=False, timeout=self.timeout)[1]
+            except net.RequestCancelled:
+                raise
+            except Exception:
+                data = b""
+            try:
+                self._img_by_src[src] = engine.load_image(data) if data else None
+            except Exception:
+                self._img_by_src[src] = None
+            loaded = True
+        for node in nodes:
+            node._img = self._img_by_src.get(node.attributes["src"])
+        if loaded:
+            self._layout_cache = None
+        return loaded
+
+    def _push_layout_rects(self, doc):
+        """Give the child's scripts their own real geometry.
+
+        The top document has done this all along; a frame never did, so
+        everything inside one read getBoundingClientRect as 0x0. A
+        SafeFrame ad is built entirely on the opposite: the child
+        observes its own body and posts the measured height out to the
+        host, which is what finally gives the <iframe> a height."""
+        if self.session is None:
+            return
+        rects, stack = [], [doc]
+        while stack:
+            b = stack.pop()
+            node = getattr(b, "node", None)
+            ridx = getattr(node, "_ridx", None) if node is not None else None
+            if ridx is not None:
+                rects.append((int(ridx), float(getattr(b, "x", 0.0)),
+                              float(getattr(b, "y", 0.0)),
+                              float(getattr(b, "width", 0.0)),
+                              float(getattr(b, "height", 0.0))))
+            stack.extend(getattr(b, "children", None) or [])
+        try:
+            self.session.set_layout_rects(rects)
+        except Exception:
+            pass
 
     def content_height(self, width, height):
         doc = self._document_layout(width, height)
