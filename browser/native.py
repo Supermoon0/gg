@@ -662,10 +662,19 @@ class _ScriptLoader:
             self.module_graph.close()
 
 
-def _mark_framed(doc, framed):
+def _mark_framed(doc, framed, window_name=None):
     """`window.top !== window` has to be true before the page's own
     inline scripts run — that check and the parent handshake are both
-    parser-time idioms in the widgets that use them."""
+    parser-time idioms in the widgets that use them.
+
+    `window_name` carries the frame element's `name` in for the same
+    reason: a SafeFrame creative reads its whole init blob out of it,
+    at parse time."""
+    if window_name:
+        try:
+            doc.set_window_name(str(window_name))
+        except Exception:
+            pass  # older wheel without the seam
     if not framed:
         return
     try:
@@ -677,7 +686,8 @@ def _mark_framed(doc, framed):
 def load_document(html, fetch_css, fetch_js=None, js_budget=8.0,
                   page_url=None, viewport_width=1280.0, timings=None,
                   network_backend=None, network_timeout=15.0,
-                  cancel_token=None, network_context=None, framed=False):
+                  cancel_token=None, network_context=None, framed=False,
+                  window_name=None):
     """Full native front half: parse -> scripts -> styles -> tree.
 
     fetch_css(hrefs) / fetch_js(srcs) -> {url: text} keep networking
@@ -738,7 +748,7 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=8.0,
                 doc.set_page_url(str(page_url))
             except Exception:
                 pass
-            _mark_framed(doc, framed)
+            _mark_framed(doc, framed, window_name)
             try:
                 host = getattr(page_url, "host", None)
                 if host and hasattr(doc, "seed_cookies"):
@@ -773,7 +783,7 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=8.0,
                 doc.set_page_url(str(page_url))
             except Exception:
                 pass  # older wheels have no set_page_url
-            _mark_framed(doc, framed)
+            _mark_framed(doc, framed, window_name)
             # seed document.cookie from the network jar so page scripts
             # see the server session before they run
             try:

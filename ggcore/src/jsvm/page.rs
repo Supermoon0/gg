@@ -1301,6 +1301,11 @@ impl PageVm {
             vm.set_object_prop(window, f, window);
         }
         vm.set_object_prop(window, "frameElement", Value::NULL);
+        // `window.name` survives navigation and is the classic channel
+        // for handing parameters into a frame -- SafeFrame ad creatives
+        // read their whole init blob out of it.
+        let empty = vm::intern(&mut vm.st, "");
+        vm.set_object_prop(window, "name", empty);
         let fctor = make_native(&mut vm.st, Native::FunctionCtor);
         vm.set_global("Function", fctor);
         vm.st.known.function = fctor;
@@ -1644,6 +1649,18 @@ impl PageVm {
     /// the `if (window.top !== window)` framed-check and the
     /// `window.parent.postMessage(...)` handshake are both parser-time
     /// inline scripts in the widgets that use them.
+    /// Seed `window.name`. The embedder sets it from the frame
+    /// element's `name` before the child's scripts run, which is the
+    /// only moment it is observable to them.
+    pub fn set_window_name(&mut self, name: &str) {
+        let window = self.st.known.window;
+        if !window.is_object() {
+            return;
+        }
+        let v = vm::intern(&mut self.st, name);
+        self.set_object_prop(window, "name", v);
+    }
+
     pub fn set_framed(&mut self, framed: bool) {
         let window = self.st.known.window;
         if !window.is_object() {

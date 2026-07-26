@@ -3495,6 +3495,21 @@ try:
                       and n.attributes.get("id") == "written"
                       for n in tree_to_list(_dw2.root, [])))
 
+    # `window.name` is the classic way to hand parameters into a
+    # frame -- a SafeFrame creative reads its whole init blob out of
+    # it -- and the only moment it is observable is before the child's
+    # own scripts run
+    if native.available():
+        _wn_root, _wn_doc, _wn_css, _wn_logs = native.load_document(
+            "<html><body><script>console.log('name=' + window.name);"
+            "</script></body></html>",
+            lambda hrefs: {}, lambda srcs: {},
+            page_url=_fr_parent_url, framed=True, window_name="INIT-BLOB")
+        check("iframe: window.name is seeded before the child's scripts",
+              _wn_logs == ["name=INIT-BLOB"], str(_wn_logs))
+    check("iframe: the frame element's name is threaded to the load",
+          "window_name" in (gg_frames.FrameDocument.load.__kwdefaults__ or {}))
+
     # removing the element disposes its frame and returns the budget
     _budget_before = _fr_mgr.budget[0]
     for n in tree_to_list(_fr_parent, []):

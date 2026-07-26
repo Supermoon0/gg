@@ -228,7 +228,8 @@ class FrameDocument:
 
     # -- loading -------------------------------------------------------
 
-    def load(self, src, srcdoc, base_url, *, cancel_token=None):
+    def load(self, src, srcdoc, base_url, *, cancel_token=None,
+             window_name=None):
         """(Re)load the frame from a src URL or srcdoc markup."""
         self.dispose_session()
         self.scroll = 0.0
@@ -274,7 +275,8 @@ class FrameDocument:
 
         try:
             self._commit(body, network, allow_scripts,
-                         cancel_token=cancel_token)
+                         cancel_token=cancel_token,
+                         window_name=window_name)
         except net.RequestCancelled:
             raise
         except Exception as exc:
@@ -286,14 +288,16 @@ class FrameDocument:
         self.blocked_reason = ""
         return True
 
-    def _commit(self, body, network, allow_scripts, *, cancel_token=None):
+    def _commit(self, body, network, allow_scripts, *, cancel_token=None,
+                window_name=None):
         if self.use_native:
             from .renderer_session import LocalRendererSession
             self.session = LocalRendererSession(
                 network, run_scripts=(self.run_scripts and allow_scripts),
                 timeout=self.timeout)
             root, _doc, css_sources, logs = self.session.commit(
-                self.url, body, cancel_token=cancel_token, framed=True)
+                self.url, body, cancel_token=cancel_token, framed=True,
+                window_name=window_name)
             self.root = root
             self.css_sources = list(css_sources)
             self.console = list(logs)
@@ -664,7 +668,8 @@ class FrameManager:
                 else:
                     src, srcdoc = node.attributes.get("src"), None
                 ok = fd.load(src, srcdoc, page_url,
-                             cancel_token=cancel_token)
+                             cancel_token=cancel_token,
+                             window_name=node.attributes.get("name"))
                 changed = True
                 self.frames[key] = fd
                 # contentWindow must resolve before `load` fires: the

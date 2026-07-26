@@ -118,7 +118,8 @@ class LocalRendererSession:
         self._dom_version = None
 
     def commit(self, url, body, *, viewport_width=1280.0, timings=None,
-               cancel_token=None, network_context=None, framed=False):
+               cancel_token=None, network_context=None, framed=False,
+               window_name=None):
         if self.doc is not None or self.network_context is not None:
             self.close()
         self.url = url
@@ -134,7 +135,8 @@ class LocalRendererSession:
             network_backend=self.network,
             network_context=self.network_context,
             network_timeout=self.timeout,
-            cancel_token=cancel_token, framed=framed)
+            cancel_token=cancel_token, framed=framed,
+            window_name=window_name)
         self.root = root
         self.doc = doc
         self.css_sources = list(css_sources)
