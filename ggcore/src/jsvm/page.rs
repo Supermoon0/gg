@@ -7355,6 +7355,35 @@ console.log('B typeof it: ' + typeof it);
     }
 
     #[test]
+    fn the_attributes_map_is_live_and_identity_stable() {
+        // React 19's HostSingleton unmount is
+        //   for (e = n.attributes; e.length;) n.removeAttributeNode(e[0])
+        // -- it never re-reads `.attributes`, so the captured map must
+        // shrink as attributes are removed or the loop never exits.
+        // On recoshopping that one loop ate the whole 400M-instruction
+        // budget and hydration died mid-flight.
+        let doc = Rc::new(RefCell::new(crate::html::parse(
+            "<div id=x class=c data-a=1 data-b=2></div>",
+        )));
+        let mut vm = PageVm::new(Some(doc));
+        assert_eq!(
+            vm.run_scripts(&["var el = document.getElementById('x');\
+                var m = el.attributes;\
+                var start = m.length;\
+                var rounds = 0;\
+                while (m.length) {\
+                  el.removeAttributeNode(m[0]);\
+                  if (++rounds > 50) break;\
+                }\
+                console.log(start, rounds, m.length,\
+                            el.attributes === m,\
+                            el.hasAttributes());"
+                .to_string()]),
+            vec!["4 4 0 true false".to_string()],
+        );
+    }
+
+    #[test]
     fn building_a_string_by_appending_is_charged_once_not_squared() {
         // The heap backstop measures retained bytes. A rope Cat node
         // retains ~32 bytes, but concat used to charge the combined

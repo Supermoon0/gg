@@ -965,6 +965,11 @@ pub(super) struct St {
     /// document for). Those are the host's to answer for -- a dropped
     /// mirror means "no document", not "write your own".
     pub(super) frame_host_owned: std::collections::HashSet<u32>,
+    /// `el.attributes` object per node. A NamedNodeMap is *live* and
+    /// identity-stable, and React 19's unmount loop banks on both:
+    /// `for (e = n.attributes; e.length;) n.removeAttributeNode(e[0])`
+    /// only terminates if removals shrink the map it captured.
+    pub(super) attr_maps: HashMap<u32, Value>,
     /// mutations page JS made through a mirror, as
     /// (handle, child node index, op, arg a, arg b, seq). Applied to
     /// the mirror immediately and to the real child by the host.
@@ -1131,6 +1136,7 @@ impl St {
             doc_writes: Vec::new(),
             doc_write_at: None,
             frame_host_owned: std::collections::HashSet::new(),
+            attr_maps: HashMap::new(),
             frame_dom_writes: Vec::new(),
             map_data: HashMap::new(),
             set_data: HashMap::new(),
@@ -8783,6 +8789,64 @@ fn doc_write_into(
     st.doc_write_at = Some((owner, parent, at + added));
 }
 
+/// Rebuild a node's cached `attributes` map in place from the DOM's
+/// current attribute list. Named keys that no longer exist are set to
+/// undefined (shape slots cannot be removed); indexed entries and
+/// `length` are replaced wholesale, which is what liveness means to
+/// the loops that capture the map.
+fn refresh_attr_map(
+    st: &mut St,
+    doc: &Rc<RefCell<dom::Document>>,
+    node: u32,
+    map: Value,
+) {
+    let oi = map.index() as usize;
+    // names the map currently advertises, to blank the stale ones
+    let nk = st.intern_name("name");
+    let prev = st.objects[oi].elems.clone();
+    let mut old_names = Vec::with_capacity(prev.len());
+    for it in prev {
+        if !it.is_object() {
+            continue;
+        }
+        if let Some(v) = raw_get_prop(st, it.index() as usize, nk) {
+            if v.is_string() {
+                old_names.push(str_ref(st, v.index()).to_string());
+            }
+        }
+    }
+    let attrs = doc.borrow().nodes[node as usize].attrs.clone();
+    for name in &old_names {
+        if !attrs.iter().any(|(k, _)| k == name) {
+            let kk = st.intern_name(name);
+            raw_set_prop(st, oi, kk, Value::UNDEFINED);
+        }
+    }
+    let lenk = st.intern_name("length");
+    raw_set_prop(st, oi, lenk, Value::int(attrs.len() as i32));
+    let mut items = Vec::with_capacity(attrs.len());
+    for (an, av) in &attrs {
+        let item = new_plain_object(st);
+        let ii = item.index() as usize;
+        let nk = st.intern_name("name");
+        let nv = push_str(st, an.clone());
+        raw_set_prop(st, ii, nk, nv);
+        let vk = st.intern_name("value");
+        let vv = push_str(st, av.clone());
+        raw_set_prop(st, ii, vk, vv);
+        let ek = st.intern_name("expando");
+        raw_set_prop(st, ii, ek, Value::boolean(false));
+        let sk = st.intern_name("specified");
+        raw_set_prop(st, ii, sk, Value::boolean(true));
+        let ok = st.intern_name("ownerElement");
+        raw_set_prop(st, ii, ok, Value::dom_node(node));
+        let kk = st.intern_name(an);
+        raw_set_prop(st, oi, kk, item);
+        items.push(item);
+    }
+    st.objects[oi].elems = items;
+}
+
 /// Can this value be registered as an event listener?
 ///
 /// The EventListener interface is a *callback interface*: a plain
@@ -9130,6 +9194,9 @@ fn dom_method(
         if key == ids.remove_attribute {
             let name = arg_string(st, args_base, argc, 0)?;
             doc.borrow_mut().remove_attr(node_us, &name);
+            if let Some(&map) = st.attr_maps.get(&node) {
+                refresh_attr_map(st, &doc, node, map);
+            }
             return Ok(Value::UNDEFINED);
         }
         if key == ids.add_event_listener {
@@ -9368,6 +9435,10 @@ fn dom_method(
             doc.borrow_mut().nodes[node as usize]
                 .attrs
                 .retain(|(k, _)| !k.eq_ignore_ascii_case(&name));
+            // liveness: a captured `el.attributes` must see the removal
+            if let Some(&map) = st.attr_maps.get(&node) {
+                refresh_attr_map(st, &doc, node, map);
+            }
             return Ok(attr);
         }
         "hasAttributes" => {
@@ -9823,31 +9894,24 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
             return Ok(push_str(st, out));
         }
         "attributes" => {
-            // NamedNodeMap snapshot: named + indexed access, each
-            // entry an Attr-ish record (jQuery probes .expando)
-            let attrs = doc.borrow().nodes[node_us].attrs.clone();
-            let obj = new_plain_object(st);
-            let oi = obj.index() as usize;
-            let lenk = st.intern_name("length");
-            raw_set_prop(st, oi, lenk,
-                         Value::int(attrs.len() as i32));
-            for (an, av) in &attrs {
-                let item = new_plain_object(st);
-                let ii = item.index() as usize;
-                let nk = st.intern_name("name");
-                let nv = push_str(st, an.clone());
-                raw_set_prop(st, ii, nk, nv);
-                let vk = st.intern_name("value");
-                let vv = push_str(st, av.clone());
-                raw_set_prop(st, ii, vk, vv);
-                let ek = st.intern_name("expando");
-                raw_set_prop(st, ii, ek, Value::boolean(false));
-                let sk = st.intern_name("specified");
-                raw_set_prop(st, ii, sk, Value::boolean(true));
-                let kk = st.intern_name(an);
-                raw_set_prop(st, oi, kk, item);
-                st.objects[oi].elems.push(item);
-            }
+            // NamedNodeMap: named + indexed access, each entry an
+            // Attr-ish record (jQuery probes .expando). One object per
+            // node for its whole life, refreshed in place on every
+            // read and every attribute removal -- a real NamedNodeMap
+            // is live and identity-stable, and React 19's unmount loop
+            // (`for (e = n.attributes; e.length;) n.removeAttribute
+            // Node(e[0])`) spins forever on a snapshot whose length
+            // can never reach zero. That one loop burned recoshopping's
+            // entire 400M-instruction budget mid-hydration.
+            let obj = match st.attr_maps.get(&node) {
+                Some(&o) => o,
+                None => {
+                    let o = new_plain_object(st);
+                    st.attr_maps.insert(node, o);
+                    o
+                }
+            };
+            refresh_attr_map(st, &doc, node, obj);
             return Ok(obj);
         }
         "children" => {
