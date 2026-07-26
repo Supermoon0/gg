@@ -2214,7 +2214,7 @@ impl PageVm {
             0,
         );
         self.st.regs.truncate(base);
-        out.map_err(|e| e.msg)
+        out.map_err(|e| e.report())
     }
 
     /// Browser entry point: run page scripts in order, collect console
@@ -2390,7 +2390,7 @@ impl PageVm {
                     Some(Value::dom_node(node)),
                     &[ev],
                 ) {
-                    self.st.logs.push(format!("[gg-js error] {}", e.msg));
+                    self.st.logs.push(format!("[gg-js error] {}", e.report()));
                 }
             }
             let handlers = self
@@ -2411,7 +2411,7 @@ impl PageVm {
                     Some(Value::dom_node(node)),
                     &[ev],
                 ) {
-                    self.st.logs.push(format!("[gg-js error] {}", e.msg));
+                    self.st.logs.push(format!("[gg-js error] {}", e.report()));
                 }
             }
             if self.st.default_prevented {
@@ -2557,7 +2557,7 @@ impl PageVm {
                 } else {
                     self.st
                         .logs
-                        .push(format!("[gg-js error] {}", e.msg));
+                        .push(format!("[gg-js error] {}", e.report()));
                 }
             }
         }
@@ -7213,6 +7213,39 @@ console.log('B typeof it: ' + typeof it);
                 "4".to_string(),
                 "bcd bc".to_string(),
                 "007 7.. ababab".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_missing_argument_is_undefined_even_with_arguments() {
+        // A function that reads `arguments` keeps the args past its
+        // parameter list -- but blanking the activation from
+        // max(argc, nparams) also spared the *missing* parameters, so
+        // they read whatever the previous call had left in that
+        // register window. naver's event dispatcher is exactly this
+        // shape: `fire(t, e) { e = e || {}; ... arguments.length }`
+        // called as `fire('x')` found a leftover string in `e`, skipped
+        // its own initializer, and threw on the next `e.q.push()`.
+        let mut vm = PageVm::new(None);
+        assert_eq!(
+            vm.run_scripts(&["function fire(t, e) {\
+                    e = e || { q: [] };\
+                    e.q.push(t);\
+                    var n = arguments.length;\
+                    for (var i = 2; i < n; i++) e.q.push(arguments[i]);\
+                    return e.q.join(',') + '/' + n;\
+                };\
+                function seed(a, b) { return a + b; };\
+                seed('leftover', 'junk');\
+                console.log(fire('one'));\
+                console.log(fire('two', { q: ['pre'] }));\
+                console.log(fire('three', null, 'x', 'y'));"
+                .to_string()]),
+            vec![
+                "one/1".to_string(),
+                "pre,two/2".to_string(),
+                "three,x,y/4".to_string(),
             ],
         );
     }

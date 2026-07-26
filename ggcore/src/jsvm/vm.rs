@@ -33,6 +33,37 @@ pub struct VmError {
     /// "TypeError", ...). Lets `catch (e)` see e.name/instanceof match
     /// what real JS would throw.
     pub kind: &'static str,
+    /// Call frames captured the first time this error unwound past a
+    /// function boundary. An engine-raised error is materialized at the
+    /// catch site, long after the frames that threw are gone, so the
+    /// trace has to be snapshotted on the way out -- and an error that
+    /// is never caught still needs it, or the host reports a bare
+    /// message with no way to tell which of a page's thousand scripts
+    /// raised it.
+    pub trace: Option<String>,
+}
+
+impl VmError {
+    /// How the host reports this error. Plain message by default —
+    /// the log vec is the engine's observable contract and callers
+    /// match on it. `GG_JS_TRACE=1` appends the captured frames, which
+    /// is the only way to tell *which* of a real page's thousand
+    /// bundled functions raised a "cannot call .push() of undefined".
+    pub fn report(&self) -> String {
+        match &self.trace {
+            Some(t) if trace_enabled() => format!("{}\n{t}", self.msg),
+            _ => self.msg.clone(),
+        }
+    }
+}
+
+fn trace_enabled() -> bool {
+    thread_local! {
+        static ON: bool = std::env::var("GG_JS_TRACE")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false);
+    }
+    ON.with(|v| *v)
 }
 
 impl std::fmt::Debug for VmError {
@@ -41,24 +72,51 @@ impl std::fmt::Debug for VmError {
     }
 }
 
+/// First register of a fresh activation that must be blanked. The
+/// caller wrote the real arguments at `new_base + 0 .. argc`;
+/// everything above that is still the previous occupant of this
+/// register window and has to be cleared or the callee reads another
+/// frame's values as its own.
+///
+/// A function that reads `arguments` keeps the args past its parameter
+/// list -- those registers are the only place the extra arguments
+/// live. A *missing* parameter is a different case: `f(t, e)` called
+/// as `f('a')` must see `e === undefined`. Blanking from
+/// `max(argc, nparams)` conflated the two, so naver's event dispatcher
+/// (`fire(t, e)` -> `e = e || {}`) found a leftover string in `e`,
+/// skipped its own initializer, and threw on the next `e.<x>.push()`.
+fn frame_blank_from(
+    uses_arguments: bool, argc: usize, nparams: usize,
+) -> usize {
+    if uses_arguments { argc } else { argc.min(nparams) }
+}
+
 fn err<T>(msg: impl Into<String>) -> Result<T, VmError> {
-    Err(VmError { msg: msg.into(), value: None, kind: "Error" })
+    Err(VmError {
+        msg: msg.into(), value: None, kind: "Error", trace: None,
+    })
 }
 
 /// An engine-raised error that real JS specifies as a TypeError
 /// (member access on nullish, calling a non-function, ...).
 fn type_err<T>(msg: impl Into<String>) -> Result<T, VmError> {
-    Err(VmError { msg: msg.into(), value: None, kind: "TypeError" })
+    Err(VmError {
+        msg: msg.into(), value: None, kind: "TypeError", trace: None,
+    })
 }
 
 /// As `type_err`, for ReferenceErrors (unresolved names, TDZ).
 fn ref_err<T>(msg: impl Into<String>) -> Result<T, VmError> {
-    Err(VmError { msg: msg.into(), value: None, kind: "ReferenceError" })
+    Err(VmError {
+        msg: msg.into(), value: None, kind: "ReferenceError", trace: None,
+    })
 }
 
 /// As `type_err`, for RangeErrors (invalid lengths and counts).
 fn range_err<T>(msg: impl Into<String>) -> Result<T, VmError> {
-    Err(VmError { msg: msg.into(), value: None, kind: "RangeError" })
+    Err(VmError {
+        msg: msg.into(), value: None, kind: "RangeError", trace: None,
+    })
 }
 
 /// Longest string the VM will build, in bytes. Rope concatenation is
@@ -215,6 +273,7 @@ fn ensure_compiled(
             msg: e.msg,
             value: None,
             kind: "SyntaxError",
+            trace: None,
         }
     })?;
     let nmi = load_module(st, mods, module);
@@ -1818,7 +1877,7 @@ fn drain_microtasks(st: &mut St, mods: &ModStore, budget: &mut usize) {
         match job {
             Job::Call { callback, args } => {
                 if let Err(e) = call_value(st, mods, callback, &args) {
-                    st.logs.push(format!("[gg-js error] {}", e.msg));
+                    st.logs.push(format!("[gg-js error] {}", e.report()));
                 }
             }
             Job::React { handler, value, derived, is_reject, finally } => {
@@ -2011,14 +2070,14 @@ pub(super) fn pump(
             st.timers[i].seq = st.timer_seq;
             fired_intervals.insert(id);
             if let Err(e) = call_value(st, mods, cb, &args) {
-                st.logs.push(format!("[gg-js error] {}", e.msg));
+                st.logs.push(format!("[gg-js error] {}", e.report()));
             }
         } else {
             let t = st.timers.remove(i);
             fired_raf |= t.is_raf;
             st.now_ms = st.now_ms.max(t.due_ms);
             if let Err(e) = call_value(st, mods, t.callback, &t.args) {
-                st.logs.push(format!("[gg-js error] {}", e.msg));
+                st.logs.push(format!("[gg-js error] {}", e.report()));
             }
         }
     }
@@ -2076,13 +2135,13 @@ pub(super) fn pump_step(
             st.timers[i].due_ms = st.now_ms + iv.max(0.0);
             st.timers[i].seq = st.timer_seq;
             if let Err(e) = call_value(st, mods, cb, &args) {
-                st.logs.push(format!("[gg-js error] {}", e.msg));
+                st.logs.push(format!("[gg-js error] {}", e.report()));
             }
         } else {
             let t = st.timers.remove(i);
             st.now_ms = st.now_ms.max(t.due_ms);
             if let Err(e) = call_value(st, mods, t.callback, &t.args) {
-                st.logs.push(format!("[gg-js error] {}", e.msg));
+                st.logs.push(format!("[gg-js error] {}", e.report()));
             }
         }
         drain_microtasks(st, mods, &mut budget);
@@ -2139,7 +2198,7 @@ pub(super) fn pump_bounded(
                 st.fuel = DEFAULT_FUEL;
                 if let Err(e) = call_value(st, mods, t.callback, &t.args)
                 {
-                    st.logs.push(format!("[gg-js error] {}", e.msg));
+                    st.logs.push(format!("[gg-js error] {}", e.report()));
                 }
             }
             _ => break,
@@ -2632,11 +2691,13 @@ fn build_function(
         msg: format!("{e:?}"),
         value: None,
         kind: "SyntaxError",
+        trace: None,
     })?;
     let module = super::compiler::compile(&ast).map_err(|e| VmError {
         msg: format!("{e:?}"),
         value: None,
         kind: "SyntaxError",
+        trace: None,
     })?;
     let mi = load_module(st, mods, module);
     let main = mods.rc(mi).module.main;
@@ -4473,6 +4534,7 @@ fn proxy_rec(st: &St, id: u32) -> Result<ProxyRec, VmError> {
             msg: "invalid Proxy record".to_string(),
             value: None,
             kind: "TypeError",
+            trace: None,
         })?;
     if rec.revoked {
         return type_err("Cannot perform operation on a revoked Proxy");
@@ -10310,7 +10372,7 @@ pub(super) fn exec(
             st, mods, mi, pi, ip, base, cl, this_v, floor, with_base,
             cur_argc,
         );
-        let e = match r {
+        let mut e = match r {
             Ok(v) => {
                 // Handlers armed by this activation must not outlive it
                 // (a callback can return from inside `try` at `floor`,
@@ -10326,11 +10388,22 @@ pub(super) fn exec(
         // that threw are gone. `e.value` set means the page threw its
         // own object, which already carries whatever stack it wants.
         let trace = if e.value.is_none() {
-            Some(stack_string(st, mods, Some(st.cur_site)))
+            Some(
+                e.trace.clone().unwrap_or_else(|| {
+                    stack_string(st, mods, Some(st.cur_site))
+                }),
+            )
         } else {
             None
         };
         if st.handlers.len() <= hfloor {
+            // Carry the frames out with the error. This activation is
+            // about to be truncated away, so a caller that reports the
+            // error later -- the host printing "[gg-js error] ..." --
+            // has no other way to say where it came from.
+            if e.trace.is_none() {
+                e.trace = trace;
+            }
             // Uncaught here. Unwind frames pushed by this activation: a
             // thrown error must not leak frames into the persistent VM
             // (each leak permanently shrinks headroom until every call
@@ -10658,7 +10731,9 @@ fn exec_loop(
             Instr::Throw { src } => {
                 let v = reg!(src);
                 let msg = throw_msg(st, v);
-                return Err(VmError { msg, value: Some(v), kind: "Error" });
+                return Err(VmError {
+                    msg, value: Some(v), kind: "Error", trace: None,
+                });
             }
             Instr::SetGlobal { atom, src } => {
                 let key = name!(atom) as usize;
@@ -11004,11 +11079,11 @@ fn exec_loop(
                         if st.regs.len() < need {
                             st.regs.resize(need, Value::UNDEFINED);
                         }
-                        let from = if callee.uses_arguments {
-                            (argc as usize).max(callee.nparams as usize)
-                        } else {
-                            (argc as usize).min(callee.nparams as usize)
-                        };
+                        let from = frame_blank_from(
+                            callee.uses_arguments,
+                            argc as usize,
+                            callee.nparams as usize,
+                        );
                         for r in from..callee.nregs as usize {
                             st.regs[new_base + r] = Value::UNDEFINED;
                         }
@@ -11094,11 +11169,11 @@ fn exec_loop(
                         if st.regs.len() < need {
                             st.regs.resize(need, Value::UNDEFINED);
                         }
-                        let from = if callee.uses_arguments {
-                            (argc as usize).max(callee.nparams as usize)
-                        } else {
-                            (argc as usize).min(callee.nparams as usize)
-                        };
+                        let from = frame_blank_from(
+                            callee.uses_arguments,
+                            argc as usize,
+                            callee.nparams as usize,
+                        );
                         for r in from..callee.nregs as usize {
                             st.regs[new_base + r] = Value::UNDEFINED;
                         }
@@ -11229,11 +11304,11 @@ fn exec_loop(
                             let callee =
                                 &callee_rc.module.protos[cp as usize];
                             let actual = args.len().min(u8::MAX as usize);
-                            let copied = if callee.uses_arguments {
-                                actual
-                            } else {
-                                actual.min(callee.nparams as usize)
-                            };
+                            let copied = frame_blank_from(
+                                callee.uses_arguments,
+                                actual,
+                                callee.nparams as usize,
+                            );
                             let new_base = base + obj as usize + 1;
                             let need = new_base + (callee.nregs as usize)
                                 .max(copied);
@@ -11245,12 +11320,7 @@ fn exec_loop(
                             {
                                 st.regs[new_base + index] = *value;
                             }
-                            let initialized = if callee.uses_arguments {
-                                actual.max(callee.nparams as usize)
-                            } else {
-                                actual.min(callee.nparams as usize)
-                            };
-                            for register in initialized
+                            for register in copied
                                 ..callee.nregs as usize
                             {
                                 st.regs[new_base + register] =
@@ -12231,14 +12301,11 @@ fn exec_loop(
                                 if st.regs.len() < need {
                                     st.regs.resize(need, Value::UNDEFINED);
                                 }
-                                let from = if callee.uses_arguments
-                                {
-                                    (argc as usize)
-                                        .max(callee.nparams as usize)
-                                } else {
-                                    (argc as usize)
-                                        .min(callee.nparams as usize)
-                                };
+                                let from = frame_blank_from(
+                                    callee.uses_arguments,
+                                    argc as usize,
+                                    callee.nparams as usize,
+                                );
                                 for r in from..callee.nregs as usize {
                                     st.regs[new_base + r] =
                                         Value::UNDEFINED;
