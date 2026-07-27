@@ -12,6 +12,7 @@ mod dom;
 mod dom_api;
 mod fonts;
 mod html;
+mod html5;
 mod jsvm;
 mod raster;
 mod style;
