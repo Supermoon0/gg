@@ -17,7 +17,9 @@ pub mod sink;
 pub mod tokenizer;
 pub mod tree;
 
-pub use tree::{parse, parse_fragment};
+pub use tree::parse;
+#[cfg(test)]
+pub use tree::parse_fragment;
 
 #[cfg(test)]
 mod html5lib_test;

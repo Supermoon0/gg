@@ -8880,7 +8880,8 @@ fn doc_write_into(
             }),
     };
     let Some((parent, at)) = at else { return };
-    let frag = html::parse(markup);
+    // whichever parser the page itself was built with
+    let frag = crate::parse_document(markup);
     let before = d.nodes[parent].children.len();
     for section in ["head", "body"] {
         if let Some(s) = find_tag(&frag, section) {

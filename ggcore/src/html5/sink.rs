@@ -344,7 +344,15 @@ pub fn to_dom(sink: &Sink) -> crate::dom::Document {
                 NodeData::Text(t) => {
                     doc.new_text(t.clone(), parent);
                 }
-                // template contents are not part of the rendered tree
+                // A template's content is a separate fragment in the
+                // spec tree; the engine's DOM has no such thing, so it
+                // hangs under the template element itself. That is
+                // where script expects to find it, and the UA sheet
+                // already keeps a template off the screen.
+                NodeData::TemplateContents => {
+                    map.insert(c, parent);
+                    stack.push(c);
+                }
                 _ => {}
             }
         }

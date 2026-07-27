@@ -810,13 +810,15 @@ struct Doc {
     ggjs: Option<jsvm::page::PageVm>,
 }
 
-/// The spec parser is wired in behind a switch while the two are
-/// compared side by side: it keeps whitespace-only text, comments and a
-/// doctype, and builds the tree the way a browser does, so the rendered
-/// result is not identical to the older parser's by construction.
-/// `GG_HTML5=1` selects it.
-fn parse_document(html: &str) -> dom::Document {
-    let spec = std::env::var("GG_HTML5").is_ok_and(|v| v != "0");
+/// Pages are parsed to the HTML5 spec: html5lib-tests' tree
+/// construction suite passes 1796/1796 against this, where the older
+/// parser in `html` is an approximation nothing measures. The two
+/// differ visibly in one way — the spec keeps a whitespace-only text
+/// node between tags and the old parser throws it away — which changed
+/// nothing the gates can see, layout having collapsed that whitespace
+/// all along. `GG_HTML5=0` puts the old parser back.
+pub(crate) fn parse_document(html: &str) -> dom::Document {
+    let spec = std::env::var("GG_HTML5").map_or(true, |v| v != "0");
     if spec {
         html5::sink::to_dom(&html5::parse(html, false).sink)
     } else {
