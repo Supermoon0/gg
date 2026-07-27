@@ -159,6 +159,19 @@ impl Sink {
             .map(|(_, v)| v.as_str())
     }
 
+    /// The spec inserts one character at a time; building a String for
+    /// each one costs more than the insertion does.
+    pub fn append_char(&mut self, parent: usize, c: char) {
+        if let Some(&last) = self.nodes[parent].children.last() {
+            if let NodeData::Text(t) = &mut self.nodes[last].data {
+                t.push(c);
+                return;
+            }
+        }
+        let n = self.push(NodeData::Text(c.to_string()));
+        self.append(parent, n);
+    }
+
     /// Append text, merging into a preceding text sibling as the spec's
     /// "insert a character" step does.
     pub fn append_text(&mut self, parent: usize, text: &str) {
@@ -170,6 +183,25 @@ impl Sink {
         }
         let n = self.push(NodeData::Text(text.to_string()));
         self.append(parent, n);
+    }
+
+    pub fn insert_char_before(
+        &mut self, parent: usize, before: usize, c: char,
+    ) {
+        let at = self.nodes[parent]
+            .children
+            .iter()
+            .position(|&x| x == before)
+            .unwrap_or(self.nodes[parent].children.len());
+        if at > 0 {
+            let prev = self.nodes[parent].children[at - 1];
+            if let NodeData::Text(t) = &mut self.nodes[prev].data {
+                t.push(c);
+                return;
+            }
+        }
+        let n = self.push(NodeData::Text(c.to_string()));
+        self.insert_before(parent, n, before);
     }
 
     pub fn insert_text_before(

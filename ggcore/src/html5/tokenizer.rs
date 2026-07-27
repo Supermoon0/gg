@@ -26,6 +26,13 @@ pub enum Token {
     EndTag {
         name: String,
     },
+    /// A run of adjacent character tokens. The spec emits one token per
+    /// character; a page whose bulk is an inline <script> is then two
+    /// hundred thousand tokens, and the queue traffic costs more than
+    /// the tokenizing. Adjacent characters coalesce here and the tree
+    /// builder unpacks them one at a time, so the insertion modes still
+    /// see the spec's stream.
+    Chars(String),
     Comment(String),
     Char(char),
     Eof,
@@ -107,7 +114,7 @@ pub enum State {
 }
 
 pub struct Tokenizer {
-    input: Vec<char>,
+    input: String,
     pos: usize,
     pub state: State,
     return_state: State,
@@ -134,6 +141,9 @@ pub struct Tokenizer {
     /// true once the tokenizer has run off the end of the input
     pub eof: bool,
     consumed: bool,
+    /// Bytes the last `next` took, so `reconsume` can step back over a
+    /// character it never had to decode twice.
+    last_len: usize,
     /// Whether a `<![CDATA[` here is real CDATA. The tree builder sets
     /// this from the adjusted current node's namespace before each
     /// token pull; outside foreign content the spec makes it a bogus
@@ -149,18 +159,31 @@ impl Tokenizer {
     pub fn new(input: &str) -> Tokenizer {
         // Preprocessing: normalize newlines, per the spec's input
         // stream preprocessing step.
-        let mut chars: Vec<char> = Vec::with_capacity(input.len());
-        let mut it = input.chars().peekable();
-        while let Some(c) = it.next() {
-            if c == '\r' {
-                if it.peek() == Some(&'\n') {
-                    it.next();
+        // Only a carriage return needs rewriting, and most documents
+        // have none: scanning for one is far cheaper than copying the
+        // whole input a character at a time to find out.
+        let chars = match input.find('\r') {
+            None => input.to_string(),
+            Some(first) => {
+                let mut out = String::with_capacity(input.len());
+                let mut rest = input;
+                let mut at = first;
+                loop {
+                    out.push_str(&rest[..at]);
+                    out.push('\n');
+                    rest = &rest[at + 1..];
+                    if let Some(s) = rest.strip_prefix('\n') {
+                        rest = s;
+                    }
+                    match rest.find('\r') {
+                        Some(next) => at = next,
+                        None => break,
+                    }
                 }
-                chars.push('\n');
-            } else {
-                chars.push(c);
+                out.push_str(rest);
+                out
             }
-        }
+        };
         Tokenizer {
             input: chars,
             pos: 0,
@@ -185,27 +208,46 @@ impl Tokenizer {
             eof: false,
             cdata_ok: false,
             consumed: false,
+            last_len: 0,
         }
     }
 
     /// Re-feed markup at the current position — `document.write` during
     /// parsing inserts at the insertion point.
     pub fn insert_at_point(&mut self, text: &str) {
-        let ins: Vec<char> = text.chars().collect();
-        self.input.splice(self.pos..self.pos, ins);
+        self.input.insert_str(self.pos, text);
     }
 
+    /// Markup is overwhelmingly ASCII, and slicing a `str` costs a
+    /// char-boundary check that a byte load does not.
     fn next(&mut self) -> Option<char> {
-        let c = self.input.get(self.pos).copied();
-        self.consumed = c.is_some();
-        if c.is_some() {
-            self.pos += 1;
+        match self.input.as_bytes().get(self.pos) {
+            None => {
+                self.consumed = false;
+                None
+            }
+            Some(&b) if b < 0x80 => {
+                self.consumed = true;
+                self.last_len = 1;
+                self.pos += 1;
+                Some(b as char)
+            }
+            Some(_) => {
+                let c = self.input[self.pos..].chars().next()?;
+                self.consumed = true;
+                self.last_len = c.len_utf8();
+                self.pos += self.last_len;
+                Some(c)
+            }
         }
-        c
     }
 
     fn peek(&self) -> Option<char> {
-        self.input.get(self.pos).copied()
+        match self.input.as_bytes().get(self.pos) {
+            None => None,
+            Some(&b) if b < 0x80 => Some(b as char),
+            Some(_) => self.input[self.pos..].chars().next(),
+        }
     }
 
     /// The spec's "reconsume": put back the character the current state
@@ -214,7 +256,7 @@ impl Tokenizer {
     /// character and lose it from the output.
     fn reconsume(&mut self) {
         if self.consumed {
-            self.pos -= 1;
+            self.pos -= self.last_len;
             self.consumed = false;
         }
     }
@@ -222,30 +264,28 @@ impl Tokenizer {
     /// Case-insensitive lookahead used by the few states the spec
     /// defines in terms of matching a literal string.
     fn match_ahead_ci(&mut self, s: &str) -> bool {
-        let cs: Vec<char> = s.chars().collect();
-        if self.pos + cs.len() > self.input.len() {
+        // Every literal the spec matches this way is ASCII, so a byte
+        // comparison says the same thing a character one would.
+        let end = self.pos + s.len();
+        if end > self.input.len() || !self.input.is_char_boundary(end) {
             return false;
         }
-        for (k, want) in cs.iter().enumerate() {
-            if !self.input[self.pos + k].eq_ignore_ascii_case(want) {
-                return false;
-            }
+        if !self.input[self.pos..end].eq_ignore_ascii_case(s) {
+            return false;
         }
-        self.pos += cs.len();
+        self.pos = end;
         true
     }
 
     fn match_ahead(&mut self, s: &str) -> bool {
-        let cs: Vec<char> = s.chars().collect();
-        if self.pos + cs.len() > self.input.len() {
+        let end = self.pos + s.len();
+        if end > self.input.len() || !self.input.is_char_boundary(end) {
             return false;
         }
-        for (k, want) in cs.iter().enumerate() {
-            if self.input[self.pos + k] != *want {
-                return false;
-            }
+        if &self.input[self.pos..end] != s {
+            return false;
         }
-        self.pos += cs.len();
+        self.pos = end;
         true
     }
 
@@ -257,13 +297,19 @@ impl Tokenizer {
     }
 
     fn emit_char(&mut self, c: char) {
-        self.out.push(Token::Char(c));
+        if let Some(Token::Chars(run)) = self.out.last_mut() {
+            run.push(c);
+            return;
+        }
+        self.out.push(Token::Chars(c.to_string()));
     }
 
     fn emit_str(&mut self, s: &str) {
-        for c in s.chars() {
-            self.out.push(Token::Char(c));
+        if let Some(Token::Chars(run)) = self.out.last_mut() {
+            run.push_str(s);
+            return;
         }
+        self.out.push(Token::Chars(s.to_string()));
     }
 
     fn start_tag(&mut self, is_end: bool) {
@@ -322,16 +368,130 @@ impl Tokenizer {
         self.tag_name == self.last_start_tag
     }
 
-    /// Run until at least one token is available (or EOF).
-    pub fn next_tokens(&mut self) -> Vec<Token> {
-        while self.out.is_empty() && !self.eof {
+    /// Run until at least one token is available (or EOF), then hand
+    /// them over in `into`. The caller's buffer comes back to us so the
+    /// allocation is made once for the whole document rather than once
+    /// per token — script data emits a token per character, so that is
+    /// the difference between one allocation and two hundred thousand.
+    pub fn next_tokens_into(&mut self, into: &mut Vec<Token>) {
+        // Keep stepping while all we have is a character run: the run
+        // grows in place, and only a real token ends the batch. A tag
+        // is the last thing in the queue when it arrives, so the tree
+        // builder still gets to set the tokenizer's state before the
+        // next character is read.
+        while !self.eof
+            && self.out.last().is_none_or(|t| matches!(t, Token::Chars(_)))
+        {
             self.step();
         }
-        std::mem::take(&mut self.out)
+        into.clear();
+        std::mem::swap(into, &mut self.out);
+    }
+
+    /// Consume every character up to the next one this state has to
+    /// think about, and emit the lot as one run. The spec's model is a
+    /// character at a time; taking that literally means a round trip
+    /// through the dispatcher for each byte of a 200 KB inline script,
+    /// which costs far more than the tokenizing does. Returns whether
+    /// anything was consumed.
+    /// Where a run of characters the current state can take verbatim
+    /// ends. Every stop byte is ASCII, and a UTF-8 continuation byte is
+    /// never ASCII, so scanning bytes cannot stop mid-character.
+    fn run_end(&self, stop: &[u8]) -> usize {
+        let bytes = self.input.as_bytes();
+        let mut i = self.pos;
+        while i < bytes.len() && !stop.contains(&bytes[i]) {
+            i += 1;
+        }
+        i
+    }
+
+    /// The same run, appended to an attribute value. Attribute values
+    /// are where most of a markup-heavy page's bytes live, and they are
+    /// copied through unchanged.
+    fn take_attr_run(&mut self, stop: &[u8]) -> bool {
+        let end = self.run_end(stop);
+        if end == self.pos {
+            return false;
+        }
+        self.attr_value.push_str(&self.input[self.pos..end]);
+        self.pos = end;
+        self.consumed = false;
+        true
+    }
+
+    /// A run appended to a tag or attribute name, lowercased in place
+    /// rather than a character at a time.
+    fn take_name_run(&mut self, stop: &[u8], attr: bool) -> bool {
+        let end = self.run_end(stop);
+        if end == self.pos {
+            return false;
+        }
+        let dst =
+            if attr { &mut self.attr_name } else { &mut self.tag_name };
+        let at = dst.len();
+        dst.push_str(&self.input[self.pos..end]);
+        let dst =
+            if attr { &mut self.attr_name } else { &mut self.tag_name };
+        dst[at..].make_ascii_lowercase();
+        self.pos = end;
+        self.consumed = false;
+        true
+    }
+
+    fn take_comment_run(&mut self) -> bool {
+        let end = self.run_end(b"<-\0");
+        if end == self.pos {
+            return false;
+        }
+        self.comment.push_str(&self.input[self.pos..end]);
+        self.pos = end;
+        self.consumed = false;
+        true
+    }
+
+    fn take_run(&mut self, stop: &[u8]) -> bool {
+        let start = self.pos;
+        let bytes = self.input.as_bytes();
+        // Every stop byte is ASCII, and a UTF-8 continuation byte is
+        // never ASCII, so scanning bytes cannot stop mid-character.
+        while self.pos < bytes.len() && !stop.contains(&bytes[self.pos]) {
+            self.pos += 1;
+        }
+        if self.pos == start {
+            return false;
+        }
+        if !matches!(self.out.last(), Some(Token::Chars(_))) {
+            self.out.push(Token::Chars(String::new()));
+        }
+        let (from, to) = (start, self.pos);
+        if let Some(Token::Chars(run)) = self.out.last_mut() {
+            run.push_str(&self.input[from..to]);
+        }
+        self.consumed = false;
+        true
+    }
+
+    /// The states whose bulk is ordinary character data, and the
+    /// characters each of them has to stop and think about.
+    fn bulk_stop(&self) -> &'static [u8] {
+        use State::*;
+        match self.state {
+            // a NULL in Data is emitted unchanged, so it can ride along
+            Data => b"&<",
+            Rcdata => b"&<\0",
+            Rawtext | ScriptData => b"<\0",
+            Plaintext => b"\0",
+            _ => &[],
+        }
     }
 
     fn step(&mut self) {
         use State::*;
+        let stop = self.bulk_stop();
+        if !stop.is_empty() && self.take_run(stop) {
+            return;
+        }
         match self.state {
             Data => match self.next() {
                 Some('&') => {
@@ -411,7 +571,11 @@ impl Tokenizer {
                     self.finish();
                 }
             },
-            TagName => match self.next() {
+            TagName => {
+                if self.take_name_run(b" \t\n\x0c/>\0", false) {
+                    return;
+                }
+                match self.next() {
                 Some(c) if is_ws(c) => self.state = BeforeAttributeName,
                 Some('/') => self.state = SelfClosingStartTag,
                 Some('>') => {
@@ -421,7 +585,8 @@ impl Tokenizer {
                 Some('\0') => self.tag_name.push('\u{fffd}'),
                 Some(c) => self.tag_name.push(c.to_ascii_lowercase()),
                 None => self.finish(),
-            },
+                }
+            }
 
             // --- RCDATA / RAWTEXT / script "less-than" families ---
             RcdataLessThan => match self.next() {
@@ -727,7 +892,11 @@ impl Tokenizer {
                     self.state = AttributeName;
                 }
             },
-            AttributeName => match self.next() {
+            AttributeName => {
+                if self.take_name_run(b" \t\n\x0c/>=\0", true) {
+                    return;
+                }
+                match self.next() {
                 Some(c) if is_ws(c) => {
                     self.reconsume();
                     self.state = AfterAttributeName;
@@ -740,7 +909,8 @@ impl Tokenizer {
                 Some('=') => self.state = BeforeAttributeValue,
                 Some('\0') => self.attr_name.push('\u{fffd}'),
                 Some(c) => self.attr_name.push(c.to_ascii_lowercase()),
-            },
+                }
+            }
             AfterAttributeName => match self.next() {
                 Some(c) if is_ws(c) => {}
                 Some('/') => {
@@ -775,7 +945,11 @@ impl Tokenizer {
                     self.state = AttributeValueUnquoted;
                 }
             },
-            AttributeValueDouble => match self.next() {
+            AttributeValueDouble => {
+                if self.take_attr_run(b"\"&\0") {
+                    return;
+                }
+                match self.next() {
                 Some('"') => self.state = AfterAttributeValueQuoted,
                 Some('&') => {
                     self.return_state = AttributeValueDouble;
@@ -784,8 +958,13 @@ impl Tokenizer {
                 Some('\0') => self.attr_value.push('\u{fffd}'),
                 Some(c) => self.attr_value.push(c),
                 None => self.finish(),
-            },
-            AttributeValueSingle => match self.next() {
+                }
+            }
+            AttributeValueSingle => {
+                if self.take_attr_run(b"'&\0") {
+                    return;
+                }
+                match self.next() {
                 Some('\'') => self.state = AfterAttributeValueQuoted,
                 Some('&') => {
                     self.return_state = AttributeValueSingle;
@@ -794,7 +973,8 @@ impl Tokenizer {
                 Some('\0') => self.attr_value.push('\u{fffd}'),
                 Some(c) => self.attr_value.push(c),
                 None => self.finish(),
-            },
+                }
+            }
             AttributeValueUnquoted => match self.next() {
                 Some(c) if is_ws(c) => self.state = BeforeAttributeName,
                 Some('&') => {
@@ -896,7 +1076,11 @@ impl Tokenizer {
                     self.state = Comment;
                 }
             },
-            Comment => match self.next() {
+            Comment => {
+                if self.take_comment_run() {
+                    return;
+                }
+                match self.next() {
                 Some('<') => {
                     self.comment.push('<');
                     self.state = CommentLessThan;
@@ -908,7 +1092,8 @@ impl Tokenizer {
                     self.emit_comment();
                     self.finish();
                 }
-            },
+                }
+            }
             CommentLessThan => match self.next() {
                 Some('!') => {
                     self.comment.push('!');
@@ -1459,31 +1644,49 @@ impl Tokenizer {
                 self.state = self.return_state;
             }
             Some(c) if c.is_ascii_alphanumeric() => {
-                // longest match against the named table
-                let rest: String =
-                    self.input[self.pos..].iter().take(32).collect();
-                let mut best: Option<(usize, &str)> = None;
-                for (name, chars) in ENTITIES {
-                    if rest.starts_with(name) {
-                        let len = name.chars().count();
-                        if best.map_or(true, |(bl, _)| len > bl) {
-                            best = Some((len, chars));
+                // Longest match against the named table. The table is
+                // sorted, and every prefix of a string sorts below it,
+                // so the longest name that prefixes the input is the
+                // greatest one below it: find where the input would sit
+                // and walk back. Sweeping all 2231 names for every '&'
+                // is otherwise the most expensive thing the tokenizer
+                // does on a page with any prose in it.
+                // No name is longer than 32 bytes, and all of them are
+                // ASCII, so a short window is enough to decide.
+                let best: Option<(usize, &'static str, bool, Option<u8>)> = {
+                    let tail = &self.input[self.pos..];
+                    let mut n = tail.len().min(32);
+                    while n > 0 && !tail.is_char_boundary(n) {
+                        n -= 1;
+                    }
+                    let rest = &tail[..n];
+                    let at =
+                        ENTITIES.partition_point(|&(nm, _)| nm <= rest);
+                    let mut found = None;
+                    for &(name, chars) in ENTITIES[..at].iter().rev() {
+                        if rest.starts_with(name) {
+                            found = Some((
+                                name.len(),
+                                chars,
+                                name.ends_with(';'),
+                                rest.as_bytes().get(name.len()).copied(),
+                            ));
+                            break;
+                        }
+                        if name.as_bytes()[0] != rest.as_bytes()[0] {
+                            break;
                         }
                     }
-                }
+                    found
+                };
                 match best {
-                    Some((len, chars)) => {
-                        let matched: String =
-                            self.input[self.pos..self.pos + len].iter().collect();
-                        let semi = matched.ends_with(';');
+                    Some((len, chars, semi, after)) => {
                         // Legacy rule: inside an attribute, a
                         // semicolon-less reference followed by '=' or an
                         // alphanumeric is left alone, so query strings
                         // like ?a&copy=1 survive.
                         if !semi && in_attr {
-                            let after =
-                                self.input.get(self.pos + len).copied();
-                            if after == Some('=')
+                            if after == Some(b'=')
                                 || after.is_some_and(|c| c.is_ascii_alphanumeric())
                             {
                                 self.flush_char_ref("&", in_attr);

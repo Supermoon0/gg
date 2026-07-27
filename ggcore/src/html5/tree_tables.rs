@@ -250,7 +250,7 @@ impl TreeBuilder {
 
     fn m_in_column_group(&mut self, t: Token) {
         match t {
-            Token::Char(c) if is_ws(c) => self.insert_text(&c.to_string()),
+            Token::Char(c) if is_ws(c) => self.insert_char(c),
             Token::Comment(c) => self.insert_comment(&c),
             Token::Doctype { .. } => {}
             Token::StartTag { ref name, .. } if name == "html" => {
@@ -606,7 +606,8 @@ impl TreeBuilder {
 
     fn m_in_template(&mut self, t: Token) {
         match t {
-            Token::Char(_) | Token::Comment(_) | Token::Doctype { .. } => {
+            Token::Char(_) | Token::Chars(_) | Token::Comment(_)
+            | Token::Doctype { .. } => {
                 self.m_in_body(t)
             }
             Token::StartTag { ref name, .. }
@@ -707,7 +708,7 @@ impl TreeBuilder {
 
     fn m_in_frameset(&mut self, t: Token) {
         match t {
-            Token::Char(c) if is_ws(c) => self.insert_text(&c.to_string()),
+            Token::Char(c) if is_ws(c) => self.insert_char(c),
             Token::Comment(c) => self.insert_comment(&c),
             Token::Doctype { .. } => {}
             Token::StartTag { ref name, .. } if name == "html" => {
@@ -743,7 +744,7 @@ impl TreeBuilder {
 
     fn m_after_frameset(&mut self, t: Token) {
         match t {
-            Token::Char(c) if is_ws(c) => self.insert_text(&c.to_string()),
+            Token::Char(c) if is_ws(c) => self.insert_char(c),
             Token::Comment(c) => self.insert_comment(&c),
             Token::Doctype { .. } => {}
             Token::StartTag { ref name, .. } if name == "html" => {
@@ -804,9 +805,17 @@ impl TreeBuilder {
 
     fn foreign(&mut self, t: Token) {
         match t {
+            // The driver unpacks character runs before the modes see
+            // them; handling it here too keeps the invariant local
+            // rather than relying on a comment two files away.
+            Token::Chars(run) => {
+                for c in run.chars() {
+                    self.foreign(Token::Char(c));
+                }
+            }
             Token::Char('\0') => self.insert_text("\u{fffd}"),
             Token::Char(c) => {
-                self.insert_text(&c.to_string());
+                self.insert_char(c);
                 if !is_ws(c) {
                     self.frameset_ok = false;
                 }

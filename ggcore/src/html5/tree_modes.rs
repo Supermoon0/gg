@@ -195,7 +195,7 @@ impl TreeBuilder {
                         Token::StartTag { name, .. } => {
                             name == "mglyph" || name == "malignmark"
                         }
-                        Token::Char(_) => false,
+                        Token::Char(_) | Token::Chars(_) => false,
                         _ => true,
                     }
                 } else if self.sink.ns(n) == Ns::MathMl
@@ -203,12 +203,33 @@ impl TreeBuilder {
                 {
                     !matches!(&t, Token::StartTag { name, .. } if name == "svg")
                 } else if self.is_html_integration_point(n) {
-                    !matches!(&t, Token::StartTag { .. } | Token::Char(_))
+                    !matches!(
+                        &t,
+                        Token::StartTag { .. }
+                            | Token::Char(_)
+                            | Token::Chars(_)
+                    )
                 } else {
                     !matches!(t, Token::Eof)
                 }
             }
         };
+        // A character run goes whole only to the modes written to take
+        // one; every other mode sees the spec's stream, a character at
+        // a time.
+        if matches!(t, Token::Chars(_))
+            && (use_foreign
+                || !matches!(self.mode, Mode::Text | Mode::InBody))
+        {
+            let Token::Chars(run) = t else { unreachable!() };
+            for c in run.chars() {
+                if self.done {
+                    return;
+                }
+                self.process(Token::Char(c));
+            }
+            return;
+        }
         if use_foreign {
             self.foreign(t);
         } else {
@@ -370,7 +391,7 @@ impl TreeBuilder {
 
     fn m_in_head(&mut self, t: Token) {
         match t {
-            Token::Char(c) if is_ws(c) => self.insert_text(&c.to_string()),
+            Token::Char(c) if is_ws(c) => self.insert_char(c),
             Token::Comment(c) => self.insert_comment(&c),
             Token::Doctype { .. } => {}
             Token::StartTag { ref name, .. } if name == "html" => {
@@ -513,7 +534,7 @@ impl TreeBuilder {
 
     fn m_after_head(&mut self, t: Token) {
         match t {
-            Token::Char(c) if is_ws(c) => self.insert_text(&c.to_string()),
+            Token::Char(c) if is_ws(c) => self.insert_char(c),
             Token::Comment(c) => self.insert_comment(&c),
             Token::Doctype { .. } => {}
             Token::StartTag { ref name, .. } if name == "html" => {
@@ -570,13 +591,26 @@ impl TreeBuilder {
 
     fn m_text(&mut self, t: Token) {
         match t {
+            // <script>/<style>/<title> content does nothing per
+            // character but append, and it is where the bulk of a real
+            // page's bytes live.
+            Token::Chars(run) => {
+                let mut s = run.as_str();
+                if self.ignore_lf {
+                    self.ignore_lf = false;
+                    s = s.strip_prefix('\n').unwrap_or(s);
+                }
+                if !s.is_empty() {
+                    self.insert_text(s);
+                }
+            }
             Token::Char(c) => {
                 if self.ignore_lf && c == '\n' {
                     self.ignore_lf = false;
                     return;
                 }
                 self.ignore_lf = false;
-                self.insert_text(&c.to_string());
+                self.insert_char(c);
             }
             Token::Eof => {
                 self.open.pop();
@@ -626,6 +660,34 @@ impl TreeBuilder {
 
     fn m_in_body(&mut self, t: Token) {
         match t {
+            // Per character the spec reconstructs the formatting
+            // elements, drops NULLs, and clears frameset-ok on the
+            // first non-space. Reconstruction is a no-op once it has
+            // run, and the other two do not depend on order, so a whole
+            // run can be settled at once and appended in one piece.
+            Token::Chars(run) => {
+                let mut s = run.as_str();
+                if self.ignore_lf {
+                    self.ignore_lf = false;
+                    s = s.strip_prefix('\n').unwrap_or(s);
+                }
+                if s.is_empty() {
+                    return;
+                }
+                self.reconstruct_active();
+                if s.contains('\0') {
+                    let stripped: String =
+                        s.chars().filter(|&c| c != '\0').collect();
+                    if !stripped.is_empty() {
+                        self.insert_text(&stripped);
+                    }
+                } else {
+                    self.insert_text(s);
+                }
+                if run.chars().any(|c| !is_ws(c) && c != '\0') {
+                    self.frameset_ok = false;
+                }
+            }
             Token::Char('\0') => {}
             Token::Char(c) => {
                 if self.ignore_lf {
@@ -635,7 +697,7 @@ impl TreeBuilder {
                     }
                 }
                 self.reconstruct_active();
-                self.insert_text(&c.to_string());
+                self.insert_char(c);
                 if !is_ws(c) {
                     self.frameset_ok = false;
                 }

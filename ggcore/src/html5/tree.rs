@@ -207,13 +207,14 @@ impl TreeBuilder {
     }
 
     fn run(&mut self) {
+        let mut tokens: Vec<Token> = Vec::new();
         while !self.done {
             self.tok.cdata_ok = self.cdata_allowed();
-            let tokens = self.tok.next_tokens();
+            self.tok.next_tokens_into(&mut tokens);
             if tokens.is_empty() {
                 break;
             }
-            for t in tokens {
+            for t in tokens.drain(..) {
                 if self.done {
                     break;
                 }
@@ -408,6 +409,14 @@ impl TreeBuilder {
             None
         } else {
             first
+        }
+    }
+
+    fn insert_char(&mut self, c: char) {
+        let (parent, before) = self.insertion_place();
+        match before {
+            Some(b) => self.sink.insert_char_before(parent, b, c),
+            None => self.sink.append_char(parent, c),
         }
     }
 

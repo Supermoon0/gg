@@ -197,29 +197,45 @@ fn html5lib_tree_construction() {
     assert_eq!(passed, total, "html5lib tree-construction regressions");
 }
 
-/// Throughput on a real page, for the record. Not a gate — run with
-/// `GG_H5_BENCH=/path/to/page.html cargo test --release bench_parse
-/// -- --nocapture`.
+/// Throughput on real pages, for the record. Not a gate — run with
+/// `GG_H5_BENCH=a.html,b.html cargo test --release bench_parse --
+/// --nocapture`. Reports the fastest of N runs, not the mean: on a
+/// shared machine the mean measures the neighbours. The engine's older
+/// parser runs beside it as a control, so a number that moves for both
+/// is the machine, not the change.
 #[test]
 fn bench_parse() {
-    let Ok(path) = std::env::var("GG_H5_BENCH") else { return };
-    let bytes = std::fs::read(&path).unwrap();
-    let html = String::from_utf8_lossy(&bytes).to_string();
-    let runs = 20;
-    let t = std::time::Instant::now();
-    let mut nodes = 0;
-    for _ in 0..runs {
-        nodes = super::parse(&html, false).sink.nodes.len();
+    let Ok(paths) = std::env::var("GG_H5_BENCH") else { return };
+    let runs = 30;
+    for path in paths.split(',') {
+        let bytes = std::fs::read(path).unwrap();
+        let html = String::from_utf8_lossy(&bytes).to_string();
+        let (mut new, mut oldt) = (f64::MAX, f64::MAX);
+        let (mut nodes, mut old) = (0, 0);
+        for _ in 0..runs {
+            let t = std::time::Instant::now();
+            nodes = super::parse(&html, false).sink.nodes.len();
+            new = new.min(t.elapsed().as_secs_f64());
+            let t = std::time::Instant::now();
+            old = crate::html::parse(&html).nodes.len();
+            oldt = oldt.min(t.elapsed().as_secs_f64());
+        }
+        let mb = bytes.len() as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "\n{}  {} KB\n  html5::parse {:6.2} ms  {:5.0} MB/s  {} nodes\n  html::parse  {:6.2} ms  {:5.0} MB/s  {} nodes   ({:.1}x)",
+            path, bytes.len() / 1024,
+            new * 1e3, mb / new, nodes,
+            oldt * 1e3, mb / oldt, old, new / oldt,
+        );
     }
-    let new = t.elapsed().as_secs_f64() / runs as f64;
-    let t = std::time::Instant::now();
-    let mut old = 0;
-    for _ in 0..runs {
-        old = crate::html::parse(&html).nodes.len();
-    }
-    let oldt = t.elapsed().as_secs_f64() / runs as f64;
-    eprintln!(
-        "\n{} KB\n  html5::parse {:6.2} ms  {} nodes\n  html::parse  {:6.2} ms  {} nodes",
-        bytes.len() / 1024, new * 1e3, nodes, oldt * 1e3, old
-    );
+}
+
+/// One parse under a profiler: `GG_H5_PROF=page.html valgrind
+/// --tool=callgrind cargo test --release prof_parse -- --nocapture`.
+#[test]
+fn prof_parse() {
+    let Ok(path) = std::env::var("GG_H5_PROF") else { return };
+    let html = String::from_utf8_lossy(&std::fs::read(&path).unwrap())
+        .to_string();
+    std::hint::black_box(super::parse(&html, false).sink.nodes.len());
 }
