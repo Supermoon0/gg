@@ -84,6 +84,33 @@ sqhy2/sqsc/sqhook_dev 계열):
   `var X=`로 선언해도 미발화였으므로 react-dom의 훅 결선 경로를
   다시 볼 것.
 
+## 5차 — hydrate 내부까지 완전 추적, AppProvider 병합에서 정지
+
+청크 텍스트 패치 + fiber walk + 컨텍스트 stamp로 끝까지 따라간 결론:
+
+- flight 데이터는 **전부 도착**(행 0..17,a..f; 상품 116813213이
+  행 a의 shoppingData에 인라인 — 클라이언트 상품 fetch 불필요).
+- hydrate() → RSC 루트 promise fulfilled → hydrateRoot() 반환 →
+  스케줄러 틱 2회 → **fiber 트리 완성**(html/head/body/div/h2까지).
+- 그러나 커밋 0: 렌더 도중 `useAppState must be used within an
+  AppProvider`가 **에러바운더리(uj-CAUGHT)에 잡혀** 서브트리가
+  fallback으로 떨어진다.
+- 근본: `useAppState`의 `useContext(u)`가 `_currentValue===undefined`
+  를 읽는다. 계측으로 확인 — 그 컨텍스트에 대한 provider push(r4,
+  react-dom case 10)가 read 시점까지 **0회**(`[read-undef] pushed=0`).
+- createContext는 정확히 1회 실행(모듈 캐시 정상), Symbol.for(
+  "react.context") 동일성/switch 매칭도 정상(격리 재현 통과),
+  turbopack `k.has` 중복가드·`M[]` 인스턴스 캐시도 정상.
+- 즉 **AppProvider 컴포넌트가 렌더 트리에 병합되지 않아** provider
+  fiber(tag10)가 생기지 않는다. `.Provider,{value:h,children:e}`
+  반환문에 앵커를 걸어도 실행 안 됨(그 `s`는 렌더되는 `s`와 다른
+  export일 가능성 — dedup된 두 청크 83141/c656 모두 AppProvider를
+  담고 각자 createContext를 갖는다). app-router의 layout(AppProvider)
+  세그먼트가 __PAGE__ 세그먼트와 병합되는 hydration 경로가 유력.
+
+이 지점은 React 19 app-router의 세그먼트 병합 내부라 별도 세션
+권장. 여기까지의 계측 스크립트는 scratchpad에 sq*.py로 있음.
+
 ## 다음 지렛대
 
 1. 렌더 중 서스펜션 포인트 특정: 13e1637b에서 react-dom의
