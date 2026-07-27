@@ -1045,6 +1045,95 @@ def sync_cookie_writes(doc, page_url, *, network_backend=None,
         return 0
 
 
+def service_dynamic_scripts(doc, base_url, known, *, network_backend=None,
+                            network_timeout=15.0, cancel_token=None,
+                            network_context=None):
+    """Run <script> elements inserted after the document load finished.
+
+    The parser-phase loader owns every script present during load, but a
+    page keeps minting script tags long after: Next.js's appBootstrap
+    appends its beforeInteractive scripts one at a time, each gated on
+    the previous one's load event, and webpack/turbopack load chunks the
+    same way. During settle and the live tick nobody serviced those --
+    the element sat in the DOM, its `load` never fired, and the boot
+    chain waiting on it hung forever with nothing pending. That was the
+    last link of shopsquare's hydration stall.
+
+    `known` carries node indices already handled; the caller owns it so
+    repeated pumps don't re-run scripts. Returns True when anything ran
+    (the caller should keep pumping -- a script's load handler usually
+    queues more work)."""
+    network_backend = _resolve_network_backend(network_backend)
+    ran = False
+    try:
+        records = doc.script_records()
+    except Exception:
+        return False
+    for raw in records:
+        node, kind, value, mode = (int(raw[0]), str(raw[1]),
+                                   str(raw[2]), str(raw[3]))
+        if node in known:
+            continue
+        known.add(node)
+        # modules need the loader's module graph, which is closed by
+        # now; surface the miss instead of silently skipping
+        if mode in ("module", "async-module", "ordered-module"):
+            print(f"[js] dynamic module script after load ignored: "
+                  f"{value[:80]}")
+            continue
+        setter = getattr(doc, "set_current_script", None)
+        if kind == "inline":
+            if setter:
+                setter(node)
+            try:
+                for line in doc.run_scripts([value]):
+                    print(f"[js console] {line}")
+            finally:
+                if setter:
+                    setter(None)
+            ran = True
+            continue
+        code = ""
+        ok = True
+        try:
+            resolved = base_url.resolve(value) if base_url else value
+            _h, code, _f = network_backend.request(
+                resolved, site_for_cookies=base_url,
+                top_level_navigation=False, timeout=network_timeout,
+                cancel_token=cancel_token, context=network_context)
+        except Exception as exc:
+            if exc.__class__.__name__ == "RequestCancelled":
+                raise
+            ok = False
+        if not ok:
+            try:
+                logs, _h2, _p2 = doc.dispatch_event(
+                    node, "error", False, False, None)
+                for line in logs:
+                    print(f"[js console] {line}")
+            except Exception:
+                pass
+            ran = True
+            continue
+        if setter:
+            setter(node)
+        try:
+            for line in doc.run_scripts([code]):
+                print(f"[js console] {line}")
+        finally:
+            if setter:
+                setter(None)
+        try:
+            logs, _h2, _p2 = doc.dispatch_event(
+                node, "load", False, False, None)
+            for line in logs:
+                print(f"[js console] {line}")
+        except Exception:
+            pass
+        ran = True
+    return ran
+
+
 def settle_async(doc, css_sources, base_url, timeout=8.0, max_rounds=2000,
                  *, network_timeout=15.0, cancel_token=None,
                  network_backend=None, network_context=None):
@@ -1060,6 +1149,11 @@ def settle_async(doc, css_sources, base_url, timeout=8.0, max_rounds=2000,
     deadline = time.monotonic() + timeout
     version_before = doc.dom_version() if hasattr(doc, "dom_version") else None
     activity = False
+    known_scripts = set()
+    try:
+        known_scripts = {int(r[0]) for r in doc.script_records()}
+    except Exception:
+        pass
     for _ in range(max_rounds):
         logs, fetches = pump_script_requests(doc)
         sync_cookie_writes(
@@ -1079,6 +1173,14 @@ def settle_async(doc, css_sources, base_url, timeout=8.0, max_rounds=2000,
                     network_backend=network_backend,
                     network_context=network_context)
             continue  # resolving fetches queues more microtasks
+        if service_dynamic_scripts(
+                doc, base_url, known_scripts,
+                network_backend=network_backend,
+                network_timeout=network_timeout,
+                cancel_token=cancel_token,
+                network_context=network_context):
+            activity = True
+            continue  # a script's load handler queues more work
         if not doc.has_pending_work():
             break
         if time.monotonic() > deadline:

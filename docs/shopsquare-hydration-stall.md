@@ -50,15 +50,30 @@ GG_TRACE_FN 명령어 트레이스(stderr 직행, 필터 무관)로 재검증한
 - 벤치: 잡음 raise는 12건 전부 무해한 기능 프로브(core-js Set
   메서드 탐지 Cf ×7, canParse/Reflect 프로브 등).
 
+## 3차 진행 (동적 스크립트 서비스)
+
+zz/GG_TRACE_FN 도구로 부트를 끝까지 따라간 결과, 남은 정지는 엔진
+미컴파일이 아니라 **이벤트 루프의 구멍**이었다: Next의 appBootstrap은
+`__next_s`(beforeInteractive) 스크립트를 한 개씩 `<script src>`로
+삽입하고 각각의 load 이벤트를 기다리는데, 로더가 끝난 뒤(정착/틱
+단계)에 삽입된 스크립트는 아무도 fetch/실행하지 않아 onload가 영원히
+오지 않았다. `native.service_dynamic_scripts`가 그 구멍을 메운다
+(settle_async 루프 + LocalRendererSession.tick 양쪽).
+
+이후 확인된 상태: __next_s 체인 완주 → app-index require →
+**hydrate() 실행** → 플라이트 8행 전부 소비(next_f_len=0) → React가
+리스너 149개 부착(SSR 채택까지 진행). 그러나 커밋/이펙트가 없다:
+상품 API fetch가 0건, li 7 그대로. React 스케줄러 틱(MessageChannel
+→ setTimeout0) 또는 RSC 루트 resolve 어딘가에서 조용히 멈춘다.
+
 ## 다음 지렛대
 
-1. GG_TRACE_FN을 app-index 쪽 함수명(예: hydrate/appBootstrap의
-   축약명 — 21479가 require하는 98028 모듈의 proto 이름을
-   zz_dump_bytecode로 먼저 알아낸다)에 걸어 어느 문장까지 가는지
-   본다. 필터 없이.
-2. 후보: `document.readyState` 'loading' 분기에서 DOMContentLoaded
-   대기 → 프레임 라이프사이클과의 타이밍; RSC 스트림 마감(C)
-   미도달; hydrateRoot 진입 전 조건 분기.
+1. hydrateRoot 이후: React 워크루프 틱이 실제 도는지
+   (MessageChannel postMessage 계수 or 스케줄러 함수명 트레이스),
+   RSC 루트 promise가 resolve되는지(createFromReadableStream 체인의
+   .then에 로그 주입 — 13e1637b 청크 텍스트 패치).
+2. Suspense 대기 후보: 플라이트가 참조하는 클라이언트 모듈 로딩
+   promise(P/W 경로), use(promise) 지점.
 3. recoshopping(webpack)은 같은 페이지에서 정상 렌더 — 대조군.
 
 ## 도구 사용법

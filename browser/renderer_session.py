@@ -104,6 +104,7 @@ class LocalRendererSession:
         if not native.available():
             raise RuntimeError("native ggcore wheel is required")
         self.network = network_backend or default_network_backend()
+        self._dyn_scripts = None
         self.run_scripts = bool(run_scripts)
         self.timeout = timeout
         self.js_budget = js_budget
@@ -197,6 +198,27 @@ class LocalRendererSession:
         self.sync_cookie_writes()
         for request in requests:
             self.service_fetch(request)
+        # scripts the page inserted after load: the tick is the only
+        # event loop a live document has, so it must run them or their
+        # load events never fire (Next.js's appBootstrap chains on
+        # exactly that)
+        if self._dyn_scripts is None:
+            try:
+                self._dyn_scripts = {
+                    int(r[0]) for r in self.doc.script_records()}
+            except Exception:
+                self._dyn_scripts = set()
+        try:
+            native.service_dynamic_scripts(
+                self.doc, self.url, self._dyn_scripts,
+                network_backend=self.network,
+                network_timeout=self.timeout,
+                cancel_token=self.cancel_token,
+                network_context=self.network_context)
+        except net.RequestCancelled:
+            raise
+        except Exception:
+            pass
         if requests:
             # a response may have carried Set-Cookie; JS writes were
             # already drained above, so the jar is now the truth
