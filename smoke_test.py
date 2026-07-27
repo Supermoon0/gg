@@ -2342,8 +2342,27 @@ from browser import native
 if native.available():
     rs_dom = native.parse_and_style(DEMO_PAGE, lambda hrefs: {})
     rs_nodes = tree_to_list(rs_dom, [])
-    check("native node count matches", len(rs_nodes) == len(
-        tree_to_list(demo_dom, [])), f"{len(rs_nodes)} nodes")
+
+    def shape(nodes):
+        # The two parsers disagree about whitespace on purpose: the Rust
+        # core follows the spec and keeps a text node between tags, the
+        # Python fallback drops it. Everything they can be asked to agree
+        # on -- the elements, their nesting, and the text that carries
+        # content -- has to match exactly, which is a stronger claim than
+        # the node count this used to compare.
+        out = []
+        for n in nodes:
+            if isinstance(n, Element):
+                out.append((n.tag, len([
+                    c for c in n.children
+                    if isinstance(c, Element) or c.text.strip()])))
+            elif n.text.strip():
+                out.append(("#text", n.text.strip()))
+        return out
+
+    check("native tree shape matches python",
+          shape(rs_nodes) == shape(tree_to_list(demo_dom, [])),
+          f"{len(rs_nodes)} vs {len(tree_to_list(demo_dom, []))} nodes")
     rs_h1 = next(n for n in rs_nodes
                  if isinstance(n, Element) and n.tag == "h1")
     check("native h1 style matches",
@@ -3755,7 +3774,11 @@ if native.available():
               and _ev(f"{_cd}.querySelectorAll('p').length") == 2
               and _ev(f"{_cd}.querySelector('.a')"
                       f" === {_cd}.getElementById('t')") is True,
-              "querySelector runs against a real dom::Document")
+              "querySelector runs against a real dom::Document: "
+              + repr((_ev(f"{_cd}.getElementById('t').textContent"),
+                      _ev(f"{_cd}.querySelectorAll('p').length"),
+                      _ev(f"{_cd}.querySelector('.a')"
+                          f" === {_cd}.getElementById('t')"))))
         check("iframe: mirror element wrappers have stable identity",
               _ev(f"{_cd}.getElementById('t')"
                   f" === {_cd}.getElementById('t')") is True,

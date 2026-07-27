@@ -2116,31 +2116,46 @@ impl PageVm {
         let mut doc = dom::Document::with_capacity(rows.len());
         let mut idx_of: HashMap<u32, usize> = HashMap::new();
         let mut ridx_of: Vec<u32> = Vec::with_capacity(rows.len());
+        // `export` names a row's parent by its position in the dump, not
+        // by the child's arena index. The two coincide only while the
+        // arena happens to be in document order — which a spec parse
+        // does not produce, and which any script that moves a node
+        // destroys. Keep the row mapping separate from the arena one.
+        let mut by_row: Vec<usize> = Vec::with_capacity(rows.len());
         for (parent, ridx, tag, text, attrs) in rows {
             let ridx = ridx as u32;
             let p = if parent < 0 {
                 None
             } else {
-                match idx_of.get(&(parent as u32)) {
-                    Some(&p) => Some(p),
-                    // parent was pruned: so is this whole subtree
-                    None => continue,
+                by_row
+                    .get(parent as usize)
+                    .copied()
+                    .filter(|&i| i != usize::MAX)
+            };
+            // a row whose parent was pruned is pruned with it
+            let placed = if parent >= 0 && p.is_none() {
+                None
+            } else {
+                match (tag, p) {
+                    (Some(t), _) => Some(doc.new_element(t, attrs, p)),
+                    // a text node with no parent cannot exist
+                    (None, Some(p)) => {
+                        Some(doc.new_text(text.unwrap_or_default(), p))
+                    }
+                    (None, None) => None,
                 }
             };
-            let new = match (tag, p) {
-                (Some(t), _) => doc.new_element(t, attrs, p),
-                // a text node with no parent cannot exist; skip it
-                (None, Some(p)) => doc.new_text(text.unwrap_or_default(), p),
-                (None, None) => continue,
-            };
-            if idx_of.is_empty() {
-                doc.root = new;
+            if let Some(new) = placed {
+                if idx_of.is_empty() {
+                    doc.root = new;
+                }
+                idx_of.insert(ridx, new);
+                while ridx_of.len() <= new {
+                    ridx_of.push(u32::MAX);
+                }
+                ridx_of[new] = ridx;
             }
-            idx_of.insert(ridx, new);
-            while ridx_of.len() <= new {
-                ridx_of.push(u32::MAX);
-            }
-            ridx_of[new] = ridx;
+            by_row.push(placed.unwrap_or(usize::MAX));
         }
         // a rebuilt DOM invalidates every wrapper handed out before:
         // the nodes they named may not exist any more

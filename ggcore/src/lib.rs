@@ -810,10 +810,24 @@ struct Doc {
     ggjs: Option<jsvm::page::PageVm>,
 }
 
+/// The spec parser is wired in behind a switch while the two are
+/// compared side by side: it keeps whitespace-only text, comments and a
+/// doctype, and builds the tree the way a browser does, so the rendered
+/// result is not identical to the older parser's by construction.
+/// `GG_HTML5=1` selects it.
+fn parse_document(html: &str) -> dom::Document {
+    let spec = std::env::var("GG_HTML5").is_ok_and(|v| v != "0");
+    if spec {
+        html5::sink::to_dom(&html5::parse(html, false).sink)
+    } else {
+        html::parse(html)
+    }
+}
+
 #[pyfunction]
 fn parse_html(html: &str) -> Doc {
     Doc {
-        doc: Rc::new(RefCell::new(html::parse(html))),
+        doc: Rc::new(RefCell::new(parse_document(html))),
         ggjs: None,
     }
 }
