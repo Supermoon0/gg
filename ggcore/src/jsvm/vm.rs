@@ -965,6 +965,12 @@ pub(super) struct St {
     /// document for). Those are the host's to answer for -- a dropped
     /// mirror means "no document", not "write your own".
     pub(super) frame_host_owned: std::collections::HashSet<u32>,
+    /// One function object per (native kind, a, b) identity triple.
+    /// A builtin read must answer the same object every time --
+    /// `a.push === a.push`, `el.focus === el.focus` -- or feature
+    /// detection sees phantom "overrides" and removeEventListener
+    /// can never match what addEventListener stored.
+    pub(super) native_memo: HashMap<(u8, u32, u32), Value>,
     /// `el.attributes` object per node. A NamedNodeMap is *live* and
     /// identity-stable, and React 19's unmount loop banks on both:
     /// `for (e = n.attributes; e.length;) n.removeAttributeNode(e[0])`
@@ -1137,6 +1143,7 @@ impl St {
             doc_write_at: None,
             frame_host_owned: std::collections::HashSet::new(),
             attr_maps: HashMap::new(),
+            native_memo: HashMap::new(),
             frame_dom_writes: Vec::new(),
             map_data: HashMap::new(),
             set_data: HashMap::new(),
@@ -1219,6 +1226,20 @@ pub(super) fn push_str(st: &mut St, s: String) -> Value {
     st.heap_bytes = st.heap_bytes.saturating_add(s.len() + 16);
     st.strs.push(Str::Flat(s));
     Value::string((st.strs.len() - 1) as u32)
+}
+
+/// make_native, but identity-stable: the same (tag, a, b) triple
+/// always answers the same function object. Only for natives whose
+/// behavior is fully determined by those fields.
+pub(super) fn memo_native(
+    st: &mut St, tag: u8, a: u32, b: u32, n: Native,
+) -> Value {
+    if let Some(&v) = st.native_memo.get(&(tag, a, b)) {
+        return v;
+    }
+    let v = make_native(st, n);
+    st.native_memo.insert((tag, a, b), v);
+    v
 }
 
 pub(super) fn make_native(st: &mut St, n: Native) -> Value {
@@ -4304,7 +4325,7 @@ fn primitive_prop_read(st: &mut St, recv: Value, key: u32) -> Value {
         false
     };
     if common || per_type {
-        return make_native(st, Native::MethodRef(key));
+        return memo_native(st, 1, key, 0, Native::MethodRef(key));
     }
     if ctor.is_function() {
         if let Some(p) = st.fn_protos.get(&ctor.index()).copied() {
@@ -4690,24 +4711,24 @@ fn internal_get(
                     | "at" | "flat" | "flatMap" | "findLast"
                     | "findLastIndex" | "keys" | "values" | "entries"
             ) {
-                return Ok(make_native(st, Native::MethodRef(key)));
+                return Ok(memo_native(st, 1, key, 0, Native::MethodRef(key)));
             }
         }
         if st.objects[oi].regex != REGEX_NONE
             && matches!(name.as_str(), "exec" | "test")
         {
-            return Ok(make_native(st, Native::MethodRef(key)));
+            return Ok(memo_native(st, 1, key, 0, Native::MethodRef(key)));
         }
         if matches!(
             name.as_str(),
             "hasOwnProperty" | "valueOf" | "propertyIsEnumerable"
                 | "isPrototypeOf"
         ) {
-            return Ok(make_native(st, Native::MethodRef(key)));
+            return Ok(memo_native(st, 1, key, 0, Native::MethodRef(key)));
         }
         if name == "toString" {
             return Ok(if st.objects[oi].is_array {
-                make_native(st, Native::MethodRef(key))
+                memo_native(st, 1, key, 0, Native::MethodRef(key))
             } else {
                 make_native(st, Native::BrandToString)
             });
@@ -4731,7 +4752,7 @@ fn internal_get(
         } else if matches!(
             name.as_str(), "call" | "apply" | "bind" | "toString" | "valueOf"
         ) {
-            make_native(st, Native::MethodRef(key))
+            memo_native(st, 1, key, 0, Native::MethodRef(key))
         } else {
             Value::UNDEFINED
         });
@@ -8896,6 +8917,21 @@ fn dom_method(
     argc: u8,
 ) -> Result<Value, VmError> {
     let _ = mods; // only event dispatch re-enters JS
+    // A script that stored its own function over a DOM method owns
+    // that name from then on -- polyfills and wrappers
+    // (`document.addEventListener = patched`) are built on it. The
+    // read path already prefers expandos; the call path must agree
+    // or the wrapper is read back but never invoked.
+    if let Some(&f) = st.dom_expando.get(&(node, key)) {
+        if f.is_function() {
+            let args: Vec<Value> = (0..argc as usize)
+                .map(|k| st.regs[args_base + k])
+                .collect();
+            return call_value_this(
+                st, mods, f, Some(Value::dom_node(node)), &args,
+            );
+        }
+    }
     let ids = st.ids;
     let doc = need_doc(st)?;
     if node == DOC_NODE {
@@ -9660,7 +9696,7 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
             _ => {}
         }
         if is_dom_method_name(st.names[key as usize].as_str()) {
-            return Ok(make_native(st, Native::DomMethod { node, key }));
+            return Ok(memo_native(st, 2, node, key, Native::DomMethod { node, key }));
         }
         return Ok(Value::UNDEFINED);
     }
@@ -10036,7 +10072,7 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
     if is_dom_method_name(st.names[key as usize].as_str())
         && !is_doc_only_method(st.names[key as usize].as_str())
     {
-        return Ok(make_native(st, Native::DomMethod { node, key }));
+        return Ok(memo_native(st, 2, node, key, Native::DomMethod { node, key }));
     }
     Ok(Value::UNDEFINED)
 }
@@ -13816,7 +13852,7 @@ fn exec_loop(
                                         | "findLastIndex"
                                 ) =>
                         {
-                            make_native(st, Native::MethodRef(key))
+                            memo_native(st, 1, key, 0, Native::MethodRef(key))
                         }
                         // core-js expandos on the JS-visible
                         // Array.prototype (@@iterator and friends)
@@ -13846,7 +13882,7 @@ fn exec_loop(
                                     "exec" | "test"
                                 ) =>
                         {
-                            make_native(st, Native::MethodRef(key))
+                            memo_native(st, 1, key, 0, Native::MethodRef(key))
                         }
                         // promises expose then/catch as READABLE values:
                         // core-js's isThenable check is `var f = x.then`
@@ -13861,7 +13897,7 @@ fn exec_loop(
                                     "then" | "catch"
                                 ) =>
                         {
-                            make_native(st, Native::MethodRef(key))
+                            memo_native(st, 1, key, 0, Native::MethodRef(key))
                         }
                         // a plain object's `toString` is the genuine
                         // Object.prototype.toString (brands); an
@@ -13883,7 +13919,7 @@ fn exec_loop(
                                     | "isPrototypeOf"
                             ) =>
                         {
-                            make_native(st, Native::MethodRef(key))
+                            memo_native(st, 1, key, 0, Native::MethodRef(key))
                         }
                         // the window object doubles as the global
                         // namespace: `window.Number`/`window.parseInt`
@@ -13916,7 +13952,7 @@ fn exec_loop(
                         "call" | "apply" | "bind" | "toString"
                             | "valueOf"
                     ) {
-                        make_native(st, Native::MethodRef(key))
+                        memo_native(st, 1, key, 0, Native::MethodRef(key))
                     } else {
                         Value::UNDEFINED
                     };

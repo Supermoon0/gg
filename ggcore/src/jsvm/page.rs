@@ -7380,6 +7380,59 @@ console.log('B typeof it: ' + typeof it);
     }
 
     #[test]
+    fn builtin_method_reads_are_identity_stable() {
+        // Every read of a builtin used to mint a fresh function
+        // object, so `a.push === a.push` was false and every
+        // "has someone overridden this?" probe saw a phantom override
+        // -- which is exactly how the shopsquare diagnosis went wrong.
+        let doc = Rc::new(RefCell::new(crate::html::parse(
+            "<div id=d></div>",
+        )));
+        let mut vm = PageVm::new(Some(doc));
+        assert_eq!(
+            vm.run_scripts(&["var a = [1];\
+                var el = document.getElementById('d');\
+                console.log(a.push === a.push,\
+                            [].map === [].map,\
+                            el.focus === el.focus,\
+                            ''.hasOwnProperty === ''.hasOwnProperty);\
+                var mine = function () { return 7; };\
+                a.push = mine;\
+                console.log(a.push === mine, a.push(9), a.length);"
+                .to_string()]),
+            vec![
+                "true true true true".to_string(),
+                "true 7 1".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_stored_function_overrides_a_dom_method_for_calls_too() {
+        // The read path preferred expandos all along; the call path
+        // dispatched straight to the builtin, so a polyfill's wrapper
+        // was read back but never invoked.
+        let doc = Rc::new(RefCell::new(crate::html::parse(
+            "<div id=d>x</div>",
+        )));
+        let mut vm = PageVm::new(Some(doc));
+        assert_eq!(
+            vm.run_scripts(&["var seen = [];\
+                var real = document.addEventListener;\
+                document.addEventListener = function (t, f) {\
+                  seen.push('doc:' + t);\
+                };\
+                document.addEventListener('ping', function () {});\
+                var el = document.getElementById('d');\
+                el.getAttribute = function (n) { return 'wrapped:' + n; };\
+                console.log(seen.join('|'), el.getAttribute('id'),\
+                            typeof real);"
+                .to_string()]),
+            vec!["doc:ping wrapped:id function".to_string()],
+        );
+    }
+
+    #[test]
     fn direct_string_calls_cover_the_same_surface_as_extraction() {
         // s.lastIndexOf('/') threw "cannot call .lastIndexOf() on a
         // string (yet)" -- the direct-call arm lagged behind the
