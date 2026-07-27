@@ -4288,7 +4288,9 @@ fn primitive_prop_read(st: &mut St, recv: Value, key: u32) -> Value {
                 | "codePointAt" | "indexOf" | "lastIndexOf" | "includes"
                 | "startsWith" | "endsWith" | "replace" | "replaceAll"
                 | "split" | "concat" | "trim" | "trimStart" | "trimEnd"
-                | "toLowerCase" | "toUpperCase" | "match" | "search"
+                | "trimLeft" | "trimRight" | "toLowerCase" | "toUpperCase"
+                | "toLocaleLowerCase" | "toLocaleUpperCase"
+                | "match" | "matchAll" | "search" | "valueOf"
                 | "repeat" | "padStart" | "padEnd" | "at"
                 | "localeCompare" | "normalize"
         )
@@ -12617,10 +12619,10 @@ fn exec_loop(
                     let av1 = if argc > 1 { st.regs[a0 + 1] } else { Value::UNDEFINED };
                     let r = match method.as_str() {
                         "trim" => push_str(st, s.trim().to_string()),
-                        "trimStart" => push_str(st, s.trim_start().to_string()),
-                        "trimEnd" => push_str(st, s.trim_end().to_string()),
-                        "toUpperCase" => push_str(st, s.to_uppercase()),
-                        "toLowerCase" => push_str(st, s.to_lowercase()),
+                        "trimStart" | "trimLeft" => push_str(st, s.trim_start().to_string()),
+                        "trimEnd" | "trimRight" => push_str(st, s.trim_end().to_string()),
+                        "toUpperCase" | "toLocaleUpperCase" => push_str(st, s.to_uppercase()),
+                        "toLowerCase" | "toLocaleLowerCase" => push_str(st, s.to_lowercase()),
                         "toString" => push_str(st, s.clone()),
                         "includes" => {
                             let sub = to_display(st, av0);
@@ -12642,6 +12644,17 @@ fn exec_loop(
                             };
                             Value::int(idx)
                         }
+                        "lastIndexOf" => {
+                            let sub = to_display(st, av0);
+                            let idx = match s.rfind(&sub) {
+                                Some(b) => s[..b].chars().count() as i32,
+                                None => -1,
+                            };
+                            Value::int(idx)
+                        }
+                        // the primitive is its own value; jQuery's
+                        // isFunction probe calls it on hot paths
+                        "valueOf" => push_str(st, s.clone()),
                         "repeat" => {
                             let n = num_of(av0)?;
                             if n < 0.0 || !n.is_finite() {

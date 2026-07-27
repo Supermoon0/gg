@@ -7380,6 +7380,31 @@ console.log('B typeof it: ' + typeof it);
     }
 
     #[test]
+    fn direct_string_calls_cover_the_same_surface_as_extraction() {
+        // s.lastIndexOf('/') threw "cannot call .lastIndexOf() on a
+        // string (yet)" -- the direct-call arm lagged behind the
+        // extracted-builtin dispatcher. Same for the locale aliases,
+        // the legacy trim pair, and valueOf.
+        let mut vm = PageVm::new(None);
+        assert_eq!(
+            vm.run_scripts(&["var u = 'a/b/c.js';\
+                console.log(u.lastIndexOf('/'), u.lastIndexOf('zz'));\
+                console.log('MiX'.toLocaleLowerCase(),\
+                            'MiX'.toLocaleUpperCase());\
+                console.log('[' + '  x  '.trimLeft() + '|'\
+                            + '  x  '.trimRight() + ']');\
+                console.log('abc'.valueOf() === 'abc');"
+                .to_string()]),
+            vec![
+                "3 -1".to_string(),
+                "mix MIX".to_string(),
+                "[x  |  x]".to_string(),
+                "true".to_string(),
+            ],
+        );
+    }
+
+    #[test]
     fn get_elements_by_name_answers_on_the_document() {
         // React 19 dedupes hoistable resources through
         // document.getElementsByName; recoshopping's hydration died on
