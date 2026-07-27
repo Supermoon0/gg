@@ -33,7 +33,8 @@ from . import psl
 # GGBrowser -- the Mozilla/AppleWebKit prefix is the compatibility
 # boilerplate every engine sends.
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-              "AppleWebKit/537.36 (KHTML, like Gecko) GGBrowser/0.1")
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/122.0.0.0 Safari/537.36 GGBrowser/0.1")
 MAX_REDIRECTS = 8
 DEFAULT_TIMEOUT = 15.0
 

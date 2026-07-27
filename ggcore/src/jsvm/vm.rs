@@ -57,6 +57,18 @@ impl VmError {
     }
 }
 
+/// Per-instruction trace for one function by name (GG_TRACE_FN).
+/// Diagnostic-only: the env read is cached, the name compare only
+/// runs when the variable is set.
+fn fn_trace_wanted(name: &str) -> bool {
+    static PAT: std::sync::OnceLock<Option<String>> =
+        std::sync::OnceLock::new();
+    match PAT.get_or_init(|| std::env::var("GG_TRACE_FN").ok()) {
+        Some(p) if !p.is_empty() => name.contains(p.as_str()),
+        _ => false,
+    }
+}
+
 fn trace_enabled() -> bool {
     thread_local! {
         static ON: bool = std::env::var("GG_JS_TRACE")
@@ -92,17 +104,21 @@ fn frame_blank_from(
 }
 
 fn err<T>(msg: impl Into<String>) -> Result<T, VmError> {
-    Err(VmError {
-        msg: msg.into(), value: None, kind: "Error", trace: None,
-    })
+    let msg = msg.into();
+    if trace_enabled() {
+        eprintln!("[gg-raise] Error: {msg}");
+    }
+    Err(VmError { msg, value: None, kind: "Error", trace: None })
 }
 
 /// An engine-raised error that real JS specifies as a TypeError
 /// (member access on nullish, calling a non-function, ...).
 fn type_err<T>(msg: impl Into<String>) -> Result<T, VmError> {
-    Err(VmError {
-        msg: msg.into(), value: None, kind: "TypeError", trace: None,
-    })
+    let msg = msg.into();
+    if trace_enabled() {
+        eprintln!("[gg-raise] TypeError: {msg}");
+    }
+    Err(VmError { msg, value: None, kind: "TypeError", trace: None })
 }
 
 /// As `type_err`, for ReferenceErrors (unresolved names, TDZ).
@@ -211,6 +227,10 @@ impl ModStore {
 
     pub(super) fn rc(&self, mi: u32) -> Rc<LoadedModule> {
         self.mods.borrow()[mi as usize].clone()
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.mods.borrow().len()
     }
 
     pub(super) fn push(&self, m: LoadedModule) -> u32 {
@@ -440,6 +460,12 @@ pub(super) enum Native {
     QueueMicrotask,
     Fetch,
     PromiseResolve,
+    /// The global `Promise` itself. A real constructor function --
+    /// callable through `new t(executor)` where t arrived in a
+    /// variable -- because core-js's PromiseCapability does exactly
+    /// that, and `typeof Promise` must answer "function" or every
+    /// library's feature detection installs its polyfill over us.
+    PromiseCtor,
     PromiseReject,
     // --- host objects (P3b): Math/Object/Array/Number/String statics,
     // dispatched by id so one variant covers them all ---
@@ -1903,10 +1929,21 @@ pub(super) fn drain_microtasks_now(
 }
 
 fn drain_microtasks(st: &mut St, mods: &ModStore, budget: &mut usize) {
-    while let Some(job) = st.microtasks.pop_front() {
+    loop {
+        // Budget check BEFORE the pop. Checking after meant the job
+        // popped on the exhausted iteration was silently discarded --
+        // one promise reaction eaten per bounded drain. A reaction
+        // that vanishes neither runs nor rejects, so whatever awaited
+        // it hangs forever with nothing pending: on naver, turbopack's
+        // registerChunk gate lost its Promise.all continuation this
+        // way whenever the load-time queue happened to be deep enough,
+        // and the whole shopping module silently never hydrated.
         if *budget == 0 {
             return;
         }
+        let Some(job) = st.microtasks.pop_front() else {
+            return;
+        };
         *budget -= 1;
         st.fuel = DEFAULT_FUEL; // fresh instruction budget per reaction
         match job {
@@ -4414,7 +4451,7 @@ fn brand_string(st: &St, v: Value) -> String {
 /// Debug disassembly: annotate an instruction with resolved names
 /// (property atoms, globals) and constant strings so minified bytecode
 /// reads. Diagnostic only (GG_JS_DUMP).
-fn annotate_instr(
+pub(super) fn annotate_instr(
     st: &St,
     gm: &[u32],
     consts: &[Value],
@@ -5557,7 +5594,15 @@ fn to_display_rec(st: &mut St, v: Value, seen: &mut Vec<u32>) -> String {
     } else if v.is_null() {
         "null".to_string()
     } else if v.is_function() {
-        "function".to_string()
+        // Must agree byte-for-byte with Function.prototype.toString:
+        // core-js decides whether the host Promise is trustworthy by
+        // comparing inspectSource(P) (the method) against String(P)
+        // (this conversion) and testing /native code/. A mismatch --
+        // or a string without "native code" -- forces its Promise
+        // polyfill in, and the polyfill's scheduler never fires here,
+        // so every async function on the page silently stops at its
+        // first await. That was naver's shopping module.
+        "function () { [native code] }".to_string()
     } else if v.is_dom_node() {
         "[object HTMLElement]".to_string()
     } else if v.is_object() {
@@ -7001,6 +7046,34 @@ fn do_native(
                 mode,
                 credentials,
             });
+            Ok(pval)
+        }
+        Native::PromiseCtor => {
+            // `new Promise(executor)` reached dynamically (the
+            // syntactic form compiles to Instr::NewPromise). Same
+            // semantics: run the executor now, a throw rejects.
+            let exec_fn = if argc > 0 {
+                st.regs[args_base]
+            } else {
+                Value::UNDEFINED
+            };
+            if !exec_fn.is_function() {
+                return type_err("Promise resolver is not a function");
+            }
+            let (pval, pid) = new_promise(st);
+            let resolve =
+                make_native(st, Native::Resolve { pid, reject: false });
+            let reject =
+                make_native(st, Native::Resolve { pid, reject: true });
+            if let Err(e) =
+                call_value(st, mods, exec_fn, &[resolve, reject])
+            {
+                let reason = e.value.unwrap_or_else(|| {
+                    let s = e.msg.clone();
+                    make_string(st, s)
+                });
+                promise_settle(st, pid, reason, true);
+            }
             Ok(pval)
         }
         Native::PromiseResolve => {
@@ -10538,6 +10611,12 @@ pub(super) fn call_value_this(
             // Each native->JS re-entry nests a real Rust `exec` frame;
             // MAX_FRAMES doesn't see those, so cap them separately.
             if st.native_depth >= MAX_NATIVE_DEPTH {
+                if trace_enabled() {
+                    eprintln!(
+                        "[gg-trace] native re-entry cap hit ({} deep)",
+                        st.native_depth
+                    );
+                }
                 return err("stack overflow");
             }
             let (m, p) = (*module, *proto);
@@ -10920,6 +10999,12 @@ fn exec_loop(
             *st.profile_samples.entry((mi, pi)).or_insert(0) += 1;
         }
         let instr = cmod.module.protos[pi as usize].code[ip];
+        if fn_trace_wanted(&cmod.module.protos[pi as usize].name) {
+            eprintln!(
+                "[gg-fn] m{mi} p{pi} {} ip{ip}: {instr:?}",
+                cmod.module.protos[pi as usize].name,
+            );
+        }
         ip += 1;
         match instr {
             Instr::LoadConst { dst, idx } => {
@@ -11283,7 +11368,9 @@ fn exec_loop(
                         String::new()
                     };
                     return type_err(format!(
-                        "{fv:?} is not a function{hint}"
+                        "{fv:?} is not a function{hint} \
+                         [at m{mi} p{pi} ip{ip} in {}]",
+                        cmod.module.protos[pi as usize].name,
                     ));
                 }
                 if matches!(
@@ -11396,7 +11483,11 @@ fn exec_loop(
             Instr::CallThis { func, recv, argc } => {
                 let fv = reg!(func);
                 if !fv.is_function() {
-                    return type_err(format!("{fv:?} is not a function"));
+                    return type_err(format!(
+                        "{fv:?} is not a function \
+                         [at m{mi} p{pi} ip{ip} in {}]",
+                        cmod.module.protos[pi as usize].name,
+                    ));
                 }
                 if matches!(
                     st.closures[fv.index() as usize],

@@ -71,6 +71,33 @@ Promise.race = function (arr) {
     }
   });
 };
+Promise.allSettled = function (arr) {
+  return Promise.all(arr.map(function (p) {
+    return Promise.resolve(p).then(
+      function (v) { return { status: 'fulfilled', value: v }; },
+      function (e) { return { status: 'rejected', reason: e }; });
+  }));
+};
+// Instances dispatch then/catch/finally at the engine level and never
+// consult this prototype; it exists because feature detection reads
+// Promise.prototype.catch / .finally before trusting the host Promise,
+// and because odd code `.call`s these with a promise as `this`.
+Promise.prototype.then = function (a, b) {
+  return Promise.resolve(this).then(a, b);
+};
+Promise.prototype.catch = function (f) {
+  return Promise.resolve(this).then(undefined, f);
+};
+Promise.prototype.finally = function (f) {
+  return Promise.resolve(this).finally(f);
+};
+// core-js's inspectSource is Function.prototype.toString uncurried and
+// .call()ed on the candidate. Left unset, that name fell through the
+// bare prototype object to the Object brand toString and answered
+// "[object Function]" -- which can never contain "native code", so
+// the host Promise could never be trusted. The extracted string
+// method stringifies whatever `this` it is handed.
+Function.prototype.toString = (function () {}).toString;
 
 // Error hierarchy in JS itself — real prototype chains (07-12) make
 // `new TypeError(m) instanceof Error` just work.
@@ -1446,13 +1473,25 @@ impl PageVm {
             let fv = make_native(&mut vm.st, n);
             vm.set_global(name, fv);
         }
-        let promise_ctor = vm.install_object(
-            "Promise",
-            &[
-                ("resolve", Native::PromiseResolve),
-                ("reject", Native::PromiseReject),
-            ],
-        );
+        // Promise is a real constructor FUNCTION. It was a plain
+        // object of statics for a long time, and that one wrong
+        // `typeof` failed core-js's trustworthiness probe on every
+        // page that ships it: the polyfill replaced the global, every
+        // async function's machinery then ran through the polyfill's
+        // scheduler (which never fires here), and whole apps stopped
+        // silently at their first await. naver's shopping module was
+        // the visible casualty.
+        let promise_ctor =
+            make_native(&mut vm.st, Native::PromiseCtor);
+        vm.set_global("Promise", promise_ctor);
+        for (m, n) in [
+            ("resolve", Native::PromiseResolve),
+            ("reject", Native::PromiseReject),
+        ] {
+            let key = vm.name_id(m);
+            let fv = make_native(&mut vm.st, n);
+            vm.st.fn_props.insert((promise_ctor.index(), key), fv);
+        }
         vm.st.known.promise = promise_ctor;
 
         // host objects (P3b): Math / Object / Array / Number / String
@@ -1704,10 +1743,15 @@ impl PageVm {
             let nav = new_plain_object(&mut vm.st);
             let ni = nav.index() as usize;
             for (f, dv) in [
+                // The Chrome token is what core-js's V8_VERSION
+                // sniff reads; >= 51 skips the Promise subclassing
+                // probe our engine cannot pass, which otherwise
+                // forces the polyfill in (see to_display on
+                // functions). GGBrowser stays as the real identity.
                 ("userAgent",
                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
                   AppleWebKit/537.36 (KHTML, like Gecko) \
-                  GGBrowser/0.1"),
+                  Chrome/122.0.0.0 Safari/537.36 GGBrowser/0.1"),
                 ("platform", "Win32"),
                 ("language", "ko-KR"),
                 ("vendor", ""),
@@ -7376,6 +7420,115 @@ console.log('B typeof it: ' + typeof it);
         assert_eq!(
             vm.run_scripts(&["console.log(log.join('|'));".to_string()]),
             vec!["300x40|300x90".to_string()],
+        );
+    }
+
+    /// Not a test: a bytecode microscope. Set GG_DUMP_SRC to a JS
+    /// file and GG_DUMP_PAT to a function-name substring, run with
+    /// --nocapture, and every matching proto's annotated disassembly
+    /// prints. Built for the shopsquare stall (docs/shopsquare-
+    /// hydration-stall.md): a branch the interpreter demonstrably
+    /// skips can only be read at this level.
+    #[test]
+    fn zz_dump_bytecode() {
+        let Ok(path) = std::env::var("GG_DUMP_SRC") else { return };
+        let pat = std::env::var("GG_DUMP_PAT")
+            .unwrap_or_else(|_| "registerChunk".to_string());
+        let src = std::fs::read_to_string(&path).unwrap();
+        let mut vm = PageVm::new(None);
+        // Drive the real runtime deterministically: register the
+        // runtime chunk (one pending dependency), then register that
+        // dependency afterwards so the gate await resolves across a
+        // real turn boundary, like on the page. If the branch runs,
+        // the runtime must complain that module 21479's factory is
+        // missing -- silence instead means the stall reproduced.
+        let prefix = "https://spastatic.naver.com/v1/shopad/static/\
+                      shopad-spblock-node/v260720-153933/_next/";
+        let prelude = format!(
+            "var __stub = function (p) {{\
+               return {{ getAttribute: function () {{\
+                 return '{prefix}' + p; }} }};\
+             }};\
+             globalThis.TURBOPACK = [\
+               [__stub('static/chunks/turbopack-x.js'),\
+                {{ otherChunks: ['static/chunks/dep.js'],\
+                   runtimeModuleIds: [21479] }}]\
+             ];",
+        );
+        let kick =
+            "console.log('[kick] registering dep');\
+             TURBOPACK.push([__stub('static/chunks/dep.js'), {}]);\
+             console.log('[kick] done');"
+                .to_string();
+        for l in vm.run_scripts(&[prelude, src]) {
+            eprintln!("log: {l}");
+        }
+        for l in vm.run_scripts(&[kick]) {
+            eprintln!("log: {l}");
+        }
+        for _ in 0..4 {
+            let (logs, _reqs) = vm.pump();
+            for l in logs {
+                eprintln!("pump: {l}");
+            }
+            if !vm.has_pending_work() {
+                break;
+            }
+        }
+        for mi in 0..vm.mods.len() as u32 {
+            let m = vm.mods.rc(mi);
+            for (pi, p) in m.module.protos.iter().enumerate() {
+                if !p.name.contains(&pat) {
+                    continue;
+                }
+                eprintln!(
+                    "=== m{mi} p{pi} name={} nparams={} nregs={} \
+                     lazy={} arrow={} len={}",
+                    p.name, p.nparams, p.nregs, p.lazy.is_some(),
+                    p.is_arrow, p.code.len(),
+                );
+                for (k, ins) in p.code.iter().enumerate() {
+                    eprintln!(
+                        "{k:4}: {:?}{}",
+                        ins,
+                        crate::jsvm::vm::annotate_instr(
+                            &vm.st, &m.global_map, &p.consts, ins,
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_bounded_drain_never_eats_a_microtask() {
+        // The exhausted iteration used to pop-then-return, silently
+        // discarding one queued reaction per bounded drain. A reaction
+        // that vanishes neither runs nor rejects -- the awaiting chain
+        // hangs forever with nothing pending, which is how turbopack's
+        // chunk gate on naver lost its Promise.all continuation and
+        // the shopping module never hydrated (nondeterministically:
+        // it needed the queue to be exactly deep enough at the time).
+        let mut vm = PageVm::new(None);
+        vm.run_scripts(&["var ran = [];".to_string()]);
+        vm.run_source(
+            "for (var i = 0; i < 10; i++) {\
+               (function (k) {\
+                 Promise.resolve().then(function () { ran.push(k); });\
+               })(i);\
+             }",
+        )
+        .unwrap();
+        // four bounded drains of 3: with the off-by-one, the fourth
+        // job of each exhausted drain was eaten and order broke
+        for _ in 0..4 {
+            crate::jsvm::vm::drain_microtasks_now(
+                &mut vm.st, &vm.mods, 3,
+            );
+        }
+        assert_eq!(
+            vm.run_scripts(&["console.log(ran.join(','));".to_string()]),
+            vec!["0,1,2,3,4,5,6,7,8,9".to_string()],
         );
     }
 

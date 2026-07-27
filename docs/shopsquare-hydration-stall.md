@@ -1,77 +1,74 @@
-# shopsquare(터보팩) 하이드레이션 정지 — 수사 기록
+# shopsquare(터보팩) 하이드레이션 정지 — 수사 기록 (2차 개정)
 
 naver.com 메인의 쇼핑 박스(`shopsquare.naver.com` iframe, Next.js
-app-router + turbopack)가 SSR 탭 7개까지만 그리고 조용히 멈춘다.
-같은 구조의 recoshopping(webpack)은 정상 렌더된다. 이 문서는 어디까지
-좁혀졌는지, 무엇이 이미 반증됐는지의 기록이다. 재수사 시 여기서
-시작할 것.
+app-router + turbopack)가 SSR 탭 7개까지만 그리고 멈춘다. 이 문서는
+현재까지의 확정 사실과 열린 앞단을 기록한다.
 
-## 확정된 사실 (계측 근거)
+## 정정 (1차 기록의 오류)
 
-터보팩 런타임(`turbopack-*.js`)을 네트워크 계층에서 텍스트 패치해
-등록/게이트/엔트리 각 단계에 로그를 심는 하네스로 얻은 단일 런 관측:
+1차 기록의 "조건은 참인데 if 분기가 소실되는 미컴파일" 결론은
+**하네스 버그가 만든 허상**이었다. sqpatch 계열 진단 스크립트의
+출력부가 `[q]/[reg]/[gate]/error`를 포함한 줄만 인쇄해서, 그 밖의
+마커([entry]/[s0]/[pre]/[post]...)가 "실행 안 됨"으로 오독됐다.
+GG_TRACE_FN 명령어 트레이스(stderr 직행, 필터 무관)로 재검증한
+결과 해당 경로는 전부 실행되고 있었다. **교훈: 진단 하네스의 출력
+필터는 마커를 추가할 때마다 함께 갱신하거나, 아예 필터 없이 찍어라.**
 
-1. 청크 15개 전부 실행되고, 전부 `registerChunk`에 올바른 경로
-   (`static/chunks/….js` — `document.currentScript.getAttribute("src")`
-   에서 하드코딩된 CDN 프리픽스를 벗겨 파생)로 등록된다.
-2. 런타임 청크의 게이트
-   `await Promise.all(otherChunks.map(t=>P(0,e,t)))`가 **통과한다**
-   (4개 의존 청크의 W 엔트리 전부 resolve, `[gate] passed` 출력).
-3. 게이트 직후 같은 문장의 주입 로그가
-   `ids=[21479] len=1 cond=true`를 출력한다. 즉 조건식은 참이다.
-4. 그런데 바로 다음의 `for (let r of t.runtimeModuleIds)
-   !function(e,t){…}(e,r)` 가 **한 번도 돌지 않는다** — IIFE 첫 줄에
-   심은 로그가 침묵한다. 에러도, unhandled rejection도 없다.
-5. 엔트리 모듈 21479(= Next.js app-index 부트: `__next_f` 소비자,
-   flight ReadableStream 생성, hydrateRoot)가 평가되지 않으므로
-   리스너 0개, 플라이트 행 8개가 raw로 잔류, 렌더 없음 — 관측된
-   증상 전부가 이 한 지점에서 설명된다.
+## 이후 실제로 찾아 고친 것 (bc3b53b~ 이 커밋)
 
-즉 **조건이 참으로 평가된 if의 결과절(for-of)이 실행되지 않는
-엔진 미컴파일**이 실물 페이지에서 재현된다. 위치는 async 메서드
-`registerChunk(e,t)` 내부, await가 if-조건의 콤마열 안에 있는 지점.
+- `el.attributes` 라이브 NamedNodeMap, `getElementsByName`,
+  `attachShadow` 강등, `crypto`, 문자열 직접호출 arm 동률 (이전 커밋들).
+- **전역 `Promise`가 plain object였다** — `typeof Promise`가
+  "object"라 모든 라이브러리 기능 탐지가 폴리필을 강제했고,
+  core-js Promise 폴리필의 스케줄러는 이 엔진에서 돌지 않아 async
+  함수 전체가 첫 await에서 무음 정지했다. `Native::PromiseCtor`로
+  실제 생성자 함수가 됐고(동적 `new t(exec)` 지원), 스태틱은
+  fn_props, prototype에는 then/catch/finally 위임을 얹었다.
+- `String(fn)` 변환이 "function"만 줘서 `/native code/` 검사가
+  깨졌다 — Function.prototype.toString 메서드와 문자열을 통일.
+- `Function.prototype.toString`이 브랜드 toString으로 새서
+  "[object Function]"을 주던 것을 프렐류드에서 추출형으로 고정.
+- UA에 Chrome/122 토큰 추가(net.py + navigator.userAgent) —
+  core-js V8_VERSION 스니프가 서브클래싱 프로브(우리가 통과 못 함)를
+  건너뛰게 한다.
+- 바운디드 마이크로태스크 드레인이 소진 시 잡을 하나 삼키던
+  오프바이원 수정(pop 전에 예산 검사).
+- 진단 인프라: `zz_dump_bytecode` 테스트(GG_DUMP_SRC/GG_DUMP_PAT —
+  바이트코드 현미경 + 실바이트 구동 하네스), `GG_TRACE_FN`(함수명
+  매칭 명령어 트레이스), err/type_err의 `[gg-raise]` 트레이스.
 
-## 반증된 가설 (전부 격리 재현 통과)
+## 현재 확정 상태 (GG_TRACE_FN + 무필터 로그 기준)
 
-- 1인자 `setTimeout(f)` 미스케줄 — 정상.
-- 배열 `push` 오버라이드 무시 / `length=0` 절단 — 다중 스크립트에
-  걸친 실제 시퀀스 포함 전부 정상.
-- `globalThis` 부재/이상 — `globalThis === window === self` 정상.
-- await를 품은 if-콤마-조건 + for-let-of + IIFE — 실물 소스를 문자
-  그대로 복사한 재현(스텁 W/S/P/L, 지연 resolve, 동시 활성화 15회,
-  바깥 `let e`/`let t`를 파라미터가 섀도잉하는 IIFE 클로저 포함)이
-  **전부 통과한다**. 작은 재현으로는 안 터진다.
-- `pushOverridden` 관측은 내장 메서드 identity 버그(`a.push !==
-  a.push`, bc3b53b에서 수정)가 만든 유령이었다.
+- registerChunk 15회 활성화 전부 완주. 게이트 await 해소,
+  포스트-어웨이트 연속체(m177 p1) 실행, **엔트리 모듈 21479 평가
+  성공**(팩토리-부재 에러 없음).
+- 그럼에도 DOM은 lis=7 그대로: 21479(등록 모듈)가 요구하는
+  app-index 부트(98028/37505 require 체인) 안 어딘가에서 무음
+  탈락. `new ReadableStream`이 생성되지 않는다(bare 재바인딩
+  래퍼로 확인 — 전역 함수 재바인딩은 스크립트 경계를 넘어
+  유효함, 단 DOM 메서드는 expando 호출 경로로만).
+- 벤치: 잡음 raise는 12건 전부 무해한 기능 프로브(core-js Set
+  메서드 탐지 Cf ×7, canParse/Reflect 프로브 등).
 
-## 유력한 다음 지렛대
+## 다음 지렛대
 
-작은 재현과 실물의 남은 차이는 **컴파일 경로**다. 실물 런타임은
-~10KB 비동기 아닌 화살표 IIFE 안에 있고, 그 본문은 `try_lazy_body`
-→ `compile_lazy`(지연 세션, 캡처 환경 재구성) 경로를 탈 수 있다.
-지연 세션 안에서 async 메서드의 연속체(스필/호이스트)가 어긋나면
-정확히 "조건은 참인데 분기 소실" 류의 미컴파일이 된다.
+1. GG_TRACE_FN을 app-index 쪽 함수명(예: hydrate/appBootstrap의
+   축약명 — 21479가 require하는 98028 모듈의 proto 이름을
+   zz_dump_bytecode로 먼저 알아낸다)에 걸어 어느 문장까지 가는지
+   본다. 필터 없이.
+2. 후보: `document.readyState` 'loading' 분기에서 DOMContentLoaded
+   대기 → 프레임 라이프사이클과의 타이밍; RSC 스트림 마감(C)
+   미도달; hydrateRoot 진입 전 조건 분기.
+3. recoshopping(webpack)은 같은 페이지에서 정상 렌더 — 대조군.
 
-다음 세션 할 일:
+## 도구 사용법
 
-1. 실물 `turbopack-*.js`를 엔진에 단독 로드해 `registerChunk`가
-   속한 proto의 **바이트코드를 덤프**하고(연료 소진 시 disasm을
-   찍는 기존 디버그 경로 재활용), await 이후 연속체에서 for-of
-   분기가 어디로 컴파일됐는지 읽는다.
-2. 대조: 같은 함수를 지연 컴파일이 **안** 걸리는 형태(본문 축소)로
-   컴파일해 바이트코드를 비교한다.
-3. 미컴파일 지점을 고치고, 실패 형태를 cargo 테스트로 고정한다.
-
-## 하네스 사용법
-
-네트워크 계층 텍스트 패치는 세션 백엔드 인스턴스의 `request`를
-감싸면 된다(반환 튜플 모양을 보존할 것 — 리스트로 받아 body만
-바꿔 되돌려준다). 터보팩 소스의 안정된 앵커 문자열:
-
-- 등록: `e={async registerChunk(e,t){`
-- 게이트: `if(await Promise.all(t.otherChunks.map(t=>P(0,e,t))),`
-- 엔트리 루프: `for(let r of t.runtimeModuleIds)!function(e,t){`
-
-주의: for-of 헤드에 콤마식을 주입하면 실JS에서도 SyntaxError다.
-계측은 문장 위치에만 넣을 것 — 이번 수사에서 잘못된 주입이
-증거를 한 차례 오염시켰다.
+- 바이트코드: `GG_DUMP_SRC=<js파일> GG_DUMP_PAT=<이름조각>
+  cargo test zz_dump_bytecode -- --nocapture`
+- 명령어 트레이스: `GG_TRACE_FN=<이름조각>` (페이지 로드 하네스에
+  같이) — stderr로 `[gg-fn] m.. p.. name ip..: Instr` 나옴.
+- raise 트레이스: `GG_JS_TRACE=1` — `[gg-raise] Kind: msg` +
+  미장식 호출 실패에는 `[at m.. p.. ip.. in name]`.
+- 런타임 텍스트 패치: 백엔드 인스턴스 `request`를 감싸 특정 URL
+  본문을 치환(반환 튜플 모양 보존). for-of 헤드에 콤마식 주입 금지
+  (SyntaxError).
