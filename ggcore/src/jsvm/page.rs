@@ -2193,6 +2193,21 @@ impl PageVm {
     /// via `contentDocument.open()/write()/close()`, as
     /// (iframe node index, markup). The host loads each into the real
     /// child document -- the VM has no child arena of its own.
+    /// Send document.write to the parser's input stream instead of the
+    /// tree, for as long as a parse is in progress.
+    pub fn set_parser_writes(&mut self, on: bool) {
+        self.st.parser_writes = if on { Some(String::new()) } else { None };
+    }
+
+    /// Markup written since the last call, to be tokenized at the
+    /// insertion point.
+    pub fn take_parser_writes(&mut self) -> String {
+        match &mut self.st.parser_writes {
+            Some(b) => std::mem::take(b),
+            None => String::new(),
+        }
+    }
+
     pub fn take_document_writes(&mut self) -> Vec<(u32, String)> {
         std::mem::take(&mut self.st.doc_writes)
     }

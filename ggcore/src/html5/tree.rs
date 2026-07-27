@@ -5,6 +5,9 @@
 //! Structured to mirror the spec's own division into insertion modes so
 //! each `Mode` arm can be read against its section.
 
+use std::collections::HashMap;
+
+use super::scripts::Scripts;
 use super::sink::{AttrName, Ns, NodeData, Quirks, Sink};
 use super::tokenizer::{State as TState, Token, Tokenizer};
 
@@ -61,12 +64,6 @@ const FORMATTING: &[&str] = &[
     "strike", "strong", "tt", "u",
 ];
 
-const VOID: &[&str] = &[
-    "area", "base", "basefont", "bgsound", "br", "col", "embed", "frame",
-    "hr", "img", "input", "keygen", "link", "meta", "param", "source",
-    "track", "wbr",
-];
-
 const IMPLIED_END: &[&str] =
     &["dd", "dt", "li", "optgroup", "option", "p", "rb", "rp", "rt", "rtc"];
 
@@ -93,6 +90,12 @@ pub struct TreeBuilder {
     /// Every <selectedcontent> in the tree, so the mirror can be
     /// refreshed without walking the document.
     selected_content: Vec<usize>,
+    /// Attributes an element was created with, for the formatting-list
+    /// clones. Only formatting elements need an entry.
+    token_attrs: HashMap<usize, Vec<(AttrName, String)>>,
+    /// Present when scripting is enabled: scripts run as the parse
+    /// reaches them.
+    scripts: Option<Scripts>,
 }
 
 /// Result of a parse: the tree, plus (for fragment parsing) the root
@@ -185,6 +188,8 @@ impl TreeBuilder {
             ignore_lf: false,
             done: false,
             selected_content: Vec::new(),
+            token_attrs: HashMap::new(),
+            scripts: if scripting { Some(Scripts::new()) } else { None },
         };
         if fragment {
             if let Some(c) = tb.context {
@@ -564,6 +569,11 @@ impl TreeBuilder {
     // ---- active formatting elements ----------------------------------
 
     fn push_active(&mut self, node: usize) {
+        // The list clones the *token*, not the element: a script that
+        // edits an element's attributes must not change the copies the
+        // parser makes of it afterwards.
+        let attrs = self.sink.attrs(node).to_vec();
+        self.token_attrs.insert(node, attrs);
         // Noah's Ark: at most three identical entries after the last
         // marker.
         let mut count = 0;
@@ -588,13 +598,21 @@ impl TreeBuilder {
         self.active.push(Formatting::Element(node));
     }
 
+    /// The attributes an element was created with.
+    fn token_attrs(&self, node: usize) -> Vec<(AttrName, String)> {
+        match self.token_attrs.get(&node) {
+            Some(a) => a.clone(),
+            None => self.sink.attrs(node).to_vec(),
+        }
+    }
+
     fn same_formatting(&self, a: usize, b: usize) -> bool {
         if self.sink.tag(a) != self.sink.tag(b)
             || self.sink.ns(a) != self.sink.ns(b)
         {
             return false;
         }
-        let (aa, ba) = (self.sink.attrs(a), self.sink.attrs(b));
+        let (aa, ba) = (self.token_attrs(a), self.token_attrs(b));
         if aa.len() != ba.len() {
             return false;
         }
@@ -646,16 +664,16 @@ impl TreeBuilder {
                 i += 1;
                 continue;
             };
-            let (ns, name, attrs) = match &self.sink.nodes[e].data {
-                NodeData::Element { ns, name, attrs } => {
-                    (*ns, name.clone(), attrs.clone())
-                }
+            let (ns, name) = match &self.sink.nodes[e].data {
+                NodeData::Element { ns, name, .. } => (*ns, name.clone()),
                 _ => {
                     i += 1;
                     continue;
                 }
             };
-            let n = self.insert_element(ns, &name, attrs);
+            let attrs = self.token_attrs(e);
+            let n = self.insert_element(ns, &name, attrs.clone());
+            self.token_attrs.insert(n, attrs);
             self.active[i] = Formatting::Element(n);
             i += 1;
         }
@@ -719,7 +737,7 @@ impl TreeBuilder {
             let common_ancestor = self.open[fmt_oi - 1];
             let mut bookmark = fmt_ai;
             let mut node_oi = self.open.iter().position(|&n| n == furthest).unwrap();
-            let mut node = furthest;
+            let mut node;
             let mut last_node = furthest;
             let mut inner = 0;
             loop {
@@ -748,13 +766,13 @@ impl TreeBuilder {
                     continue;
                 };
                 // replace node with a fresh copy
-                let (ns, name, attrs) = match &self.sink.nodes[node].data {
-                    NodeData::Element { ns, name, attrs } => {
-                        (*ns, name.clone(), attrs.clone())
-                    }
+                let (ns, name) = match &self.sink.nodes[node].data {
+                    NodeData::Element { ns, name, .. } => (*ns, name.clone()),
                     _ => unreachable!(),
                 };
-                let fresh = self.create(ns, &name, attrs);
+                let attrs = self.token_attrs(node);
+                let fresh = self.create(ns, &name, attrs.clone());
+                self.token_attrs.insert(fresh, attrs);
                 self.active[ai] = Formatting::Element(fresh);
                 self.open[node_oi] = fresh;
                 node = fresh;
@@ -772,13 +790,13 @@ impl TreeBuilder {
             }
             // a fresh copy of the formatting element takes the
             // furthest block's children
-            let (ns, name, attrs) = match &self.sink.nodes[fmt_node].data {
-                NodeData::Element { ns, name, attrs } => {
-                    (*ns, name.clone(), attrs.clone())
-                }
+            let (ns, name) = match &self.sink.nodes[fmt_node].data {
+                NodeData::Element { ns, name, .. } => (*ns, name.clone()),
                 _ => unreachable!(),
             };
-            let fresh = self.create(ns, &name, attrs);
+            let attrs = self.token_attrs(fmt_node);
+            let fresh = self.create(ns, &name, attrs.clone());
+            self.token_attrs.insert(fresh, attrs);
             let kids = self.sink.nodes[furthest].children.clone();
             for k in kids {
                 self.sink.append(fresh, k);

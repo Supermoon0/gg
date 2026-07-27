@@ -978,6 +978,12 @@ pub(super) struct St {
     /// markup per iframe node; `close()` hands it to the host, which
     /// loads it into the real child document.
     pub(super) doc_write_buf: HashMap<u32, String>,
+    /// While the HTML parser is running, document.write belongs to the
+    /// input stream at the insertion point, not to the tree: what it
+    /// writes has to be tokenized, or a written <script> never runs.
+    /// Set by the parser; None restores the after-load behaviour of
+    /// grafting parsed markup in beside the writing script.
+    pub(super) parser_writes: Option<String>,
     /// (iframe node, markup) for documents whose `close()` has run.
     pub(super) doc_writes: Vec<(u32, String)>,
     /// Parser insertion point for `document.write` into the *running*
@@ -1165,6 +1171,7 @@ impl St {
             frame_mirrors: HashMap::new(),
             frame_docs: HashMap::new(),
             doc_write_buf: HashMap::new(),
+            parser_writes: None,
             doc_writes: Vec::new(),
             doc_write_at: None,
             frame_host_owned: std::collections::HashSet::new(),
@@ -8848,6 +8855,10 @@ fn queue_scroll(
 fn doc_write_into(
     st: &mut St, doc: &Rc<RefCell<dom::Document>>, markup: &str,
 ) {
+    if let Some(buf) = &mut st.parser_writes {
+        buf.push_str(markup);
+        return;
+    }
     let owner = st.current_script.unwrap_or(u32::MAX);
     let mut d = doc.borrow_mut();
     let at = match st.doc_write_at {

@@ -583,11 +583,42 @@ impl TreeBuilder {
                 self.mode = self.original_mode;
                 self.by_mode(Token::Eof);
             }
+            Token::EndTag { ref name } if name == "script" => {
+                let node = self.current();
+                self.open.pop();
+                self.mode = self.original_mode;
+                self.run_script(node);
+            }
             Token::EndTag { .. } => {
                 self.open.pop();
                 self.mode = self.original_mode;
             }
             _ => {}
+        }
+    }
+
+    /// The spec's script execution point: the script runs here, with the
+    /// tree as far as it has been built, and anything it writes is
+    /// tokenized before the rest of the input.
+    fn run_script(&mut self, node: usize) {
+        if self.scripts.is_none() {
+            return;
+        }
+        let src: String = self.sink.nodes[node]
+            .children
+            .iter()
+            .filter_map(|&c| match &self.sink.nodes[c].data {
+                NodeData::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        if src.trim().is_empty() {
+            return;
+        }
+        let scripts = self.scripts.as_mut().unwrap();
+        let written = scripts.run(&mut self.sink, node, &src);
+        if !written.is_empty() {
+            self.tok.insert_at_point(&written);
         }
     }
 
