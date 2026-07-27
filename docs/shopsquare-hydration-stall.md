@@ -66,14 +66,33 @@ zz/GG_TRACE_FN 도구로 부트를 끝까지 따라간 결과, 남은 정지는 
 상품 API fetch가 0건, li 7 그대로. React 스케줄러 틱(MessageChannel
 → setTimeout0) 또는 RSC 루트 resolve 어딘가에서 조용히 멈춘다.
 
+## 4차 진행 — 현재 프런티어
+
+청크 텍스트 패치로 hydrate 내부까지 확인 (스크립트: scratchpad의
+sqhy2/sqsc/sqhook_dev 계열):
+
+- `l`(RSC 루트 promise) **fulfilled**, `await l` 통과, `[hy] mounting
+  errorDoc=false`, `hydrateRoot(P, f, ...)` **정상 반환**(object).
+- `unstable_scheduleCallback(pri=3)` **2회**, 스케줄러 틱(MessageChannel
+  onmessage) **2회 실행** — React 렌더 패스가 돈다.
+- 그 후 커밋 없음: li 7 그대로, 상품 API fetch 0, 신규 스크립트 0.
+  전형적 서스펜션 지문(use(thenable) 영구 대기) 또는 렌더 내부에서
+  React가 삼킨 엔진 오류.
+- 플라이트 행은 0..17,a..f 전부 초기 HTML에 존재(불완전 스트림 아님).
+- DevTools 훅(inject/onCommitFiberRoot) 프로브는 아직 발화 안 함 —
+  주의: `window.X=`는 bare 전역 조회에 안 보인다(expando 함정),
+  `var X=`로 선언해도 미발화였으므로 react-dom의 훅 결선 경로를
+  다시 볼 것.
+
 ## 다음 지렛대
 
-1. hydrateRoot 이후: React 워크루프 틱이 실제 도는지
-   (MessageChannel postMessage 계수 or 스케줄러 함수명 트레이스),
-   RSC 루트 promise가 resolve되는지(createFromReadableStream 체인의
-   .then에 로그 주입 — 13e1637b 청크 텍스트 패치).
-2. Suspense 대기 후보: 플라이트가 참조하는 클라이언트 모듈 로딩
-   promise(P/W 경로), use(promise) 지점.
+1. 렌더 중 서스펜션 포인트 특정: 13e1637b에서 react-dom의
+   suspense/thenable 처리부(`.then(`이 붙는 retry 경로)나
+   use() 대응 지점에 로그 주입. 또는 GG_TRACE_FN을 스케줄러 틱
+   핸들러(C) 소속 proto명으로 걸어 두 틱의 마지막 명령을 본다.
+2. 엔진 오류 삼킴 확인: React는 렌더 오류를 잡아 재시도한다 —
+   GG_JS_TRACE=1로 [gg-raise]에 hydration 중 TypeError가 새로
+   생기는지(기존 12건 외) 대조.
 3. recoshopping(webpack)은 같은 페이지에서 정상 렌더 — 대조군.
 
 ## 도구 사용법
