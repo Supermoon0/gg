@@ -58,6 +58,7 @@ pub fn compile_lazy(src: &LazySrc) -> Result<Module, CompileError> {
         fns: Vec::new(),
         const_globals: HashSet::new(),
         discarding: false,
+        dst_hint: None,
     };
     let lit = if let Some(lz) = &src.lit.lazy_body {
         // lazy-parsed: build the body AST now, from the original
@@ -99,6 +100,7 @@ pub fn compile(stmts: &[Stmt]) -> Result<Module, CompileError> {
         fns: Vec::new(),
         const_globals: HashSet::new(),
         discarding: false,
+        dst_hint: None,
     };
     // Main proto: register 0 holds the last expression-statement value
     // so eval() can return it.
@@ -150,6 +152,11 @@ struct Compiler {
     /// Set only while compiling an update expression whose value is
     /// discarded; see `expr_discarded`.
     discarding: bool,
+    /// A register a binary expression should write its result into, so
+    /// `s += i` becomes `Add s, s, i` rather than add-to-temp-then-Move.
+    /// Taken at the top of `expr`, so exactly one expression can use it
+    /// and it never leaks into a subexpression.
+    dst_hint: Option<u8>,
 }
 
 /// How a name was declared — drives const and TDZ rules.
@@ -3872,6 +3879,7 @@ impl Compiler {
     }
 
     fn expr(&mut self, e: &Expr) -> Result<u8, CompileError> {
+        let hint = self.dst_hint.take();
         match e {
             Expr::Num(n) => {
                 let r = self.fx().alloc()?;
@@ -3959,10 +3967,10 @@ impl Compiler {
                 // no LoadInt inside the loop to refill it.
                 if *op == BinOp::Lt {
                     if let Some(imm) = int_literal(b) {
-                        let dst = if ra >= self.fx().locals_end {
-                            ra
-                        } else {
-                            self.fx().alloc()?
+                        let dst = match hint {
+                            Some(d) => d,
+                            None if ra >= self.fx().locals_end => ra,
+                            None => self.fx().alloc()?,
                         };
                         self.fx().emit(Instr::LtImm { dst, a: ra, imm });
                         let f = self.fx();
@@ -3975,10 +3983,10 @@ impl Compiler {
                 // a long chain (a+b+c+...) then needs O(1) temps
                 // instead of one per term (minified bundles have
                 // thousand-term expressions)
-                let dst = if ra >= self.fx().locals_end {
-                    ra
-                } else {
-                    self.fx().alloc()?
+                let dst = match hint {
+                    Some(d) => d,
+                    None if ra >= self.fx().locals_end => ra,
+                    None => self.fx().alloc()?,
                 };
                 let Some(i) = bin_instr(*op, dst, ra, rb) else {
                     return self.err(format!("operator {op:?} not yet"));
@@ -4524,13 +4532,22 @@ impl Compiler {
                         Box::new(target.clone()),
                         Box::new(value.clone()),
                     );
+                    if let Place::Reg(reg) = self.resolve(name) {
+                        // ask for the result in the variable's own
+                        // register; the operand guard above has already
+                        // snapshotted anything the right side could
+                        // clobber, so the write lands last and lands right
+                        self.dst_hint = Some(reg);
+                        let rv = self.expr(&combined)?;
+                        if rv != reg {
+                            self.fx()
+                                .emit(Instr::Move { dst: reg, src: rv });
+                        }
+                        return Ok(reg);
+                    }
                     let rv = self.expr(&combined)?;
                     self.store_name(name, rv);
-                    if let Place::Reg(reg) = self.resolve(name) {
-                        Ok(reg)
-                    } else {
-                        Ok(rv)
-                    }
+                    Ok(rv)
                 }
                 AssignOp::Log(_) => unreachable!("logical assignment desugared in assign()"),
             },

@@ -10922,6 +10922,7 @@ fn exec_loop(
     let mut cur_argc = argc0;
     let mut cmod: Rc<LoadedModule> = mods.rc(mi);
     let heap_cap = max_heap_bytes();
+    let trace_fn = fn_trace_on();
 
     macro_rules! reg {
         ($i:expr) => {
@@ -11038,7 +11039,7 @@ fn exec_loop(
             *st.profile_samples.entry((mi, pi)).or_insert(0) += 1;
         }
         let instr = cmod.module.protos[pi as usize].code[ip];
-        if fn_trace_on()
+        if trace_fn
             && fn_trace_wanted(&cmod.module.protos[pi as usize].name)
         {
             eprintln!(
