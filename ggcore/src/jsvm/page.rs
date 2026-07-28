@@ -6791,6 +6791,29 @@ console.log('B typeof it: ' + typeof it);
             1.0);
     }
 
+    /// `\uXXXX` names a character in an identifier just as in a string,
+    /// so `A` and `A` are the same name.
+    #[test]
+    fn identifiers_accept_unicode_escapes() {
+        // escape declares, plain reads
+        assert_eq!(n(r"var \u0041 = 4; A"), 4.0);
+        // plain declares, escape reads
+        assert_eq!(n(r"var A = 5; \u0041"), 5.0);
+        // an escape in the middle, and in a member name
+        assert_eq!(n(r"var a\u0042c = 6; aBc"), 6.0);
+        assert_eq!(n(r"var o = {}; o.\u0062 = 7; o.b"), 7.0);
+        // the braced form, and a non-ASCII letter
+        assert_eq!(n(r"var \u{48}i = 8; Hi"), 8.0);
+        assert_eq!(n("var \\u{d55c} = 9; \u{d55c}"), 9.0);
+        // a digit is fine after the first character, not before it
+        assert_eq!(n(r"var a\u0031 = 3; a1"), 3.0);
+        assert!(eval(r"var \u0031a = 1;").is_err());
+        // an escape that names punctuation is not an identifier
+        assert!(eval(r"var \u002B = 1;").is_err());
+        // and a non-\u escape is not one either
+        assert!(eval(r"var \x41 = 1;").is_err());
+    }
+
     /// VT and FF are WhiteSpace in the grammar, same as space and tab.
     #[test]
     fn vertical_tab_and_form_feed_are_whitespace() {

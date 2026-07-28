@@ -177,6 +177,9 @@ impl<'a> Lexer<'a> {
                 self.lex_template()?
             } else if is_ident_start(c) {
                 self.lex_ident()?
+            } else if c == b'\\' && self.peek(1) == b'u' {
+                // an identifier is allowed to *begin* with an escape
+                self.lex_ident()?
             } else if c == b'#' && is_ident_start(self.peek(1)) {
                 // private name (#x): an identifier that keeps its '#'.
                 // Fields/methods desugar to ordinary '#x'-keyed
@@ -470,13 +473,50 @@ impl<'a> Lexer<'a> {
 
     fn lex_ident(&mut self) -> Result<Tok, LexError> {
         let start = self.pos;
+        // Only allocated once an escape shows up; the overwhelmingly
+        // common identifier is a plain slice of the source.
+        let mut owned: Option<String> = None;
         loop {
             let c = self.peek(0);
             if is_ident_continue(c) {
+                if let Some(s) = owned.as_mut() {
+                    s.push(c as char);
+                }
                 self.pos += 1;
+            } else if c == b'\\' {
+                // `A` names the character A, in an identifier just
+                // as in a string, and `var A` declares `A`.
+                if owned.is_none() {
+                    owned = Some(self.src[start..self.pos].to_string());
+                }
+                self.pos += 1;
+                if self.peek(0) != b'u' {
+                    return Err(self.err(
+                        "only \\u escapes are allowed in an identifier"));
+                }
+                self.pos += 1;
+                let n = self.lex_unicode_escape()?;
+                let ch = char::from_u32(n).ok_or_else(|| {
+                    self.err("bad \\u escape in identifier")
+                })?;
+                let s = owned.as_mut().expect("just set");
+                let fits = if s.is_empty() {
+                    ident_start_char(ch)
+                } else {
+                    ident_part_char(ch)
+                };
+                if !fits {
+                    return Err(self.err(format!(
+                        "U+{n:04X} is not valid in an identifier"
+                    )));
+                }
+                s.push(ch);
             } else if c >= 0x80 {
                 let ch = self.char_here()?;
                 if ch.is_alphanumeric() {
+                    if let Some(s) = owned.as_mut() {
+                        s.push(ch);
+                    }
                     self.pos += ch.len_utf8();
                 } else {
                     break;
@@ -484,6 +524,9 @@ impl<'a> Lexer<'a> {
             } else {
                 break;
             }
+        }
+        if let Some(s) = owned {
+            return Ok(Tok::Ident(s));
         }
         if self.pos == start {
             // Never emit an empty identifier: that would return a token
@@ -599,6 +642,17 @@ fn is_ident_start(c: u8) -> bool {
 
 fn is_ident_continue(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
+}
+
+/// What an escape is allowed to name. The same test the raw-character
+/// path uses, so `Abc` and `Abc` are the same identifier.
+fn ident_start_char(ch: char) -> bool {
+    ch.is_alphabetic() || ch == '_' || ch == '$'
+}
+
+fn ident_part_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '$'
+        || ch == '\u{200c}' || ch == '\u{200d}'
 }
 
 #[cfg(test)]
