@@ -1044,6 +1044,15 @@ pub(super) struct St {
     /// virtual clock (ms). Timers advance it; Date.now reads it — so a
     /// headless run is deterministic and never sleeps.
     pub(super) now_ms: f64,
+    /// The browser keeps two clocks and so do we. `Date.now` is the
+    /// wall clock — virtual here, which is what makes a headless run
+    /// reproducible. `performance.now` is the monotonic one a page
+    /// measures itself with, and a frozen monotonic clock is a trap: a
+    /// script that spins until it advances never finishes, and every
+    /// benchmark reports zero. This one is real, from VM start.
+    /// `GG_JS_VIRTUAL_TIME=1` pins it for determinism runs.
+    pub(super) perf_origin: std::time::Instant,
+    pub(super) perf_virtual: bool,
     /// fetches issued but not yet handed to the host (Python) driver.
     pub(super) pending_fetches: Vec<PendingFetch>,
     /// fetch_id -> promise id, handed to the driver, awaiting resolve.
@@ -1193,6 +1202,9 @@ impl St {
             next_timer_id: 0,
             timer_seq: 0,
             now_ms: 0.0,
+            perf_origin: std::time::Instant::now(),
+            perf_virtual: std::env::var("GG_JS_VIRTUAL_TIME")
+                .is_ok_and(|v| v != "0"),
             pending_fetches: Vec::new(),
             awaiting: HashMap::new(),
             next_fetch_id: 0,
@@ -6917,7 +6929,11 @@ fn do_native(
             });
             Ok(Value::int(id as i32))
         }
-        Native::PerfNow => Ok(Value::number(st.now_ms)),
+        Native::PerfNow => Ok(Value::number(if st.perf_virtual {
+            st.now_ms
+        } else {
+            st.perf_origin.elapsed().as_secs_f64() * 1000.0
+        })),
         Native::ClassList { node, op } => {
             let doc = need_doc(st)?;
             let current = doc
