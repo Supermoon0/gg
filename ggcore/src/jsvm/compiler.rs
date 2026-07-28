@@ -57,6 +57,7 @@ pub fn compile_lazy(src: &LazySrc) -> Result<Module, CompileError> {
         string_map: HashMap::new(),
         fns: Vec::new(),
         const_globals: HashSet::new(),
+        discarding: false,
     };
     let lit = if let Some(lz) = &src.lit.lazy_body {
         // lazy-parsed: build the body AST now, from the original
@@ -97,6 +98,7 @@ pub fn compile(stmts: &[Stmt]) -> Result<Module, CompileError> {
         string_map: HashMap::new(),
         fns: Vec::new(),
         const_globals: HashSet::new(),
+        discarding: false,
     };
     // Main proto: register 0 holds the last expression-statement value
     // so eval() can return it.
@@ -145,6 +147,9 @@ struct Compiler {
     /// Script-level `const` names (they compile to globals so later
     /// scripts see them); assignment within this script is rejected.
     const_globals: HashSet<String>,
+    /// Set only while compiling an update expression whose value is
+    /// discarded; see `expr_discarded`.
+    discarding: bool,
 }
 
 /// How a name was declared — drives const and TDZ rules.
@@ -3223,7 +3228,7 @@ impl Compiler {
                     self.fx().emit(Instr::CellWrap { reg: r });
                 }
                 if let Some(update) = update {
-                    self.expr(update)?;
+                    self.expr_discarded(update)?;
                     let f = self.fx();
                     f.tmp_top = f.locals_end;
                 }
@@ -3949,6 +3954,22 @@ impl Compiler {
                 } else {
                     ra
                 };
+                // `i < 3000000` is the counted-loop shape: an integer
+                // literal on the right needs no register of its own, and
+                // no LoadInt inside the loop to refill it.
+                if *op == BinOp::Lt {
+                    if let Some(imm) = int_literal(b) {
+                        let dst = if ra >= self.fx().locals_end {
+                            ra
+                        } else {
+                            self.fx().alloc()?
+                        };
+                        self.fx().emit(Instr::LtImm { dst, a: ra, imm });
+                        let f = self.fx();
+                        f.tmp_top = (dst + 1).max(f.locals_end);
+                        return Ok(dst);
+                    }
+                }
                 let rb = self.expr(b)?;
                 // reuse the left operand's temp as the destination:
                 // a long chain (a+b+c+...) then needs O(1) temps
@@ -4327,6 +4348,18 @@ impl Compiler {
         Ok(dst)
     }
 
+    /// Compile an expression whose value is thrown away. A postfix
+    /// `i++` in this position needs no old value, so it compiles as the
+    /// cheaper prefix form — same side effect, one register and one
+    /// instruction less around the hottest loop shape there is.
+    fn expr_discarded(&mut self, e: &Expr) -> Result<(), CompileError> {
+        let was = self.discarding;
+        self.discarding = matches!(e, Expr::Update { .. });
+        let r = self.expr(e);
+        self.discarding = was;
+        r.map(|_| ())
+    }
+
     fn update(
         &mut self,
         op: UpdateOp,
@@ -4356,17 +4389,12 @@ impl Compiler {
                 }
             }
             self.fx().emit(Instr::ToNum { dst: cur, src: cur });
-            let one = self.fx().alloc()?;
-            self.fx().emit(Instr::LoadInt { dst: one, val: 1 });
+            let delta = match op {
+                UpdateOp::Inc => 1,
+                UpdateOp::Dec => -1,
+            };
             let newv = self.fx().alloc()?;
-            match op {
-                UpdateOp::Inc => {
-                    self.fx().emit(Instr::Add { dst: newv, a: cur, b: one });
-                }
-                UpdateOp::Dec => {
-                    self.fx().emit(Instr::Sub { dst: newv, a: cur, b: one });
-                }
-            }
+            self.fx().emit(Instr::IncBy { dst: newv, src: cur, delta });
             match prop {
                 MemberProp::Static(name) => {
                     let atom = self.atom(name);
@@ -4390,20 +4418,25 @@ impl Compiler {
         self.check_assignable(name)?;
         let tdz = self.tdz_pending(name);
         let place = self.resolve(name);
-        let one = self.fx().alloc()?;
-        self.fx().emit(Instr::LoadInt { dst: one, val: 1 });
+        let delta = match op {
+            UpdateOp::Inc => 1,
+            UpdateOp::Dec => -1,
+        };
+        // `++` is ToNumeric-then-add, never `+`: `var i = "5"; i++`
+        // leaves 6, not "51". IncBy carries that meaning, so the
+        // identifier path stops going through the string-capable Add.
         if let Place::Reg(reg) = place {
-            // fast path: pure register variable
             if tdz {
                 self.emit_tdz_check(name, reg);
             }
-            if prefix {
-                self.emit_update(op, reg, reg, one);
+            if prefix || self.discarding {
+                self.fx().emit(Instr::IncBy { dst: reg, src: reg, delta });
                 Ok(reg)
             } else {
+                // postfix yields the *numeric* old value
                 let old = self.fx().alloc()?;
-                self.fx().emit(Instr::Move { dst: old, src: reg });
-                self.emit_update(op, reg, reg, one);
+                self.fx().emit(Instr::ToNum { dst: old, src: reg });
+                self.fx().emit(Instr::IncBy { dst: reg, src: old, delta });
                 Ok(old)
             }
         } else {
@@ -4412,13 +4445,15 @@ impl Compiler {
             if tdz {
                 self.emit_tdz_check(name, cur);
             }
-            if prefix {
-                self.emit_update(op, cur, cur, one);
+            self.fx().emit(Instr::ToNum { dst: cur, src: cur });
+            if prefix || self.discarding {
+                self.fx().emit(Instr::IncBy { dst: cur, src: cur, delta });
                 self.store_place(place, cur);
                 Ok(cur)
             } else {
                 let updated = self.fx().alloc()?;
-                self.emit_update(op, updated, cur, one);
+                self.fx()
+                    .emit(Instr::IncBy { dst: updated, src: cur, delta });
                 self.store_place(place, updated);
                 Ok(cur)
             }
@@ -4587,6 +4622,22 @@ impl Compiler {
 
 /// Register-to-register instruction for a binary operator, if the VM
 /// has one.
+/// An integer literal small enough to ride in an instruction.
+fn int_literal(e: &Expr) -> Option<i32> {
+    match e {
+        Expr::Num(n) if n.fract() == 0.0
+            && *n >= i32::MIN as f64
+            && *n <= i32::MAX as f64
+            // -0 is not the integer 0 for every operator that might
+            // later reuse this helper; keep it off the fast path.
+            && !(*n == 0.0 && n.is_sign_negative()) =>
+        {
+            Some(*n as i32)
+        }
+        _ => None,
+    }
+}
+
 fn bin_instr(op: BinOp, dst: u8, a: u8, b: u8) -> Option<Instr> {
     Some(match op {
         BinOp::In => Instr::In { dst, a, b },

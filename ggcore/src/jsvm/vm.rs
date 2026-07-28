@@ -60,6 +60,16 @@ impl VmError {
 /// Per-instruction trace for one function by name (GG_TRACE_FN).
 /// Diagnostic-only: the env read is cached, the name compare only
 /// runs when the variable is set.
+/// Whether GG_TRACE_FN is set at all. The interpreter checks this once
+/// per instruction, so the answer has to cost a load and a branch —
+/// not an Rc deref and a substring search.
+fn fn_trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("GG_TRACE_FN").is_ok_and(|v| !v.is_empty())
+    })
+}
+
 fn fn_trace_wanted(name: &str) -> bool {
     static PAT: std::sync::OnceLock<Option<String>> =
         std::sync::OnceLock::new();
@@ -10911,6 +10921,7 @@ fn exec_loop(
     let mut this_v = this0;
     let mut cur_argc = argc0;
     let mut cmod: Rc<LoadedModule> = mods.rc(mi);
+    let heap_cap = max_heap_bytes();
 
     macro_rules! reg {
         ($i:expr) => {
@@ -11015,7 +11026,7 @@ fn exec_loop(
         // orchestrator) stays under the instruction budget but exhausts
         // RAM and aborts the process on a failed allocation. Trip a
         // catchable RangeError first.
-        if st.heap_bytes > max_heap_bytes() {
+        if st.heap_bytes > heap_cap {
             return range_err("string heap exhausted");
         }
         st.fuel -= 1;
@@ -11027,7 +11038,9 @@ fn exec_loop(
             *st.profile_samples.entry((mi, pi)).or_insert(0) += 1;
         }
         let instr = cmod.module.protos[pi as usize].code[ip];
-        if fn_trace_wanted(&cmod.module.protos[pi as usize].name) {
+        if fn_trace_on()
+            && fn_trace_wanted(&cmod.module.protos[pi as usize].name)
+        {
             eprintln!(
                 "[gg-fn] m{mi} p{pi} {} ip{ip}: {instr:?}",
                 cmod.module.protos[pi as usize].name,
@@ -11216,6 +11229,27 @@ fn exec_loop(
             }
             Instr::Not { dst, src } => {
                 reg!(dst) = Value::boolean(!truthy(st, reg!(src)));
+            }
+            Instr::IncBy { dst, src, delta } => {
+                let x = reg!(src);
+                reg!(dst) = if x.is_int() {
+                    match x.as_i32().checked_add(delta) {
+                        Some(v) => Value::int(v),
+                        None => Value::number(
+                            x.as_i32() as f64 + delta as f64),
+                    }
+                } else {
+                    Value::number(to_number(st, mods, x)? + delta as f64)
+                };
+            }
+            Instr::LtImm { dst, a, imm } => {
+                let x = reg!(a);
+                let r = if x.is_int() {
+                    x.as_i32() < imm
+                } else {
+                    to_number(st, mods, x)? < imm as f64
+                };
+                reg!(dst) = Value::boolean(r);
             }
             Instr::Lt { dst, a, b } => cmp!(dst, a, b, <),
             Instr::LtEq { dst, a, b } => cmp!(dst, a, b, <=),

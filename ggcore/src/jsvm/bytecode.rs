@@ -27,6 +27,13 @@ pub enum Instr {
     Not { dst: u8, src: u8 },
     /// dst = ToNumber(src) — the unary `+` operator
     ToNum { dst: u8, src: u8 },
+    /// `dst = ToNumeric(src) + delta`. What `++`/`--` actually mean:
+    /// numeric, never string concatenation. Folding the constant in
+    /// also spares the loop a LoadInt per iteration.
+    IncBy { dst: u8, src: u8, delta: i32 },
+    /// `dst = a < imm`, the counted-loop shape. The immediate is an
+    /// integer, so the string-vs-string branch of `Lt` cannot apply.
+    LtImm { dst: u8, a: u8, imm: i32 },
     Lt { dst: u8, a: u8, b: u8 },
     LtEq { dst: u8, a: u8, b: u8 },
     Gt { dst: u8, a: u8, b: u8 },

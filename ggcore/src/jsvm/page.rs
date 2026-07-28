@@ -2854,10 +2854,28 @@ impl PageVm {
         }
     }
 
+    /// One script under a profiler, no Python in the way:
+    /// `GG_JS_PROF='<code>' valgrind --tool=callgrind cargo test
+    /// --release prof_js -- --nocapture`.
+    pub fn prof_entry() {
+        let Ok(src) = std::env::var("GG_JS_PROF") else { return };
+        let mut vm = PageVm::new(None);
+        let out = vm.run_source(&src);
+        std::hint::black_box(out.is_ok());
+    }
+
     pub fn eval(src: &str) -> Result<(Value, Vec<String>), String> {
         let mut vm = PageVm::new(None);
         let v = vm.run_source(src)?;
         Ok((v, std::mem::take(&mut vm.st.logs)))
+    }
+}
+
+#[cfg(test)]
+mod prof {
+    #[test]
+    fn prof_js() {
+        super::PageVm::prof_entry();
     }
 }
 
