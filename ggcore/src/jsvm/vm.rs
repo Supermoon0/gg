@@ -10372,7 +10372,7 @@ fn dom_set_prop(
         "nodeValue" | "data" => {
             let value = to_display(st, v);
             let mut d = doc.borrow_mut();
-            if d.nodes[node_us].tag.is_none() {
+            if !d.nodes[node_us].is_element() {
                 d.nodes[node_us].text = value;
                 d.version += 1;
             }

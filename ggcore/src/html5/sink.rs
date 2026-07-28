@@ -309,60 +309,121 @@ impl Sink {
     }
 }
 
-/// Adapter into the engine's DOM. Comments and the doctype are dropped
-/// (the engine has never modelled them); everything else transfers,
-/// with namespaced names flattened the way the rest of the engine
-/// expects to read them.
+/// Adapter into the engine's DOM. Nothing is dropped any more: the
+/// engine's `Document` carries node kinds, namespaces, a doctype and a
+/// template's content fragment, so a parse survives the crossing whole.
 pub fn to_dom(sink: &Sink) -> crate::dom::Document {
-    let mut doc = crate::dom::Document::with_capacity(sink.nodes.len().max(16));
-    // The engine's Document is rooted at <html>, not at a document node.
-    let root = sink.nodes[sink.document]
-        .children
-        .iter()
-        .copied()
-        .find(|&c| sink.is_html_element(c, "html"));
-    let Some(root) = root else {
-        let idx = doc.new_element("html".to_string(), Vec::new(), None);
-        doc.root = idx;
-        return doc;
+    use crate::dom::{DocumentChild, Doctype};
+    let mut doc = crate::dom::Document::with_capacity(sink.nodes.len() + 8);
+    doc.quirks = match sink.quirks {
+        Quirks::NoQuirks => crate::dom::Quirks::NoQuirks,
+        Quirks::LimitedQuirks => crate::dom::Quirks::LimitedQuirks,
+        Quirks::Quirks => crate::dom::Quirks::Quirks,
     };
-    let mut map: HashMap<usize, usize> = HashMap::new();
-    let idx = doc.new_element("html".to_string(), dom_attrs(sink, root), None);
-    doc.root = idx;
-    map.insert(root, idx);
-    let mut stack = vec![root];
-    while let Some(src) = stack.pop() {
-        let parent = map[&src];
-        for &c in &sink.nodes[src].children {
-            match &sink.nodes[c].data {
-                NodeData::Element { name, .. } => {
-                    let n = doc.new_element(
-                        name.clone(), dom_attrs(sink, c), Some(parent));
-                    map.insert(c, n);
-                    stack.push(c);
+    for &c in &sink.nodes[sink.document].children {
+        match &sink.nodes[c].data {
+            NodeData::Doctype { name, public_id, system_id } => {
+                doc.doctype = Some(Doctype {
+                    name: name.clone(),
+                    public_id: public_id.clone(),
+                    system_id: system_id.clone(),
+                });
+                doc.document_children.push(DocumentChild::Doctype);
+            }
+            NodeData::Element { .. } => {
+                let idx = transfer(sink, c, None, &mut doc);
+                if sink.is_html_element(c, "html") {
+                    doc.root = idx;
                 }
-                NodeData::Text(t) => {
-                    doc.new_text(t.clone(), parent);
-                }
-                // A template's content is a separate fragment in the
-                // spec tree; the engine's DOM has no such thing, so it
-                // hangs under the template element itself. That is
-                // where script expects to find it, and the UA sheet
-                // already keeps a template off the screen.
-                NodeData::TemplateContents => {
-                    map.insert(c, parent);
-                    stack.push(c);
-                }
-                _ => {}
+                doc.document_children.push(DocumentChild::Node(idx));
+            }
+            _ => {
+                let idx = transfer(sink, c, None, &mut doc);
+                doc.document_children.push(DocumentChild::Node(idx));
             }
         }
+    }
+    if doc.nodes.is_empty() {
+        doc.root = doc.new_element("html".to_string(), Vec::new(), None);
     }
     doc
 }
 
-fn dom_attrs(sink: &Sink, idx: usize) -> Vec<(String, String)> {
-    sink.attrs(idx)
-        .iter()
-        .map(|(k, v)| (k.serialized().replace(' ', ":"), v.clone()))
-        .collect()
+/// A fragment parse compares the context element's children, so the
+/// engine's tree is rooted at a fragment rather than at <html>.
+pub fn to_dom_fragment(sink: &Sink, root: usize) -> crate::dom::Document {
+    let mut doc = crate::dom::Document::with_capacity(sink.nodes.len() + 8);
+    let fragment = doc.new_fragment();
+    doc.root = fragment;
+    doc.document_children.push(crate::dom::DocumentChild::Node(fragment));
+    for &c in &sink.nodes[root].children {
+        transfer(sink, c, Some(fragment), &mut doc);
+    }
+    doc
+}
+
+/// Copy one parse node and its subtree across. Iterative: a document
+/// can nest as deeply as its author cared to.
+fn transfer(
+    sink: &Sink, src: usize, parent: Option<usize>,
+    doc: &mut crate::dom::Document,
+) -> usize {
+    let root = transfer_one(sink, src, parent, doc);
+    let mut stack = vec![(src, root)];
+    while let Some((s, d)) = stack.pop() {
+        // Children are created in document order — a node is appended
+        // the moment it is made — and only then queued in reverse, so
+        // the stack walks them forwards.
+        let mut made = Vec::with_capacity(sink.nodes[s].children.len());
+        for &c in &sink.nodes[s].children {
+            if matches!(sink.nodes[c].data, NodeData::TemplateContents) {
+                // A template's content is its own fragment, not a child.
+                let fragment = doc.new_fragment();
+                doc.template_contents.insert(d, fragment);
+                for &g in &sink.nodes[c].children {
+                    let n = transfer_one(sink, g, Some(fragment), doc);
+                    made.push((g, n));
+                }
+                continue;
+            }
+            let n = transfer_one(sink, c, Some(d), doc);
+            made.push((c, n));
+        }
+        stack.extend(made.into_iter().rev());
+    }
+    root
+}
+
+fn transfer_one(
+    sink: &Sink, src: usize, parent: Option<usize>,
+    doc: &mut crate::dom::Document,
+) -> usize {
+    match &sink.nodes[src].data {
+        NodeData::Element { ns, name, attrs } => {
+            let ns = match ns {
+                Ns::Html => crate::dom::Namespace::Html,
+                Ns::Svg => crate::dom::Namespace::Svg,
+                Ns::MathMl => crate::dom::Namespace::MathMl,
+            };
+            let flat: Vec<(String, String)> = attrs
+                .iter()
+                .map(|(k, v)| (k.serialized().replace(' ', ":"), v.clone()))
+                .collect();
+            let spaces: Vec<Option<(String, String)>> = attrs
+                .iter()
+                .map(|(k, _)| {
+                    k.prefix.clone().map(|p| (p, k.local.clone()))
+                })
+                .collect();
+            let idx = doc.new_element_ns(name.clone(), flat, parent, ns);
+            doc.nodes[idx].attr_namespaces = spaces;
+            idx
+        }
+        NodeData::Text(t) => match parent {
+            Some(p) => doc.new_text(t.clone(), p),
+            None => doc.new_text(t.clone(), 0),
+        },
+        NodeData::Comment(t) => doc.new_comment(t.clone(), parent),
+        _ => doc.new_fragment(),
+    }
 }

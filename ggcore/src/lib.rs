@@ -665,7 +665,7 @@ fn raw_text(doc: &dom::Document, root: usize) -> String {
     let mut stack = vec![root];
     while let Some(idx) = stack.pop() {
         let node = &doc.nodes[idx];
-        if node.tag.is_none() {
+        if node.is_text() {
             out.push_str(&node.text);
         }
         for &c in node.children.iter().rev() {
@@ -827,6 +827,24 @@ pub(crate) fn parse_document(html: &str) -> dom::Document {
 }
 
 #[pyfunction]
+fn parse_html_fragment(
+    html: &str, context_tag: &str, context_namespace: &str,
+) -> Doc {
+    let ns = match context_namespace {
+        "http://www.w3.org/2000/svg" => "svg ",
+        "http://www.w3.org/1998/Math/MathML" => "math ",
+        _ => "",
+    };
+    let parsed = html5::parse_fragment(
+        html, &format!("{ns}{context_tag}"), false);
+    Doc {
+        doc: Rc::new(RefCell::new(html5::sink::to_dom_fragment(
+            &parsed.sink, parsed.root))),
+        ggjs: None,
+    }
+}
+
+#[pyfunction]
 fn parse_html(html: &str) -> Doc {
     Doc {
         doc: Rc::new(RefCell::new(parse_document(html))),
@@ -904,6 +922,24 @@ fn collect_script_records(doc: &dom::Document) -> Vec<ScriptRecord> {
 impl Doc {
     fn node_count(&self) -> usize {
         self.doc.borrow().nodes.len()
+    }
+
+    /// html5lib/WPT's canonical tree dump of this document.
+    fn html5lib_tree_dump(&self) -> String {
+        let doc = self.doc.borrow();
+        match doc.nodes[doc.root].kind {
+            dom::NodeKind::DocumentFragment => {
+                doc.html5lib_children_dump(doc.root)
+            }
+            _ => doc.html5lib_tree_dump(),
+        }
+    }
+
+    /// The document type as (name, public id, system id).
+    fn doctype_info(&self) -> Option<(String, String, String)> {
+        self.doc.borrow().doctype.as_ref().map(|d| {
+            (d.name.clone(), d.public_id.clone(), d.system_id.clone())
+        })
     }
 
     /// ("inline", css_text) and ("link", href) entries in document order.
@@ -1466,6 +1502,15 @@ impl Doc {
         let mut stack = vec![doc.root];
         while let Some(idx) = stack.pop() {
             let node = &doc.nodes[idx];
+            if !node.is_renderable() {
+                // Comments, processing instructions and a template's
+                // content fragment are in the DOM but not on the screen.
+                // A fragment is transparent: its children still are.
+                for &child in node.children.iter().rev() {
+                    stack.push(child);
+                }
+                continue;
+            }
             map[idx] = out.len();
             let parent = match node.parent {
                 Some(p) if map[p] != usize::MAX => map[p] as i64,
@@ -1653,6 +1698,7 @@ fn ggcore(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TextEngine>()?;
     m.add_class::<NativeWindow>()?;
     m.add_function(wrap_pyfunction!(parse_html, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_html_fragment, m)?)?;
     m.add_function(wrap_pyfunction!(jsvm_eval, m)?)?;
     m.add_function(wrap_pyfunction!(jsvm_run, m)?)?;
     Ok(())

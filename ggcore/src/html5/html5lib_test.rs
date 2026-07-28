@@ -146,6 +146,63 @@ fn run_case(c: &Case) -> String {
     }
 }
 
+/// The same case, read back out of the engine's DOM rather than the
+/// parse tree.
+fn run_case_via_dom(c: &Case) -> String {
+    let scripting = c.scripting.unwrap_or(false);
+    match &c.fragment {
+        Some(ctx) => {
+            let p = super::parse_fragment(&c.data, ctx, scripting);
+            let doc = super::sink::to_dom_fragment(&p.sink, p.root);
+            doc.html5lib_children_dump(doc.root)
+        }
+        None => {
+            let p = super::parse(&c.data, scripting);
+            super::sink::to_dom(&p.sink).html5lib_tree_dump()
+        }
+    }
+}
+
+/// The parse tree and the engine's DOM must say the same thing. The
+/// adapter between them used to drop comments, the doctype and a
+/// template's content, and flatten namespaces; this is the assertion
+/// that keeps it honest, over the whole corpus rather than a fixture.
+#[test]
+fn engine_dom_matches_the_parse_tree() {
+    let mut checked = 0;
+    let mut differ: Vec<String> = Vec::new();
+    for (name, text) in dat_files() {
+        for c in parse_dat(&text, &name) {
+            checked += 1;
+            let tree = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| run_case(&c)),
+            );
+            let dom = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| run_case_via_dom(&c)),
+            );
+            match (tree, dom) {
+                (Ok(a), Ok(b)) if a == b => {}
+                (Ok(a), Ok(b)) => {
+                    if differ.len() < 8 {
+                        differ.push(format!(
+                            "\n--- {}#{}\ninput:      {:?}\nparse tree:\n{}engine dom:\n{}",
+                            c.file, c.index, c.data, a, b
+                        ));
+                    }
+                }
+                _ => differ.push(format!("{}#{}: panic", c.file, c.index)),
+            }
+        }
+    }
+    eprintln!("\nengine dom vs parse tree: {} cases", checked);
+    assert!(
+        differ.is_empty(),
+        "the adapter into the engine's DOM is lossy in {} cases:{}",
+        differ.len(),
+        differ.join(""),
+    );
+}
+
 #[test]
 fn html5lib_tree_construction() {
     let show: usize = std::env::var("GG_H5_SHOW")
