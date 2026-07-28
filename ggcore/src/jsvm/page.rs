@@ -2335,10 +2335,27 @@ impl PageVm {
     }
 
     pub fn run_source(&mut self, src: &str) -> Result<Value, String> {
-        let ast =
-            parser::parse_program(src).map_err(|e| format!("{e:?}"))?;
+        self.run_source_detail(src).map_err(|(_, msg)| msg)
+    }
+
+    /// Console output so far, drained.
+    pub fn take_logs(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.st.logs)
+    }
+
+    /// As `run_source`, but keeping the error's *kind* — "SyntaxError"
+    /// for anything that failed to parse or compile, otherwise the
+    /// VmError's own kind. A conformance runner has to tell a syntax
+    /// error from a TypeError to judge a negative test, and the
+    /// flattened message cannot always say which it was.
+    pub fn run_source_detail(
+        &mut self, src: &str,
+    ) -> Result<Value, (String, String)> {
+        let syn = |e: String| ("SyntaxError".to_string(), e);
+        let ast = parser::parse_program(src)
+            .map_err(|e| syn(format!("{e:?}")))?;
         let module =
-            compiler::compile(&ast).map_err(|e| format!("{e:?}"))?;
+            compiler::compile(&ast).map_err(|e| syn(format!("{e:?}")))?;
         let mi = self.load(module);
         let m = self.mods.rc(mi);
         let main = m.module.main;
@@ -2361,7 +2378,7 @@ impl PageVm {
             0,
         );
         self.st.regs.truncate(base);
-        out.map_err(|e| e.report())
+        out.map_err(|e| (e.kind.to_string(), e.report()))
     }
 
     /// Browser entry point: run page scripts in order, collect console

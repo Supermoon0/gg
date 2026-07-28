@@ -1648,6 +1648,19 @@ fn jsvm_eval(src: &str) -> PyResult<f64> {
     }
 }
 
+/// Run one script in a fresh VM and report how it ended: (ok, error
+/// kind, message, console output). A conformance runner needs the kind
+/// — a negative test that must raise SyntaxError is not satisfied by a
+/// TypeError.
+#[pyfunction]
+fn jsvm_probe(src: &str) -> (bool, String, String, Vec<String>) {
+    let mut vm = jsvm::page::PageVm::new(None);
+    match vm.run_source_detail(src) {
+        Ok(_) => (true, String::new(), String::new(), vm.take_logs()),
+        Err((kind, msg)) => (false, kind, msg, vm.take_logs()),
+    }
+}
+
 /// Run a script on the gg-js VM and return its console.log output —
 /// the same contract as Doc.run_scripts, so benches run on either.
 #[pyfunction]
@@ -1701,5 +1714,6 @@ fn ggcore(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_html_fragment, m)?)?;
     m.add_function(wrap_pyfunction!(jsvm_eval, m)?)?;
     m.add_function(wrap_pyfunction!(jsvm_run, m)?)?;
+    m.add_function(wrap_pyfunction!(jsvm_probe, m)?)?;
     Ok(())
 }
