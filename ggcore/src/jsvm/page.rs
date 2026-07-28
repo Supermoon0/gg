@@ -6619,6 +6619,52 @@ console.log('B typeof it: ' + typeof it);
         assert!(msg("throw {a: 1};").contains("[object Object]"));
     }
 
+    /// `name` and `length` are own properties of every function. This
+    /// engine computes them instead of storing them, which made them
+    /// invisible to every reflection path — `hasOwnProperty` said no,
+    /// `getOwnPropertyDescriptor` said undefined, `getOwnPropertyNames`
+    /// left them out.
+    #[test]
+    fn function_name_and_length_are_own_properties() {
+        assert_eq!(n("function f(a,b){} f.hasOwnProperty('name')?1:0"), 1.0);
+        assert_eq!(n("function f(a,b){} f.hasOwnProperty('length')?1:0"), 1.0);
+        assert_eq!(
+            n("function f(a,b){} \
+               Object.getOwnPropertyNames(f).indexOf('name') >= 0 && \
+               Object.getOwnPropertyNames(f).indexOf('length') >= 0 ? 1 : 0"),
+            1.0);
+        // the spec attributes: not writable, not enumerable, but
+        // configurable — that combination is what verifyProperty checks
+        assert_eq!(
+            n("function f(a,b){} \
+               var d = Object.getOwnPropertyDescriptor(f, 'length'); \
+               d.value === 2 && d.writable === false && \
+               d.enumerable === false && d.configurable === true ? 1 : 0"),
+            1.0);
+        assert_eq!(
+            n("function foo(){} \
+               var d = Object.getOwnPropertyDescriptor(foo, 'name'); \
+               d.value === 'foo' && d.writable === false && \
+               d.enumerable === false && d.configurable === true ? 1 : 0"),
+            1.0);
+        // .prototype is writable but neither enumerable nor configurable
+        assert_eq!(
+            n("function f(){} \
+               var d = Object.getOwnPropertyDescriptor(f, 'prototype'); \
+               d.writable === true && d.enumerable === false && \
+               d.configurable === false ? 1 : 0"),
+            1.0);
+        // an assigned static still reports as a plain data property
+        assert_eq!(
+            n("function f(){} f.x = 7; \
+               var d = Object.getOwnPropertyDescriptor(f, 'x'); \
+               d.value === 7 && d.writable && d.enumerable && \
+               d.configurable ? 1 : 0"),
+            1.0);
+        // neither shows up in Object.keys — they are not enumerable
+        assert_eq!(n("function f(a){} Object.keys(f).length"), 0.0);
+    }
+
     /// VT and FF are WhiteSpace in the grammar, same as space and tab.
     #[test]
     fn vertical_tab_and_form_feed_are_whitespace() {

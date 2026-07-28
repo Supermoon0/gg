@@ -3672,7 +3672,10 @@ fn method_ref_dispatch(
         }
         "hasOwnProperty" => {
             let k = args.first().copied().unwrap_or(Value::UNDEFINED);
-            if recv.is_string() {
+            // strings and functions both keep own properties outside
+            // the shape, so the descriptor lookup below cannot see
+            // them — `f.hasOwnProperty('name')` answered false
+            if recv.is_string() || recv.is_function() {
                 return Ok(Value::boolean(
                     has_own_property(st, mods, recv, k)?,
                 ));
@@ -7704,6 +7707,15 @@ fn host_fn(
                     .filter(|&&(f, _)| f == fidx)
                     .map(|&(_, k)| k).collect();
                 keys.sort_unstable();
+                // `length` and `name` are own properties of every
+                // function even though this engine computes them
+                // instead of storing them
+                let name_id = st.intern_name("name");
+                for k in [st.ids.length, name_id] {
+                    if !keys.contains(&k) {
+                        keys.push(k);
+                    }
+                }
                 if matches!(st.closures[fidx as usize],
                             ClosureRec::User { .. }) {
                     keys.push(st.ids.prototype);
@@ -7785,30 +7797,47 @@ fn host_fn(
                 let Some(&key) = st.name_ids.get(&key_name) else {
                     return Ok(Value::UNDEFINED);
                 };
-                let v = if key == st.ids.prototype {
+                // (value, writable, enumerable, configurable). `name`
+                // and `length` are computed rather than stored, so
+                // without naming them here reflection could not see
+                // them at all and they read as absent.
+                let found = if key == st.ids.prototype {
                     match st.closures[obj.index() as usize] {
+                        // a normal function's .prototype is writable
+                        // but neither enumerable nor configurable
                         ClosureRec::User { .. } => {
-                            Some(fn_prototype(st, obj))
+                            Some((fn_prototype(st, obj), true, false, false))
                         }
                         _ => None, // native bind etc: spec says none
                     }
+                } else if let Some(&v) =
+                    st.fn_props.get(&(obj.index(), key))
+                {
+                    // an assigned static wins over the computed one,
+                    // matching the order the read path uses
+                    Some((v, true, true, true))
+                } else if key == st.ids.length {
+                    let n = Value::int(fn_arity(st, mods, obj));
+                    Some((n, false, false, true))
+                } else if key_name == "name" {
+                    let n = fn_name(st, mods, obj);
+                    Some((make_string(st, n), false, false, true))
                 } else {
-                    st.fn_props.get(&(obj.index(), key)).copied()
+                    None
                 };
-                let Some(v) = v else {
+                let Some((v, w, e, c)) = found else {
                     return Ok(Value::UNDEFINED);
                 };
                 let out = new_plain_object(st);
                 let pi = out.index() as usize;
-                let t = Value::boolean(true);
                 let vid = st.intern_name("value");
                 let wid = st.intern_name("writable");
                 let eid = st.intern_name("enumerable");
                 let cid = st.intern_name("configurable");
                 raw_set_prop(st, pi, vid, v);
-                raw_set_prop(st, pi, wid, t);
-                raw_set_prop(st, pi, eid, t);
-                raw_set_prop(st, pi, cid, t);
+                raw_set_prop(st, pi, wid, Value::boolean(w));
+                raw_set_prop(st, pi, eid, Value::boolean(e));
+                raw_set_prop(st, pi, cid, Value::boolean(c));
                 return Ok(out);
             }
             if !obj.is_object() {
@@ -11857,7 +11886,13 @@ fn exec_loop(
                                 String::new()
                             };
                             let kid = st.intern_name(&k);
+                            // `length` and `name` are own properties of
+                            // every function; this engine computes them
+                            // rather than storing them, so a check
+                            // against stored statics alone says no
                             let has = k == "prototype"
+                                || k == "length"
+                                || k == "name"
                                 || st.fn_props
                                     .contains_key(&(ov.index(), kid));
                             reg!(obj) = Value::boolean(has);
