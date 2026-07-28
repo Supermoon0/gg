@@ -7947,6 +7947,10 @@ fn host_fn(
                 }
                 let ii = out.index() as usize;
                 if let Some(index) = elem_index(&name) {
+                    if index >= MAX_ARRAY_ELEMS {
+                        return range_err(
+                            "array index exceeds the engine limit");
+                    }
                     let elems = &mut st.objects[ii].elems;
                     if index >= elems.len() {
                         elems.resize(index, Value::UNDEFINED);
@@ -13906,6 +13910,15 @@ fn exec_loop(
                     }
                     if st.objects[oi].is_array {
                         if let Some(k) = elem_index(&text) {
+                            // the numeric-string write path had no cap,
+                            // so an index near 2^53 asked for a 72 PB
+                            // Vec and Rust aborts the process on a
+                            // failed allocation — a page could take the
+                            // whole browser down with it
+                            if k >= MAX_ARRAY_ELEMS {
+                                return range_err(
+                                    "array index exceeds the engine limit");
+                            }
                             let elems = &mut st.objects[oi].elems;
                             if k < elems.len() {
                                 elems[k] = v;

@@ -6665,6 +6665,27 @@ console.log('B typeof it: ' + typeof it);
         assert_eq!(n("function f(a){} Object.keys(f).length"), 0.0);
     }
 
+    /// A page must not be able to abort the process. Rust cannot
+    /// recover a failed allocation, so any element-storage growth that
+    /// takes its size from script has to be capped *before* the resize
+    /// — one uncapped path asked for 72 PB and took the whole
+    /// interpreter down with it.
+    #[test]
+    fn huge_array_indices_throw_instead_of_aborting() {
+        // the numeric-string write path, which had no cap
+        assert_eq!(
+            n("var a = []; \
+               try { a['9007199254740990'] = 1; 0 } catch (e) { 1 }"),
+            1.0);
+        // and the same index as a number, which did
+        assert_eq!(
+            n("var a = []; \
+               try { a[9007199254740990] = 1; 0 } catch (e) { 1 }"),
+            1.0);
+        // an ordinary index is untouched by the cap
+        assert_eq!(n("var a = []; a['1000'] = 7; a.length"), 1001.0);
+    }
+
     /// VT and FF are WhiteSpace in the grammar, same as space and tab.
     #[test]
     fn vertical_tab_and_form_feed_are_whitespace() {
