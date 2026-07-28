@@ -5913,6 +5913,80 @@ console.log('B typeof it: ' + typeof it);
             451.0);
     }
 
+    /// A nested pattern may carry its own default, and the `=` shows up
+    /// only after the pattern closes — the shape behind the largest
+    /// single block of Test262 parse failures.
+    #[test]
+    fn nested_patterns_take_defaults() {
+        // array element that is an array pattern with a default
+        assert_eq!(
+            n("var [[x, y] = [4, 5]] = []; x * 10 + y"), 45.0);
+        assert_eq!(
+            n("var [[x, y] = [4, 5]] = [[1, 2]]; x * 10 + y"), 12.0);
+        // object property whose value is a pattern with a default
+        assert_eq!(
+            n("var {p: {q} = {q: 8}} = {}; q"), 8.0);
+        assert_eq!(
+            n("var {p: {q} = {q: 8}} = {p: {q: 3}}; q"), 3.0);
+        // computed key with a nested defaulted pattern
+        assert_eq!(
+            n("var k = 'p'; var {[k]: [a] = [6]} = {}; a"), 6.0);
+        // three deep, defaults at every level (property-list-with-
+        // property-list.js in Test262 is exactly this shape)
+        assert_eq!(
+            n("var {x: {y: {z} = {z: 2}} = {}} = {}; z"), 2.0);
+        // a present-but-undefined value still takes the default
+        assert_eq!(
+            n("var [[a] = [7]] = [undefined]; a"), 7.0);
+        // the default is evaluated once, and only when it is needed
+        assert_eq!(
+            n("var calls = 0; \
+               function d() { calls++; return [1, 2]; } \
+               var [[a, b] = d()] = []; a * 100 + b * 10 + calls"),
+            121.0);
+        assert_eq!(
+            n("var calls = 0; \
+               function d() { calls++; return [1, 2]; } \
+               var [[a, b] = d()] = [[3, 4]]; a * 100 + b * 10 + calls"),
+            340.0);
+    }
+
+    /// Parameters get the same treatment: a destructuring parameter can
+    /// default as a whole (`([x] = it) => {}`), and its elements can
+    /// default individually.
+    #[test]
+    fn destructuring_params_take_defaults() {
+        assert_eq!(n("(([x] = [3]) => x)()"), 3.0);
+        assert_eq!(n("(([x] = [3]) => x)([9])"), 9.0);
+        assert_eq!(n("(({a} = {a: 4}) => a)()"), 4.0);
+        // nested pattern with a default, inside a parameter
+        assert_eq!(n("(([[x, y] = [4, 5]]) => x * 10 + y)([])"), 45.0);
+        assert_eq!(
+            n("(([[x, y] = [4, 5]]) => x * 10 + y)([[1, 2]])"), 12.0);
+        // and on a function declaration, not just an arrow
+        assert_eq!(
+            n("function f({p: {q} = {q: 8}}) { return q } f({})"), 8.0);
+        // the whole-pattern default is applied before the unpack reads
+        assert_eq!(
+            n("function g([a, b] = [1, 2]) { return a * 10 + b } g()"),
+            12.0);
+    }
+
+    /// Destructuring *assignment* is a separate desugaring path, and it
+    /// takes defaults only on plain targets. A nested pattern with a
+    /// default (`[[a] = [1]] = x`) is still unsupported there — see the
+    /// note in parser.rs destr_target.
+    #[test]
+    fn destructuring_assignment_takes_defaults_on_plain_targets() {
+        assert_eq!(n("var a, b; [a = 4, b = 5] = []; a * 10 + b"), 45.0);
+        assert_eq!(
+            n("var a, b; [a = 4, b = 5] = [1, 2]; a * 10 + b"), 12.0);
+        assert_eq!(n("var q; ({q = 8} = {}); q"), 8.0);
+        // nested patterns work, just not nested patterns with defaults
+        assert_eq!(
+            n("var x, y; [[x, y]] = [[1, 2]]; x * 10 + y"), 12.0);
+    }
+
     #[test]
     fn param_defaults_and_patterns() {
         // default parameters

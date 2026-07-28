@@ -430,40 +430,38 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Capture the raw source of a `${...}` hole up to its matching `}`,
-    /// skipping strings. (Nested templates inside a hole are not
-    /// supported yet — the parser stage will replace this heuristic.)
+    /// Capture the raw source of a `${...}` hole, up to the `}` that
+    /// closes it.
+    ///
+    /// This used to count braces and skip over strings, which is wrong
+    /// the moment a hole contains anything else that can hold a brace or
+    /// a quote. `` `${s.replace(/'/g, "x")}` `` ended the scan inside a
+    /// string that never closed; a `// }` comment closed the hole early;
+    /// a nested template was not supported at all. Running the real
+    /// tokenizer over the hole gets all three right for free — it
+    /// already knows a regex from a division, and a nested template
+    /// recurses back through here.
     fn template_expr_src(&mut self) -> Result<String, LexError> {
         let start = self.pos;
+        // A hole begins an expression, so a leading `/` opens a regex.
+        self.regex_ok = true;
         let mut depth = 1usize;
         loop {
-            match self.peek(0) {
-                0 => return Err(self.err("unterminated ${} in template")),
-                b'{' => depth += 1,
-                b'}' => {
+            let before = self.pos;
+            let tok = self.next_token()?;
+            match tok.kind {
+                Tok::Punct(P::LBrace) => depth += 1,
+                Tok::Punct(P::RBrace) => {
                     depth -= 1;
                     if depth == 0 {
-                        let src = self.src[start..self.pos].to_string();
-                        self.pos += 1;
-                        return Ok(src);
+                        return Ok(self.src[start..before].to_string());
                     }
                 }
-                b'\n' => self.line += 1,
-                q @ (b'"' | b'\'') => {
-                    self.pos += 1;
-                    loop {
-                        match self.peek(0) {
-                            0 => return Err(self.err("unterminated string")),
-                            b'\\' => self.pos += 1,
-                            c if c == q => break,
-                            _ => {}
-                        }
-                        self.pos += 1;
-                    }
+                Tok::Eof => {
+                    return Err(self.err("unterminated ${} in template"))
                 }
                 _ => {}
             }
-            self.pos += 1;
         }
     }
 

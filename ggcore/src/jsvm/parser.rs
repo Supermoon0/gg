@@ -872,9 +872,7 @@ impl Parser {
                     optional: false,
                 };
                 if self.at_punct(P::LBrace) || self.at_punct(P::LBracket) {
-                    let inner = self.fresh_tmp("d");
-                    out.push((inner.clone(), Some(member)));
-                    self.pattern_binds(&inner, out, false)?;
+                    self.nested_pattern(member, out)?;
                 } else {
                     let bind = self.expect_ident()?;
                     let init = self.maybe_default(member)?;
@@ -895,9 +893,7 @@ impl Parser {
             if self.eat_punct(P::Colon) {
                 // { key: <nested pattern or ident> }
                 if self.at_punct(P::LBrace) || self.at_punct(P::LBracket) {
-                    let inner = self.fresh_tmp("d");
-                    out.push((inner.clone(), Some(member)));
-                    self.pattern_binds(&inner, out, false)?;
+                    self.nested_pattern(member, out)?;
                 } else {
                     let bind = self.expect_ident()?;
                     let init = self.maybe_default(member)?;
@@ -946,9 +942,7 @@ impl Parser {
                 break;
             }
             if self.at_punct(P::LBrace) || self.at_punct(P::LBracket) {
-                let inner = self.fresh_tmp("d");
-                out.push((inner.clone(), Some(index_expr(i))));
-                self.pattern_binds(&inner, out, false)?;
+                self.nested_pattern(index_expr(i), out)?;
             } else {
                 let name = self.expect_ident()?;
                 let init = self.maybe_default(index_expr(i))?;
@@ -960,6 +954,29 @@ impl Parser {
             }
         }
         self.expect_punct(P::RBracket)?;
+        Ok(())
+    }
+
+    /// Bind a temp to `access`, then unpack a nested pattern out of it.
+    ///
+    /// A nested pattern can carry its own default — `[[a] = [1]]`,
+    /// `{x: {y} = {}}` — and the `=` only appears once the pattern has
+    /// closed, long after the temp's initializer was pushed. So push it
+    /// first and patch it afterwards; the decls stay in the order the
+    /// unpack needs, since the nested binds read the temp by name.
+    fn nested_pattern(
+        &mut self,
+        access: Expr,
+        out: &mut Vec<(String, Option<Expr>)>,
+    ) -> Result<(), ParseError> {
+        let inner = self.fresh_tmp("d");
+        let slot = out.len();
+        out.push((inner.clone(), Some(access)));
+        self.pattern_binds(&inner, out, false)?;
+        if self.at_punct(P::Assign) {
+            let access = out[slot].1.take().expect("just pushed");
+            out[slot].1 = Some(self.maybe_default(access)?);
+        }
         Ok(())
     }
 
@@ -1304,7 +1321,7 @@ impl Parser {
             {
                 let tmp = self.fresh_tmp("da");
                 let mut stmts = Vec::new();
-                if Self::destr_into(
+                if self.destr_into(
                     &left,
                     &Expr::Ident(tmp.clone()),
                     &mut stmts,
@@ -1337,19 +1354,29 @@ impl Parser {
     /// Emit assignments unpacking `src` according to a literal used as
     /// a destructuring pattern. Returns false on unsupported shapes
     /// (the caller then reports the usual error).
-    fn destr_into(pat: &Expr, src: &Expr, out: &mut Vec<Stmt>) -> bool {
+    fn destr_into(
+        &mut self,
+        pat: &Expr,
+        src: &Expr,
+        out: &mut Vec<Stmt>,
+    ) -> bool {
         match pat {
-            Expr::Array(els) => els.iter().enumerate().all(|(i, el)| {
-                let item = Expr::Member {
-                    obj: Box::new(src.clone()),
-                    prop: MemberProp::Computed(Box::new(Expr::Num(
-                        i as f64,
-                    ))),
-                    optional: false,
-                };
-                Self::destr_target(el, item, out)
-            }),
-            Expr::Object(props) => props.iter().all(|p| {
+            Expr::Array(els) => {
+                let els = els.clone();
+                els.iter().enumerate().all(|(i, el)| {
+                    let item = Expr::Member {
+                        obj: Box::new(src.clone()),
+                        prop: MemberProp::Computed(Box::new(Expr::Num(
+                            i as f64,
+                        ))),
+                        optional: false,
+                    };
+                    self.destr_target(el, item, out)
+                })
+            }
+            Expr::Object(props) => {
+                let props = props.clone();
+                props.iter().all(|p| {
                 let item = Expr::Member {
                     obj: Box::new(src.clone()),
                     prop: match &p.key {
@@ -1365,13 +1392,19 @@ impl Parser {
                     },
                     optional: false,
                 };
-                Self::destr_target(&p.value, item, out)
-            }),
+                self.destr_target(&p.value, item, out)
+                })
+            }
             _ => false,
         }
     }
 
-    fn destr_target(t: &Expr, item: Expr, out: &mut Vec<Stmt>) -> bool {
+    fn destr_target(
+        &mut self,
+        t: &Expr,
+        item: Expr,
+        out: &mut Vec<Stmt>,
+    ) -> bool {
         match t {
             // an elision hole parses as `undefined` — skip it
             Expr::Ident(n) if n == "undefined" => true,
@@ -1408,8 +1441,19 @@ impl Parser {
             }
             // nested pattern: unpack the member chain
             Expr::Array(_) | Expr::Object(_) => {
-                Self::destr_into(t, &item, out)
+                let t = t.clone();
+                self.destr_into(&t, &item, out)
             }
+            // Not reached for a *nested pattern* with a default —
+            // `[[a] = [1]] = x`. The inner `[a] = [1]` is parsed as an
+            // expression first, so it has already been desugared into
+            // the arrow call below by the time the outer pattern looks
+            // at it, and arrives here as an Expr::Call. Supporting it
+            // means holding the desugar back while a literal might
+            // still turn out to be a pattern. The binding form
+            // (`var [[a] = [1]] = x`) does not go through here and does
+            // work; this is ~165 Test262 cases against the binding
+            // form's ~7100.
             _ => false,
         }
     }
@@ -1483,7 +1527,27 @@ impl Parser {
                     let tmp = self.fresh_tmp("p");
                     let mut binds: Vec<(String, Option<Expr>)> = Vec::new();
                     self.pattern_binds(&tmp, &mut binds, false)?;
-                    params.push(tmp);
+                    params.push(tmp.clone());
+                    // `([x] = iter) => {}`: the pattern as a whole can
+                    // carry a default, and it has to be applied to the
+                    // temp before the unpack reads anything off it.
+                    if self.eat_punct(P::Assign) {
+                        let def = self.assign_expr()?;
+                        prologue.push(Stmt::Expr(Expr::Assign(
+                            AssignOp::Plain,
+                            Box::new(Expr::Ident(tmp.clone())),
+                            Box::new(Expr::Cond(
+                                Box::new(Expr::Binary(
+                                    BinOp::StrictNotEq,
+                                    Box::new(Expr::Ident(tmp.clone())),
+                                    Box::new(Expr::Ident(
+                                        "undefined".to_string())),
+                                )),
+                                Box::new(Expr::Ident(tmp)),
+                                Box::new(def),
+                            )),
+                        )));
+                    }
                     prologue.push(Stmt::VarDecl {
                         kind: DeclKind::Var, decls: binds,
                     });
