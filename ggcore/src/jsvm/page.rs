@@ -130,29 +130,77 @@ function TypeError(m, o) {
       || typeof this !== 'object') return new TypeError(m, o);
   Error.call(this, m, o);
 }
-TypeError.prototype = new Error();
-TypeError.prototype.name = 'TypeError';
 function RangeError(m, o) {
   if (this === undefined || this === null
       || typeof this !== 'object') return new RangeError(m, o);
   Error.call(this, m, o);
 }
-RangeError.prototype = new Error();
-RangeError.prototype.name = 'RangeError';
 function SyntaxError(m, o) {
   if (this === undefined || this === null
       || typeof this !== 'object') return new SyntaxError(m, o);
   Error.call(this, m, o);
 }
-SyntaxError.prototype = new Error();
-SyntaxError.prototype.name = 'SyntaxError';
 function ReferenceError(m, o) {
   if (this === undefined || this === null
       || typeof this !== 'object') return new ReferenceError(m, o);
   Error.call(this, m, o);
 }
-ReferenceError.prototype = new Error();
-ReferenceError.prototype.name = 'ReferenceError';
+function EvalError(m, o) {
+  if (this === undefined || this === null
+      || typeof this !== 'object') return new EvalError(m, o);
+  Error.call(this, m, o);
+}
+function URIError(m, o) {
+  if (this === undefined || this === null
+      || typeof this !== 'object') return new URIError(m, o);
+  Error.call(this, m, o);
+}
+// Assigning a fresh object to .prototype drops the constructor
+// back-pointer that comes with it. Almost nothing reads it, so this
+// went unnoticed — until it turned out that `assert.throws` compares
+// `thrown.constructor !== expected` rather than using instanceof, so
+// every error subclass answered `Error` and every such assertion
+// failed with "Expected a TypeError but got a Error". Restore it
+// non-enumerably, the way the default one was.
+(function () {
+  var kinds = [
+    [TypeError, 'TypeError'], [RangeError, 'RangeError'],
+    [SyntaxError, 'SyntaxError'], [ReferenceError, 'ReferenceError'],
+    [EvalError, 'EvalError'], [URIError, 'URIError']
+  ];
+  for (var i = 0; i < kinds.length; i++) {
+    var ctor = kinds[i][0];
+    ctor.prototype = new Error();
+    ctor.prototype.name = kinds[i][1];
+    Object.defineProperty(ctor.prototype, 'constructor', {
+      value: ctor, writable: true, enumerable: false, configurable: true
+    });
+  }
+})();
+// Promise.any rejects with one of these, so it is not optional once
+// Promise.any exists.
+function AggregateError(errs, m, o) {
+  if (this === undefined || this === null
+      || typeof this !== 'object') return new AggregateError(errs, m, o);
+  Error.call(this, m, o);
+  var list = [];
+  if (errs !== undefined && errs !== null) {
+    var it = errs[Symbol.iterator];
+    if (typeof it === 'function') {
+      var g = it.call(errs), s;
+      while (!(s = g.next()).done) list.push(s.value);
+    } else {
+      for (var i = 0; i < errs.length; i++) list.push(errs[i]);
+    }
+  }
+  this.errors = list;
+}
+AggregateError.prototype = new Error();
+AggregateError.prototype.name = 'AggregateError';
+Object.defineProperty(AggregateError.prototype, 'constructor', {
+  value: AggregateError, writable: true, enumerable: false,
+  configurable: true
+});
 // Symbol: a string-based stand-in. Unique enough for property keys and
 // the well-known-symbol protocol; `typeof` reports 'string' (known gap).
 var __ggSymN = 0;
@@ -6684,6 +6732,63 @@ console.log('B typeof it: ' + typeof it);
             1.0);
         // an ordinary index is untouched by the cap
         assert_eq!(n("var a = []; a['1000'] = 7; a.length"), 1001.0);
+    }
+
+    /// An error subclass has to point back at its own constructor.
+    /// `assert.throws` — and plenty of library code — compares
+    /// `thrown.constructor` rather than using instanceof.
+    #[test]
+    fn error_subclasses_point_at_their_own_constructor() {
+        for (ctor, thrower) in [
+            ("TypeError", "null.x"),
+            ("RangeError", "[].length = -1"),
+            ("ReferenceError", "xyzzy"),
+        ] {
+            assert_eq!(
+                n(&format!(
+                    "try {{ {thrower} }} catch (e) {{ \
+                       e.constructor === {ctor} && e.name === '{ctor}' \
+                       && e instanceof {ctor} && e instanceof Error \
+                       ? 1 : 0 }}"
+                )),
+                1.0,
+                "{ctor} raised by the VM",
+            );
+        }
+        for ctor in ["TypeError", "RangeError", "SyntaxError",
+                     "ReferenceError", "EvalError", "URIError"] {
+            assert_eq!(
+                n(&format!(
+                    "var e = new {ctor}('m'); \
+                     e.constructor === {ctor} && \
+                     {ctor}.prototype.constructor === {ctor} && \
+                     e.message === 'm' && e.name === '{ctor}' ? 1 : 0"
+                )),
+                1.0,
+                "new {ctor}",
+            );
+        }
+        // constructor stays non-enumerable, as the default one was
+        assert_eq!(
+            n("var k = 0; for (var p in new TypeError('m')) \
+               { if (p === 'constructor') k = 1; } k"),
+            0.0);
+        // JSON.parse is specified to throw a SyntaxError
+        assert_eq!(
+            n("try { JSON.parse('{'); 0 } catch (e) { \
+               e.constructor === SyntaxError ? 1 : 0 }"),
+            1.0);
+        assert_eq!(
+            n("try { JSON.parse('[1,]'); 0 } catch (e) { \
+               e instanceof SyntaxError ? 1 : 0 }"),
+            1.0);
+        // AggregateError collects its errors
+        assert_eq!(
+            n("var e = new AggregateError([1, 2], 'boom'); \
+               e.errors.length === 2 && e.errors[1] === 2 && \
+               e.message === 'boom' && e.name === 'AggregateError' && \
+               e.constructor === AggregateError ? 1 : 0"),
+            1.0);
     }
 
     /// VT and FF are WhiteSpace in the grammar, same as space and tab.

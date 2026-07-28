@@ -145,6 +145,15 @@ fn range_err<T>(msg: impl Into<String>) -> Result<T, VmError> {
     })
 }
 
+/// `JSON.parse` is specified to throw a SyntaxError, not a plain
+/// Error — and code that branches on the error type sees the
+/// difference.
+fn syntax_err<T>(msg: impl Into<String>) -> Result<T, VmError> {
+    Err(VmError {
+        msg: msg.into(), value: None, kind: "SyntaxError", trace: None,
+    })
+}
+
 /// Longest string the VM will build, in bytes. Rope concatenation is
 /// O(1), so a hostile `while(1) s += s` mints multi-gigabyte strings
 /// in ~30 statements (far under the execution fuel) and the process
@@ -8434,7 +8443,7 @@ fn json_parse(st: &mut St, p: &mut JsonP) -> Result<Value, VmError> {
     match p.peek() {
         Some(c @ ('{' | '[')) => {
             if p.depth >= 512 {
-                return err("JSON input too deeply nested");
+                return syntax_err("JSON input too deeply nested");
             }
             p.depth += 1;
             let r = if c == '{' {
@@ -8453,14 +8462,14 @@ fn json_parse(st: &mut St, p: &mut JsonP) -> Result<Value, VmError> {
         Some('f') => json_parse_lit(p, "false", Value::FALSE),
         Some('n') => json_parse_lit(p, "null", Value::NULL),
         Some(c) if c == '-' || c.is_ascii_digit() => json_parse_number(p),
-        _ => err(p.bad()),
+        _ => syntax_err(p.bad()),
     }
 }
 
 fn json_parse_lit(p: &mut JsonP, word: &str, v: Value) -> Result<Value, VmError> {
     for want in word.chars() {
         if p.bump() != Some(want) {
-            return err(p.bad());
+            return syntax_err(p.bad());
         }
     }
     Ok(v)
@@ -8495,7 +8504,7 @@ fn json_parse_number(p: &mut JsonP) -> Result<Value, VmError> {
     }
     match numstr.parse::<f64>() {
         Ok(n) => Ok(Value::number(n)),
-        Err(_) => err("Invalid number in JSON"),
+        Err(_) => syntax_err("Invalid number in JSON"),
     }
 }
 
@@ -8504,7 +8513,7 @@ fn json_parse_string(p: &mut JsonP) -> Result<String, VmError> {
     let mut s = String::new();
     loop {
         match p.bump() {
-            None => return err("Unterminated string in JSON"),
+            None => return syntax_err("Unterminated string in JSON"),
             Some('"') => return Ok(s),
             Some('\\') => match p.bump() {
                 Some('"') => s.push('"'),
@@ -8521,12 +8530,12 @@ fn json_parse_string(p: &mut JsonP) -> Result<String, VmError> {
                         let d = p.bump().and_then(|c| c.to_digit(16));
                         match d {
                             Some(d) => code = code * 16 + d,
-                            None => return err("Bad \\u escape in JSON"),
+                            None => return syntax_err("Bad \\u escape in JSON"),
                         }
                     }
                     s.push(char::from_u32(code).unwrap_or('\u{fffd}'));
                 }
-                _ => return err("Bad escape in JSON"),
+                _ => return syntax_err("Bad escape in JSON"),
             },
             Some(c) => s.push(c),
         }
@@ -8548,7 +8557,7 @@ fn json_parse_array(st: &mut St, p: &mut JsonP) -> Result<Value, VmError> {
         match p.bump() {
             Some(',') => continue,
             Some(']') => return Ok(new_array(st, elems)),
-            _ => return err("Expected , or ] in JSON"),
+            _ => return syntax_err("Expected , or ] in JSON"),
         }
     }
 }
@@ -8565,12 +8574,12 @@ fn json_parse_object(st: &mut St, p: &mut JsonP) -> Result<Value, VmError> {
     loop {
         p.ws();
         if p.peek() != Some('"') {
-            return err("Expected string key in JSON");
+            return syntax_err("Expected string key in JSON");
         }
         let key = json_parse_string(p)?;
         p.ws();
         if p.bump() != Some(':') {
-            return err("Expected : in JSON");
+            return syntax_err("Expected : in JSON");
         }
         let val = json_parse(st, p)?;
         let key_id = st.intern_name(&key);
@@ -8579,7 +8588,7 @@ fn json_parse_object(st: &mut St, p: &mut JsonP) -> Result<Value, VmError> {
         match p.bump() {
             Some(',') => continue,
             Some('}') => return Ok(obj),
-            _ => return err("Expected , or } in JSON"),
+            _ => return syntax_err("Expected , or } in JSON"),
         }
     }
 }
@@ -8598,7 +8607,7 @@ fn arg_string(st: &mut St, args_base: usize, argc: u8, k: usize)
 fn need_doc(st: &St) -> Result<Rc<RefCell<dom::Document>>, VmError> {
     match &st.doc {
         Some(d) => Ok(d.clone()),
-        None => err("no document attached to this VM"),
+        None => syntax_err("no document attached to this VM"),
     }
 }
 
