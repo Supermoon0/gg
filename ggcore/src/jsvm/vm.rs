@@ -1954,7 +1954,7 @@ pub(super) fn drain_microtasks_now(
 ) {
     let mut budget = budget_max;
     drain_microtasks(st, mods, &mut budget);
-    report_unhandled_rejections(st);
+    report_unhandled_rejections(st, mods);
 }
 
 fn drain_microtasks(st: &mut St, mods: &ModStore, budget: &mut usize) {
@@ -2042,7 +2042,7 @@ pub(super) fn pump_microtasks(
     if budget == 0 && !st.microtasks.is_empty() {
         st.logs.push("[gg-js] microtask budget exceeded".to_string());
     }
-    report_unhandled_rejections(st);
+    report_unhandled_rejections(st, mods);
     let issued = std::mem::take(&mut st.pending_fetches);
     for request in &issued {
         st.awaiting.insert(request.fetch_id, request.promise);
@@ -2053,7 +2053,7 @@ pub(super) fn pump_microtasks(
 /// Report promises that rejected and were never asked about. Only
 /// once the queue is empty: a handler attached later in the same drain
 /// is not a swallowed error.
-fn report_unhandled_rejections(st: &mut St) {
+fn report_unhandled_rejections(st: &mut St, mods: &ModStore) {
     if st.rejected.is_empty() {
         return;
     }
@@ -2068,7 +2068,7 @@ fn report_unhandled_rejections(st: &mut St) {
         }
         let PromiseState::Rejected(v) = rec.state else { continue };
         st.promises[pid as usize].handled = true; // report once
-        let msg = throw_msg(st, v);
+        let msg = throw_msg(st, mods, v);
         let msg = msg.strip_prefix("uncaught ").unwrap_or(&msg).to_string();
         st.logs.push(format!("[gg-js error] unhandled rejection: {msg}"));
     }
@@ -2182,7 +2182,7 @@ pub(super) fn pump(
             }
         }
     }
-    report_unhandled_rejections(st);
+    report_unhandled_rejections(st, mods);
     let issued = std::mem::take(&mut st.pending_fetches);
     for p in &issued {
         st.awaiting.insert(p.fetch_id, p.promise);
@@ -2247,7 +2247,7 @@ pub(super) fn pump_step(
         }
         drain_microtasks(st, mods, &mut budget);
     }
-    report_unhandled_rejections(st);
+    report_unhandled_rejections(st, mods);
     let issued = std::mem::take(&mut st.pending_fetches);
     for p in &issued {
         st.awaiting.insert(p.fetch_id, p.promise);
@@ -10865,16 +10865,26 @@ fn exception_value(
 
 /// Message shown if a thrown value escapes uncaught. Error-like
 /// objects print as "name: message", everything else as its display.
-fn throw_msg(st: &mut St, v: Value) -> String {
+fn throw_msg(st: &mut St, mods: &ModStore, v: Value) -> String {
     if v.is_object() {
         let oi = v.index() as usize;
         let name_id = st.intern_name("name");
         let msg_id = st.intern_name("message");
-        if let (Some(n), Some(m)) =
-            (raw_get_prop(st, oi, name_id), raw_get_prop(st, oi, msg_id))
-        {
-            let n = to_display(st, n);
-            let m = to_display(st, m);
+        let name = raw_get_prop(st, oi, name_id);
+        let msg = raw_get_prop(st, oi, msg_id);
+        // Either half of the pair is enough to call it error-like.
+        // Requiring both meant a class that sets only `message` and
+        // leaves the label to its prototype's toString reported as
+        // "[object Object]" — which is exactly what Test262's own
+        // Test262Error does, so a quarter of that corpus came back
+        // with no diagnosis at all.
+        if name.is_some() || msg.is_some() {
+            let n = match name {
+                Some(n) => to_display(st, n),
+                None => ctor_name(st, mods, oi)
+                    .unwrap_or_else(|| "Error".to_string()),
+            };
+            let m = msg.map(|m| to_display(st, m)).unwrap_or_default();
             // An uncaught error in a third-party bundle is the one
             // report anyone gets; without the frames it names nothing
             // anybody can act on.
@@ -10891,11 +10901,30 @@ fn throw_msg(st: &mut St, v: Value) -> String {
                 }
                 _ => String::new(),
             };
+            if m.is_empty() {
+                return format!("uncaught {n}{frames}");
+            }
             return format!("uncaught {n}: {m}{frames}");
         }
     }
     let d = to_display(st, v);
     format!("uncaught {d}")
+}
+
+/// The name of the constructor that made `oi`, for labelling a thrown
+/// object that carries a message but no `name`. Property reads only —
+/// the throw path must not run user code to report a throw.
+fn ctor_name(st: &mut St, mods: &ModStore, oi: usize) -> Option<String> {
+    let ctor_id = st.intern_name("constructor");
+    let ctor = raw_get_prop(st, oi, ctor_id)?;
+    // A function's `name` is computed, not stored in a slot, so the
+    // raw property read that found the constructor cannot be used
+    // again to read its name.
+    if !ctor.is_function() {
+        return None;
+    }
+    let n = fn_name(st, mods, ctor);
+    if n.is_empty() { None } else { Some(n) }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11139,7 +11168,7 @@ fn exec_loop(
             }
             Instr::Throw { src } => {
                 let v = reg!(src);
-                let msg = throw_msg(st, v);
+                let msg = throw_msg(st, mods, v);
                 return Err(VmError {
                     msg, value: Some(v), kind: "Error", trace: None,
                 });

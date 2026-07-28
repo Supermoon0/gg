@@ -6580,6 +6580,54 @@ console.log('B typeof it: ' + typeof it);
         );
     }
 
+    /// What an uncaught throw is *called*. A thrown object only needs
+    /// one half of the name/message pair to be reported as an error
+    /// rather than as "[object Object]" — the shape Test262's own
+    /// Test262Error uses, and the reason a quarter of that corpus
+    /// used to fail with nothing to go on.
+    #[test]
+    fn uncaught_throws_name_themselves() {
+        let msg = |src: &str| match eval(src) {
+            Err(e) => e,
+            Ok(_) => panic!("expected a throw from {src}"),
+        };
+        // message only: the label comes from the constructor
+        assert!(
+            msg("function Test262Error(m) { this.message = m; } \
+                 throw new Test262Error('bad value');")
+                .contains("Test262Error: bad value"),
+            "got {}",
+            msg("function Test262Error(m) { this.message = m; } \
+                 throw new Test262Error('bad value');")
+        );
+        // an explicit name still wins over the constructor
+        assert!(msg(
+            "var e = new Error('x'); e.name = 'Custom'; throw e;"
+        )
+        .contains("Custom: x"));
+        // name only, no message: no dangling colon
+        let m = msg("throw {name: 'Whoops'};");
+        assert!(m.contains("Whoops"), "got {m}");
+        assert!(!m.contains("Whoops:"), "dangling colon in {m}");
+        // a thrown built-in Error still reads off its own name
+        assert!(msg("throw new TypeError('nope');").contains("TypeError: nope"));
+        assert!(msg("throw new RangeError('oob');").contains("RangeError: oob"));
+        // VM-raised errors do not go through here at all — they carry
+        // their name as the error kind, not in the message
+        assert_eq!(msg("null.x;"), "cannot read .x of null");
+        // a thrown object with neither half is still not error-like
+        assert!(msg("throw {a: 1};").contains("[object Object]"));
+    }
+
+    /// VT and FF are WhiteSpace in the grammar, same as space and tab.
+    #[test]
+    fn vertical_tab_and_form_feed_are_whitespace() {
+        assert_eq!(n("var\u{0b}a\u{0b}=\u{0b}4; a"), 4.0);
+        assert_eq!(n("var\u{0c}b\u{0c}=\u{0c}5; b"), 5.0);
+        // and they do not count as line terminators for ASI
+        assert_eq!(n("var c = 1\u{0b}+ 2; c"), 3.0);
+    }
+
     #[test]
     fn try_finally_paths() {
         // finally runs on the normal path

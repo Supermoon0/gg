@@ -108,7 +108,10 @@ impl<'a> Lexer<'a> {
     fn skip_ws_and_comments(&mut self) -> Result<(), LexError> {
         loop {
             match self.peek(0) {
-                b' ' | b'\t' | b'\r' => self.pos += 1,
+                // <TAB> <VT> <FF> <SP> <CR>. VT and FF are WhiteSpace
+                // in the grammar just like the other three, and leaving
+                // them out made them "unexpected character 0x0b".
+                b' ' | b'\t' | 0x0b | 0x0c | b'\r' => self.pos += 1,
                 b'\n' => {
                     self.pos += 1;
                     self.line += 1;
