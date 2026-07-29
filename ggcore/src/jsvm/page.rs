@@ -1189,12 +1189,50 @@ Date.UTC = function (y, m, d, h, mi, s, ms) {
     * 86400000 + (h || 0) * 3600000 + (mi || 0) * 60000
     + (s || 0) * 1000 + (ms || 0);
 };
+// ISO first, then the two formats that actually turn up in markup and
+// in hand-written dates. Only ISO was accepted, so `new Date("1/1/2000")`
+// — the commonest way a date is written in the wild — was NaN.
+var __ggMonNames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun',
+                    'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+var __ggISO =
+  /^(\d{4})-(\d{2})(?:-(\d{2}))?(?:[ ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?)?/;
+// M/D/YYYY, the US ordering, optionally with a time
+var __ggSlash =
+  /^(\d{1,2})\/(\d{1,2})\/(\d{1,4})(?:[ ](\d{1,2}):(\d{2})(?::(\d{2}))?)?/;
+// "Jan 1, 2000" and "1 Jan 2000", the two textual orderings
+var __ggText1 =
+  /^([A-Za-z]{3})[a-z]*[ ](\d{1,2}),?[ ](\d{1,4})(?:[ ](\d{1,2}):(\d{2})(?::(\d{2}))?)?/;
+var __ggText2 =
+  /^(\d{1,2})[ ]([A-Za-z]{3})[a-z]*[ ](\d{1,4})(?:[ ](\d{1,2}):(\d{2})(?::(\d{2}))?)?/;
 Date.parse = function (s) {
-  s = ('' + s).replace('T', ' ');
-  var m = /^(\d{4})-(\d{2})-(\d{2})(?:[ ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?)?/.exec(s);
-  if (!m) return NaN;
-  return Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] || 0),
-                  +(m[5] || 0), +(m[6] || 0), +(m[7] || 0));
+  // Strip a leading weekday by name, not by shape: "Jan 2, 2000" also
+  // starts with three letters and a space.
+  s = ('' + s).replace('T', ' ')
+    .replace(/^(?:sun|mon|tue|wed|thu|fri|sat)[a-z]*,?[ ]/i, '');
+  s = s.replace(/[ ]*(?:GMT|UTC|Z)$/, '');
+  var m = __ggISO.exec(s);
+  if (m) {
+    return Date.UTC(+m[1], +m[2] - 1, +(m[3] || 1), +(m[4] || 0),
+                    +(m[5] || 0), +(m[6] || 0), +(m[7] || 0));
+  }
+  var mon, day, yr, h, mi, sec;
+  if ((m = __ggSlash.exec(s))) {
+    mon = +m[1] - 1; day = +m[2]; yr = +m[3];
+    h = m[4]; mi = m[5]; sec = m[6];
+  } else if ((m = __ggText1.exec(s))) {
+    mon = __ggMonNames.indexOf(m[1].toLowerCase());
+    day = +m[2]; yr = +m[3]; h = m[4]; mi = m[5]; sec = m[6];
+  } else if ((m = __ggText2.exec(s))) {
+    mon = __ggMonNames.indexOf(m[2].toLowerCase());
+    day = +m[1]; yr = +m[3]; h = m[4]; mi = m[5]; sec = m[6];
+  } else {
+    return NaN;
+  }
+  if (mon < 0 || mon > 11) return NaN;
+  // A two-digit year is 19xx from 50 up and 20xx below it, the same
+  // split every other engine uses.
+  if (yr < 50) yr += 2000; else if (yr < 100) yr += 1900;
+  return Date.UTC(yr, mon, day, +(h || 0), +(mi || 0), +(sec || 0), 0);
 };
 (function () {
   var P = Date.prototype;
@@ -6896,6 +6934,42 @@ console.log('B typeof it: ' + typeof it);
         assert_eq!(
             n("var re = /a/g; re.lastIndex = 99; \
                re.exec('aaa') === null && re.lastIndex === 0 ? 1 : 0"),
+            1.0);
+    }
+
+    /// Date.parse only accepted the ISO form, so the commonest way a
+    /// date is actually written was NaN.
+    #[test]
+    fn date_parse_accepts_the_usual_formats() {
+        let iso = "Date.UTC(2000, 0, 2)";
+        for s in ["2000-01-02", "2000-01-02T00:00:00", "1/2/2000",
+                  "Jan 2, 2000", "January 2, 2000", "2 Jan 2000",
+                  "Wed, 2 Jan 2000"] {
+            assert_eq!(
+                n(&format!("Date.parse('{s}') === {iso} ? 1 : 0")),
+                1.0,
+                "Date.parse({s:?})",
+            );
+        }
+        // times come through
+        assert_eq!(
+            n("Date.parse('1/2/2000 03:04:05') === \
+               Date.UTC(2000, 0, 2, 3, 4, 5) ? 1 : 0"),
+            1.0);
+        // two-digit years split at 50, as everywhere else
+        assert_eq!(
+            n("Date.parse('1/1/49') === Date.UTC(2049, 0, 1) && \
+               Date.parse('1/1/50') === Date.UTC(1950, 0, 1) ? 1 : 0"),
+            1.0);
+        // and the constructor goes through the same path
+        assert_eq!(
+            n("new Date('1/2/2000').getFullYear() * 100 + \
+               new Date('1/2/2000').getDate()"),
+            200002.0);
+        // nonsense is still NaN, not a wrong date
+        assert_eq!(
+            n("isNaN(Date.parse('not a date')) && \
+               isNaN(Date.parse('13/40/2000')) ? 1 : 0"),
             1.0);
     }
 
