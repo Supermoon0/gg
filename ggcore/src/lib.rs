@@ -14,6 +14,7 @@ mod fonts;
 mod html;
 mod html5;
 mod jsvm;
+mod perf;
 mod raster;
 mod style;
 mod svg;

@@ -114,12 +114,19 @@ def _measure(name, url, out):
             pass
 
 
-def main():
+def main(selected=()):
+    selected = set(selected)
+    sites = [site for site in SITES
+             if not selected or site[0] in selected or site[1] in selected]
+    if not sites:
+        choices = ", ".join(name for name, _url in SITES)
+        raise SystemExit(f"일치하는 사이트가 없습니다. 선택 가능: {choices}")
+
     print(f"{'사이트':10} {'노드':>6} {'스타일':>6} {'페인트':>6} "
           f"{'텍스트':>6} {'이미지':>5} {'JS오류':>6} {'시간':>6}  결과")
     print("-" * 78)
     context = multiprocessing.get_context("spawn")
-    for name, url in SITES:
+    for name, url in sites:
         queue = context.Queue()
         process = context.Process(
             target=_measure, args=(name, url, queue), daemon=True)
@@ -144,4 +151,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

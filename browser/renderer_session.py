@@ -117,10 +117,15 @@ class LocalRendererSession:
         self.cancel_token = None
         self.network_context = None
         self._dom_version = None
+        # set by a paint-first commit: scripts were parsed but not run,
+        # and the first tick after the page is on screen runs them
+        self._pending_scripts = False
+        self._pending_framed = False
+        self._pending_window_name = None
 
     def commit(self, url, body, *, viewport_width=1280.0, timings=None,
                cancel_token=None, network_context=None, framed=False,
-               window_name=None):
+               window_name=None, defer_scripts=False):
         if self.doc is not None or self.network_context is not None:
             self.close()
         self.url = url
@@ -137,7 +142,12 @@ class LocalRendererSession:
             network_context=self.network_context,
             network_timeout=self.timeout,
             cancel_token=cancel_token, framed=framed,
-            window_name=window_name)
+            window_name=window_name, defer_scripts=defer_scripts)
+        self._pending_scripts = bool(
+            fetch_js is not None and defer_scripts
+            and native.can_defer_scripts(doc))
+        self._pending_framed = framed
+        self._pending_window_name = window_name
         self.root = root
         self.doc = doc
         self.css_sources = list(css_sources)
@@ -194,7 +204,25 @@ class LocalRendererSession:
     def tick(self, dt_ms=None):
         if self.doc is None or not native.async_available():
             return RendererUpdate()
+        deferred = ()
+        if self._pending_scripts:
+            # First tick after a paint-first commit: the pre-JS tree is
+            # already on screen, so now run what the page asked for. The
+            # DOM version bump this produces is what makes the caller
+            # rebuild and repaint.
+            self._pending_scripts = False
+            deferred = native.run_page_scripts(
+                self.doc, self._fetch_text_many,
+                js_budget=self.js_budget, page_url=self.url,
+                network_backend=self.network,
+                network_timeout=self.timeout,
+                cancel_token=self.cancel_token,
+                network_context=self.network_context,
+                framed=self._pending_framed,
+                window_name=self._pending_window_name)
         logs, requests = native.pump_script_requests(self.doc, dt_ms)
+        if deferred:
+            logs = list(deferred) + list(logs)
         self.sync_cookie_writes()
         for request in requests:
             self.service_fetch(request)
@@ -572,7 +600,8 @@ class RemoteRendererSession:
         return self.host.alive
 
     def commit(self, url, body, *, viewport_width=1280.0, timings=None,
-               cancel_token=None, network_context=None, framed=False):
+               cancel_token=None, network_context=None, framed=False,
+               defer_scripts=False):
         from .ipc.blobs import BlobStore
 
         if network_context is not None:
@@ -592,6 +621,7 @@ class RemoteRendererSession:
                     "timeout": self.timeout,
                     "js_budget": self.js_budget,
                     "framed": bool(framed),
+                    "defer_scripts": bool(defer_scripts),
                 }, timeout=max(self.timeout, self.js_budget + 2.0),
                 advance_generation=True, cancel_token=cancel_token)
         finally:

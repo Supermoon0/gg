@@ -15,9 +15,10 @@
 python main.py                        # tkinter 셸, 홈 화면(about:home)
 python main.py https://naver.com      # tkinter 셸
 python main.py --native               # 러스트(winit) 창 셸
-python smoke_test.py                  # 헤드리스 파이프라인 테스트 (249종)
+python smoke_test.py                  # 헤드리스 파이프라인 테스트 (437종)
 python basket_test.py                 # 대표 사이트 렌더 측정 (9곳)
-cd ggcore && cargo test --lib --no-default-features  # 198 통과 + 진단용 2종 ignored
+python basket_test.py 정부24          # 이름 또는 URL로 일부 사이트만 측정
+cd ggcore && cargo test --lib --no-default-features  # 274 통과 + 진단용 2종 ignored
 ```
 
 native shell은 renderer child process를 기본 사용한다. 디버그/테스트에서 로컬

@@ -1,9 +1,12 @@
 //! Style computation: hash-bucket rule index + cascade + inheritance.
 
+use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 use crate::css::{CssParser, Rule, Simple};
-use crate::dom::Document;
+use crate::dom::{bloom_slot, Document, BLOOM_WORDS};
 
 const INHERITED: &[(&str, &str)] = &[
     ("font-size", "16px"),
@@ -13,6 +16,7 @@ const INHERITED: &[(&str, &str)] = &[
     ("color", "black"),
     ("text-align", "left"),
     ("white-space", "normal"),
+    ("visibility", "visible"),
 ];
 
 fn parse_px(value: &str, default: f64) -> f64 {
@@ -53,7 +57,7 @@ fn bucket_key(rule: &Rule) -> BucketKey<'_> {
     BucketKey::Universal
 }
 
-struct RuleIndex<'r> {
+pub(crate) struct RuleIndex<'r> {
     by_id: HashMap<&'r str, Vec<usize>>,
     by_class: HashMap<&'r str, Vec<usize>>,
     by_tag: HashMap<&'r str, Vec<usize>>,
@@ -62,7 +66,7 @@ struct RuleIndex<'r> {
 }
 
 impl<'r> RuleIndex<'r> {
-    fn new(rules: &'r [Rule]) -> Self {
+    pub(crate) fn new(rules: &'r [Rule]) -> Self {
         let mut idx = RuleIndex {
             by_id: HashMap::new(),
             by_class: HashMap::new(),
@@ -87,35 +91,70 @@ impl<'r> RuleIndex<'r> {
         idx
     }
 
-    fn matching(&self, doc: &Document, node_idx: usize) -> Vec<usize> {
+    /// Rules whose rightmost compound could match this node, by bucket.
+    /// Split out of `matching` so the perf harness can measure selector
+    /// interpretation without the caller's allocations.
+    fn gather_candidates(
+        &self,
+        doc: &Document,
+        node_idx: usize,
+        out: &mut Vec<usize>,
+    ) {
+        out.clear();
         let node = &doc.nodes[node_idx];
-        let mut candidates: Vec<usize> = Vec::new();
         if let Some(tag) = node.tag.as_deref() {
             if let Some(v) = self.by_tag.get(tag) {
-                candidates.extend_from_slice(v);
+                out.extend_from_slice(v);
             }
         }
         for cls in &node.classes {
             if let Some(v) = self.by_class.get(cls.as_str()) {
-                candidates.extend_from_slice(v);
+                out.extend_from_slice(v);
             }
         }
         if let Some(id) = node.attr("id") {
             if let Some(v) = self.by_id.get(id) {
-                candidates.extend_from_slice(v);
+                out.extend_from_slice(v);
             }
         }
-        candidates.extend_from_slice(&self.universal);
+        out.extend_from_slice(&self.universal);
+    }
 
-        let mut matched: Vec<usize> = candidates
-            .into_iter()
-            .filter(|&o| self.rules[o].selector.matches(doc, node_idx))
-            .collect();
-        // cascade: sort by (origin, specificity, source order) —
-        // must mirror compute_styles' global sort
-        matched.sort_by_key(|&o| {
-            (self.rules[o].origin, self.rules[o].selector.specificity, o)
-        });
+    /// Rules matching this node, in cascade order, into `matched`.
+    /// Both buffers are caller-owned so a whole tree walk can share one
+    /// pair instead of allocating two Vecs per element.
+    pub(crate) fn matching_into(
+        &self,
+        doc: &Document,
+        node_idx: usize,
+        candidates: &mut Vec<usize>,
+        matched: &mut Vec<usize>,
+    ) {
+        self.gather_candidates(doc, node_idx, candidates);
+        matched.clear();
+        for &o in candidates.iter() {
+            if self.rules[o].selector.matches(doc, node_idx) {
+                matched.push(o);
+            }
+        }
+        // `rules` is pre-sorted by (origin, specificity) in
+        // `parse_sheets`, so ascending rule index already IS cascade
+        // order — origin, then specificity, then source order. Sorting
+        // the indices directly avoids re-reading every matched rule to
+        // rebuild a sort key.
+        matched.sort_unstable();
+    }
+
+    /// Allocating convenience wrapper (kept for callers that want an
+    /// owned result; the style pass uses `matching_into`).
+    pub(crate) fn matching(
+        &self,
+        doc: &Document,
+        node_idx: usize,
+    ) -> Vec<usize> {
+        let mut candidates = Vec::new();
+        let mut matched = Vec::new();
+        self.matching_into(doc, node_idx, &mut candidates, &mut matched);
         matched
     }
 }
@@ -125,12 +164,36 @@ pub fn compute_styles(doc: &mut Document, css_sources: &[String]) {
     compute_styles_vw(doc, css_sources, 1280.0);
 }
 
-/// As `compute_styles`, with an explicit viewport width for @media.
-pub fn compute_styles_vw(
-    doc: &mut Document,
+thread_local! {
+    /// The last stylesheet set parsed, keyed by content + viewport.
+    ///
+    /// Every restyle used to re-parse every sheet from source: hovering
+    /// a link re-parsed the page's entire CSS. Parsing is ~7% of a cold
+    /// style pass and 100% wasted on a restyle, which is the case that
+    /// has to hit 60fps. The honest fix is a caller-held `Stylesheet`
+    /// handle (it would also survive across documents); this keeps the
+    /// existing API while making a restyle free.
+    static PARSED: RefCell<Option<(u64, Vec<Rule>, Vec<Rule>)>> =
+        const { RefCell::new(None) };
+}
+
+fn sheet_key(css_sources: &[String], viewport_width: f64) -> u64 {
+    let mut h = DefaultHasher::new();
+    css_sources.len().hash(&mut h);
+    for src in css_sources {
+        src.hash(&mut h);
+    }
+    // @media is resolved at parse time, so the viewport is part of the
+    // identity of the parsed result.
+    viewport_width.to_bits().hash(&mut h);
+    h.finish()
+}
+
+/// Parse the sources into (normal rules, ::before/::after rules).
+pub(crate) fn parse_sheets(
     css_sources: &[String],
     viewport_width: f64,
-) {
+) -> (Vec<Rule>, Vec<Rule>) {
     let mut rules: Vec<Rule> = Vec::new();
     for (si, src) in css_sources.iter().enumerate() {
         let mut parser = CssParser::new(src);
@@ -150,32 +213,103 @@ pub fn compute_styles_vw(
 
     // ::before/::after rules style synthesized children — they must
     // not participate in normal matching
-    let pseudo_rules: Vec<Rule> = {
-        let mut ps = Vec::new();
-        rules.retain_mut(|r| {
-            if r.selector.pseudo.is_some() {
-                ps.push(Rule {
-                    selector: r.selector.clone(),
-                    decls: std::mem::take(&mut r.decls),
-                    origin: r.origin,
-                });
-                false
-            } else {
-                true
-            }
-        });
-        ps
-    };
-    let index = RuleIndex::new(&rules);
-    let root = doc.root;
-    let default_style: HashMap<String, String> = INHERITED
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    style_node(
-        doc, &index, &pseudo_rules, root, &default_style, 16.0,
-        &HashMap::new(),
-    );
+    let mut pseudo_rules = Vec::new();
+    rules.retain_mut(|r| {
+        if r.selector.pseudo.is_some() {
+            pseudo_rules.push(Rule {
+                selector: r.selector.clone(),
+                decls: std::mem::take(&mut r.decls),
+                origin: r.origin,
+            });
+            false
+        } else {
+            true
+        }
+    });
+    (rules, pseudo_rules)
+}
+
+/// Drop the parsed-stylesheet cache (so a benchmark can time a cold
+/// pass; nothing in the engine needs this).
+#[cfg(test)]
+pub(crate) fn clear_stylesheet_cache() {
+    PARSED.with(|c| *c.borrow_mut() = None);
+}
+
+/// As `compute_styles`, with an explicit viewport width for @media.
+pub fn compute_styles_vw(
+    doc: &mut Document,
+    css_sources: &[String],
+    viewport_width: f64,
+) {
+    let key = sheet_key(css_sources, viewport_width);
+    PARSED.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.as_ref().map_or(true, |(k, _, _)| *k != key) {
+            let (rules, pseudo) = parse_sheets(css_sources, viewport_width);
+            *cache = Some((key, rules, pseudo));
+        }
+        let (_, rules, pseudo_rules) = cache.as_ref().unwrap();
+
+        fill_ancestor_bloom(doc);
+        let index = RuleIndex::new(rules);
+        let root = doc.root;
+        let default_style: HashMap<String, String> = INHERITED
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut scratch = Scratch::default();
+        style_node(
+            doc, &index, pseudo_rules, root, &default_style, 16.0,
+            &HashMap::new(), &mut scratch,
+        );
+    });
+}
+
+/// Record every ancestor's tag/id/class names into each node's bloom
+/// filter, so `css::matches` can reject a descendant selector without
+/// walking to the root.
+pub(crate) fn fill_ancestor_bloom(doc: &mut Document) {
+    // All-ones means "unknown". Nodes not reachable from the root
+    // (detached subtrees querySelector can still see) keep it, so they
+    // are never rejected on the strength of a filter we never built.
+    doc.ancestor_bloom.clear();
+    doc.ancestor_bloom
+        .resize(doc.nodes.len(), [u64::MAX; BLOOM_WORDS]);
+
+    let mut stack = vec![(doc.root, [0u64; BLOOM_WORDS])];
+    while let Some((idx, from_ancestors)) = stack.pop() {
+        doc.ancestor_bloom[idx] = from_ancestors;
+        let mut with_me = from_ancestors;
+        let node = &doc.nodes[idx];
+        // must stay in step with what `compound_matches` compares:
+        // exact tag / class / id strings
+        if let Some(tag) = node.tag.as_deref() {
+            let (w, bit) = bloom_slot(tag);
+            with_me[w] |= bit;
+        }
+        for class in &node.classes {
+            let (w, bit) = bloom_slot(class);
+            with_me[w] |= bit;
+        }
+        if let Some(id) = node.attr("id") {
+            let (w, bit) = bloom_slot(id);
+            with_me[w] |= bit;
+        }
+        for &child in &node.children {
+            stack.push((child, with_me));
+        }
+    }
+    doc.ancestor_bloom_version = doc.version;
+}
+
+/// Buffers reused across the whole tree walk. `matching` used to
+/// allocate two Vecs per element; the matched set is consumed before
+/// the recursion, so one pair for the entire pass is enough.
+#[derive(Default)]
+struct Scratch {
+    candidates: Vec<usize>,
+    matched: Vec<usize>,
 }
 
 /// Strip quotes from a CSS `content` string; None when the rule makes
@@ -204,6 +338,7 @@ fn style_node(
     parent_style: &HashMap<String, String>,
     root_px: f64,
     parent_vars: &HashMap<String, String>,
+    scratch: &mut Scratch,
 ) {
     // synthesized children keep the style their host computed for
     // them; only their text child needs the inheritance pass
@@ -216,7 +351,7 @@ fn style_node(
         for child in children {
             style_node(
                 doc, index, pseudo_rules, child, &my_style, root_px,
-                parent_vars,
+                parent_vars, scratch,
             );
         }
         return;
@@ -234,8 +369,11 @@ fn style_node(
 
     if doc.nodes[idx].is_element() {
         // 2. cascade via rule index
-        for order in index.matching(doc, idx) {
-            for (prop, value) in &index.rules[order].decls {
+        index.matching_into(
+            doc, idx, &mut scratch.candidates, &mut scratch.matched,
+        );
+        for k in 0..scratch.matched.len() {
+            for (prop, value) in &index.rules[scratch.matched[k]].decls {
                 apply(&mut style, prop, value);
             }
         }
@@ -335,24 +473,29 @@ fn style_node(
         style.insert("font-size".to_string(), px_string(px));
     }
 
-    doc.nodes[idx].style = style;
-
-    let children = doc.nodes[idx].children.clone();
-    let my_style = doc.nodes[idx].style.clone();
     // the root element establishes the `rem` unit for the whole subtree
     let child_root_px = if idx == doc.root {
         parse_px(
-            my_style.get("font-size").map(String::as_str).unwrap_or("16px"),
+            style.get("font-size").map(String::as_str).unwrap_or("16px"),
             16.0,
         )
     } else {
         root_px
     };
-    for child in children {
+    // `style` stays owned here across the recursion: the children only
+    // ever need a shared reference to it, so storing it into the node
+    // first and cloning it back out was one full HashMap deep copy per
+    // element. The child list is walked by index rather than cloned for
+    // the same reason — and it must stay in the tree while the children
+    // are styled, because sibling and :nth-child selectors read it.
+    for k in 0..doc.nodes[idx].children.len() {
+        let child = doc.nodes[idx].children[k];
         style_node(
-            doc, index, pseudo_rules, child, &my_style, child_root_px, vars,
+            doc, index, pseudo_rules, child, &style, child_root_px, vars,
+            scratch,
         );
     }
+    doc.nodes[idx].style = style;
 
     // synthesize ::before/::after children from matching pseudo rules
     if doc.nodes[idx].is_element() {
@@ -369,7 +512,20 @@ fn synthesize_pseudos(
     idx: usize,
     vars: &HashMap<String, String>,
 ) {
+    if pseudo_rules.is_empty() {
+        return;
+    }
     for which in [0u8, 1u8] {
+        // Probe before building anything. The inherited style map below
+        // costs a HashMap and sixteen Strings, and hardly any element
+        // has a ::before or ::after — paying for it on every element of
+        // every page was most of what this function did.
+        if !pseudo_rules.iter().any(|r| {
+            r.selector.pseudo == Some(which)
+                && r.selector.matches(doc, idx)
+        }) {
+            continue;
+        }
         let mut style: HashMap<String, String> = HashMap::new();
         // inherited properties come from the host element
         for (prop, default) in INHERITED {
@@ -380,20 +536,15 @@ fn synthesize_pseudos(
                 .unwrap_or_else(|| default.to_string());
             style.insert(prop.to_string(), v);
         }
-        let mut any = false;
         for r in pseudo_rules {
             if r.selector.pseudo != Some(which)
                 || !r.selector.matches(doc, idx)
             {
                 continue;
             }
-            any = true;
             for (prop, value) in &r.decls {
                 apply(&mut style, prop, value);
             }
-        }
-        if !any {
-            continue;
         }
         // var() substitution with the host's variable scope
         let needs: Vec<String> = style
@@ -446,6 +597,15 @@ fn synthesize_pseudos(
             doc.new_text(text, pidx);
         }
     }
+    // Synthesizing a pseudo bumps `version`, which would retire the
+    // ancestor filter for the rest of the pass. Nothing here changes an
+    // existing node's ancestors, so the filter stays valid: mark the
+    // new nodes unknown and re-adopt the version.
+    if doc.ancestor_bloom.len() < doc.nodes.len() {
+        doc.ancestor_bloom
+            .resize(doc.nodes.len(), [u64::MAX; BLOOM_WORDS]);
+    }
+    doc.ancestor_bloom_version = doc.version;
 }
 
 // --- CSS custom properties (var) — mirrors Python style.py ------------
@@ -459,6 +619,12 @@ fn ident_byte(c: u8) -> bool {
 /// Next var(...) in value: (open_idx, end_idx_past_paren, inner).
 fn find_var(value: &str, from: usize) -> Option<(usize, usize, &str)> {
     let b = value.as_bytes();
+    // Fast reject: this runs for every property of every element, and
+    // a var() reference always contains '(' — most values contain none,
+    // so one scan beats the case-insensitive 4-byte compare per offset.
+    if from >= b.len() || !b[from..].contains(&b'(') {
+        return None;
+    }
     let mut i = from;
     while i + 4 <= b.len() {
         if b[i..i + 4].eq_ignore_ascii_case(b"var(")
@@ -563,6 +729,87 @@ fn expand_box(style: &mut HashMap<String, String>, prefix: &str, value: &str) {
     style.insert(format!("{prefix}-left"), l.into());
 }
 
+fn expand_axis(
+    style: &mut HashMap<String, String>,
+    start: &str,
+    end: &str,
+    value: &str,
+) {
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    if let Some(first) = parts.first() {
+        style.insert(start.into(), (*first).into());
+        style.insert(end.into(), parts.get(1).unwrap_or(first).to_string());
+    }
+}
+
+fn border_parts(value: &str) -> (Option<f64>, Option<String>, Option<&str>) {
+    let mut width: Option<f64> = None;
+    let mut line_style: Option<String> = None;
+    let mut color: Option<&str> = None;
+    for part in value.split_whitespace() {
+        let p = part.to_ascii_lowercase();
+        if matches!(p.as_str(), "none" | "hidden" | "solid" | "dashed"
+            | "dotted" | "double" | "groove" | "ridge" | "inset"
+            | "outset")
+        {
+            if p == "none" || p == "hidden" {
+                width = Some(0.0);
+            }
+            line_style = Some(p);
+        } else if let Some(w) = parse_size(&p) {
+            width = Some(w);
+        } else {
+            color = Some(part);
+        }
+    }
+    if width.is_none() && line_style.is_some() {
+        width = Some(if matches!(line_style.as_deref(), Some("none" | "hidden")) {
+            0.0
+        } else {
+            1.0
+        });
+    }
+    (width, line_style, color)
+}
+
+fn set_border_side(
+    style: &mut HashMap<String, String>,
+    side: &str,
+    width: Option<f64>,
+    line_style: Option<&str>,
+    color: Option<&str>,
+) {
+    if let Some(w) = width {
+        style.insert(format!("border-{side}-width"), px_string(w));
+    }
+    if let Some(s) = line_style {
+        style.insert(format!("border-{side}-style"), s.to_string());
+    }
+    if let Some(c) = color {
+        style.insert(format!("border-{side}-color"), c.to_string());
+    }
+}
+
+fn expand_border_box(
+    style: &mut HashMap<String, String>,
+    suffix: &str,
+    value: &str,
+) {
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    let values = match parts.len() {
+        1 => [parts[0], parts[0], parts[0], parts[0]],
+        2 => [parts[0], parts[1], parts[0], parts[1]],
+        3 => [parts[0], parts[1], parts[2], parts[1]],
+        4 => [parts[0], parts[1], parts[2], parts[3]],
+        _ => return,
+    };
+    for (side, part) in ["top", "right", "bottom", "left"]
+        .iter().zip(values.iter())
+    {
+        style.insert(format!("border-{side}-{suffix}"), (*part).to_string());
+    }
+}
+
 /// Mirror of Python's style.parse_size (default bases).
 fn parse_size(value: &str) -> Option<f64> {
     let v = value.trim().to_ascii_lowercase();
@@ -646,6 +893,35 @@ mod tests {
         let b = tag_style(&doc, "b");
         assert_eq!(b["flex-grow"], "0");
         assert_eq!(b["flex-basis"], "auto");
+    }
+
+    #[test]
+    fn logical_ltr_box_properties_expand() {
+        let doc = styled(
+            "p{margin-inline-start:20px;padding-inline:3px 5px;\
+                inline-size:40px;inset-block-start:7px}",
+            "<p>x</p>",
+        );
+        let p = tag_style(&doc, "p");
+        assert_eq!(p["margin-left"], "20px");
+        assert_eq!(p["padding-left"], "3px");
+        assert_eq!(p["padding-right"], "5px");
+        assert_eq!(p["width"], "40px");
+        assert_eq!(p["top"], "7px");
+    }
+
+    #[test]
+    fn physical_border_sides_expand_and_cascade_independently() {
+        let doc = styled(
+            ".g{border:none} textarea.g{border-bottom:8px solid transparent}",
+            "<textarea class=g></textarea>",
+        );
+        let ta = tag_style(&doc, "textarea");
+        assert_eq!(ta["border-top-width"], "0px");
+        assert_eq!(ta["border-right-width"], "0px");
+        assert_eq!(ta["border-bottom-width"], "8px");
+        assert_eq!(ta["border-bottom-style"], "solid");
+        assert_eq!(ta["border-bottom-color"], "transparent");
     }
 
     #[test]
@@ -934,27 +1210,47 @@ mod tests {
 
 fn apply(style: &mut HashMap<String, String>, prop: &str, value: &str) {
     let value = value.trim();
-    if prop == "margin" {
+    // Resolve the common logical box properties to the LTR physical box
+    // model while declarations are applied, preserving cascade order.
+    let prop = match prop {
+        "margin-inline-start" => "margin-left",
+        "margin-inline-end" => "margin-right",
+        "margin-block-start" => "margin-top",
+        "margin-block-end" => "margin-bottom",
+        "padding-inline-start" => "padding-left",
+        "padding-inline-end" => "padding-right",
+        "padding-block-start" => "padding-top",
+        "padding-block-end" => "padding-bottom",
+        "inset-inline-start" => "left",
+        "inset-inline-end" => "right",
+        "inset-block-start" => "top",
+        "inset-block-end" => "bottom",
+        "inline-size" => "width",
+        "block-size" => "height",
+        "min-inline-size" => "min-width",
+        "max-inline-size" => "max-width",
+        "min-block-size" => "min-height",
+        "max-block-size" => "max-height",
+        other => other,
+    };
+    if prop == "margin-inline" {
+        expand_axis(style, "margin-left", "margin-right", value);
+    } else if prop == "margin-block" {
+        expand_axis(style, "margin-top", "margin-bottom", value);
+    } else if prop == "padding-inline" {
+        expand_axis(style, "padding-left", "padding-right", value);
+    } else if prop == "padding-block" {
+        expand_axis(style, "padding-top", "padding-bottom", value);
+    } else if prop == "inset-inline" {
+        expand_axis(style, "left", "right", value);
+    } else if prop == "inset-block" {
+        expand_axis(style, "top", "bottom", value);
+    } else if prop == "margin" {
         expand_box(style, "margin", value);
     } else if prop == "padding" {
         expand_box(style, "padding", value);
     } else if prop == "border" {
-        let mut width: Option<f64> = None;
-        let mut color: Option<&str> = None;
-        for part in value.split_whitespace() {
-            let p = part.to_ascii_lowercase();
-            if p == "none" || p == "hidden" {
-                width = Some(0.0);
-            } else if matches!(p.as_str(), "solid" | "dashed" | "dotted"
-                | "double" | "groove" | "ridge" | "inset" | "outset")
-            {
-                continue;
-            } else if let Some(w) = parse_size(&p) {
-                width = Some(w);
-            } else {
-                color = Some(part);
-            }
-        }
+        let (mut width, line_style, color) = border_parts(value);
         match width {
             Some(w) => {
                 style.insert("border-width".into(), px_string(w));
@@ -963,11 +1259,30 @@ fn apply(style: &mut HashMap<String, String>, prop: &str, value: &str) {
                 style
                     .entry("border-width".into())
                     .or_insert_with(|| "1px".into());
+                width = Some(1.0);
             }
+        }
+        if let Some(ref s) = line_style {
+            style.insert("border-style".into(), s.clone());
         }
         if let Some(c) = color {
             style.insert("border-color".into(), c.to_string());
         }
+        for side in ["top", "right", "bottom", "left"] {
+            set_border_side(
+                style, side, width, line_style.as_deref(), color,
+            );
+        }
+    } else if matches!(prop, "border-top" | "border-right"
+        | "border-bottom" | "border-left")
+    {
+        let side = &prop[7..];
+        let (width, line_style, color) = border_parts(value);
+        set_border_side(style, side, width, line_style.as_deref(), color);
+    } else if matches!(prop, "border-width" | "border-style" | "border-color") {
+        let suffix = &prop[7..];
+        style.insert(prop.into(), value.into());
+        expand_border_box(style, suffix, value);
     } else if prop == "flex" {
         // flex: none | <grow> <shrink>? <basis>?
         if value.eq_ignore_ascii_case("none") {
@@ -1003,6 +1318,23 @@ fn apply(style: &mut HashMap<String, String>, prop: &str, value: &str) {
     } else if prop == "font" {
         // too complex to fully parse; ignore rather than misrender
     } else {
-        style.insert(prop.to_string(), value.to_string());
+        set(style, prop, value);
+    }
+}
+
+/// Set a declaration, reusing the stored String when the property is
+/// already present. An element matches dozens of rules that mostly
+/// re-set the same handful of properties, so `insert(k.to_string(),
+/// v.to_string())` was allocating (and immediately freeing) two Strings
+/// per declaration for the whole cascade.
+fn set(style: &mut HashMap<String, String>, prop: &str, value: &str) {
+    match style.get_mut(prop) {
+        Some(slot) => {
+            slot.clear();
+            slot.push_str(value);
+        }
+        None => {
+            style.insert(prop.to_string(), value.to_string());
+        }
     }
 }

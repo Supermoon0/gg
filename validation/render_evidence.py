@@ -50,7 +50,7 @@ def fetch_many(urls, base, binary=False):
 
 
 def render(name, url_str, height=800, expected_text=(), forbidden_text=(),
-           advance_ms=0.0):
+           advance_ms=0.0, min_images=0):
     t0 = time.perf_counter()
     url = net.URL(url_str)
     _h, body, url = net.request_text(url)
@@ -93,6 +93,11 @@ def render(name, url_str, height=800, expected_text=(), forbidden_text=(),
     d = DocumentLayout(nodes)
     d.layout(W, height)
     cmds = paint_tree(d, [])
+    image_count = sum(1 for command in cmds
+                      if hasattr(command, "image_id"))
+    if image_count < min_images:
+        raise AssertionError(
+            f"{name} image paint mismatch: {image_count} < {min_images}")
     painted_text = " ".join(
         c.text for c in cmds if hasattr(c, "text") and c.text)
     missing = [text for text in expected_text if text not in painted_text]
@@ -127,6 +132,6 @@ if __name__ == "__main__":
                advance_ms=3100.0)
     if "css" in targets:
         render("css", "file://" + os.path.join(HERE, "fixture_css.html"),
-               height=2100)
+               height=2100, min_images=1)
     if "js" in targets:
         render("js", "file://" + os.path.join(HERE, "fixture_js.html"))

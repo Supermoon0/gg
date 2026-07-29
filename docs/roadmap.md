@@ -235,10 +235,15 @@ timing-function 오버라이드.
 - [x] 현재 Rust/Python 소스로 release wheel 재빌드·재설치
 - [x] PR용 Windows/Linux 자동 검증 workflow 추가
 - [x] 실사이트 바스켓 정기·수동 workflow 추가
-- [ ] Python smoke 전체 실행
-- [ ] network/CSS/JSVM gauntlet 재실행
-- [ ] home/demo/css/js render evidence 재생성
-- [ ] 네이버와 사이트 바스켓 실브라우징 회귀
+- [x] Python smoke 전체 실행 — **437/437 통과 (2026-07-29, Windows)**
+- [x] network/CSS/JSVM gauntlet 재실행 — **network 47/47, CSS 23/23,
+      JSVM promised CLAIM 전부 통과 (2026-07-29)**
+- [x] home/demo/css/js render evidence 재생성 — **4종 생성·육안 확인
+      (2026-07-29)**. 이 과정에서 `<circle>`·`<rect>`가 회색 broken-image
+      placeholder로 나오던 SVG shape 누락을 발견해 path lowering과 smoke
+      회귀 검증을 추가했다.
+- [x] 네이버와 사이트 바스켓 실브라우징 회귀 — **9곳 완주, 8곳
+      읽을만함·의도적 소형 페이지 example만 빈약 (2026-07-29, Windows)**
 
 ## P0 — 안전성과 동적 렌더 정확성
 
@@ -358,6 +363,11 @@ timing-function 오버라이드.
   것으로 실제 봇월 — OOM이 아니라 정상. 정부24 "시간초과"는 배열 폭주는
   막혔으나 스크립트 루프가 명령어 예산(400M)을 다 태워 120s 소요, 프로세스
   타임아웃이 봉쇄.
+- 정부24 시간초과 재진단·해결(2026-07-29): Nuxt 루트 모듈에 있는
+  **1,240개 literal dynamic import 후보를 정적 import처럼 전부 선취**하던
+  모듈 그래프가 원인이었다. 동적 import를 실제 실행 시점에만 해석·fetch하도록
+  고쳐 **120s 시간초과 → 5.0s, 1,154 엘리먼트/80 텍스트, 읽을만함**으로
+  회복했다. 전체 9곳 재측정도 예외·시간초과 없이 완주했다.
 - **후속 과제**: (a) 실행 fuel이 명령어 수 기반이라 무거운 유한 루프가
   벽시계로 오래 걸릴 수 있다 — load 내 스크립트별 벽시계 예산 검토.
   (b) 근본 해결은 GC(현재 문자열 힙·객체가 문서 수명 내내 단조 증가).

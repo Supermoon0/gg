@@ -55,7 +55,12 @@ class Browser:
         self.document = None
         self.layout_list = []
         self.display_list = []
-        self.focus_node = None
+        # hover/focus state has to exist before the first mouse event.
+        # It used to be enough that render_page set it, because the
+        # first load blocked the event loop for most of a second; with
+        # the paint-first pipeline the window is live in ~30ms and
+        # on_motion can arrive before any page has loaded.
+        self._reset_interaction()
         self.history = []
         self.history_index = -1
         self.navigation_timeout = net.DEFAULT_TIMEOUT
@@ -304,6 +309,14 @@ class Browser:
             self.nodes, self._doc, self._css_sources, js_logs = \
                 self.renderer.commit(
                     url, body, timings=load_timings,
+                    # paint the pre-JS tree, then let the live loop run
+                    # the page's scripts and rebuild (it already handles
+                    # tick -> dom_changed -> frame). Waiting for every
+                    # script before the first pixel is what made naver
+                    # show nothing for ~660ms. GG_PAINT_FIRST=0 restores
+                    # the old blocking order.
+                    defer_scripts=(
+                        os.environ.get("GG_PAINT_FIRST", "1") != "0"),
                     cancel_token=self._loading_token)
             self._load_timings = load_timings
             self._hover_rules = any(
@@ -536,6 +549,9 @@ class Browser:
         engine = textengine.engine()
         if not keep_cache:
             engine.clear_images()
+            # the SVG/background handles name ids in the store we just
+            # emptied, so they have to go with it
+            textengine.clear_image_caches()
             self._img_by_src = {}
         img_nodes = [n for n in tree_to_list(nodes, [])
                      if isinstance(n, Element) and n.tag == "img"

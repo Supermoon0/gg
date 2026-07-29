@@ -1,6 +1,6 @@
 //! CSS parser (same grammar and error recovery as the Python parser).
 
-use crate::dom::Document;
+use crate::dom::{bloom_slot, Document};
 
 #[derive(Clone, Debug)]
 pub enum Simple {
@@ -97,6 +97,12 @@ impl Selector {
         let comp = &self.chain[upto - 1];
         match self.combinators[upto - 1] {
             Combinator::Descendant => {
+                // Most descendant candidates fail, and failing costs a
+                // full walk to the root. The ancestor filter answers
+                // "no" in a load and an AND.
+                if !ancestor_possible(doc, idx, comp) {
+                    return false;
+                }
                 let mut cur = doc.nodes[idx].parent;
                 while let Some(p) = cur {
                     if compound_matches(doc, p, comp)
@@ -137,6 +143,48 @@ impl Selector {
                 false
             }
         }
+    }
+}
+
+/// The most selective name in `compound` (id > class > tag) as an
+/// ancestor-bloom slot. `None` when nothing in it is hashable (`*`,
+/// `:hover`, attribute-only, `:not(...)` — whose inner names are
+/// negated and must never be looked up), and then the filter cannot
+/// reject.
+fn compound_bloom_slot(compound: &[Simple]) -> Option<(usize, u64)> {
+    let mut best: Option<(u8, &str)> = None;
+    for part in compound {
+        let cand = match part {
+            Simple::Id(v) => (3u8, v.as_str()),
+            Simple::Class(v) => (2, v.as_str()),
+            Simple::Tag(v) => (1, v.as_str()),
+            _ => continue,
+        };
+        if best.is_none_or(|(rank, _)| cand.0 > rank) {
+            best = Some(cand);
+        }
+    }
+    best.map(|(_, name)| bloom_slot(name))
+}
+
+/// Could any ancestor of `idx` match `compound`? `false` is definitive;
+/// `true` still needs the walk. Answers `true` whenever the filter is
+/// missing or stale, so a wrong answer is never possible — only a
+/// slower one.
+fn ancestor_possible(
+    doc: &Document,
+    idx: usize,
+    compound: &[Simple],
+) -> bool {
+    if doc.ancestor_bloom_version != doc.version {
+        return true;
+    }
+    let Some(filter) = doc.ancestor_bloom.get(idx) else {
+        return true;
+    };
+    match compound_bloom_slot(compound) {
+        Some((word, bit)) => filter[word] & bit != 0,
+        None => true,
     }
 }
 

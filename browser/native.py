@@ -185,24 +185,15 @@ class _ModuleGraph:
                     self.sources[key], base_url, module_key=key,
                     import_map=self.import_map)
             self.transforms[key] = transformed
-            # Start sibling fetches together before descending into the graph.
-            all_dependencies = (
-                transformed.dependencies + transformed.dynamic_dependencies)
-            for dependency in all_dependencies:
+            # Start static sibling fetches together before descending into
+            # the graph. Dynamic imports are requests, not dependencies of
+            # the initial graph: eagerly walking a modern chunk manifest can
+            # download thousands of routes the page never executes.
+            for dependency in transformed.dependencies:
                 self._source_future(dependency)
             for dependency, dependency_type in zip(
                     transformed.dependencies, transformed.dependency_types):
                 self._prepare(dependency, dependency_type)
-            # Literal dynamic imports are fetched and compiled up front so
-            # their factories remain usable after the Python loader returns,
-            # but they are not evaluated until import() is called.
-            for dependency, dependency_type in zip(
-                    transformed.dynamic_dependencies,
-                    transformed.dynamic_dependency_types):
-                try:
-                    self._prepare(dependency, dependency_type)
-                except Exception as exc:
-                    self.dynamic_errors[dependency] = exc
             self.prepare_state[key] = "prepared"
         except Exception as exc:
             self.prepare_state[key] = "errored"
@@ -238,7 +229,7 @@ class _ModuleGraph:
             "throw error;});};",
             "globalThis.__ggDynamicImport__ = "
             "globalThis.__ggDynamicImport__ || function(url){"
-            "return globalThis.__ggEvaluateModule__(url);};",
+            "return globalThis.__ggDynamicImportExpression__(url,url);};",
             "globalThis.__ggDynamicImportExpression__ = "
             "globalThis.__ggDynamicImportExpression__ || "
             "function(specifier, referrer, options){"
@@ -683,12 +674,72 @@ def _mark_framed(doc, framed, window_name=None):
         pass  # older wheel without the frame seam
 
 
+def can_defer_scripts(doc):
+    """Whether this document supports running its scripts separately.
+
+    Only the modern script-records path does; an older wheel keeps the
+    inline legacy loop in load_document.
+    """
+    return (hasattr(doc, "script_records")
+            and hasattr(doc, "fire_dom_content_loaded")
+            and hasattr(doc, "fire_load"))
+
+
+def run_page_scripts(doc, fetch_js, *, js_budget=8.0, page_url=None,
+                     network_backend=None, network_timeout=15.0,
+                     cancel_token=None, network_context=None,
+                     framed=False, window_name=None):
+    """Fetch and run a parsed document's scripts; returns console logs.
+
+    Split out of load_document so the caller can paint the pre-JS tree
+    first and run these afterwards — on naver that is the difference
+    between showing something at ~90ms and showing nothing until every
+    script has finished.
+    """
+    network_backend = _resolve_network_backend(network_backend)
+    logs = []
+    if page_url:
+        try:
+            doc.set_page_url(str(page_url))
+        except Exception:
+            pass  # older wheels have no set_page_url
+        _mark_framed(doc, framed, window_name)
+        # seed document.cookie from the network jar so page scripts see
+        # the server session before they run
+        try:
+            host = getattr(page_url, "host", None)
+            if host and hasattr(doc, "seed_cookies"):
+                jar = network_backend.cookies_for(
+                    page_url, context=network_context)
+                if jar:
+                    doc.seed_cookies(jar)
+        except Exception:
+            pass
+    loader = _ScriptLoader(
+        doc, fetch_js, js_budget, page_url,
+        network_backend=network_backend,
+        network_timeout=network_timeout,
+        cancel_token=cancel_token,
+        network_context=network_context)
+    logs.extend(loader.run(doc.script_records()))
+    # Fold only actual JS setter writes back into the network jar.
+    sync_cookie_writes(
+        doc, page_url, network_backend=network_backend,
+        network_context=network_context)
+    return logs
+
+
 def load_document(html, fetch_css, fetch_js=None, js_budget=8.0,
                   page_url=None, viewport_width=1280.0, timings=None,
                   network_backend=None, network_timeout=15.0,
                   cancel_token=None, network_context=None, framed=False,
-                  window_name=None):
+                  window_name=None, defer_scripts=False):
     """Full native front half: parse -> scripts -> styles -> tree.
+
+    defer_scripts skips the script stage entirely: the caller gets the
+    pre-JS tree to paint immediately and is responsible for calling
+    run_page_scripts() afterwards. Ignored when the document is too old
+    to support it (see can_defer_scripts).
 
     fetch_css(hrefs) / fetch_js(srcs) -> {url: text} keep networking
     in Python. Returns (root, doc_handle, css_sources, js_console).
@@ -726,6 +777,10 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=8.0,
     # overlap: stylesheets download while scripts fetch and run.
     # fetch_css must be UI-silent (it runs off the main thread); results
     # land in prefetched and net's cache, so the post-JS pass is free.
+    # declared before the prefetch thread starts: _warm reports into it,
+    # and a fetch_css that fails immediately would otherwise race the
+    # binding itself
+    logs = []
     pre_hrefs = [v for k, v in doc.stylesheet_entries() if k == "link"]
     prefetched = {}
     warm = None
@@ -733,41 +788,24 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=8.0,
         def _warm():
             try:
                 prefetched.update(fetch_css(pre_hrefs))
-            except Exception:
-                pass
+            except Exception as exc:
+                # swallowing this hid real network failures — the page
+                # rendered unstyled with nothing to explain why. Safe to
+                # append: warm.join() precedes every read of `logs`.
+                logs.append(f"[gg] css prefetch failed: {exc}")
         warm = threading.Thread(target=_warm, daemon=True)
         warm.start()
 
-    logs = []
     stage_started = time.perf_counter()
-    if (fetch_js is not None and hasattr(doc, "script_records")
-            and hasattr(doc, "fire_dom_content_loaded")
-            and hasattr(doc, "fire_load")):
-        if page_url:
-            try:
-                doc.set_page_url(str(page_url))
-            except Exception:
-                pass
-            _mark_framed(doc, framed, window_name)
-            try:
-                host = getattr(page_url, "host", None)
-                if host and hasattr(doc, "seed_cookies"):
-                    jar = network_backend.cookies_for(
-                        page_url, context=network_context)
-                    if jar:
-                        doc.seed_cookies(jar)
-            except Exception:
-                pass
-        loader = _ScriptLoader(
-            doc, fetch_js, js_budget, page_url,
+    if fetch_js is not None and defer_scripts and can_defer_scripts(doc):
+        pass  # the caller paints first, then calls run_page_scripts()
+    elif fetch_js is not None and can_defer_scripts(doc):
+        logs.extend(run_page_scripts(
+            doc, fetch_js, js_budget=js_budget, page_url=page_url,
             network_backend=network_backend,
-            network_timeout=network_timeout,
-            cancel_token=cancel_token,
-            network_context=network_context)
-        logs.extend(loader.run(doc.script_records()))
-        sync_cookie_writes(
-            doc, page_url, network_backend=network_backend,
-            network_context=network_context)
+            network_timeout=network_timeout, cancel_token=cancel_token,
+            network_context=network_context, framed=framed,
+            window_name=window_name))
     elif fetch_js is not None:
         import time
         entries = doc.script_entries()

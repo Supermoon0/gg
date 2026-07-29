@@ -7,10 +7,10 @@ from browser import keyboard, net
 from browser.html_parser import Element, HTMLParser, Text, tree_to_list
 from browser.css_parser import CSSParser
 from browser.style import (RuleIndex, cascade_priority, default_rules,
-                           style)
+                           parse_size, style)
 from browser.layout import (HSTEP, VSTEP, BlockLayout, DocumentLayout,
-                            ImageLayout, layout_tree_to_list, paint_tree,
-                            sticky_offset)
+                            ImageLayout, InlineBlockLayout,
+                            layout_tree_to_list, paint_tree, sticky_offset)
 from browser.pages import DEMO_PAGE
 
 passed = 0
@@ -109,6 +109,8 @@ check("CSS rule count (non-matching @media excluded, :hover kept)",
       len(rules) == 5, f"got {len(rules)}")
 ua = default_rules()
 check("UA stylesheet parses", len(ua) > 20, f"{len(ua)} rules")
+check("calc length combines percentages and pixels",
+      abs(parse_size("calc(100% - 560px)", 720) - 160) < 0.01)
 
 # :hover / :focus match only while the shell marks the node
 hov_dom = HTMLParser(
@@ -245,6 +247,16 @@ theme_p = _find(_styled(":where([data-theme=dark]){--x:#000} "
                         "p{color:var(--x,#eee)}", "<p>x</p>"), "p")
 check("attr-gated :where stays inert without the attribute",
       theme_p.style["color"] == "#eee", theme_p.style["color"])
+logical_p = _find(_styled(
+    "p{margin-inline-start:20px;padding-inline:3px 5px;"
+    "inline-size:40px;inset-block-start:7px}", "<p>x</p>"), "p")
+check("logical LTR box properties normalize to physical edges",
+      logical_p.style.get("margin-left") == "20px"
+      and logical_p.style.get("padding-left") == "3px"
+      and logical_p.style.get("padding-right") == "5px"
+      and logical_p.style.get("width") == "40px"
+      and logical_p.style.get("top") == "7px",
+      str(logical_p.style))
 
 # --- attribute selectors (M1: naver uses 636 of them) ---
 attr_hit = _find(_styled("[data-k=v]{color:red}",
@@ -380,10 +392,10 @@ check("data: font sources are accepted",
 
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
-                 "img.half{width:48px}",
+                 "img.half{width:48px} img.zero{width:0;height:0}",
                  '<img class=big width=10 height=10>'
                  '<img class=half>'
-                 '<img width=30 height=20>')
+                 '<img width=30 height=20><img class=zero width=30 height=20>')
 _ridoc = DocumentLayout(ri_dom)
 _ridoc.layout(400)
 _ims = [o for o in layout_tree_to_list(_ridoc, [])
@@ -397,6 +409,9 @@ check("CSS width alone keeps the intrinsic ratio",
 check("attrs still size an unstyled img",
       abs(_ims[2].width - 30) < 1 and abs(_ims[2].height - 20) < 1,
       f"{_ims[2].width:.0f}x{_ims[2].height:.0f}")
+check("explicit CSS zero size suppresses replaced intrinsic dimensions",
+      _ims[3].width == 0 and _ims[3].height == 0,
+      f"{_ims[3].width:.0f}x{_ims[3].height:.0f}")
 
 # transform: translate shifts the painted subtree, layout unaffected
 tf_dom = _styled(
@@ -432,6 +447,25 @@ check("transform % translate uses own border box",
       and _tpbox.top == _tpanchor.top - 40 - 20,
       f"box=({_tpbox.left}, {_tpbox.top}) anchor=({_tpanchor.left}, "
       f"{_tpanchor.top})")
+
+# Out-of-flow descendants must remain inside the transformed visual subtree.
+# The positioned-layout pass reparents them under DocumentLayout, so this
+# catches a lost ancestor transform (Naver's N logo drifting to mid-search).
+ta_dom = _styled(
+    "", '<div style="position:relative; width:200px; height:20px; '
+    'background-color:#abc123; transform:translateX(-50%)">'
+    '<div style="position:absolute; left:0; top:0; width:20px; '
+    'height:10px; background-color:#def456"></div></div>')
+_tadoc = DocumentLayout(ta_dom)
+_tadoc.layout(400)
+_tacmds = paint_tree(_tadoc, [])
+_taparent = next(c for c in _tacmds
+                 if getattr(c, "color", "") == "#abc123")
+_tachild = next(c for c in _tacmds
+                if getattr(c, "color", "") == "#def456")
+check("ancestor transform moves absolute descendants",
+      abs(_taparent.left - _tachild.left) < .01,
+      f"parent={_taparent.left} child={_tachild.left}")
 
 # scale(0) hides the subtree
 ts_dom = _styled(
@@ -1001,13 +1035,28 @@ if native.async_available():
         '</script></body></html>', lambda hrefs: {}, _fetch_import,
         page_url=net.URL("https://modules.test/index.html"),
         js_budget=2.0)
-    _import_tick_logs, _import_tick_fetches = _j_doc.tick(10.0)
+    _import_before_tick = list(_import_fetches)
+    _import_tick_logs, _import_tick_fetches = native.pump_script_requests(
+        _j_doc, 10.0)
+    for _import_request in _import_tick_fetches:
+        native.service_script_fetch(
+            _j_doc, net.URL("https://modules.test/index.html"),
+            _import_request)
+    _import_done_logs, _import_done_fetches = native.pump_script_requests(
+        _j_doc, microtasks_only=True)
     check("dynamic import defers evaluation and resolves its namespace",
           _import_logs == ["import-main"]
-          and list(_import_tick_logs) == [
-              "import-before", "lazy-evaluated", "import-value:8"]
-          and not _import_tick_fetches,
-          repr((_import_logs, list(_import_tick_logs))))
+          and list(_import_tick_logs) == ["import-before"]
+          and list(_import_done_logs) == [
+              "lazy-evaluated", "import-value:8"]
+          and not _import_done_fetches,
+          repr((_import_logs, list(_import_tick_logs),
+                list(_import_done_logs))))
+    check("literal dynamic import fetches only when it executes",
+          _import_before_tick == ["/import-main.js"]
+          and _import_fetches == [
+              "/import-main.js", "https://modules.test/lazy.js"],
+          repr((_import_before_tick, _import_fetches)))
     check("literal dynamic import participates in the URL fetch cache",
           _import_fetches.count("https://modules.test/lazy.js") == 1,
           repr(_import_fetches))
@@ -1033,13 +1082,21 @@ if native.async_available():
             page_url=net.URL("https://modules.test/index.html"),
             js_budget=2.0))
     _missing_import_tick_logs, _missing_import_tick_fetches = (
-        _mi_doc.tick(1.0))
+        native.pump_script_requests(_mi_doc, 1.0))
+    for _missing_import_request in _missing_import_tick_fetches:
+        native.service_script_fetch(
+            _mi_doc, net.URL("https://modules.test/index.html"),
+            _missing_import_request)
+    _missing_import_done_logs, _missing_import_done_fetches = (
+        native.pump_script_requests(_mi_doc, microtasks_only=True))
     check("failed dynamic import rejects without failing its parent module",
           _missing_import_logs == ["missing-import-main"]
-          and list(_missing_import_tick_logs) == ["missing-import:TypeError"]
-          and not _missing_import_tick_fetches,
+          and not _missing_import_tick_logs
+          and list(_missing_import_done_logs) == ["missing-import:TypeError"]
+          and not _missing_import_done_fetches,
           repr((_missing_import_logs,
-                list(_missing_import_tick_logs))))
+                list(_missing_import_tick_logs),
+                list(_missing_import_done_logs))))
 
     _computed_import_sources = {
         "/computed-import-main.js": (
@@ -1589,6 +1646,15 @@ check("opacity:0 subtree is not painted",
       "shown" in " ".join(_otexts) and "hidden" not in " ".join(_otexts),
       str(_otexts))
 
+vis_dom = _styled("", '<div style="visibility:hidden"><p>hidden</p></div>'
+                  '<p>shown</p>')
+_vdoc = DocumentLayout(vis_dom)
+_vdoc.layout(400)
+_vtexts = [c.text for c in paint_tree(_vdoc, []) if hasattr(c, "text")]
+check("visibility:hidden subtree keeps layout but is not painted",
+      "shown" in " ".join(_vtexts) and "hidden" not in " ".join(_vtexts),
+      str(_vtexts))
+
 ph_dom = _styled("", '<input placeholder="search here">')
 _pdoc2 = DocumentLayout(ph_dom)
 _pdoc2.layout(400)
@@ -1929,20 +1995,20 @@ for b in layout_tree_to_list(doc3, []):
             boxes[node_id] = b
 
 center = boxes["center"]
-# border-box 200 = content 176 + padding 20 + border 4, centered in 800:
-# auto margin (800-200)/2 = 300, + border-left 2 + padding-left 10 = 12
-check("margin auto centers", abs(center.x - (HSTEP + 300 + 12)) < 1,
+# content-box 200 + padding 20 + border 4 = 224, centered in 800:
+# auto margin (800-224)/2 = 288, + border-left 2 + padding-left 10 = 12
+check("margin auto centers", abs(center.x - (HSTEP + 288 + 12)) < 1,
       f"x={center.x}")
-check("width is border-box", abs(center.width - 176) < 1,
+check("width defaults to CSS content-box", abs(center.width - 200) < 1,
       f"w={center.width}")
 fa, fb, fc = boxes["fa"], boxes["fb"], boxes["fc"]
 check("flex row placement", fa.y == fb.y == fc.y and fa.x < fb.x < fc.x,
       f"x: {fa.x:.0f},{fb.x:.0f},{fc.x:.0f}")
-# the two auto items grow from their content basis and together consume
-# all free space; each gets ~half, up to the b/c glyph-width difference
-check("flex grow shares space",
-      abs((fb.width + fc.width) - (800 - 100)) < 1
-      and abs(fb.width - fc.width) < 4,
+# flex-grow defaults to zero: auto-basis siblings keep their max-content
+# width and leave unused room on the line.
+check("flex default does not grow auto items",
+      fb.width < 50 and fc.width < 50
+      and (fb.width + fc.width) < (800 - 100),
       f"fb.width={fb.width:.0f} fc.width={fc.width:.0f}")
 # a `flex:1 0 0` pane fills the row while a `flex:0 0 auto` label keeps
 # its content width (naver's nav tabs: the grow pane must not collapse)
@@ -1950,7 +2016,6 @@ lbl, nav = boxes["lbl"], boxes["nav"]
 check("flex:1 0 0 grows past a content-sized sibling",
       nav.width > 300 and lbl.width < 100 and lbl.x < nav.x,
       f"lbl.width={lbl.width:.0f} nav.width={nav.width:.0f}")
-
 # --- grid named lines, row spans, and collision-free auto placement ---
 GRID_PAGE = """<html><body style="margin:0">
 <div id=ng style="display:grid; width:400px; gap:10px;
@@ -1971,6 +2036,17 @@ GRID_PAGE = """<html><body style="margin:0">
   <div id=reserved style="grid-column:1 / span 2;
        grid-row:1 / span 2">reserved</div>
   <div id=auto-second>auto2</div>
+</div>
+<div id=g-center style="display:grid; width:300px; height:160px;
+     grid-template-rows:minmax(0,1fr);
+     justify-items:center; align-items:center">
+  <div id=g-center-item style="width:80px; height:40px">center</div>
+</div>
+<div id=g-auto style="display:grid; width:300px; height:160px;
+     grid-template-rows:minmax(0,1fr);
+     justify-items:center; align-items:center">
+  <div id=g-auto-item style="width:80px; height:40px;
+       margin-top:auto">auto</div>
 </div>
 </body></html>"""
 grid_dom = HTMLParser(GRID_PAGE).parse()
@@ -2007,6 +2083,20 @@ check("grid auto placement reserves later explicit spans",
       f"{grid_boxes['auto-first'].y - cg.y:.0f}) "
       f"auto2=({grid_boxes['auto-second'].x - cg.x:.0f},"
       f"{grid_boxes['auto-second'].y - cg.y:.0f})")
+g_center = grid_boxes["g-center"]
+center_item = grid_boxes["g-center-item"]
+check("grid justify-items and align-items center fixed-size items",
+      abs(center_item.x - (g_center.x + 110)) < 1
+      and abs(center_item.y - (g_center.y + 60)) < 1,
+      f"item=({center_item.x - g_center.x:.0f},"
+      f"{center_item.y - g_center.y:.0f})")
+g_auto = grid_boxes["g-auto"]
+auto_item = grid_boxes["g-auto-item"]
+check("grid auto block margin consumes remaining track space",
+      abs(auto_item.x - (g_auto.x + 110)) < 1
+      and abs(auto_item.y - (g_auto.y + 120)) < 1,
+      f"item=({auto_item.x - g_auto.x:.0f},"
+      f"{auto_item.y - g_auto.y:.0f})")
 
 STICKY_PAGE = """<html><body style="margin:0">
 <div id=stick-wrap style="height:300px">
@@ -2171,17 +2261,35 @@ FLEX2_PAGE = """<html><body style="margin: 0">
   <div id=grb style="flex: 2; height:10px">b</div>
   <div id=grc style="width:60px; height:10px">c</div>
 </div>
+<div id=intrinsic-row style="display:flex; width:300px">
+  <div id=intrinsic-fill style="flex:1 1 0; height:10px">fill</div>
+  <div id=intrinsic-tools style="display:flex; flex:0 0 auto">
+    <div id=intrinsic-a style="width:24px; padding:0 8px;
+         height:10px"></div>
+    <div id=intrinsic-b><span id=intrinsic-span
+         style="display:inline-block; width:24px;
+         padding:0 8px; height:10px"></span></div>
+  </div>
+</div>
+<div id=inline-host>text<span id=inline-atom
+     style="display:inline-block; width:24px;
+     padding:0 8px; height:10px"></span></div>
 </body></html>"""
 fdom = HTMLParser(FLEX2_PAGE).parse()
 style(fdom, sorted(ua, key=cascade_priority))
 fdoc = DocumentLayout(fdom)
 fdoc.layout(800)
 fb2 = {}
+inline_atoms = {}
 for b in layout_tree_to_list(fdoc, []):
     if isinstance(b, BlockLayout) and isinstance(b.node, Element):
         node_id = b.node.attributes.get("id")
         if node_id:
             fb2[node_id] = b
+    if isinstance(b, InlineBlockLayout) and isinstance(b.node, Element):
+        node_id = b.node.attributes.get("id")
+        if node_id:
+            inline_atoms[node_id] = b
 _j = fb2["jc"]
 check("justify-content:center leads with half the free space",
       abs(fb2["jca"].x - (_j.x + 100)) < 1
@@ -2207,6 +2315,19 @@ check("flex shorthand: grow factors split the remainder 1:2",
       and abs(fb2["grc"].width - 60) < 1,
       f"a={fb2['gra'].width:.0f} b={fb2['grb'].width:.0f} "
       f"c={fb2['grc'].width:.0f}")
+check("flex max-content includes definite descendants' padding boxes",
+      abs(fb2["intrinsic-tools"].width - 80) < 1
+      and abs(fb2["intrinsic-fill"].width - 220) < 1,
+      f"tools={fb2['intrinsic-tools'].width:.0f} "
+      f"fill={fb2['intrinsic-fill'].width:.0f} "
+      f"a={fb2['intrinsic-a'].outer_width():.0f} "
+      f"b={fb2['intrinsic-b'].outer_width():.0f} "
+      f"span={fb2['intrinsic-span'].outer_width():.0f}")
+check("line inline-block uses content-box width and survives measurement",
+      abs(inline_atoms["inline-atom"].width - 40) < 1
+      and abs(fb2["inline-atom"].outer_width() - 40) < 1,
+      f"atom={inline_atoms['inline-atom'].width:.0f} "
+      f"inner={fb2['inline-atom'].outer_width():.0f}")
 absbox = boxes["abs"]
 check("absolute positioning", abs(absbox.x - 50) < 1
       and abs(absbox.y - 300) < 1,
@@ -2214,6 +2335,25 @@ check("absolute positioning", abs(absbox.x - 50) < 1
 in_flow_h = boxes["flexbox"].y + boxes["flexbox"].height
 check("absolute is out of flow", doc3.height < 300,
       f"doc height={doc3.height:.0f}")
+
+CALC_LAYOUT_PAGE = """<html><body style="margin:0">
+<div id=calc-parent style="height:720px">
+  <div id=calc-child style="height:calc(100% - 560px)">calc</div>
+</div>
+</body></html>"""
+calc_dom = HTMLParser(CALC_LAYOUT_PAGE).parse()
+style(calc_dom, sorted(ua, key=cascade_priority))
+calc_doc = DocumentLayout(calc_dom)
+calc_doc.layout(800, 720)
+calc_boxes = {
+    b.node.attributes.get("id"): b
+    for b in layout_tree_to_list(calc_doc, [])
+    if isinstance(b, BlockLayout) and isinstance(b.node, Element)
+    and b.node.attributes.get("id")
+}
+check("calc percentage height uses definite parent height",
+      abs(calc_boxes["calc-child"].height - 160) < 1,
+      f"height={calc_boxes['calc-child'].height:.0f}")
 
 # --- mis-render regressions: relative offset, %/vh height, flex auto ---
 REGRESS_PAGE = """<html><body style="margin: 0">
@@ -2255,9 +2395,9 @@ check("relative offset shifts the box",
 check("relative offset is visual-only (siblings keep flow position)",
       abs(after.y - 40) < 1, f"after.y={after.y:.0f}")
 
-# height:200px parent (padding 10 -> content 180); child 50% = 90
+# content-box height:200px parent; child 50% = 100
 check("% height resolves against definite parent height",
-      abs(boxes4["half"].height - 90) < 1,
+      abs(boxes4["half"].height - 100) < 1,
       f"h={boxes4['half'].height:.0f}")
 check("% height without a base stays auto (not 0)",
       boxes4["pct"].height > 10, f"h={boxes4['pct'].height:.0f}")
@@ -2278,7 +2418,7 @@ check("100vh resolves against the viewport height",
       abs(boxes4["vh100"].height - 600) < 1,
       f"h={boxes4['vh100'].height:.0f}")
 check("% height unchanged by viewport pass",
-      abs(boxes4["half"].height - 90) < 1,
+      abs(boxes4["half"].height - 100) < 1,
       f"h={boxes4['half'].height:.0f}")
 
 # --- transparent rgba() must not paint (naver search box was a black box:
@@ -2441,6 +2581,19 @@ if native.available():
         img = getattr(svg_el, "_img", None)
         check("inline svg rasterizes", img is not None
               and img[1] == 50 and img[2] == 50, str(img))
+        SHAPE_SVG_PAGE = ('<html><body><svg viewBox="0 0 60 60">'
+                          '<circle cx="30" cy="30" r="24" fill="#0ea5e9"/>'
+                          '<rect x="22" y="22" width="16" height="16" '
+                          'fill="#facc15"/></svg></body></html>')
+        shape_svg_dom = HTMLParser(SHAPE_SVG_PAGE).parse()
+        style(shape_svg_dom, sorted(ua, key=cascade_priority))
+        textengine.load_svgs(shape_svg_dom)
+        shape_svg_el = next(n for n in tree_to_list(shape_svg_dom, [])
+                            if isinstance(n, Element) and n.tag == "svg")
+        shape_img = getattr(shape_svg_el, "_img", None)
+        check("inline svg circle and rect rasterize", shape_img is not None
+              and shape_img[1] == 60 and shape_img[2] == 60,
+              str(shape_img))
         import tkinter as _tk
         _r2 = _tk.Tk(); _r2.withdraw()
         from browser import layout as _layout2
@@ -4568,6 +4721,77 @@ if native.available():
     _sjp.close()
 else:
     print("[SKIP] scrollTop driver checks - native ggcore not built")
+
+# Physical border shorthands participate in the cascade side by side.
+# This is the exact structure used by Google's one-row search textarea:
+# a broad border:none reset, then a more-specific transparent bottom edge.
+_bs_dom = _styled(
+    ".g{border:none;padding:0;padding-top:14px;line-height:22px;"
+    "background-color:transparent}"
+    "textarea.g{border-bottom:8px solid transparent}",
+    "<textarea id=bs class=g rows=1></textarea>")
+_bs_node = next(n for n in tree_to_list(_bs_dom, [])
+                if isinstance(n, Element)
+                and n.attributes.get("id") == "bs")
+_bs_doc = DocumentLayout(_bs_dom)
+_bs_doc.layout(800, 600)
+_bs_box = next(o for o in layout_tree_to_list(_bs_doc, [])
+               if isinstance(o, BlockLayout) and o.node is _bs_node)
+check("border-side: specific bottom survives border:none reset",
+      _bs_node.style.get("border-top-width") == "0px"
+      and _bs_node.style.get("border-bottom-width") == "8px"
+      and _bs_box.bt == 0 and _bs_box.bb == 8,
+      repr((_bs_node.style, _bs_box.bt, _bs_box.bb)))
+check("textarea: rows intrinsic height composes with padding + border",
+      abs(_bs_box.height - 28.0) < 0.01
+      and abs(_bs_box.outer_height() - 50.0) < 0.01,
+      repr((_bs_box.height, _bs_box.outer_height())))
+check("forms: transparent authored textarea suppresses native face",
+      _bs_box._author_styled_face())
+
+# A block/flex box nested through an inline span still establishes its own
+# box. Its 24px content plus 8px side padding is a 40px flex base, not 24px.
+_nfi_dom = _styled(
+    "body{margin:0}.row{display:flex}.icon{display:inline-block}"
+    ".button{display:flex;width:24px;padding:0 8px}",
+    "<div class=row><div id=nfi class=icon><span>"
+    "<div class=button><span style='display:flex;width:24px;height:24px'>"
+    "</span></div></span></div></div>")
+_nfi_doc = DocumentLayout(_nfi_dom)
+_nfi_doc.layout(800, 600)
+_nfi_boxes = [o for o in layout_tree_to_list(_nfi_doc, [])
+              if isinstance(o, BlockLayout)
+              and getattr(o.node, "attributes", {}).get("id") == "nfi"]
+check("intrinsic flex: nested block includes its horizontal padding",
+      _nfi_boxes and abs(_nfi_boxes[0].outer_width() - 40.0) < 0.01,
+      repr([(b.width, b.outer_width()) for b in _nfi_boxes]))
+
+# An auto-width flex item must reserve a definite block descendant's width.
+# Naver's 64px shortcut links sit inside otherwise unsized <li> items; using
+# only the label text as the flex basis makes all service icons overlap.
+_nsl_dom = _styled(
+    "body{margin:0}.row{display:flex;width:676px}.item{display:block}"
+    ".link{display:block;width:64px;"
+    "height:20px}",
+    "<ul class=row><li id=nsl1 class=item><a class=link>메일</a></li>"
+    "<li id=nsl2 class=item style='margin-left:-3px'>"
+    "<a class=link>카페</a></li>"
+    "<li id=nsl3 class=item style='margin-left:-3px'>"
+    "<a class=link>블로그</a></li></ul>")
+_nsl_doc = DocumentLayout(_nsl_dom)
+_nsl_doc.layout(800, 600)
+_nsl_items = {
+    o.node.attributes.get("id"): o
+    for o in layout_tree_to_list(_nsl_doc, [])
+    if isinstance(o, BlockLayout)
+    and o.node.attributes.get("id", "").startswith("nsl")
+}
+check("intrinsic flex: definite block child sets auto item width",
+      len(_nsl_items) == 3
+      and all(abs(b.width - 64.0) < 0.01 for b in _nsl_items.values())
+      and abs(_nsl_items["nsl2"].x - _nsl_items["nsl1"].x - 61.0) < 0.01
+      and abs(_nsl_items["nsl3"].x - _nsl_items["nsl2"].x - 61.0) < 0.01,
+      repr([(k, b.x, b.width) for k, b in _nsl_items.items()]))
 
 check("overflow: a nested clip rect scrolls with its content",
       _sc_clip_before and _sc_clip_after

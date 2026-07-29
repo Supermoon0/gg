@@ -67,6 +67,24 @@ pub enum DocumentChild {
     Node(usize),
 }
 
+/// 256 bits per node. Sized so a deep node (~10 ancestors, ~6 names
+/// each) still leaves most bits clear — a saturated filter rejects
+/// nothing.
+pub const BLOOM_WORDS: usize = 4;
+
+/// Which (word, bit) a name occupies in an ancestor bloom filter.
+/// FNV-1a: this runs per candidate selector, so it has to be cheaper
+/// than the ancestor walk it replaces — SipHash is not.
+pub fn bloom_slot(name: &str) -> (usize, u64) {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in name.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let bit = h % (BLOOM_WORDS as u64 * 64);
+    ((bit / 64) as usize, 1u64 << (bit % 64))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quirks {
     NoQuirks,
@@ -137,6 +155,16 @@ pub struct Document {
     pub hover_chain: Vec<usize>,
     /// :focus state — the focused element, if any
     pub focused: Option<usize>,
+    /// Per-node bloom filter over every *ancestor's* tag, id and class
+    /// names. A descendant selector whose left compound is not in the
+    /// filter cannot match, so the ancestor walk is skipped entirely —
+    /// that walk is where a style pass spends most of its rejections.
+    /// Empty (or short) means "not built": callers must not reject.
+    pub ancestor_bloom: Vec<[u64; BLOOM_WORDS]>,
+    /// `version` when `ancestor_bloom` was built. The filter is only
+    /// trusted while this matches, so a DOM mutation silently disables
+    /// it rather than producing a wrong answer.
+    pub ancestor_bloom_version: u64,
     /// Explicit HTMLScriptElement.async property writes. A dynamically
     /// created script defaults to async, so `script.async = false` must be
     /// distinguishable from an untouched element with no async attribute.
@@ -159,6 +187,8 @@ impl Document {
             version: 0,
             hover_chain: Vec::new(),
             focused: None,
+            ancestor_bloom: Vec::new(),
+            ancestor_bloom_version: u64::MAX,
             script_async_overrides: HashMap::new(),
             script_created_dynamically: HashSet::new(),
         }

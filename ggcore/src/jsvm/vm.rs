@@ -383,6 +383,9 @@ pub(super) enum Native {
     /// accepts anything, returns undefined (window.addEventListener
     /// and friends — enough for feature-detecting bundles to proceed)
     Noop,
+    /// Browser collection APIs whose compatible empty result is an Array.
+    /// Callers commonly read `.length` or iterate the returned value.
+    EmptyArray,
     /// window.scrollTo / scrollBy / scroll: routed through the same
     /// host queue as element scrolling, with the DOC_NODE sentinel
     /// standing for the page's own scroller.
@@ -936,6 +939,7 @@ pub(super) struct Ids {
     pub(super) remove: u32,
     pub(super) set_attribute: u32,
     pub(super) get_attribute: u32,
+    pub(super) has_attribute: u32,
     pub(super) remove_attribute: u32,
     pub(super) add_event_listener: u32,
     pub(super) text_content: u32,
@@ -957,7 +961,8 @@ impl Default for Ids {
             query_selector_all: u32::MAX,
             get_elements_by_tag_name: u32::MAX, append_child: u32::MAX,
             remove: u32::MAX, set_attribute: u32::MAX,
-            get_attribute: u32::MAX, remove_attribute: u32::MAX,
+            get_attribute: u32::MAX, has_attribute: u32::MAX,
+            remove_attribute: u32::MAX,
             add_event_listener: u32::MAX,
             text_content: u32::MAX, inner_html: u32::MAX, id: u32::MAX,
             class_name: u32::MAX, body: u32::MAX, title: u32::MAX,
@@ -1147,6 +1152,15 @@ pub(super) struct St {
     /// reads/writes on these route to the style / data-* attributes.
     pub(super) style_nodes: HashMap<u32, u32>,
     pub(super) dataset_nodes: HashMap<u32, u32>,
+    /// The reverse: the proxy already handed out for a node. `el.style`
+    /// is specified to return the *same* object on every read; minting
+    /// a fresh one per read was both wrong (`el.style !== el.style`)
+    /// and unbounded — gg has no GC, and React reads `.style` on every
+    /// style update, so a live page pinned one object per read forever.
+    /// Safe to key on the node index: `St` is per document and the DOM
+    /// arena never renumbers.
+    pub(super) style_proxies: HashMap<u32, Value>,
+    pub(super) dataset_proxies: HashMap<u32, Value>,
     /// [[Prototype]] of function values (static inheritance:
     /// `Object.setPrototypeOf(Sub, Sup)`); static reads walk this.
     pub(super) fn_proto_chain: HashMap<u32, Value>,
@@ -1332,6 +1346,8 @@ impl St {
             set_data: HashMap::new(),
             style_nodes: HashMap::new(),
             dataset_nodes: HashMap::new(),
+            style_proxies: HashMap::new(),
+            dataset_proxies: HashMap::new(),
             fn_proto_chain: HashMap::new(),
             ready_state: "loading",
             ty_names: [Value::UNDEFINED; 6],
@@ -1642,19 +1658,10 @@ fn buffer_object(st: &mut St, bi: u32) -> Value {
     Value::UNDEFINED
 }
 
-/// ToIntegerOrInfinity, then clamped into 0..=n counting from the end
-/// when negative. NaN is zero — it is *not* "the argument was absent",
-/// which is a separate case the caller handles before getting here:
-/// `slice(0, NaN)` is an empty slice, `slice(0)` runs to the end.
-fn clamp_index(a: f64, n: usize) -> usize {
-    if a.is_nan() {
-        return 0;
-    }
-    if a == f64::INFINITY {
-        return n;
-    }
-    if a == f64::NEG_INFINITY {
-        return 0;
+/// `a` clamped into 0..=n, counting from the end when negative.
+fn clamp_index(a: f64, n: usize, dflt: usize) -> usize {
+    if !a.is_finite() {
+        return if a == f64::NEG_INFINITY { 0 } else { dflt };
     }
     let a = a.trunc();
     if a < 0.0 {
@@ -3902,10 +3909,16 @@ fn method_ref_dispatch(
     let idx_arg = |k: usize| -> f64 {
         nums.get(k).copied().unwrap_or(f64::NAN)
     };
-    let clamp = |v: f64, hi: f64| -> usize {
+    // String.prototype.slice/substr count negative indices from the end,
+    // while startsWith/endsWith/substring clamp them to zero.
+    let clamp_relative = |v: f64, hi: f64| -> usize {
         let v = if v.is_nan() { 0.0 } else { v };
         let v = if v < 0.0 { (hi + v).max(0.0) } else { v.min(hi) };
         v as usize
+    };
+    let clamp_absolute = |v: f64, hi: f64| -> usize {
+        let v = if v.is_nan() { 0.0 } else { v };
+        v.max(0.0).min(hi) as usize
     };
     match name.as_str() {
         // The plain string transforms, reached through the extracted
@@ -3930,7 +3943,7 @@ fn method_ref_dispatch(
                 .first()
                 .map(|&v| to_display(st, v))
                 .unwrap_or_default();
-            let from = clamp(idx_arg(1), len);
+            let from = clamp_absolute(idx_arg(1), len);
             let rest = String::from_utf16_lossy(&units[from.min(units.len())..]);
             Ok(Value::boolean(rest.starts_with(&needle)))
         }
@@ -3940,7 +3953,7 @@ fn method_ref_dispatch(
                 .map(|&v| to_display(st, v))
                 .unwrap_or_default();
             let end = if args.len() > 1 {
-                clamp(idx_arg(1), len)
+                clamp_absolute(idx_arg(1), len)
             } else {
                 units.len()
             };
@@ -3970,21 +3983,35 @@ fn method_ref_dispatch(
             }
             Ok(Value::number(found))
         }
-        "substring" | "substr" => {
-            let a = clamp(idx_arg(0), len);
-            let b = if args.len() > 1 {
-                if name == "substr" {
-                    (a + clamp(idx_arg(1), len)).min(units.len())
-                } else {
-                    clamp(idx_arg(1), len)
-                }
-            } else {
+        "substring" => {
+            let a = clamp_absolute(idx_arg(0), len);
+            let b = if args.get(1).is_none_or(|v| v.is_undefined()) {
                 units.len()
+            } else {
+                clamp_absolute(idx_arg(1), len)
             };
             let (a, b) = if a <= b { (a, b) } else { (b, a) };
             Ok(make_string(
                 st,
                 String::from_utf16_lossy(&units[a.min(units.len())..b.min(units.len())]),
+            ))
+        }
+        "substr" => {
+            let a = clamp_relative(idx_arg(0), len);
+            let remaining = units.len().saturating_sub(a);
+            let count = if args.get(1).is_none_or(|v| v.is_undefined()) {
+                remaining
+            } else {
+                let requested = idx_arg(1);
+                if requested.is_nan() || requested <= 0.0 {
+                    0
+                } else {
+                    (requested.min(remaining as f64)) as usize
+                }
+            };
+            Ok(make_string(
+                st,
+                String::from_utf16_lossy(&units[a..a + count]),
             ))
         }
         "padStart" | "padEnd" => {
@@ -4032,18 +4059,14 @@ fn method_ref_dispatch(
             }
             Ok(make_string(st, out))
         }
-        "slice" | "substring" => {
-            let a = clamp(idx_arg(0), len);
-            let b = if args.len() > 1 {
-                clamp(idx_arg(1), len)
+        "slice" => {
+            let a = clamp_relative(idx_arg(0), len);
+            let b = if args.get(1).is_some_and(|v| !v.is_undefined()) {
+                clamp_relative(idx_arg(1), len)
             } else {
                 len as usize
             };
-            let (a, b) = if name == "substring" && a > b {
-                (b, a)
-            } else {
-                (a, b.max(a))
-            };
+            let b = b.max(a);
             let out = String::from_utf16_lossy(&units[a..b]);
             Ok(make_string(st, out))
         }
@@ -6575,6 +6598,7 @@ fn do_native(
             Ok(Value::UNDEFINED)
         }
         Native::Noop => Ok(Value::UNDEFINED),
+        Native::EmptyArray => Ok(new_array(st, Vec::new())),
         Native::WinScroll { relative } => {
             // (x, y) or ({left, top, behavior})
             let a0 = if argc > 0 { st.regs[args_base] } else { Value::UNDEFINED };
@@ -8391,7 +8415,7 @@ fn host_fn(
             Ok(m)
         }
         TA_BUF_NEW => {
-            let n = to_number(st, mods, argv!(0))?;
+            let n = num_of(argv!(0))?;
             let n = if n.is_finite() && n > 0.0 { n as usize } else { 0 };
             if n > MAX_STR_BYTES {
                 return range_err("ArrayBuffer is too large");
@@ -8404,11 +8428,11 @@ fn host_fn(
                 return type_err("not an ArrayBuffer");
             };
             let n = st.buffers[bi as usize].len();
-            let a = clamp_index(to_number(st, mods, argv!(1))?, n);
+            let a = clamp_index(num_of(argv!(1))?, n, 0);
             let b = if argv!(2).is_undefined() {
                 n
             } else {
-                clamp_index(to_number(st, mods, argv!(2))?, n)
+                clamp_index(num_of(argv!(2))?, n, n)
             };
             let part = if b > a {
                 st.buffers[bi as usize][a..b].to_vec()
@@ -8444,7 +8468,7 @@ fn host_fn(
             };
             let kind = kind_from_index(num_of(argv!(3))? as usize);
             let blen = st.buffers[bi as usize].len();
-            let off = to_number(st, mods, argv!(1))?;
+            let off = num_of(argv!(1))?;
             let off = if off.is_finite() && off > 0.0 {
                 off as usize
             } else {
@@ -8458,7 +8482,7 @@ fn host_fn(
             let len = if argv!(2).is_undefined() {
                 (blen - off) / w
             } else {
-                let l = to_number(st, mods, argv!(2))?;
+                let l = num_of(argv!(2))?;
                 if l.is_finite() && l > 0.0 { l as usize } else { 0 }
             };
             if off + len * w > blen {
@@ -10201,6 +10225,11 @@ fn dom_method(
                 None => Value::NULL,
             });
         }
+        if key == ids.has_attribute {
+            let name = arg_string(st, args_base, argc, 0)?;
+            let found = doc.borrow().nodes[node_us].attr(&name).is_some();
+            return Ok(Value::boolean(found));
+        }
         if key == ids.remove_attribute {
             let name = arg_string(st, args_base, argc, 0)?;
             doc.borrow_mut().remove_attr(node_us, &name);
@@ -10775,14 +10804,23 @@ fn dom_get_prop(st: &mut St, key: u32, node: u32) -> Result<Value, VmError> {
             return Ok(obj);
         }
         "style" => {
-            // proxy: property access routes to the style attribute
+            // proxy: property access routes to the style attribute.
+            // One per node, reused: see style_proxies.
+            if let Some(&obj) = st.style_proxies.get(&node) {
+                return Ok(obj);
+            }
             let obj = new_plain_object(st);
             st.style_nodes.insert(obj.index(), node);
+            st.style_proxies.insert(node, obj);
             return Ok(obj);
         }
         "dataset" => {
+            if let Some(&obj) = st.dataset_proxies.get(&node) {
+                return Ok(obj);
+            }
             let obj = new_plain_object(st);
             st.dataset_nodes.insert(obj.index(), node);
+            st.dataset_proxies.insert(node, obj);
             return Ok(obj);
         }
         "parentNode" | "parentElement" => {
@@ -11081,6 +11119,7 @@ fn is_dom_method_name(name: &str) -> bool {
             | "getElementsByClassName"
             | "getElementsByName"
             | "getAttribute"
+            | "hasAttribute"
             | "setAttribute"
             | "setAttributeNS"
             | "removeAttribute"
@@ -13768,23 +13807,43 @@ fn exec_loop(
                             }
                         }
                         "slice" | "substring" => {
-                            let chars: Vec<char> = s.chars().collect();
-                            let len = chars.len() as i64;
-                            let ra = if argc > 0 { num_of(av0)? as i64 } else { 0 };
-                            let rb = if argc > 1 { num_of(av1)? as i64 } else { len };
+                            let units: Vec<u16> = s.encode_utf16().collect();
+                            let len = units.len() as f64;
+                            let ra = if argc > 0 {
+                                to_number(st, mods, av0)?
+                            } else {
+                                0.0
+                            };
+                            let rb = if argc > 1 && !av1.is_undefined() {
+                                to_number(st, mods, av1)?
+                            } else {
+                                len
+                            };
+                            let relative = |value: f64| -> usize {
+                                let value = if value.is_nan() { 0.0 } else { value };
+                                if value < 0.0 {
+                                    (len + value).max(0.0) as usize
+                                } else {
+                                    value.min(len) as usize
+                                }
+                            };
+                            let absolute = |value: f64| -> usize {
+                                let value = if value.is_nan() { 0.0 } else { value };
+                                value.max(0.0).min(len) as usize
+                            };
                             let (mut a, mut b);
                             if method == "slice" {
-                                a = if ra < 0 { (len + ra).max(0) } else { ra.min(len) };
-                                b = if rb < 0 { (len + rb).max(0) } else { rb.min(len) };
+                                a = relative(ra);
+                                b = relative(rb);
                             } else {
-                                a = ra.clamp(0, len);
-                                b = rb.clamp(0, len);
+                                a = absolute(ra);
+                                b = absolute(rb);
                                 if a > b {
                                     std::mem::swap(&mut a, &mut b);
                                 }
                             }
-                            let out: String = if a < b {
-                                chars[a as usize..b as usize].iter().collect()
+                            let out = if a < b {
+                                String::from_utf16_lossy(&units[a..b])
                             } else {
                                 String::new()
                             };
@@ -14021,16 +14080,21 @@ fn exec_loop(
                             let units: Vec<u16> =
                                 s.encode_utf16().collect();
                             let len = units.len() as f64;
-                            let start = av0.to_number_raw();
+                            let start = if argc > 0 {
+                                to_number(st, mods, av0)?
+                            } else {
+                                0.0
+                            };
+                            let start = if start.is_nan() { 0.0 } else { start };
                             let start = if start < 0.0 {
                                 (len + start).max(0.0)
                             } else {
                                 start.min(len)
                             } as usize;
-                            let count = if av1.is_undefined() {
+                            let count = if argc < 2 || av1.is_undefined() {
                                 units.len() - start
                             } else {
-                                (av1.to_number_raw().max(0.0) as usize)
+                                (to_number(st, mods, av1)?.max(0.0) as usize)
                                     .min(units.len() - start)
                             };
                             let out = String::from_utf16_lossy(

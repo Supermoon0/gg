@@ -275,6 +275,13 @@ class Shell:
             self.renderer.commit(
                 url, body, viewport_width=self._styled_width,
                 timings=load_timings,
+                # paint the pre-JS tree, then let tick_live run the
+                # page's scripts and rebuild — waiting for every script
+                # before the first pixel is what made naver take ~840ms
+                # to show anything. GG_PAINT_FIRST=0 restores the old
+                # blocking order.
+                defer_scripts=(
+                    os.environ.get("GG_PAINT_FIRST", "1") != "0"),
                 cancel_token=self._loading_token)
         for line in logs:
             print(f"[js console] {line}")
@@ -299,6 +306,9 @@ class Shell:
         # Paint the DOM committed by parser-time scripts first. Async data,
         # images and lazy cards continue from tick_live after this frame.
         self.engine.clear_images()
+        # the SVG/background handles name ids in the store we just
+        # emptied, so they have to go with it
+        textengine.clear_image_caches()
         self._img_by_src = {}
         self._deferred_resources = True
         self.scroll = 0

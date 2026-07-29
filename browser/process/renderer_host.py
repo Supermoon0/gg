@@ -215,6 +215,7 @@ def renderer_worker(connection, renderer_id):
                         net.URL(p["url"]), body,
                         viewport_width=float(p.get("viewport_width", 1280.0)),
                         timings=timings, framed=framed,
+                        defer_scripts=bool(p.get("defer_scripts", False)),
                         cancel_token=backend.new_cancel_token())
                     _worker_result(channel, request, {
                         "export": session.export(), "css_sources": css,

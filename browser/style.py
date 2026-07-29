@@ -22,6 +22,7 @@ INHERITED_PROPERTIES = {
     "color": "black",
     "text-align": "left",
     "white-space": "normal",
+    "visibility": "visible",
 }
 
 # The browser's built-in default styles.
@@ -30,7 +31,7 @@ head, script, style, title, meta, link, template, noscript { display: none; }
 input[type=hidden] { display: none; }
 input { height: 1.5em; width: 175px; }
 input[type=checkbox], input[type=radio] { width: 13px; height: 13px; }
-textarea { width: 250px; height: 3em; }
+textarea { width: 250px; }
 /* select is a replaced control: its own box paints the selected
    option's label plus a dropdown chevron, and its <option> children
    never flow (they stay in the DOM for submission and the a11y tree) */
@@ -115,7 +116,40 @@ def parse_size(value, percent_base=0.0, em_base=16.0):
              "min-content", "max-content", "fit-content"):
         return None
     try:
-        if v.endswith("px"):
+        if v.startswith("calc(") and v.endswith(")"):
+            # The overwhelmingly common calc() form in page layout is a
+            # linear sum/difference of lengths (Google's logo well uses
+            # ``calc(100% - 560px)``).  Treating it as unsupported made the
+            # declaration disappear and left min-height as the used height.
+            # Keep the evaluator deliberately small and fail closed for
+            # multiplication, division, nested functions, or stray tokens.
+            inner = v[5:-1]
+            term = re.compile(
+                r"\s*([+-]?)\s*((?:\d+(?:\.\d*)?|\.\d+))"
+                r"(rem|px|em|vw|vh|%)?")
+            pos = 0
+            total = 0.0
+            first = True
+            while pos < len(inner):
+                match = term.match(inner, pos)
+                if match is None or (not first and not match.group(1)):
+                    return None
+                sign = -1.0 if match.group(1) == "-" else 1.0
+                number = float(match.group(2))
+                unit = match.group(3) or ""
+                if unit == "rem":
+                    number *= 16.0
+                elif unit == "em":
+                    number *= em_base
+                elif unit in ("%", "vw", "vh"):
+                    number *= percent_base / 100.0
+                elif unit not in ("", "px"):
+                    return None
+                total += sign * number
+                pos = match.end()
+                first = False
+            out = total
+        elif v.endswith("px"):
             out = float(v[:-2])
         elif v.endswith("rem"):
             out = float(v[:-3]) * 16.0
@@ -360,34 +394,130 @@ def _expand_box(styles, prefix, value):
         styles[f"{prefix}-left"] = parts[3]
 
 
+def _expand_axis(styles, start, end, value):
+    parts = value.split()
+    if len(parts) == 1:
+        styles[start] = styles[end] = parts[0]
+    elif len(parts) >= 2:
+        styles[start], styles[end] = parts[0], parts[1]
+
+
+_BORDER_STYLES = {
+    "none", "hidden", "solid", "dashed", "dotted", "double",
+    "groove", "ridge", "inset", "outset",
+}
+
+
+def _border_parts(value):
+    """Return the width/style/color components of a border shorthand."""
+    width = None
+    line_style = None
+    color = None
+    for part in value.split():
+        p = part.casefold()
+        if p in _BORDER_STYLES:
+            line_style = p
+            if p in ("none", "hidden"):
+                width = 0.0
+        elif parse_size(p) is not None:
+            width = parse_size(p)
+        else:
+            color = part
+    if width is None and line_style is not None:
+        width = 0.0 if line_style in ("none", "hidden") else 1.0
+    return width, line_style, color
+
+
+def _set_border_side(styles, side, width, line_style, color):
+    if width is not None:
+        styles[f"border-{side}-width"] = px_str(width)
+    if line_style is not None:
+        styles[f"border-{side}-style"] = line_style
+    if color is not None:
+        styles[f"border-{side}-color"] = color
+
+
+def _expand_border_box(styles, suffix, value):
+    """Expand border-{width,style,color}: 1--4 values to four sides."""
+    parts = value.split()
+    if len(parts) == 1:
+        parts *= 4
+    elif len(parts) == 2:
+        parts = [parts[0], parts[1], parts[0], parts[1]]
+    elif len(parts) == 3:
+        parts = [parts[0], parts[1], parts[2], parts[1]]
+    if len(parts) >= 4:
+        for side, part in zip(("top", "right", "bottom", "left"), parts):
+            styles[f"border-{side}-{suffix}"] = part
+
+
 def _apply(styles, prop, value):
     """Apply one declaration, expanding simple shorthands."""
     value = value.strip()
-    if prop == "margin":
+    # Logical properties resolve LTR here. The public sites we render set
+    # their RTL overrides explicitly; normalizing at declaration time keeps
+    # cascade order intact and lets the physical box model consume them.
+    logical = {
+        "margin-inline-start": "margin-left",
+        "margin-inline-end": "margin-right",
+        "margin-block-start": "margin-top",
+        "margin-block-end": "margin-bottom",
+        "padding-inline-start": "padding-left",
+        "padding-inline-end": "padding-right",
+        "padding-block-start": "padding-top",
+        "padding-block-end": "padding-bottom",
+        "inset-inline-start": "left",
+        "inset-inline-end": "right",
+        "inset-block-start": "top",
+        "inset-block-end": "bottom",
+        "inline-size": "width",
+        "block-size": "height",
+        "min-inline-size": "min-width",
+        "max-inline-size": "max-width",
+        "min-block-size": "min-height",
+        "max-block-size": "max-height",
+    }
+    prop = logical.get(prop, prop)
+    if prop == "margin-inline":
+        _expand_axis(styles, "margin-left", "margin-right", value)
+    elif prop == "margin-block":
+        _expand_axis(styles, "margin-top", "margin-bottom", value)
+    elif prop == "padding-inline":
+        _expand_axis(styles, "padding-left", "padding-right", value)
+    elif prop == "padding-block":
+        _expand_axis(styles, "padding-top", "padding-bottom", value)
+    elif prop == "inset-inline":
+        _expand_axis(styles, "left", "right", value)
+    elif prop == "inset-block":
+        _expand_axis(styles, "top", "bottom", value)
+    elif prop == "margin":
         _expand_box(styles, "margin", value)
     elif prop == "padding":
         _expand_box(styles, "padding", value)
     elif prop == "border":
-        # "1px solid #ccc" in any order; "none"/"0" disables
-        width = None
-        color = None
-        for part in value.split():
-            p = part.casefold()
-            if p in ("none", "hidden"):
-                width = 0.0
-            elif p in ("solid", "dashed", "dotted", "double",
-                       "groove", "ridge", "inset", "outset"):
-                continue
-            elif parse_size(p) is not None:
-                width = parse_size(p)
-            else:
-                color = part
+        # Keep physical sides as well as compatibility shorthands. A later
+        # higher-specificity border-bottom must be able to override only the
+        # bottom after an earlier `border:none` reset (Google's textarea).
+        width, line_style, color = _border_parts(value)
         if width is not None:
             styles["border-width"] = px_str(width)
         elif "border-width" not in styles:
             styles["border-width"] = "1px"
+            width = 1.0
+        if line_style is not None:
+            styles["border-style"] = line_style
         if color:
             styles["border-color"] = color
+        for side in ("top", "right", "bottom", "left"):
+            _set_border_side(styles, side, width, line_style, color)
+    elif prop in ("border-top", "border-right", "border-bottom",
+                  "border-left"):
+        side = prop[7:]
+        _set_border_side(styles, side, *_border_parts(value))
+    elif prop in ("border-width", "border-style", "border-color"):
+        suffix = prop[7:]
+        styles[prop] = value
+        _expand_border_box(styles, suffix, value)
     elif prop == "flex":
         # flex: none | <grow> <shrink>? <basis>?
         v = value.casefold()

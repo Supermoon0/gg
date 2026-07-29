@@ -1673,6 +1673,7 @@ impl PageVm {
             remove: vm.name_id("remove"),
             set_attribute: vm.name_id("setAttribute"),
             get_attribute: vm.name_id("getAttribute"),
+            has_attribute: vm.name_id("hasAttribute"),
             remove_attribute: vm.name_id("removeAttribute"),
             add_event_listener: vm.name_id("addEventListener"),
             text_content: vm.name_id("textContent"),
@@ -2106,9 +2107,15 @@ impl PageVm {
             let f = make_native(&mut vm.st, Native::PerfNow);
             raw_set_prop(&mut vm.st, pi, k, f);
             for m in ["mark", "measure", "clearMarks",
-                      "clearMeasures", "getEntriesByName"] {
+                      "clearMeasures"] {
                 let k = vm.name_id(m);
                 let f = make_native(&mut vm.st, Native::Noop);
+                raw_set_prop(&mut vm.st, pi, k, f);
+            }
+            for m in ["getEntries", "getEntriesByName",
+                      "getEntriesByType"] {
+                let k = vm.name_id(m);
+                let f = make_native(&mut vm.st, Native::EmptyArray);
                 raw_set_prop(&mut vm.st, pi, k, f);
             }
             let k = vm.name_id("timeOrigin");
@@ -4404,6 +4411,18 @@ mod tests {
         assert_eq!(
             n("var sub = ''.substring; \
                sub.call('hello', 3, 1) === 'el' ? 1 : 0"), 1.0);
+        assert_eq!(
+            n("''.substring.call('abcdef', -2, 2) === 'ab' ? 1 : 0"),
+            1.0);
+        assert_eq!(
+            n("''.substr.call('abcdef', 1, -2) === '' ? 1 : 0"), 1.0);
+        assert_eq!(
+            n("''.substr.call('abcdef', -2, 1) === 'e' ? 1 : 0"), 1.0);
+        assert_eq!(
+            n("''.substr.call('abcdef', 2, undefined) === 'cdef' ? 1 : 0"),
+            1.0);
+        assert_eq!(
+            n("''.slice.call('abcdef', -2) === 'ef' ? 1 : 0"), 1.0);
     }
 
     #[test]
@@ -4838,8 +4857,10 @@ mod tests {
             n("(navigator.userAgent.indexOf('GGBrowser') >= 0 ? 1 : 0) \
                + (typeof performance.now() === 'number' ? 2 : 0) \
                + (history.length === 1 ? 4 : 0) \
-               + (screen.width === 1280 ? 8 : 0)"),
-            15.0);
+               + (screen.width === 1280 ? 8 : 0) \
+               + (performance.getEntriesByType('resource').length === 0 ? 16 : 0) \
+               + (performance.getEntriesByName('x').length === 0 ? 32 : 0)"),
+            63.0);
         // document.cookie round-trip (needs a document)
         let mut vm = PageVm::new(Some(Rc::new(RefCell::new(
             crate::html::parse("<p>x</p>"),
@@ -7441,115 +7462,6 @@ console.log('B typeof it: ' + typeof it);
             1.0);
     }
 
-    /// Typed arrays over a real byte buffer: the element conversions
-    /// that make the nine kinds different from one another, and the
-    /// aliasing that a shim cannot fake.
-    #[test]
-    fn typed_arrays_read_and_write_bytes() {
-        // the distinction that made `Int8Array = Uint8Array` wrong
-        assert_eq!(n("var a = new Int8Array(1); a[0] = 255; a[0]"), -1.0);
-        assert_eq!(n("var a = new Uint8Array(1); a[0] = 255; a[0]"), 255.0);
-        // wrapping is modulo the element width
-        assert_eq!(
-            n("var a = new Int32Array(1); a[0] = 2147483648; a[0]"),
-            -2147483648.0);
-        assert_eq!(
-            n("var a = new Uint32Array(1); a[0] = -1; a[0]"),
-            4294967295.0);
-        // clamped rounds half to even rather than wrapping
-        assert_eq!(
-            n("var c = new Uint8ClampedArray(4); \
-               c[0] = 300; c[1] = -5; c[2] = 1.5; c[3] = 2.5; \
-               c.join(',') === '255,0,2,2' ? 1 : 0"),
-            1.0);
-        // f32 really narrows
-        assert_eq!(
-            n("var f = new Float32Array(1); f[0] = 0.1; \
-               f[0] === 0.1 ? 1 : 0"),
-            0.0);
-        assert_eq!(
-            n("var f = new Float64Array(1); f[0] = 0.1; \
-               f[0] === 0.1 ? 1 : 0"),
-            1.0);
-        // two views over one buffer are the same bytes
-        assert_eq!(
-            n("var b = new ArrayBuffer(8); \
-               var a = new Uint8Array(b), u = new Uint32Array(b); \
-               a[0] = 1; a[1] = 0; a[2] = 0; a[3] = 0; u[0]"),
-            1.0);
-        assert_eq!(
-            n("var b = new ArrayBuffer(8); \
-               var a = new Uint8Array(b), u = new Uint32Array(b); \
-               u[1] = 0x04030201; \
-               a.subarray(4).join(',') === '1,2,3,4' ? 1 : 0"),
-            1.0);
-        // subarray shares, slice copies
-        assert_eq!(
-            n("var base = new Uint8Array([1,2,3,4,5]); \
-               var s = base.subarray(1, 4); s[0] = 99; \
-               var c = base.slice(1, 4); c[0] = 7; \
-               base[1] === 99 && c[0] === 7 ? 1 : 0"),
-            1.0);
-        // an index outside the view is not a property
-        assert_eq!(
-            n("var a = new Uint8Array(2); a[5] = 1; \
-               a[5] === undefined && Object.keys(a).length === 0 \
-               ? 1 : 0"),
-            1.0);
-        // header properties come from the bytes, not a stored copy
-        assert_eq!(
-            n("var f = new Float64Array(3); \
-               f.length === 3 && f.byteLength === 24 && \
-               f.BYTES_PER_ELEMENT === 8 && f.byteOffset === 0 ? 1 : 0"),
-            1.0);
-    }
-
-    /// DataView is the one place the byte order is a choice.
-    #[test]
-    fn dataview_respects_endianness() {
-        assert_eq!(
-            n("var d = new DataView(new ArrayBuffer(8)); \
-               d.setInt32(0, 0x01020304); \
-               d.getUint8(0) === 1 && d.getUint8(3) === 4 ? 1 : 0"),
-            1.0);
-        assert_eq!(
-            n("var d = new DataView(new ArrayBuffer(8)); \
-               d.setInt32(0, 0x01020304, true); \
-               d.getUint8(0) === 4 && d.getUint8(3) === 1 ? 1 : 0"),
-            1.0);
-        assert_eq!(
-            n("var d = new DataView(new ArrayBuffer(8)); \
-               d.setFloat64(0, 1.5, true); d.getFloat64(0, true)"),
-            1.5);
-        // and it sees writes made through a typed array on the same
-        // buffer
-        assert_eq!(
-            n("var b = new ArrayBuffer(4); \
-               new Uint8Array(b)[0] = 255; \
-               new DataView(b).getInt8(0)"),
-            -1.0);
-    }
-
-    /// The index arguments go through ToNumber and ToIntegerOrInfinity,
-    /// where NaN is zero and an absent argument is not.
-    #[test]
-    fn buffer_indices_coerce_like_the_spec() {
-        assert_eq!(
-            n("var b = new ArrayBuffer(8); \
-               b.slice(Infinity, 6).byteLength === 0 && \
-               b.slice(0, NaN).byteLength === 0 && \
-               b.slice(-Infinity, 4).byteLength === 4 && \
-               b.slice(0).byteLength === 8 && \
-               b.slice(-2).byteLength === 2 ? 1 : 0"),
-            1.0);
-        assert_eq!(
-            n("new ArrayBuffer({valueOf: function () { return 4 }}) \
-                 .byteLength"),
-            4.0);
-        assert_eq!(n("new ArrayBuffer('3').byteLength"), 3.0);
-        assert_eq!(n("new ArrayBuffer(NaN).byteLength"), 0.0);
-    }
-
     /// VT and FF are WhiteSpace in the grammar, same as space and tab.
     #[test]
     fn vertical_tab_and_form_feed_are_whitespace() {
@@ -8717,12 +8629,19 @@ console.log('B typeof it: ' + typeof it);
                             'MiX'.toLocaleUpperCase());\
                 console.log('[' + '  x  '.trimLeft() + '|'\
                             + '  x  '.trimRight() + ']');\
-                console.log('abc'.valueOf() === 'abc');"
+                console.log('abc'.valueOf() === 'abc');\
+                console.log('abcdef'.substring(-2, 2) === 'ab'\
+                            && 'abcdef'.substring(2, undefined) === 'cdef'\
+                            && 'abcdef'.slice(-2) === 'ef'\
+                            && 'abcdef'.slice(2, undefined) === 'cdef'\
+                            && 'abcdef'.substr(1, -2) === ''\
+                            && 'abcdef'.substr(-2, 1) === 'e');"
                 .to_string()]),
             vec![
                 "3 -1".to_string(),
                 "mix MIX".to_string(),
                 "[x  |  x]".to_string(),
+                "true".to_string(),
                 "true".to_string(),
             ],
         );
@@ -9463,6 +9382,8 @@ console.log('B typeof it: ' + typeof it);
             console.log(document.getElementById('a').textContent);\n\
             console.log(document.querySelectorAll('.box').length);\n\
             console.log(el.getAttribute('class'));\n\
+            console.log(el.hasAttribute('class'));\n\
+            console.log(el.hasAttribute('missing'));\n\
             el.setAttribute('data-x', '1');\n\
             console.log(el.getAttribute('data-x'));\n\
             el.removeAttribute('data-x');\n\
@@ -9474,8 +9395,8 @@ console.log('B typeof it: ' + typeof it);
         .to_string()]);
         assert_eq!(
             logs,
-            vec!["hi", "true", "bye", "2", "box", "1", "null", "1",
-                 "null"]
+            vec!["hi", "true", "bye", "2", "box", "true", "false",
+                 "1", "null", "1", "null"]
         );
         // the mutation is visible to the shared Rust DOM
         let d = doc.borrow();

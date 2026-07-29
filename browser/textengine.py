@@ -26,12 +26,35 @@ def has_family(name):
     return _engine is not None and _engine.has_family(name)
 
 
+# Handles for rasterized SVGs and decoded background images, keyed by
+# whatever determines the result. The engine's image store hands out a
+# fresh id per call and never evicts, and these two loaders re-ran for
+# every element on every DOM mutation — naver mutates on nearly every
+# tick, so the store grew without bound (hundreds of MB in a minute).
+# `<img>` was already covered by browser/shell's _img_by_src; these two
+# had no cache at all. Cleared with the engine's store on navigation:
+# the ids are only valid while it keeps them.
+_svg_cache = {}
+_bg_cache = {}
+
+
+def clear_image_caches():
+    """Drop cached SVG/background handles. Must accompany every
+    engine.clear_images() — the ids outlive nothing."""
+    _svg_cache.clear()
+    _bg_cache.clear()
+
+
 def load_svgs(nodes):
     """Rasterize every inline <svg> to an image handle (node._img),
     so layout/paint treat it exactly like an <img>. Fill resolution:
     computed style `fill` (inline style attr included via the cascade)
     beats the presentation attribute; the svg element's fill inherits
-    to paths; default is black. `fill: none` paths are skipped."""
+    to shapes; default is black. `fill: none` shapes are skipped.
+
+    The native rasterizer consumes path data, so basic circle and rect
+    elements are lowered to equivalent paths before crossing the binding.
+    """
     if _engine is None:
         return
     from .colors import to_rgb
@@ -49,16 +72,45 @@ def load_svgs(nodes):
                 return None if c == "none" else to_rgb(c)
         return to_rgb("black")
 
+    def number(node, name, default=0.0):
+        try:
+            return float(node.attributes.get(name, default))
+        except (TypeError, ValueError):
+            return default
+
+    def shape_path(node):
+        if node.tag == "path":
+            return node.attributes.get("d") or None
+        if node.tag == "rect":
+            x, y = number(node, "x"), number(node, "y")
+            width, height = number(node, "width"), number(node, "height")
+            if width <= 0 or height <= 0:
+                return None
+            return (f"M{x} {y}H{x + width}V{y + height}"
+                    f"H{x}Z")
+        if node.tag == "circle":
+            cx, cy, radius = (number(node, "cx"), number(node, "cy"),
+                              number(node, "r"))
+            if radius <= 0:
+                return None
+            return (f"M{cx - radius} {cy}"
+                    f"A{radius} {radius} 0 1 0 {cx + radius} {cy}"
+                    f"A{radius} {radius} 0 1 0 {cx - radius} {cy}Z")
+        return None
+
     for svg in tree_to_list(nodes, []):
         if not (isinstance(svg, Element) and svg.tag == "svg"):
             continue
         paths = []
         for n in tree_to_list(svg, []):
-            if isinstance(n, Element) and n.tag == "path" \
-                    and n.attributes.get("d"):
+            if isinstance(n, Element):
+                path = shape_path(n)
+            else:
+                path = None
+            if path:
                 rgb = fill_of(n, svg)
                 if rgb is not None:
-                    paths.append((n.attributes["d"], rgb))
+                    paths.append((path, rgb))
         vb = (svg.attributes.get("viewbox")
               or svg.attributes.get("viewBox") or "").split()
         try:
@@ -75,8 +127,16 @@ def load_svgs(nodes):
             continue
         out_w = max(1, round(vw))
         out_h = max(1, round(vh))
-        svg._img = _engine.load_svg(
-            (vx, vy, vw, vh), out_w, out_h, paths)
+        # these inputs fully determine the raster, so the same icon
+        # redrawn next tick reuses the handle instead of minting one
+        key = (vx, vy, vw, vh, out_w, out_h,
+               tuple((d, tuple(rgb)) for d, rgb in paths))
+        handle = _svg_cache.get(key)
+        if handle is None:
+            handle = _engine.load_svg(
+                (vx, vy, vw, vh), out_w, out_h, paths)
+            _svg_cache[key] = handle
+        svg._img = handle
 
 
 def load_background_images(nodes, fetch_raw):
@@ -98,16 +158,19 @@ def load_background_images(nodes, fetch_raw):
     if not jobs:
         return
     urls = list({spec["url"] for _n, spec in jobs})
-    raw = fetch_raw(urls)
-    handles = {}
-    for u in urls:
+    # only fetch and decode what is not already held: this used to
+    # re-download and re-decode every background layer on every DOM
+    # mutation, and each decode was a permanent entry in the store
+    missing = [u for u in urls if u not in _bg_cache]
+    raw = fetch_raw(missing) if missing else {}
+    for u in missing:
         data = raw.get(u)
         try:
-            handles[u] = _engine.load_image(data) if data else None
+            _bg_cache[u] = _engine.load_image(data) if data else None
         except Exception:
-            handles[u] = None
+            _bg_cache[u] = None
     for n, spec in jobs:
-        img = handles.get(spec["url"])
+        img = _bg_cache.get(spec["url"])
         if img:
             n._bg = (img[0], img[1], img[2], spec)
 
