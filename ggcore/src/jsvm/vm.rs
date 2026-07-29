@@ -1784,6 +1784,12 @@ fn wrap_regex(
     let rv = Value::object((st.objects.len() - 1) as u32);
     // real instance properties (jQuery reads .source to rebuild
     // regexes: m.expr.match.bool.source.match(/\w+/g))
+    // Stored per instance rather than served from the prototype, which
+    // is a shortcut — but none of them are *enumerable* in a real
+    // engine (source and the flag booleans are prototype accessors
+    // there; lastIndex is an own non-enumerable). Leaving them
+    // enumerable put eight internal names into `for...in` over any
+    // regex, into Object.assign({}, re), and into JSON.stringify.
     let oi = rv.index() as usize;
     let sk = st.intern_name("source");
     let sv = push_str(st, pattern.to_string());
@@ -1803,6 +1809,11 @@ fn wrap_regex(
     }
     let lk = st.intern_name("lastIndex");
     raw_set_prop(st, oi, lk, Value::int(0));
+    for nm in ["source", "flags", "global", "ignoreCase", "multiline",
+               "sticky", "unicode", "lastIndex"] {
+        let k = st.intern_name(nm);
+        st.non_enum.insert((oi as u32, k));
+    }
     rv
 }
 
@@ -4487,12 +4498,15 @@ fn define_properties_from(
             return type_err("Object.defineProperties was rejected");
         }
     }
-    let shape = st.objects[di].shape;
-    let mut pairs: Vec<(u16, u32)> = st.shapes[shape as usize]
-        .props.iter().map(|(&a, &s)| (s, a)).collect();
-    pairs.sort_by_key(|&(slot, _)| slot);
-    for (slot, atom) in pairs {
-        let desc = st.objects[di].slots[slot as usize];
+    // Own *enumerable* keys, in insertion order. The enumerable part
+    // is not a detail: `Object.create({}, Math)` is legal precisely
+    // because Math's own properties are not enumerable, so only a
+    // descriptor somebody assigned to it is read. Iterating everything
+    // reached `Math.PI` and complained that 3.14 is not a descriptor.
+    for atom in own_keys_ordered(st, di, true) {
+        let Some(desc) = raw_get_prop(st, di, atom) else {
+            continue;
+        };
         if !internal_define_property(st, mods, target, atom, desc)? {
             return type_err("Object.defineProperties was rejected");
         }
@@ -7723,12 +7737,22 @@ fn host_fn(
                     continue;
                 }
                 let keys = internal_own_keys(st, mods, src)?;
+                let src_obj = src.is_object().then(|| src.index());
                 for key_value in keys {
                     let name = to_display(st, key_value);
                     if name == "length" {
                         continue;
                     }
                     let key = st.intern_name(&name);
+                    // own *enumerable* only — internal_own_keys answers
+                    // like Reflect.ownKeys and includes the hidden ones,
+                    // so Object.assign({}, /re/) was copying the eight
+                    // properties this engine keeps on a regex instance.
+                    if let Some(si) = src_obj {
+                        if st.non_enum.contains(&(si, key)) {
+                            continue;
+                        }
+                    }
                     let value = internal_get(st, mods, src, key, src)?;
                     let _ = internal_set(
                         st, mods, target, key, value, target,
@@ -8421,8 +8445,29 @@ struct JsonCtx {
 /// slots by insertion, then accessor-only keys. Used by JSON.stringify so
 /// getters are serialized (real engines call them) and defineProperty
 /// accessors are not silently dropped.
-fn json_own_keys(st: &St, oi: usize) -> Vec<u32> {
-    own_keys_ordered(st, oi, true)
+fn json_own_keys(st: &mut St, oi: usize) -> Vec<u32> {
+    // A plain object's integer-like keys live in element storage, not
+    // in the shape, and own_keys_ordered only walks the shape. Every
+    // other caller compensates for that separately; this one did not,
+    // so JSON.stringify silently dropped them:
+    //
+    //     JSON.stringify({1: "a", 2: "b"})   ->  {}
+    //
+    // which is data loss on any id-keyed object, and exactly the shape
+    // an API response gets reshaped into. Integer keys come first and
+    // ascending, which is also the order the spec asks for.
+    let mut out = Vec::new();
+    if !st.objects[oi].is_array {
+        for k in 0..st.objects[oi].elems.len() {
+            if st.objects[oi].elems[k].is_undefined() {
+                continue; // hole, or a value JSON omits anyway
+            }
+            let atom = st.intern_name(&k.to_string());
+            out.push(atom);
+        }
+    }
+    out.extend(own_keys_ordered(st, oi, true));
+    out
 }
 
 /// Full SerializeJSONProperty: applies toJSON, then a function replacer,
@@ -8531,7 +8576,20 @@ fn json_serialize(
                     PropHit::Getter(g) if g.is_function() => {
                         call_value_this(st, mods, g, Some(v), &[])?
                     }
-                    _ => Value::UNDEFINED,
+                    // an integer-like key is in element storage, where
+                    // the shape lookup above cannot see it
+                    _ => {
+                        let nm = st.names[atom as usize].clone();
+                        match nm.parse::<usize>() {
+                            Ok(ix)
+                                if ix.to_string() == nm
+                                    && ix < st.objects[oi].elems.len() =>
+                            {
+                                st.objects[oi].elems[ix]
+                            }
+                            _ => Value::UNDEFINED,
+                        }
+                    }
                 };
                 let kname = st.names[atom as usize].clone();
                 if let Some(vs) =
@@ -11544,11 +11602,13 @@ fn exec_loop(
                 let arr = new_array(st, vals);
                 // sloppy-mode arguments.callee (jindo's Component
                 // .extend saves it for re-invocation on subclasses).
-                // Deviation: enumerable here, non-enumerable in spec
+                // Non-enumerable, as the spec has it — otherwise it
+                // shows up in `for (var i in arguments)` and in
+                // Object.keys(arguments) alongside the real indices.
                 let k = st.intern_name("callee");
-                raw_set_prop(
-                    st, arr.index() as usize, k, Value::function(cur_cl),
-                );
+                let ai = arr.index() as usize;
+                raw_set_prop(st, ai, k, Value::function(cur_cl));
+                st.non_enum.insert((ai as u32, k));
                 reg!(dst) = arr;
             }
             Instr::LoadSelf { dst } => {

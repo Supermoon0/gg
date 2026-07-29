@@ -1173,15 +1173,23 @@ function __gg_days(y, m, d) {
   return era * 146097 + doe - 719468;
 }
 function Date(a, b, c, d, e, f, g) {
-  if (arguments.length === 0) { this._t = __ggDateNow(); }
+  var t;
+  if (arguments.length === 0) { t = __ggDateNow(); }
   else if (arguments.length === 1) {
-    if (typeof a === 'number') { this._t = a; }
-    else if (a instanceof Date) { this._t = a._t; }
-    else { this._t = Date.parse('' + a); }
+    if (typeof a === 'number') { t = a; }
+    else if (a instanceof Date) { t = a._t; }
+    else { t = Date.parse('' + a); }
   } else {
-    this._t = Date.UTC(a, b, c === undefined ? 1 : c,
-                       d || 0, e || 0, f || 0, g || 0);
+    t = Date.UTC(a, b, c === undefined ? 1 : c,
+                 d || 0, e || 0, f || 0, g || 0);
   }
+  // The timestamp is this engine's storage, not a property of a Date.
+  // As a plain assignment it was enumerable, so `_t` turned up in
+  // Object.keys(new Date()), in for-in, in Object.assign, and in
+  // JSON.stringify of anything holding a date.
+  Object.defineProperty(this, '_t', {
+    value: t, writable: true, enumerable: false, configurable: true
+  });
 }
 Date.now = __ggDateNow;
 Date.UTC = function (y, m, d, h, mi, s, ms) {
@@ -1612,10 +1620,10 @@ impl PageVm {
             ("hypot", Native::HostFn(host::M_HYPOT)),
             ("clz32", Native::HostFn(host::M_CLZ32)),
         ]);
-        vm.set_object_prop(math, "PI", Value::number(std::f64::consts::PI));
-        vm.set_object_prop(math, "E", Value::number(std::f64::consts::E));
-        vm.set_object_prop(math, "LN2", Value::number(std::f64::consts::LN_2));
-        vm.set_object_prop(math, "SQRT2",
+        vm.set_builtin_prop(math, "PI", Value::number(std::f64::consts::PI));
+        vm.set_builtin_prop(math, "E", Value::number(std::f64::consts::E));
+        vm.set_builtin_prop(math, "LN2", Value::number(std::f64::consts::LN_2));
+        vm.set_builtin_prop(math, "SQRT2",
                            Value::number(std::f64::consts::SQRT_2));
 
         let object_ctor = vm.install_callable(
@@ -2082,6 +2090,7 @@ impl PageVm {
             let key = self.name_id(m);
             let fv = make_native(&mut self.st, *native);
             raw_set_prop(&mut self.st, obj.index() as usize, key, fv);
+            self.st.non_enum.insert((obj.index(), key));
         }
         self.set_global(name, obj);
         obj
@@ -2090,6 +2099,17 @@ impl PageVm {
     fn set_object_prop(&mut self, obj: Value, prop: &str, val: Value) {
         let key = self.name_id(prop);
         raw_set_prop(&mut self.st, obj.index() as usize, key, val);
+    }
+
+    /// Like set_object_prop, but for a builtin's own constants, which
+    /// are not enumerable. `Object.keys(Math)` is specified to be
+    /// empty; it used to list all 27 of Math's members, and
+    /// `Object.create({}, Math)` — legal precisely *because* they are
+    /// not enumerable — tried to read Math.PI as a descriptor.
+    fn set_builtin_prop(&mut self, obj: Value, prop: &str, val: Value) {
+        let key = self.name_id(prop);
+        raw_set_prop(&mut self.st, obj.index() as usize, key, val);
+        self.st.non_enum.insert((obj.index(), key));
     }
 
     /// Compile a script and bind it into the shared namespace.
@@ -7034,11 +7054,93 @@ console.log('B typeof it: ' + typeof it);
                  {x: {get: function () { return 7 }, enumerable: true}}); \
                o.x === 7 && Object.keys(o).join('') === 'x' ? 1 : 0"),
             1.0);
+        // a builtin namespace has no enumerable own properties, so
+        // it is legal as a descriptor map: only what someone assigned
+        // to it is read
+        assert_eq!(n("Object.keys(Math).length"), 0.0);
+        assert_eq!(
+            n("Math.prop = {value: 12, enumerable: true}; \
+               var o = Object.create({}, Math); \
+               o.hasOwnProperty('prop') && o.prop === 12 ? 1 : 0"),
+            1.0);
+        // ...while still being reachable by name
+        assert_eq!(n("Math.floor(Math.PI * 100)"), 314.0);
         // and integer keys still come first, ascending
         assert_eq!(
             n("var o = {}; o.z = 1; o[2] = 1; o.a = 1; o[1] = 1; \
                var r = []; for (var k in o) r.push(k); r.join(',')  \
                  === '1,2,z,a' ? 1 : 0"),
+            1.0);
+    }
+
+    /// Engine bookkeeping must not be visible as enumerable own
+    /// properties. Each of these leaked into for-in, Object.keys,
+    /// Object.assign and JSON.stringify.
+    #[test]
+    fn engine_internals_are_not_enumerable() {
+        // Date kept its timestamp as a plain `_t` assignment
+        assert_eq!(n("Object.keys(new Date(0)).length"), 0.0);
+        assert_eq!(
+            n("JSON.stringify(Object.assign({}, new Date(0))) === '{}' \
+               ? 1 : 0"),
+            1.0);
+        // ...and still works
+        assert_eq!(n("new Date(0).getTime()"), 0.0);
+        assert_eq!(
+            n("new Date(0).toISOString() === '1970-01-01T00:00:00.000Z' \
+               ? 1 : 0"),
+            1.0);
+        // a RegExp instance kept eight
+        assert_eq!(n("Object.keys(/a/g).length"), 0.0);
+        assert_eq!(
+            n("JSON.stringify({...(/a/g)}) === '{}' ? 1 : 0"), 1.0);
+        assert_eq!(
+            n("var r = /a(b)/gi; \
+               r.source === 'a(b)' && r.flags === 'gi' && \
+               r.global === true && r.lastIndex === 0 ? 1 : 0"),
+            1.0);
+        // arguments.callee is non-enumerable, the indices are not
+        assert_eq!(
+            n("function f() { return Object.keys(arguments).join(',') } \
+               f(1, 2) === '0,1' ? 1 : 0"),
+            1.0);
+        assert_eq!(
+            n("function f() { return arguments.callee === f } \
+               f() ? 1 : 0"),
+            1.0);
+        // Object.assign copies own *enumerable* only
+        assert_eq!(
+            n("JSON.stringify(Object.assign({a: 1}, {b: 2})) \
+                 === '{\"a\":1,\"b\":2}' ? 1 : 0"),
+            1.0);
+    }
+
+    /// An integer-like key on a plain object lives in element storage.
+    /// Every reflection path compensated for that except JSON, which
+    /// dropped such keys without a word.
+    #[test]
+    fn json_stringify_keeps_integer_keys() {
+        assert_eq!(
+            n("JSON.stringify({1: 'a', 2: 'b'}) \
+                 === '{\"1\":\"a\",\"2\":\"b\"}' ? 1 : 0"),
+            1.0);
+        // mixed: integer keys first, ascending, then insertion order
+        assert_eq!(
+            n("var o = {}; o.z = 1; o[2] = 2; o.a = 3; o[1] = 4; \
+               JSON.stringify(o) \
+                 === '{\"1\":4,\"2\":2,\"z\":1,\"a\":3}' ? 1 : 0"),
+            1.0);
+        // and it round-trips
+        assert_eq!(
+            n("var o = {}; o[1001] = 'v'; \
+               JSON.parse(JSON.stringify(o))[1001] === 'v' ? 1 : 0"),
+            1.0);
+        // arrays are unchanged
+        assert_eq!(
+            n("JSON.stringify([1, 2]) === '[1,2]' ? 1 : 0"), 1.0);
+        assert_eq!(
+            n("JSON.stringify({a: [1, {b: 2}]}) \
+                 === '{\"a\":[1,{\"b\":2}]}' ? 1 : 0"),
             1.0);
     }
 
