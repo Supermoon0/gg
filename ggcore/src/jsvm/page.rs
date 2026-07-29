@@ -1207,11 +1207,38 @@ var __ggISO =
 // M/D/YYYY, the US ordering, optionally with a time
 var __ggSlash =
   /^(\d{1,2})\/(\d{1,2})\/(\d{1,4})(?:[ ](\d{1,2}):(\d{2})(?::(\d{2}))?)?/;
-// "Jan 1, 2000" and "1 Jan 2000", the two textual orderings
-var __ggText1 =
-  /^([A-Za-z]{3})[a-z]*[ ](\d{1,2}),?[ ](\d{1,4})(?:[ ](\d{1,2}):(\d{2})(?::(\d{2}))?)?/;
-var __ggText2 =
-  /^(\d{1,2})[ ]([A-Za-z]{3})[a-z]*[ ](\d{1,4})(?:[ ](\d{1,2}):(\d{2})(?::(\d{2}))?)?/;
+// A written month can sit in any of the three positions, and the day
+// and year in the other two: "Jan 1 2000", "1 Jan 2000", "1 2000 Jan",
+// "Jan 2000 1", "2000 Jan 1", "2000 1 Jan" are all the same date.
+// Rather than write six patterns, pull the month name out and read
+// whatever numbers are left.
+var __ggMonRe = /(^|[^A-Za-z])(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*/i;
+var __ggTimeRe = /(\d{1,2}):(\d{2})(?::(\d{2}))?/;
+function __ggParseText(s) {
+  var mm = __ggMonRe.exec(s);
+  if (!mm) return null;
+  var mon = __ggMonNames.indexOf(mm[2].toLowerCase());
+  var rest = s.slice(0, mm.index) + ' '
+    + s.slice(mm.index + mm[0].length);
+  var h = 0, mi = 0, sec = 0;
+  var tm = __ggTimeRe.exec(rest);
+  if (tm) {
+    h = +tm[1]; mi = +tm[2]; sec = +(tm[3] || 0);
+    rest = rest.slice(0, tm.index) + ' '
+      + rest.slice(tm.index + tm[0].length);
+  }
+  var nums = rest.match(/\d+/g);
+  if (!nums || nums.length !== 2) return null;
+  var a = +nums[0], b = +nums[1];
+  // A number above 31 can only be the year. If both are, there is no
+  // date to be had. If neither is, the day is written first — that is
+  // the ordering every "1 Jan 99" style string uses.
+  var day, yr;
+  if (a > 31 && b > 31) return null;
+  else if (a > 31) { yr = a; day = b; }
+  else { day = a; yr = b; }
+  return [yr, mon, day, h, mi, sec];
+}
 Date.parse = function (s) {
   // Strip a leading weekday by name, not by shape: "Jan 2, 2000" also
   // starts with three letters and a space.
@@ -1225,20 +1252,21 @@ Date.parse = function (s) {
   }
   var mon, day, yr, h, mi, sec;
   if ((m = __ggSlash.exec(s))) {
-    // M/D/Y unless the first field cannot be a month, in which case
-    // it is a year: "99/1/2" is 1999-01-02, not month 99.
-    if (+m[1] > 12) {
+    // M/D/Y, unless the first field cannot be a month. Above 31 it can
+    // only be a year, so "99/1/2" is 1999-01-02. Between 13 and 31 it
+    // could be either a year or a day and there is no way to tell, so
+    // the whole string is rejected rather than guessed at.
+    if (+m[1] > 31) {
       yr = +m[1]; mon = +m[2] - 1; day = +m[3];
+    } else if (+m[1] > 12) {
+      return NaN;
     } else {
       mon = +m[1] - 1; day = +m[2]; yr = +m[3];
     }
     h = m[4]; mi = m[5]; sec = m[6];
-  } else if ((m = __ggText1.exec(s))) {
-    mon = __ggMonNames.indexOf(m[1].toLowerCase());
-    day = +m[2]; yr = +m[3]; h = m[4]; mi = m[5]; sec = m[6];
-  } else if ((m = __ggText2.exec(s))) {
-    mon = __ggMonNames.indexOf(m[2].toLowerCase());
-    day = +m[1]; yr = +m[3]; h = m[4]; mi = m[5]; sec = m[6];
+  } else if ((m = __ggParseText(s))) {
+    yr = m[0]; mon = m[1]; day = m[2];
+    h = m[3]; mi = m[4]; sec = m[5];
   } else {
     return NaN;
   }
@@ -1246,6 +1274,14 @@ Date.parse = function (s) {
   // A two-digit year is 19xx from 50 up and 20xx below it, the same
   // split every other engine uses.
   if (yr < 50) yr += 2000; else if (yr < 100) yr += 1900;
+  // The day has to exist. Date.UTC rolls an out-of-range day into the
+  // following month, so without this "99/1/99" came back as
+  // 1999-04-09 — a confidently wrong date, which is worse than NaN.
+  var leap = (yr % 4 === 0 && yr % 100 !== 0) || yr % 400 === 0;
+  var mlen = [31, leap ? 29 : 28, 31, 30, 31, 30,
+              31, 31, 30, 31, 30, 31];
+  if (day < 1 || day > mlen[mon]) return NaN;
+  if (+(h || 0) > 24 || +(mi || 0) > 59 || +(sec || 0) > 59) return NaN;
   return Date.UTC(yr, mon, day, +(h || 0), +(mi || 0), +(sec || 0), 0);
 };
 (function () {
@@ -7011,14 +7047,49 @@ console.log('B typeof it: ' + typeof it);
             n("new Date('1/2/2000').getFullYear() * 100 + \
                new Date('1/2/2000').getDate()"),
             200002.0);
-        // a first field that cannot be a month is a year
+        // above 31 the first field can only be a year
         assert_eq!(
             n("Date.parse('99/1/2') === Date.UTC(1999, 0, 2) && \
-               Date.parse('13/1/2') === Date.UTC(2013, 0, 2) ? 1 : 0"),
+               Date.parse('50/1/2') === Date.UTC(1950, 0, 2) && \
+               Date.parse('32/1/2') === Date.UTC(2032, 0, 2) ? 1 : 0"),
             1.0);
-        // ...and one that can be, still is
+        // 13..31 could be a year or a day; rather than guess, reject
+        assert_eq!(
+            n("isNaN(Date.parse('13/1/2')) && \
+               isNaN(Date.parse('31/1/2')) ? 1 : 0"),
+            1.0);
+        // 12 and below is a month
         assert_eq!(
             n("Date.parse('12/1/2') === Date.UTC(2002, 11, 1) ? 1 : 0"),
+            1.0);
+        // a written month may sit in any of the three positions
+        for s in ["may 1 2000", "1 may 2000", "1 2000 may",
+                  "may 2000 1", "2000 may 1", "2000 1 may",
+                  "May 1, 2000"] {
+            assert_eq!(
+                n(&format!(
+                    "Date.parse('{s}') === Date.UTC(2000, 4, 1) ? 1 : 0"
+                )),
+                1.0,
+                "Date.parse({s:?})",
+            );
+        }
+        // two numbers that can both only be years is not a date
+        assert_eq!(
+            n("isNaN(Date.parse('may 1999 1999')) && \
+               isNaN(Date.parse('may 0 0')) ? 1 : 0"),
+            1.0);
+        // an out-of-range day is rejected, not rolled into the next
+        // month: "99/1/99" was coming back as 1999-04-09
+        assert_eq!(
+            n("isNaN(Date.parse('99/1/99')) && \
+               isNaN(Date.parse('2/30/2000')) && \
+               isNaN(Date.parse('4/31/2000')) ? 1 : 0"),
+            1.0);
+        // ...but a real leap day is fine
+        assert_eq!(
+            n("Date.parse('2/29/2000') === Date.UTC(2000, 1, 29) && \
+               isNaN(Date.parse('2/29/1900')) ? 1 : 0"),
             1.0);
         // nonsense is still NaN, not a wrong date
         assert_eq!(
@@ -7141,6 +7212,37 @@ console.log('B typeof it: ' + typeof it);
         assert_eq!(
             n("JSON.stringify({a: [1, {b: 2}]}) \
                  === '{\"a\":[1,{\"b\":2}]}' ? 1 : 0"),
+            1.0);
+    }
+
+    /// Property order is insertion order, and it must be the same in
+    /// every process. Accessor-only keys were enumerated straight out
+    /// of a HashMap, so `Object.keys` over an object of getters gave a
+    /// different answer each run — and a Test262 case that checks
+    /// enumeration stops at the *first* throwing getter passed or
+    /// failed at random.
+    #[test]
+    fn accessor_keys_enumerate_in_insertion_order() {
+        assert_eq!(
+            n("var o = {get a() { return 1 }, get b() { return 2 }, \
+                       get c() { return 3 }}; \
+               Object.keys(o).join('') === 'abc' ? 1 : 0"),
+            1.0);
+        // enumeration reaches `a` before `b`, so `a` throws first
+        assert_eq!(
+            n("var o = {get a() { throw new RangeError('r') }, \
+                       get b() { throw new Error('b') }}; \
+               try { Object.entries(o); 0 } \
+               catch (e) { e.constructor === RangeError ? 1 : 0 }"),
+            1.0);
+        // defineProperty accessors keep their order too
+        assert_eq!(
+            n("var o = {}; \
+               Object.defineProperty(o, 'p', \
+                 {get: function () { return 1 }, enumerable: true}); \
+               Object.defineProperty(o, 'q', \
+                 {get: function () { return 2 }, enumerable: true}); \
+               Object.keys(o).join('') === 'pq' ? 1 : 0"),
             1.0);
     }
 

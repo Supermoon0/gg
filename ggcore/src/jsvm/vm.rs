@@ -951,6 +951,13 @@ pub(super) struct St {
     /// (object index, name id) -> (getter, setter) accessor pair
     /// (Object.defineProperty with get/set; UNDEFINED = absent side)
     pub(super) accessors: HashMap<(u32, u32), (Value, Value)>,
+    /// Insertion order for accessor-only keys. `accessors` is a
+    /// HashMap, and Rust seeds its hasher differently in every
+    /// process — so enumerating it handed a random order to
+    /// `Object.keys` and `for...in`, which are specified to give
+    /// insertion order and are very much observable.
+    pub(super) accessor_seq: HashMap<(u32, u32), u32>,
+    pub(super) accessor_next: u32,
     /// Property-attribute side-tables, populated only when scripts opt out
     /// of the defaults (defineProperty / freeze / seal). Hot paths gate on
     /// `is_empty()` so ordinary objects pay nothing.
@@ -1218,6 +1225,8 @@ impl St {
             fn_props: HashMap::new(),
             dom_expando: HashMap::new(),
             accessors: HashMap::new(),
+            accessor_seq: HashMap::new(),
+            accessor_next: 0,
             non_writable: std::collections::HashSet::new(),
             non_enum: std::collections::HashSet::new(),
             local_storage: HashMap::new(),
@@ -4521,11 +4530,21 @@ fn own_keys_ordered(st: &St, oi: usize, skip_non_enum: bool) -> Vec<u32> {
     data.sort_by_key(|&(slot, _)| slot);
     let mut atoms: Vec<u32> = data.into_iter().map(|(_, a)| a).collect();
     if st.objects[oi].has_accessors {
-        for (&(o, k), _) in st.accessors.iter() {
-            if o == oi as u32 && !atoms.contains(&k) {
-                atoms.push(k);
-            }
-        }
+        let mut acc: Vec<(u32, u32)> = st
+            .accessors
+            .keys()
+            .filter(|&&(o, k)| o == oi as u32 && !atoms.contains(&k))
+            .map(|&(o, k)| {
+                let seq = st
+                    .accessor_seq
+                    .get(&(o, k))
+                    .copied()
+                    .unwrap_or(u32::MAX);
+                (seq, k)
+            })
+            .collect();
+        acc.sort_unstable();
+        atoms.extend(acc.into_iter().map(|(_, k)| k));
     }
     if skip_non_enum && !st.non_enum.is_empty() {
         atoms.retain(|&k| !st.non_enum.contains(&(oi as u32, k)));
@@ -7476,6 +7495,8 @@ fn define_one_prop(
         let ng = if get_p.is_some() { get_p.unwrap() } else { og };
         let ns = if set_p.is_some() { set_p.unwrap() } else { os };
         st.accessors.insert((oi as u32, key), (ng, ns));
+        st.accessor_seq.entry((oi as u32, key))
+            .or_insert_with(|| { st.accessor_next += 1; st.accessor_next });
         st.objects[oi].has_accessors = true;
     } else if let Some(v) = val_p {
         // a data descriptor replaces any prior accessor of the same name
@@ -8965,6 +8986,8 @@ pub(super) fn frame_element_value(
             None => Value::UNDEFINED,
         };
         st.accessors.insert((oi as u32, k), (g, sfn));
+        st.accessor_seq.entry((oi as u32, k))
+            .or_insert_with(|| { st.accessor_next += 1; st.accessor_next });
     }
     st.objects[oi].has_accessors = true;
     for (name, op) in [
@@ -8997,6 +9020,8 @@ pub(super) fn define_getter(
 ) {
     let k = st.intern_name(name);
     st.accessors.insert((oi as u32, k), (getter, Value::UNDEFINED));
+    st.accessor_seq.entry((oi as u32, k))
+        .or_insert_with(|| { st.accessor_next += 1; st.accessor_next });
     st.objects[oi].has_accessors = true;
 }
 
