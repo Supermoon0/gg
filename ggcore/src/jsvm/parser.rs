@@ -7,7 +7,7 @@
 
 use std::rc::Rc;
 use super::ast::*;
-use super::lexer::{tokenize, LexError, Token, Tok, TplElem, P};
+use super::lexer::{is_reserved_word, tokenize, LexError, Token, Tok, TplElem, P};
 
 pub struct ParseError {
     pub msg: String,
@@ -884,6 +884,7 @@ impl Parser {
                 continue;
             }
             let key = self.expect_ident()?;
+            let key_escaped = self.toks[self.pos - 1].escaped;
             seen.push(key.clone());
             let member = Expr::Member {
                 obj: Box::new(Expr::Ident(tmp.to_string())),
@@ -900,6 +901,16 @@ impl Parser {
                     out.push((bind, Some(init)));
                 }
             } else {
+                // shorthand in a binding pattern binds the name, so
+                // the same rule as in an object literal applies: a
+                // reserved word is fine as a key, not as a name.
+                if key_escaped && is_reserved_word(&key) {
+                    return Err(self.err(format!(
+                        "'{key}' is a reserved word and shorthand \
+                         makes it a binding, which an escape cannot \
+                         spell"
+                    )));
+                }
                 let init = self.maybe_default(member)?;
                 out.push((key, Some(init)));
             }
@@ -2048,7 +2059,24 @@ impl Parser {
                 }
                 Ok(Expr::Template(out))
             }
-            Tok::Ident(name) => match name.as_str() {
+            Tok::Ident(name) => {
+                // An escape may spell an identifier, never a reserved
+                // word: `if` where a name is expected is a
+                // SyntaxError, and it is certainly not the keyword.
+                // The check has to be here, at the reference site,
+                // rather than in the lexer — a *property* name may be
+                // a reserved word, escaped or not, so `{ i\u0066: x }`
+                // is perfectly legal and the lexer cannot tell which
+                // position it is in.
+                if self.toks[self.pos - 1].escaped
+                    && is_reserved_word(&name)
+                {
+                    return Err(self.err(format!(
+                        "'{name}' is a reserved word and an escape \
+                         cannot spell one where a name is expected"
+                    )));
+                }
+                match name.as_str() {
                 "this" => Ok(Expr::This),
                 "true" => Ok(Expr::Bool(true)),
                 "false" => Ok(Expr::Bool(false)),
@@ -2210,7 +2238,7 @@ impl Parser {
                     }
                 }
                 _ => Ok(Expr::Ident(name)),
-            },
+            }}
             Tok::Punct(P::LParen) => {
                 // parens lift the for-head no-in restriction
                 let saved_no_in = self.no_in;
@@ -2438,6 +2466,24 @@ impl Parser {
             }
             let prop = match self.bump() {
                 Tok::Ident(name) => {
+                    // `{ break: 1 }` is fine — a property name may be a
+                    // reserved word. `{ bre\u0061k }` is not: shorthand
+                    // makes the name an identifier *reference* as well,
+                    // and an escape may not spell a reserved word
+                    // there. Which of the two it is only becomes clear
+                    // one token later, so the check waits for it.
+                    let escaped_here = self.toks[self.pos - 1].escaped;
+                    if escaped_here
+                        && is_reserved_word(&name)
+                        && !self.at_punct(P::Colon)
+                        && !self.at_punct(P::LParen)
+                    {
+                        return Err(self.err(format!(
+                            "'{name}' is a reserved word and shorthand \
+                             makes it a reference, which an escape \
+                             cannot spell"
+                        )));
+                    }
                     if self.at_punct(P::LParen) {
                         // method shorthand: { foo() { ... } }
                         let f = self.func_lit(Some(name.clone()), false)?;

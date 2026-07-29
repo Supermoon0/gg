@@ -46,6 +46,11 @@ pub struct Token {
     pub kind: Tok,
     pub line: u32,
     pub nl_before: bool,
+    /// This identifier was written with a `\u` escape. It matters
+    /// because an escape may not spell a reserved word *where an
+    /// identifier is expected* — but a property name may be a reserved
+    /// word, escaped or not, so only the parser knows if it is legal.
+    pub escaped: bool,
 }
 
 pub struct LexError {
@@ -74,6 +79,7 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
         line: 1,
         nl_before: false,
         regex_ok: true,
+        saw_escape: false,
     };
     let mut out = Vec::new();
     loop {
@@ -94,6 +100,9 @@ struct Lexer<'a> {
     nl_before: bool,
     /// Whether a `/` at the current position starts a regex literal.
     regex_ok: bool,
+    /// Set by lex_ident when the identifier it just built used an
+    /// escape; read and cleared once per token.
+    saw_escape: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -163,6 +172,7 @@ impl<'a> Lexer<'a> {
         self.nl_before = false;
         let line = self.line;
 
+        self.saw_escape = false;
         let kind = if self.pos >= self.bytes.len() {
             Tok::Eof
         } else {
@@ -217,7 +227,7 @@ impl<'a> Lexer<'a> {
             ),
             Tok::Eof => false,
         };
-        Ok(Token { kind, line, nl_before })
+        Ok(Token { kind, line, nl_before, escaped: self.saw_escape })
     }
 
     fn lex_number(&mut self) -> Result<Tok, LexError> {
@@ -526,17 +536,7 @@ impl<'a> Lexer<'a> {
             }
         }
         if let Some(s) = owned {
-            // An escape may spell an identifier, but not a keyword:
-            // `if` is a SyntaxError, not `if`. Letting it
-            // through meant an escaped keyword parsed as the keyword,
-            // which is how 519 negative tests started passing code
-            // they exist to reject.
-            if is_reserved_word(&s) {
-                return Err(self.err(format!(
-                    "'{s}' is a reserved word and cannot be written \
-                     with an escape"
-                )));
-            }
+            self.saw_escape = true;
             return Ok(Tok::Ident(s));
         }
         if self.pos == start {
@@ -658,7 +658,7 @@ fn is_ident_continue(c: u8) -> bool {
 /// The always-reserved words. `let`/`static`/`implements` and friends
 /// are reserved only in strict mode, which the lexer does not track,
 /// so they are left out rather than rejected where they are legal.
-fn is_reserved_word(s: &str) -> bool {
+pub(super) fn is_reserved_word(s: &str) -> bool {
     matches!(
         s,
         "await" | "break" | "case" | "catch" | "class" | "const"

@@ -13,13 +13,15 @@ grows does not silently move the score:
 
 * a test in the baseline that now fails is a **regression** and fails
   the run, always;
-* a test *not* in the baseline that fails is a **new failure**. Those
-  are allowed up to a recorded budget and reported either way — a
-  no-regression gate alone lets the pass rate drift downwards for
-  free as the corpus grows;
 * the corpus is fingerprinted by content, not by a revision string
   someone remembered to bump, so a checkout that does not match the
-  baseline is an error rather than a surprise;
+  baseline is an error rather than a surprise. That check is also what
+  makes the recorded passes the whole gate: a matching fingerprint
+  means an identical set of cases, so there is no such thing here as a
+  test that is both new and comparable. An earlier version of this file
+  also counted "new failures" against a budget, which sounds like a
+  guard against drift and is not one — with the case set pinned, every
+  test that was already failing counted as new, all 76290 of them;
 * ``--file``/``--limit`` run a subset, which cannot be compared against
   a whole-corpus baseline. They turn the comparison off and say so.
 """
@@ -366,8 +368,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
     p.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     p.add_argument("--update-baseline", action="store_true")
-    p.add_argument("--new-failure-budget", type=int, default=None,
-                   help="new failures tolerated; stored in the baseline")
     p.add_argument("--failure-samples", type=int, default=40)
     p.add_argument("--partial", type=Path,
                    help="append results here and resume from it")
@@ -413,8 +413,6 @@ def main(argv: list[str] | None = None) -> int:
             f"{crashes} case(s) took the whole process down with them")
 
     regressions: list[str] = []
-    new_failures: list[str] = []
-    budget = args.new_failure_budget
     exit_code = 0
 
     if subset:
@@ -432,8 +430,6 @@ def main(argv: list[str] | None = None) -> int:
             args.baseline.write_text(json.dumps({
                 "schema_version": 1,
                 "corpus_sha256": digest,
-                "new_failure_budget":
-                    budget if budget is not None else 0,
                 "passed": passed,
             }, indent=1) + "\n", encoding="utf-8")
             prints.append(
@@ -453,19 +449,13 @@ def main(argv: list[str] | None = None) -> int:
                 exit_code = 2
             else:
                 known = set(base.get("passed", []))
-                if budget is None:
-                    budget = int(base.get("new_failure_budget", 0))
                 regressions = sorted(known - current)
-                seen = known | current
-                new_failures = sorted(
-                    i for i, ok, _ in results if not ok and i not in seen)
                 prints.append(
                     f"baseline: regressions={len(regressions)}, "
-                    f"new failures={len(new_failures)} (budget {budget}), "
-                    f"improvements={len(current - known)}")
+                    f"improvements={len(current - known)}, "
+                    f"passing {len(current)}/{len(results)} "
+                    f"({len(current) / len(results):.2%})")
                 if regressions:
-                    exit_code = 1
-                if len(new_failures) > budget:
                     exit_code = 1
 
     report = {
@@ -483,7 +473,6 @@ def main(argv: list[str] | None = None) -> int:
             "process_crashes": crashes,
         },
         "regressions": regressions,
-        "new_failures": new_failures,
         "failure_samples": [
             {"id": i, "why": w} for i, w in failures[:args.failure_samples]
         ],
