@@ -4460,6 +4460,46 @@ pub(super) fn lookup_prop(st: &St, oi: usize, key: u32) -> PropHit {
 /// in insertion order. Includes accessor-only keys. When `skip_non_enum`
 /// is set, keys marked `enumerable:false` are dropped (Object.keys/for-in/
 /// JSON); getOwnPropertyNames passes false to see them all.
+/// Apply a descriptor map to `target`, in the order the map's keys
+/// were created. Shared by Object.defineProperties and Object.create,
+/// which the spec defines in terms of the same operation.
+///
+/// Order matters and is observable: a shape stores its properties in a
+/// HashMap, so anything that walks it has to sort by slot to get back
+/// the insertion order that `for...in` is specified to produce.
+fn define_properties_from(
+    st: &mut St,
+    mods: &ModStore,
+    target: Value,
+    descs: Value,
+) -> Result<(), VmError> {
+    let di = descs.index() as usize;
+    // numeric keys of the descriptor map live in element storage
+    // ({"907": {...}} — getOwnPropertyDescriptors output); iterating
+    // only shape props silently defined nothing for them
+    for i in 0..st.objects[di].elems.len() {
+        let desc = st.objects[di].elems[i];
+        if desc.is_undefined() {
+            continue; // hole
+        }
+        let key = st.intern_name(&i.to_string());
+        if !internal_define_property(st, mods, target, key, desc)? {
+            return type_err("Object.defineProperties was rejected");
+        }
+    }
+    let shape = st.objects[di].shape;
+    let mut pairs: Vec<(u16, u32)> = st.shapes[shape as usize]
+        .props.iter().map(|(&a, &s)| (s, a)).collect();
+    pairs.sort_by_key(|&(slot, _)| slot);
+    for (slot, atom) in pairs {
+        let desc = st.objects[di].slots[slot as usize];
+        if !internal_define_property(st, mods, target, atom, desc)? {
+            return type_err("Object.defineProperties was rejected");
+        }
+    }
+    Ok(())
+}
+
 fn own_keys_ordered(st: &St, oi: usize, skip_non_enum: bool) -> Vec<u32> {
     let shape = st.objects[oi].shape;
     let mut data: Vec<(u16, u32)> = st.shapes[shape as usize]
@@ -7829,31 +7869,7 @@ fn host_fn(
             if !descs.is_object() {
                 return err("defineProperties needs a descriptor map");
             }
-            let di = descs.index() as usize;
-            // numeric keys of the descriptor map live in element
-            // storage ({"907": {...}} — getOwnPropertyDescriptors
-            // output); iterating only shape props silently defined
-            // nothing for them
-            for i in 0..st.objects[di].elems.len() {
-                let desc = st.objects[di].elems[i];
-                if desc.is_undefined() {
-                    continue; // hole
-                }
-                let key = st.intern_name(&i.to_string());
-                if !internal_define_property(st, mods, obj, key, desc)? {
-                    return type_err("Object.defineProperties was rejected");
-                }
-            }
-            let shape = st.objects[di].shape;
-            let mut pairs: Vec<(u16, u32)> = st.shapes[shape as usize]
-                .props.iter().map(|(&a, &s)| (s, a)).collect();
-            pairs.sort_by_key(|&(slot, _)| slot);
-            for (slot, atom) in pairs {
-                let desc = st.objects[di].slots[slot as usize];
-                if !internal_define_property(st, mods, obj, atom, desc)? {
-                    return type_err("Object.defineProperties was rejected");
-                }
-            }
+            define_properties_from(st, mods, obj, descs)?;
             Ok(obj)
         }
         O_GET_OWN_NAMES => {
@@ -8133,29 +8149,15 @@ fn host_fn(
             if proto.is_object() {
                 st.objects[out.index() as usize].proto = proto;
             }
-            // optional property-descriptor map (Babel _inherits):
-            // plain {value} descriptors become data properties
+            // The optional descriptor map is defineProperties, and is
+            // specified as literally that. It used to be a private
+            // loop that read only `value`, ignored `enumerable` and
+            // the accessor half, and walked the shape's HashMap
+            // unsorted — so `for...in` over the result came out in an
+            // order that changed from one process to the next.
             let descs = argv!(1);
             if descs.is_object() {
-                let di = descs.index() as usize;
-                let shape = st.objects[di].shape;
-                let props: Vec<(u32, u16)> = st.shapes[shape as usize]
-                    .props
-                    .iter()
-                    .map(|(&a, &s)| (a, s))
-                    .collect();
-                for (atom, slot) in props {
-                    let desc = st.objects[di].slots[slot as usize];
-                    if desc.is_object() {
-                        let vk = st.intern_name("value");
-                        if let Some(v) = raw_get_prop(
-                            st, desc.index() as usize, vk)
-                        {
-                            raw_set_prop(
-                                st, out.index() as usize, atom, v);
-                        }
-                    }
-                }
+                define_properties_from(st, mods, out, descs)?;
             }
             Ok(out)
         }

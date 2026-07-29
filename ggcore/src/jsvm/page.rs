@@ -1217,7 +1217,13 @@ Date.parse = function (s) {
   }
   var mon, day, yr, h, mi, sec;
   if ((m = __ggSlash.exec(s))) {
-    mon = +m[1] - 1; day = +m[2]; yr = +m[3];
+    // M/D/Y unless the first field cannot be a month, in which case
+    // it is a year: "99/1/2" is 1999-01-02, not month 99.
+    if (+m[1] > 12) {
+      yr = +m[1]; mon = +m[2] - 1; day = +m[3];
+    } else {
+      mon = +m[1] - 1; day = +m[2]; yr = +m[3];
+    }
     h = m[4]; mi = m[5]; sec = m[6];
   } else if ((m = __ggText1.exec(s))) {
     mon = __ggMonNames.indexOf(m[1].toLowerCase());
@@ -6985,10 +6991,54 @@ console.log('B typeof it: ' + typeof it);
             n("new Date('1/2/2000').getFullYear() * 100 + \
                new Date('1/2/2000').getDate()"),
             200002.0);
+        // a first field that cannot be a month is a year
+        assert_eq!(
+            n("Date.parse('99/1/2') === Date.UTC(1999, 0, 2) && \
+               Date.parse('13/1/2') === Date.UTC(2013, 0, 2) ? 1 : 0"),
+            1.0);
+        // ...and one that can be, still is
+        assert_eq!(
+            n("Date.parse('12/1/2') === Date.UTC(2002, 11, 1) ? 1 : 0"),
+            1.0);
         // nonsense is still NaN, not a wrong date
         assert_eq!(
             n("isNaN(Date.parse('not a date')) && \
                isNaN(Date.parse('13/40/2000')) ? 1 : 0"),
+            1.0);
+    }
+
+    /// `for...in` order is insertion order, and it must not depend on
+    /// which process you are in. Object.create's descriptor-map loop
+    /// walked a HashMap unsorted, so the order changed run to run —
+    /// which showed up as a Test262 case that passed or failed at
+    /// random.
+    #[test]
+    fn object_create_defines_properties_in_order() {
+        assert_eq!(
+            n("var p = {}; \
+               p.a = {value: 1, enumerable: true}; \
+               p.b = {value: 2, enumerable: true}; \
+               p.c = {value: 3, enumerable: true}; \
+               var r = []; \
+               for (var k in Object.create({}, p)) r.push(k); \
+               r.join('') === 'abc' ? 1 : 0"),
+            1.0);
+        // Object.create's descriptor map is defineProperties, so it
+        // honours the whole descriptor, not just `value`
+        assert_eq!(
+            n("var o = Object.create({}, {x: {value: 5}}); \
+               o.x === 5 && Object.keys(o).length === 0 ? 1 : 0"),
+            1.0);
+        assert_eq!(
+            n("var o = Object.create({}, \
+                 {x: {get: function () { return 7 }, enumerable: true}}); \
+               o.x === 7 && Object.keys(o).join('') === 'x' ? 1 : 0"),
+            1.0);
+        // and integer keys still come first, ascending
+        assert_eq!(
+            n("var o = {}; o.z = 1; o[2] = 1; o.a = 1; o[1] = 1; \
+               var r = []; for (var k in o) r.push(k); r.join(',')  \
+                 === '1,2,z,a' ? 1 : 0"),
             1.0);
     }
 
