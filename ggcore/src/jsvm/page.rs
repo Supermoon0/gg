@@ -6848,6 +6848,12 @@ console.log('B typeof it: ' + typeof it);
         assert!(eval(r"var \u0031a = 1;").is_err());
         // an escape that names punctuation is not an identifier
         assert!(eval(r"var \u002B = 1;").is_err());
+        // an escape may spell an identifier, never a keyword
+        assert!(eval(r"var x = 1; \u0069\u0066 (x) { }").is_err());
+        assert!(eval(r"\u0076ar x = 1;").is_err());
+        assert!(eval(r"var \u0074rue = 1;").is_err());
+        // a word that merely contains one is still fine
+        assert_eq!(n(r"var \u0069fy = 2; ify"), 2.0);
         // and a non-\u escape is not one either
         assert!(eval(r"var \x41 = 1;").is_err());
     }

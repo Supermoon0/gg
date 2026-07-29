@@ -526,6 +526,17 @@ impl<'a> Lexer<'a> {
             }
         }
         if let Some(s) = owned {
+            // An escape may spell an identifier, but not a keyword:
+            // `if` is a SyntaxError, not `if`. Letting it
+            // through meant an escaped keyword parsed as the keyword,
+            // which is how 519 negative tests started passing code
+            // they exist to reject.
+            if is_reserved_word(&s) {
+                return Err(self.err(format!(
+                    "'{s}' is a reserved word and cannot be written \
+                     with an escape"
+                )));
+            }
             return Ok(Tok::Ident(s));
         }
         if self.pos == start {
@@ -642,6 +653,22 @@ fn is_ident_start(c: u8) -> bool {
 
 fn is_ident_continue(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
+}
+
+/// The always-reserved words. `let`/`static`/`implements` and friends
+/// are reserved only in strict mode, which the lexer does not track,
+/// so they are left out rather than rejected where they are legal.
+fn is_reserved_word(s: &str) -> bool {
+    matches!(
+        s,
+        "await" | "break" | "case" | "catch" | "class" | "const"
+            | "continue" | "debugger" | "default" | "delete" | "do"
+            | "else" | "enum" | "export" | "extends" | "false"
+            | "finally" | "for" | "function" | "if" | "import" | "in"
+            | "instanceof" | "new" | "null" | "return" | "super"
+            | "switch" | "this" | "throw" | "true" | "try" | "typeof"
+            | "var" | "void" | "while" | "with" | "yield"
+    )
 }
 
 /// What an escape is allowed to name. The same test the raw-character
