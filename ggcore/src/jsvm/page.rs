@@ -589,26 +589,296 @@ function URL(u, base) {
   this.searchParams = new URLSearchParams(this.search);
 }
 URL.prototype.toString = function () { return this.href; };
-// Byte buffers. Bytes live in a plain array shared with the backing
-// ArrayBuffer, and the view carries its own index properties -- a real
-// engine aliases them, so a write *through a view* is not seen by
-// another view of the same buffer unless it goes through `set()`,
-// which does write through. Byte-stream code (React's flight parser,
-// TextDecoder) builds with `set` and reads through views, which this
-// serves exactly; it is not a substitute for shared mutable memory.
+// Byte buffers. The bytes live natively, in one place per
+// ArrayBuffer, and every view is a window onto them — so two views of
+// the same buffer genuinely alias, and an element costs its own width
+// rather than a whole JS property. The argument shuffling below stays
+// here because the constructor overloads are fiddly and cold; the
+// per-element work is native.
 function ArrayBuffer(len) {
-  len = len > 0 ? Math.floor(len) : 0;
-  this.byteLength = len;
-  this._b = [];
-  for (var i = 0; i < len; i++) this._b.push(0);
+  return __ggBufNew(len);
 }
+ArrayBuffer.prototype = {};
 ArrayBuffer.prototype.slice = function (a, b) {
-  var out = new ArrayBuffer(0);
-  out._b = this._b.slice(a, b === undefined ? this.byteLength : b);
-  out.byteLength = out._b.length;
+  return __ggBufSlice(this, a === undefined ? 0 : a, b);
+};
+ArrayBuffer.isView = function (v) { return __ggIsView(v); };
+// index into the native kind table; must match kind_from_index
+var __ggKinds = {
+  Int8Array: 0, Uint8Array: 1, Uint8ClampedArray: 2,
+  Int16Array: 3, Uint16Array: 4, Int32Array: 5, Uint32Array: 6,
+  Float32Array: 7, Float64Array: 8
+};
+var __ggWidths = [1, 1, 1, 2, 2, 4, 4, 4, 8];
+function __ggMakeView(kind, src, off, len) {
+  var w = __ggWidths[kind], buf, n, i;
+  if (src === undefined || src === null) {
+    return __ggViewNew(__ggBufNew(0), 0, 0, kind);
+  }
+  if (typeof src === 'number') {
+    n = src > 0 ? Math.floor(src) : 0;
+    return __ggViewNew(__ggBufNew(n * w), 0, n, kind);
+  }
+  if (__ggIsBuffer(src)) {
+    return __ggViewNew(src, off === undefined ? 0 : off, len, kind);
+  }
+  // a typed array or any array-like: copy element by element, which is
+  // a *value* conversion, not a reinterpretation of the bytes
+  n = src.length;
+  n = typeof n === 'number' && n > 0 ? Math.floor(n) : 0;
+  var out = __ggViewNew(__ggBufNew(n * w), 0, n, kind);
+  for (i = 0; i < n; i++) out[i] = src[i];
+  return out;
+}
+function __ggIsBuffer(v) {
+  return !!v && typeof v === 'object' && !__ggIsView(v)
+    && typeof v.byteLength === 'number' && v.slice === ArrayBuffer.prototype.slice;
+}
+// One prototype shared by every typed array, the way %TypedArray% is.
+var __ggTAProto = {};
+__ggTAProto.set = function (src, offset) {
+  __ggViewSet(this, src, offset === undefined ? 0 : offset);
+};
+__ggTAProto.subarray = function (a, b) {
+  var n = this.length;
+  a = a === undefined ? 0 : (a < 0 ? Math.max(n + a, 0) : Math.min(a, n));
+  b = b === undefined ? n : (b < 0 ? Math.max(n + b, 0) : Math.min(b, n));
+  if (b < a) b = a;
+  var w = this.BYTES_PER_ELEMENT;
+  // shares the buffer, as a subarray must
+  return __ggViewNew(this.buffer, this.byteOffset + a * w, b - a,
+                     __ggKinds[this.constructor.name]);
+};
+__ggTAProto.slice = function (a, b) {
+  var v = this.subarray(a, b);
+  var out = new this.constructor(v.length);
+  out.set(v);
   return out;
 };
-ArrayBuffer.isView = function (v) { return !!(v && v.__typed); };
+__ggTAProto.fill = function (v, a, b) {
+  var n = this.length;
+  a = a === undefined ? 0 : (a < 0 ? Math.max(n + a, 0) : Math.min(a, n));
+  b = b === undefined ? n : (b < 0 ? Math.max(n + b, 0) : Math.min(b, n));
+  for (var i = a; i < b; i++) this[i] = v;
+  return this;
+};
+__ggTAProto.copyWithin = function (t, a, b) {
+  var n = this.length, tmp = [];
+  t = t < 0 ? Math.max(n + t, 0) : Math.min(t, n);
+  a = a === undefined ? 0 : (a < 0 ? Math.max(n + a, 0) : Math.min(a, n));
+  b = b === undefined ? n : (b < 0 ? Math.max(n + b, 0) : Math.min(b, n));
+  for (var i = a; i < b; i++) tmp.push(this[i]);
+  for (var j = 0; j < tmp.length && t + j < n; j++) this[t + j] = tmp[j];
+  return this;
+};
+__ggTAProto.indexOf = function (v, from) {
+  // the fromIndex is not optional in practice: React's flight parser
+  // scans for the next row terminator with `chunk.indexOf(10, at)`,
+  // and ignoring it re-finds the first one forever
+  var i = from === undefined ? 0 : Math.floor(from);
+  if (i < 0) i = Math.max(this.length + i, 0);
+  for (; i < this.length; i++) if (this[i] === v) return i;
+  return -1;
+};
+__ggTAProto.lastIndexOf = function (v, from) {
+  var i = from === undefined ? this.length - 1 : Math.floor(from);
+  if (i < 0) i = this.length + i;
+  if (i > this.length - 1) i = this.length - 1;
+  for (; i >= 0; i--) if (this[i] === v) return i;
+  return -1;
+};
+__ggTAProto.includes = function (v, from) {
+  var i = from === undefined ? 0 : Math.floor(from);
+  if (i < 0) i = Math.max(this.length + i, 0);
+  for (; i < this.length; i++) {
+    if (this[i] === v || (v !== v && this[i] !== this[i])) return true;
+  }
+  return false;
+};
+__ggTAProto.at = function (i) {
+  i = Math.floor(i || 0);
+  if (i < 0) i += this.length;
+  return i >= 0 && i < this.length ? this[i] : undefined;
+};
+__ggTAProto.join = function (sep) {
+  var out = [];
+  for (var i = 0; i < this.length; i++) out.push(this[i]);
+  return out.join(sep === undefined ? ',' : sep);
+};
+__ggTAProto.toString = function () { return this.join(','); };
+__ggTAProto.reverse = function () {
+  var n = this.length;
+  for (var i = 0; i < (n >> 1); i++) {
+    var t = this[i]; this[i] = this[n - 1 - i]; this[n - 1 - i] = t;
+  }
+  return this;
+};
+__ggTAProto.sort = function (cmp) {
+  var a = [];
+  for (var i = 0; i < this.length; i++) a.push(this[i]);
+  // numeric by default, not the string order Array.prototype.sort uses
+  a.sort(cmp || function (x, y) {
+    if (x !== x) return y !== y ? 0 : 1;
+    if (y !== y) return -1;
+    return x - y;
+  });
+  for (i = 0; i < a.length; i++) this[i] = a[i];
+  return this;
+};
+__ggTAProto.forEach = function (fn, thisArg) {
+  for (var i = 0; i < this.length; i++) fn.call(thisArg, this[i], i, this);
+};
+__ggTAProto.map = function (fn, thisArg) {
+  var out = new this.constructor(this.length);
+  for (var i = 0; i < this.length; i++) {
+    out[i] = fn.call(thisArg, this[i], i, this);
+  }
+  return out;
+};
+__ggTAProto.filter = function (fn, thisArg) {
+  var keep = [];
+  for (var i = 0; i < this.length; i++) {
+    if (fn.call(thisArg, this[i], i, this)) keep.push(this[i]);
+  }
+  return new this.constructor(keep);
+};
+__ggTAProto.reduce = function (fn, init) {
+  var i = 0, acc = init;
+  if (arguments.length < 2) {
+    if (!this.length) throw new TypeError('reduce of empty array');
+    acc = this[0]; i = 1;
+  }
+  for (; i < this.length; i++) acc = fn(acc, this[i], i, this);
+  return acc;
+};
+__ggTAProto.every = function (fn, thisArg) {
+  for (var i = 0; i < this.length; i++) {
+    if (!fn.call(thisArg, this[i], i, this)) return false;
+  }
+  return true;
+};
+__ggTAProto.some = function (fn, thisArg) {
+  for (var i = 0; i < this.length; i++) {
+    if (fn.call(thisArg, this[i], i, this)) return true;
+  }
+  return false;
+};
+__ggTAProto.find = function (fn, thisArg) {
+  for (var i = 0; i < this.length; i++) {
+    if (fn.call(thisArg, this[i], i, this)) return this[i];
+  }
+  return undefined;
+};
+__ggTAProto.findIndex = function (fn, thisArg) {
+  for (var i = 0; i < this.length; i++) {
+    if (fn.call(thisArg, this[i], i, this)) return i;
+  }
+  return -1;
+};
+function __ggTAIter(self, pick) {
+  var i = 0;
+  return { next: function () {
+    return i < self.length
+      ? { value: pick(self, i++), done: false }
+      : { value: undefined, done: true };
+  } };
+}
+__ggTAProto.values = function () {
+  return __ggTAIter(this, function (s, i) { return s[i] });
+};
+__ggTAProto.keys = function () {
+  return __ggTAIter(this, function (s, i) { return i });
+};
+__ggTAProto.entries = function () {
+  return __ggTAIter(this, function (s, i) { return [i, s[i]] });
+};
+__ggTAProto[Symbol.iterator] = __ggTAProto.values;
+// The five header properties are derived from the native view record,
+// so they cannot drift from the bytes.
+Object.defineProperty(__ggTAProto, 'length', {
+  get: function () { return __ggViewInfo(this)[0] }, configurable: true
+});
+Object.defineProperty(__ggTAProto, 'byteOffset', {
+  get: function () { return __ggViewInfo(this)[1] }, configurable: true
+});
+Object.defineProperty(__ggTAProto, 'byteLength', {
+  get: function () { return __ggViewInfo(this)[2] }, configurable: true
+});
+Object.defineProperty(__ggTAProto, 'BYTES_PER_ELEMENT', {
+  get: function () { return __ggViewInfo(this)[3] }, configurable: true
+});
+Object.defineProperty(__ggTAProto, 'buffer', {
+  get: function () { return __ggViewInfo(this)[4] }, configurable: true
+});
+var __ggTAProtos = [];
+function __ggDefineTA(name) {
+  var kind = __ggKinds[name];
+  var ctor = function (src, off, len) {
+    return __ggMakeView(kind, src, off, len);
+  };
+  Object.defineProperty(ctor, 'name', {value: name, configurable: true});
+  var proto = Object.create(__ggTAProto);
+  Object.defineProperty(proto, 'constructor',
+    {value: ctor, writable: true, enumerable: false, configurable: true});
+  ctor.prototype = proto;
+  ctor.BYTES_PER_ELEMENT = __ggWidths[kind];
+  ctor.from = function (src, fn) {
+    var n = src && src.length ? src.length : 0;
+    var out = new ctor(n);
+    for (var i = 0; i < n; i++) out[i] = fn ? fn(src[i], i) : src[i];
+    return out;
+  };
+  ctor.of = function () { return new ctor(arguments); };
+  __ggTAProtos[kind] = proto;
+  return ctor;
+}
+var Int8Array = __ggDefineTA('Int8Array');
+var Uint8Array = __ggDefineTA('Uint8Array');
+var Uint8ClampedArray = __ggDefineTA('Uint8ClampedArray');
+var Int16Array = __ggDefineTA('Int16Array');
+var Uint16Array = __ggDefineTA('Uint16Array');
+var Int32Array = __ggDefineTA('Int32Array');
+var Uint32Array = __ggDefineTA('Uint32Array');
+var Float32Array = __ggDefineTA('Float32Array');
+var Float64Array = __ggDefineTA('Float64Array');
+// DataView reads a named type at a byte offset, and is the one place
+// endianness is a choice rather than a fixed layout.
+function DataView(buf, off, len) {
+  if (!__ggIsBuffer(buf)) throw new TypeError('DataView needs an ArrayBuffer');
+  off = off === undefined ? 0 : Math.floor(off);
+  len = len === undefined ? buf.byteLength - off : Math.floor(len);
+  if (off < 0 || len < 0 || off + len > buf.byteLength) {
+    throw new RangeError('DataView is outside the buffer');
+  }
+  return __ggViewNew(buf, off, len, 9);
+}
+DataView.prototype = {};
+(function () {
+  var kinds = [['Int8', 0], ['Uint8', 1], ['Int16', 3], ['Uint16', 4],
+               ['Int32', 5], ['Uint32', 6], ['Float32', 7],
+               ['Float64', 8]];
+  for (var i = 0; i < kinds.length; i++) {
+    (function (nm, k) {
+      DataView.prototype['get' + nm] = function (at, le) {
+        return __ggDvGet(this, at, k, !!le);
+      };
+      DataView.prototype['set' + nm] = function (at, v, le) {
+        __ggDvSet(this, at, k, v, !!le);
+      };
+    })(kinds[i][0], kinds[i][1]);
+  }
+  Object.defineProperty(DataView.prototype, 'byteLength', {
+    get: function () { return __ggViewInfo(this)[0] }, configurable: true
+  });
+  Object.defineProperty(DataView.prototype, 'byteOffset', {
+    get: function () { return __ggViewInfo(this)[1] }, configurable: true
+  });
+  Object.defineProperty(DataView.prototype, 'buffer', {
+    get: function () { return __ggViewInfo(this)[4] }, configurable: true
+  });
+})();
+__ggRegisterProtos(ArrayBuffer.prototype, __ggTAProtos,
+                   DataView.prototype);
 function __ggBytes(src) {
   var out = [], i;
   if (src === undefined || src === null) return out;
@@ -622,97 +892,6 @@ function __ggBytes(src) {
   }
   return out;
 }
-function Uint8Array(src, off, len) {
-  var bytes;
-  if (src instanceof ArrayBuffer) {
-    off = off === undefined ? 0 : Math.floor(off);
-    len = len === undefined ? src.byteLength - off : Math.floor(len);
-    if (len < 0) len = 0;
-    bytes = src._b.slice(off, off + len);
-    this.buffer = src;
-    this.byteOffset = off;
-  } else {
-    bytes = __ggBytes(src);
-    var buf = new ArrayBuffer(0);
-    buf._b = bytes;
-    buf.byteLength = bytes.length;
-    this.buffer = buf;
-    this.byteOffset = 0;
-  }
-  for (var i = 0; i < bytes.length; i++) this[i] = bytes[i] & 255;
-  this.length = bytes.length;
-  this.byteLength = bytes.length;
-  this.BYTES_PER_ELEMENT = 1;
-  this.__typed = true;
-}
-Uint8Array.prototype.set = function (src, offset) {
-  offset = offset === undefined ? 0 : Math.floor(offset);
-  var b = __ggBytes(src);
-  for (var i = 0; i < b.length; i++) {
-    this[offset + i] = b[i];
-    this.buffer._b[this.byteOffset + offset + i] = b[i];
-  }
-};
-Uint8Array.prototype.subarray = function (a, b) {
-  a = a === undefined ? 0 : (a < 0 ? this.length + a : a);
-  b = b === undefined ? this.length : (b < 0 ? this.length + b : b);
-  var out = [];
-  for (var i = a; i < b && i < this.length; i++) out.push(this[i]);
-  var view = new Uint8Array(out);
-  view.buffer = this.buffer;
-  view.byteOffset = this.byteOffset + a;
-  return view;
-};
-Uint8Array.prototype.slice = function (a, b) {
-  return new Uint8Array(this.subarray(a, b));
-};
-Uint8Array.prototype.fill = function (v, a, b) {
-  a = a === undefined ? 0 : a;
-  b = b === undefined ? this.length : b;
-  for (var i = a; i < b; i++) this[i] = v & 255;
-  return this;
-};
-Uint8Array.prototype.indexOf = function (v, from) {
-  // the fromIndex is not optional in practice: React's flight parser
-  // scans for the next row terminator with `chunk.indexOf(10, at)`,
-  // and ignoring it re-finds the first one forever
-  var i = from === undefined ? 0 : Math.floor(from);
-  if (i < 0) i = Math.max(this.length + i, 0);
-  for (; i < this.length; i++) if (this[i] === v) return i;
-  return -1;
-};
-Uint8Array.prototype.lastIndexOf = function (v, from) {
-  var i = from === undefined ? this.length - 1 : Math.floor(from);
-  if (i < 0) i = this.length + i;
-  if (i > this.length - 1) i = this.length - 1;
-  for (; i >= 0; i--) if (this[i] === v) return i;
-  return -1;
-};
-Uint8Array.prototype.includes = function (v, from) {
-  return this.indexOf(v, from) !== -1;
-};
-Uint8Array.prototype.join = function (sep) {
-  var out = [];
-  for (var i = 0; i < this.length; i++) out.push(this[i]);
-  return out.join(sep === undefined ? ',' : sep);
-};
-Uint8Array.prototype.forEach = function (fn, thisArg) {
-  for (var i = 0; i < this.length; i++) fn.call(thisArg, this[i], i, this);
-};
-Uint8Array.prototype.toString = function () { return this.join(','); };
-Uint8Array.prototype[Symbol.iterator] = function () {
-  var i = 0, self = this;
-  return { next: function () {
-    return i < self.length
-      ? { value: self[i++], done: false }
-      : { value: undefined, done: true };
-  } };
-};
-Uint8Array.from = function (src) { return new Uint8Array(src); };
-Uint8Array.of = function () { return new Uint8Array(arguments); };
-Uint8Array.BYTES_PER_ELEMENT = 1;
-var Uint8ClampedArray = Uint8Array;
-var Int8Array = Uint8Array;
 function TextEncoder() { this.encoding = 'utf-8'; }
 TextEncoder.prototype.encode = function (s) {
   s = s === undefined ? '' : '' + s;
@@ -1518,6 +1697,22 @@ impl PageVm {
         vm.set_global("__ggDateNow", dn);
         let stk = make_native(&mut vm.st, Native::StackTrace);
         vm.set_global("__ggStack", stk);
+        // Typed arrays: the bytes and the per-element conversion are
+        // native, the constructor overloads are in the prelude.
+        for (nm, id) in [
+            ("__ggBufNew", host::TA_BUF_NEW),
+            ("__ggBufSlice", host::TA_BUF_SLICE),
+            ("__ggViewNew", host::TA_VIEW_NEW),
+            ("__ggViewInfo", host::TA_INFO),
+            ("__ggViewSet", host::TA_SET),
+            ("__ggDvGet", host::TA_DV_GET),
+            ("__ggDvSet", host::TA_DV_SET),
+            ("__ggIsView", host::TA_IS_VIEW),
+            ("__ggRegisterProtos", host::TA_REGISTER),
+        ] {
+            let f = make_native(&mut vm.st, Native::HostFn(id));
+            vm.set_global(nm, f);
+        }
         vm.set_global("NaN", Value::number(f64::NAN));
         vm.set_global("Infinity", Value::number(f64::INFINITY));
         vm.install_object(

@@ -574,6 +574,19 @@ pub(super) mod host {
     pub const CV_MEASURE_TEXT: u16 = 120;
     pub const CV_IMAGE_DATA: u16 = 121;
     pub const CV_GRADIENT: u16 = 122;
+    // Typed arrays. The argument shuffling that the many constructor
+    // overloads need stays in the JS prelude; these are the parts that
+    // have to be native — the bytes, and reading one element out of
+    // them.
+    pub const TA_BUF_NEW: u16 = 130;
+    pub const TA_VIEW_NEW: u16 = 131;
+    pub const TA_INFO: u16 = 132;
+    pub const TA_SET: u16 = 133;
+    pub const TA_DV_GET: u16 = 134;
+    pub const TA_DV_SET: u16 = 135;
+    pub const TA_BUF_SLICE: u16 = 136;
+    pub const TA_IS_VIEW: u16 = 137;
+    pub const TA_REGISTER: u16 = 138;
 }
 
 /// Hidden class: property layout shared by every object that acquired
@@ -594,6 +607,10 @@ pub(super) struct Obj {
     promise: u32,
     /// index into St.regexes when this object is a RegExp, else REGEX_NONE.
     regex: u32,
+    /// index into St.views when this object is a typed array or a
+    /// DataView, else TYPED_NONE. The bytes themselves live in
+    /// St.buffers, so two views over one ArrayBuffer genuinely alias.
+    typed: u32,
     /// [[Prototype]]: an object value, or UNDEFINED for none. Property
     /// reads that miss the own shape walk this chain.
     proto: Value,
@@ -613,6 +630,53 @@ struct ProxyRec {
 pub(super) const PROMISE_NONE: u32 = u32::MAX;
 /// Sentinel: an Obj that is not a RegExp.
 pub(super) const REGEX_NONE: u32 = u32::MAX;
+
+pub(super) const TYPED_NONE: u32 = u32::MAX;
+
+/// The element types a typed array can hold. BigInt64/BigUint64 are
+/// absent because this engine has no BigInt yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ElemKind {
+    I8, U8, U8Clamped, I16, U16, I32, U32, F32, F64,
+    /// a DataView: no element type of its own, every read names one
+    Raw,
+}
+
+impl ElemKind {
+    fn width(self) -> usize {
+        match self {
+            ElemKind::I8 | ElemKind::U8 | ElemKind::U8Clamped
+                | ElemKind::Raw => 1,
+            ElemKind::I16 | ElemKind::U16 => 2,
+            ElemKind::I32 | ElemKind::U32 | ElemKind::F32 => 4,
+            ElemKind::F64 => 8,
+        }
+    }
+
+    fn ctor_name(self) -> &'static str {
+        match self {
+            ElemKind::I8 => "Int8Array",
+            ElemKind::U8 => "Uint8Array",
+            ElemKind::U8Clamped => "Uint8ClampedArray",
+            ElemKind::I16 => "Int16Array",
+            ElemKind::U16 => "Uint16Array",
+            ElemKind::I32 => "Int32Array",
+            ElemKind::U32 => "Uint32Array",
+            ElemKind::F32 => "Float32Array",
+            ElemKind::F64 => "Float64Array",
+            ElemKind::Raw => "DataView",
+        }
+    }
+}
+
+/// A view onto a byte buffer: which buffer, where in it, how many
+/// elements, and how to read one.
+pub(super) struct ViewRec {
+    pub(super) buffer: u32,
+    pub(super) offset: usize,
+    pub(super) len: usize,
+    pub(super) kind: ElemKind,
+}
 
 /// A compiled regex: the fast `regex` crate when it can handle the
 /// pattern, else `fancy-regex` for JS-only features (backreferences,
@@ -833,6 +897,10 @@ pub(super) struct KnownCtors {
     pub(super) number: Value,
     pub(super) boolean: Value,
     pub(super) function: Value,
+    /// Prototype every ArrayBuffer gets, and one per typed-array kind
+    /// (indexed by ElemKind order). Filled by PageVm at startup.
+    pub(super) array_buffer_proto: Value,
+    pub(super) typed_protos: [Value; 10],
 }
 
 impl Default for KnownCtors {
@@ -846,6 +914,8 @@ impl Default for KnownCtors {
             number: Value::UNDEFINED,
             boolean: Value::UNDEFINED,
             function: Value::UNDEFINED,
+            array_buffer_proto: Value::UNDEFINED,
+            typed_protos: [Value::UNDEFINED; 10],
         }
     }
 }
@@ -1086,6 +1156,10 @@ pub(super) struct St {
     ty_names: [Value; 6],
     /// Compiled RegExp records; an Obj.regex indexes here.
     pub(super) regexes: Vec<RegexRec>,
+    /// Raw bytes behind every ArrayBuffer. A view holds an index here,
+    /// so views over one buffer share storage the way the spec says.
+    pub(super) buffers: Vec<Vec<u8>>,
+    pub(super) views: Vec<ViewRec>,
     /// (pattern, flags) -> an index into `regexes`. A regex *literal*
     /// evaluates to a fresh object every time it is reached, so a loop
     /// body containing one used to rebuild the automaton on every
@@ -1262,6 +1336,8 @@ impl St {
             ready_state: "loading",
             ty_names: [Value::UNDEFINED; 6],
             regexes: Vec::new(),
+            buffers: Vec::new(),
+            views: Vec::new(),
             regex_cache: HashMap::new(),
             promises: Vec::new(),
             rejected: Vec::new(),
@@ -1360,6 +1436,309 @@ pub(super) fn make_native(st: &mut St, n: Native) -> Value {
     Value::function((st.closures.len() - 1) as u32)
 }
 
+/// Read one element out of a byte buffer. Typed arrays are
+/// little-endian on every platform anyone ships, so the layout is
+/// fixed rather than native-order; DataView asks for an order
+/// explicitly.
+fn read_elem(bytes: &[u8], at: usize, kind: ElemKind, le: bool) -> f64 {
+    macro_rules! grab {
+        ($n:expr) => {{
+            let mut b = [0u8; $n];
+            b.copy_from_slice(&bytes[at..at + $n]);
+            if !le {
+                b.reverse();
+            }
+            b
+        }};
+    }
+    match kind {
+        ElemKind::I8 => bytes[at] as i8 as f64,
+        ElemKind::U8 | ElemKind::U8Clamped | ElemKind::Raw => {
+            bytes[at] as f64
+        }
+        ElemKind::I16 => i16::from_le_bytes(grab!(2)) as f64,
+        ElemKind::U16 => u16::from_le_bytes(grab!(2)) as f64,
+        ElemKind::I32 => i32::from_le_bytes(grab!(4)) as f64,
+        ElemKind::U32 => u32::from_le_bytes(grab!(4)) as f64,
+        ElemKind::F32 => f32::from_le_bytes(grab!(4)) as f64,
+        ElemKind::F64 => f64::from_le_bytes(grab!(8)),
+    }
+}
+
+/// Write one element, with the conversion its type specifies. The
+/// integer kinds wrap modulo their width (ToInt32 and friends), which
+/// is why `Int8Array` cannot simply be `Uint8Array` — the same byte
+/// reads back as -1 or 255 depending on which it is. Uint8Clamped is
+/// the exception that clamps and rounds half-to-even instead.
+fn write_elem(
+    bytes: &mut [u8],
+    at: usize,
+    kind: ElemKind,
+    le: bool,
+    v: f64,
+) {
+    macro_rules! put {
+        ($arr:expr) => {{
+            let mut b = $arr;
+            if !le {
+                b.reverse();
+            }
+            bytes[at..at + b.len()].copy_from_slice(&b);
+        }};
+    }
+    // ToIntegerOrInfinity then modulo 2^n: NaN and the infinities all
+    // become 0, and the rest wrap.
+    let wrap = |bits: u32| -> u64 {
+        if !v.is_finite() {
+            return 0;
+        }
+        let m = 2f64.powi(bits as i32);
+        let t = v.trunc().rem_euclid(m);
+        t as u64
+    };
+    match kind {
+        ElemKind::I8 | ElemKind::U8 | ElemKind::Raw => {
+            bytes[at] = wrap(8) as u8;
+        }
+        ElemKind::U8Clamped => {
+            bytes[at] = if v.is_nan() {
+                0
+            } else if v <= 0.0 {
+                0
+            } else if v >= 255.0 {
+                255
+            } else {
+                // ties to even, as the spec's ToUint8Clamp says
+                let f = v.floor();
+                let d = v - f;
+                let n = if d < 0.5 {
+                    f
+                } else if d > 0.5 {
+                    f + 1.0
+                } else if (f as i64) % 2 == 0 {
+                    f
+                } else {
+                    f + 1.0
+                };
+                n as u8
+            };
+        }
+        ElemKind::I16 | ElemKind::U16 => {
+            put!((wrap(16) as u16).to_le_bytes())
+        }
+        ElemKind::I32 | ElemKind::U32 => {
+            put!((wrap(32) as u32).to_le_bytes())
+        }
+        ElemKind::F32 => put!((v as f32).to_le_bytes()),
+        ElemKind::F64 => put!(v.to_le_bytes()),
+    }
+}
+
+/// Read `view[i]`. Out of range is undefined — a typed array has no
+/// prototype chain to fall through to for indices.
+fn typed_get(st: &St, oi: usize, i: f64) -> Value {
+    let t = st.objects[oi].typed;
+    let r = &st.views[t as usize];
+    if r.kind == ElemKind::Raw
+        || i < 0.0
+        || i.fract() != 0.0
+        || i as usize >= r.len
+    {
+        return Value::UNDEFINED;
+    }
+    let w = r.kind.width();
+    Value::number(read_elem(
+        &st.buffers[r.buffer as usize],
+        r.offset + (i as usize) * w,
+        r.kind,
+        true,
+    ))
+}
+
+/// Write `view[i] = x`, converting to the element type. Out of range
+/// is silently dropped, which is what the spec says for an
+/// integer-indexed exotic object.
+fn typed_set(st: &mut St, oi: usize, i: f64, x: f64) {
+    let t = st.objects[oi].typed;
+    let (buffer, offset, len, kind) = {
+        let r = &st.views[t as usize];
+        (r.buffer, r.offset, r.len, r.kind)
+    };
+    if kind == ElemKind::Raw
+        || i < 0.0
+        || i.fract() != 0.0
+        || i as usize >= len
+    {
+        return;
+    }
+    let w = kind.width();
+    write_elem(
+        &mut st.buffers[buffer as usize],
+        offset + (i as usize) * w,
+        kind,
+        true,
+        x,
+    );
+}
+
+/// ElemKind <-> the small integer the JS side passes around, so the
+/// prelude can name a type without a string compare per element.
+fn kind_from_index(i: usize) -> ElemKind {
+    match i {
+        0 => ElemKind::I8,
+        1 => ElemKind::U8,
+        2 => ElemKind::U8Clamped,
+        3 => ElemKind::I16,
+        4 => ElemKind::U16,
+        5 => ElemKind::I32,
+        6 => ElemKind::U32,
+        7 => ElemKind::F32,
+        8 => ElemKind::F64,
+        _ => ElemKind::Raw,
+    }
+}
+
+fn kind_to_index(k: ElemKind) -> usize {
+    match k {
+        ElemKind::I8 => 0,
+        ElemKind::U8 => 1,
+        ElemKind::U8Clamped => 2,
+        ElemKind::I16 => 3,
+        ElemKind::U16 => 4,
+        ElemKind::I32 => 5,
+        ElemKind::U32 => 6,
+        ElemKind::F32 => 7,
+        ElemKind::F64 => 8,
+        ElemKind::Raw => 9,
+    }
+}
+
+/// The buffer arena index behind an ArrayBuffer object.
+fn buffer_index(st: &St, v: Value) -> Option<u32> {
+    if !v.is_object() {
+        return None;
+    }
+    let oi = v.index() as usize;
+    if !is_array_buffer(st, oi) {
+        return None;
+    }
+    Some(st.views[st.objects[oi].typed as usize].buffer)
+}
+
+/// The ArrayBuffer object that owns a given arena slot. Buffers are
+/// created with their object, so the mapping is recovered by scanning
+/// — there are few buffers and `.buffer` is not a hot read.
+fn buffer_object(st: &mut St, bi: u32) -> Value {
+    for (oi, o) in st.objects.iter().enumerate() {
+        if o.typed != TYPED_NONE
+            && st.views[o.typed as usize].buffer == bi
+            && st.views[o.typed as usize].kind == ElemKind::Raw
+            && st.views[o.typed as usize].len == 0
+            && st.views[o.typed as usize].offset == 0
+        {
+            return Value::object(oi as u32);
+        }
+    }
+    Value::UNDEFINED
+}
+
+/// `a` clamped into 0..=n, counting from the end when negative.
+fn clamp_index(a: f64, n: usize, dflt: usize) -> usize {
+    if !a.is_finite() {
+        return if a == f64::NEG_INFINITY { 0 } else { dflt };
+    }
+    let a = a.trunc();
+    if a < 0.0 {
+        let from_end = n as f64 + a;
+        if from_end < 0.0 { 0 } else { from_end as usize }
+    } else if a as usize > n {
+        n
+    } else {
+        a as usize
+    }
+}
+
+/// Read an array-like or typed array into plain numbers, for `set`.
+fn to_number_list(
+    st: &mut St,
+    mods: &ModStore,
+    src: Value,
+) -> Result<Vec<f64>, VmError> {
+    if let Some(t) = view_of(st, src) {
+        let (len, off, kind, bi) = {
+            let r = &st.views[t as usize];
+            (r.len, r.offset, r.kind, r.buffer)
+        };
+        let w = kind.width();
+        return Ok((0..len)
+            .map(|i| {
+                read_elem(&st.buffers[bi as usize], off + i * w, kind, true)
+            })
+            .collect());
+    }
+    if !src.is_object() {
+        return Ok(Vec::new());
+    }
+    let lk = st.intern_name("length");
+    let n = match raw_get_prop(st, src.index() as usize, lk) {
+        Some(v) => num_of(v).unwrap_or(0.0),
+        None => st.objects[src.index() as usize].elems.len() as f64,
+    };
+    let n = if n.is_finite() && n > 0.0 { n as usize } else { 0 };
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let k = st.intern_name(&i.to_string());
+        let v = internal_get(st, mods, src, k, src)?;
+        out.push(num_of(v).unwrap_or(f64::NAN));
+    }
+    Ok(out)
+}
+
+/// A fresh ArrayBuffer object of `len` zeroed bytes.
+fn new_array_buffer(st: &mut St, len: usize) -> Value {
+    st.buffers.push(vec![0u8; len]);
+    let bi = (st.buffers.len() - 1) as u32;
+    st.heap_bytes = st.heap_bytes.saturating_add(len);
+    let v = new_plain_object(st);
+    let oi = v.index() as usize;
+    // The view record marks it as a buffer rather than a view: len 0
+    // and kind Raw, pointing at itself. Reads go through `buffer_of`.
+    st.views.push(ViewRec {
+        buffer: bi,
+        offset: 0,
+        len: 0,
+        kind: ElemKind::Raw,
+    });
+    st.objects[oi].typed = (st.views.len() - 1) as u32;
+    let k = st.intern_name("byteLength");
+    raw_set_prop(st, oi, k, Value::int(len as i32));
+    st.non_enum.insert((oi as u32, k));
+    st.objects[oi].proto = st.known.array_buffer_proto;
+    v
+}
+
+/// Is this object an ArrayBuffer (rather than a view onto one)?
+fn is_array_buffer(st: &St, oi: usize) -> bool {
+    let t = st.objects[oi].typed;
+    t != TYPED_NONE
+        && st.views[t as usize].kind == ElemKind::Raw
+        && st.views[t as usize].len == 0
+        && st.views[t as usize].offset == 0
+}
+
+/// The view record for an object, if it is a typed array or DataView.
+fn view_of(st: &St, v: Value) -> Option<u32> {
+    if !v.is_object() {
+        return None;
+    }
+    let t = st.objects[v.index() as usize].typed;
+    if t == TYPED_NONE || is_array_buffer(st, v.index() as usize) {
+        None
+    } else {
+        Some(t)
+    }
+}
+
 pub(super) fn new_plain_object(st: &mut St) -> Value {
     st.objects.push(Obj {
         shape: 0,
@@ -1370,6 +1749,7 @@ pub(super) fn new_plain_object(st: &mut St) -> Value {
         regex: REGEX_NONE,
         proto: Value::UNDEFINED,
         has_accessors: false,
+        typed: TYPED_NONE,
     });
     Value::object((st.objects.len() - 1) as u32)
 }
@@ -1384,6 +1764,7 @@ fn new_array(st: &mut St, elems: Vec<Value>) -> Value {
         regex: REGEX_NONE,
         proto: Value::UNDEFINED,
         has_accessors: false,
+        typed: TYPED_NONE,
     });
     Value::object((st.objects.len() - 1) as u32)
 }
@@ -1789,6 +2170,7 @@ fn wrap_regex(
         regex: ri,
         proto: Value::UNDEFINED,
         has_accessors: false,
+        typed: TYPED_NONE,
     });
     let rv = Value::object((st.objects.len() - 1) as u32);
     // real instance properties (jQuery reads .source to rebuild
@@ -7999,6 +8381,188 @@ fn host_fn(
             }
             Ok(m)
         }
+        TA_BUF_NEW => {
+            let n = num_of(argv!(0))?;
+            let n = if n.is_finite() && n > 0.0 { n as usize } else { 0 };
+            if n > MAX_STR_BYTES {
+                return range_err("ArrayBuffer is too large");
+            }
+            Ok(new_array_buffer(st, n))
+        }
+        TA_BUF_SLICE => {
+            let src = argv!(0);
+            let Some(bi) = buffer_index(st, src) else {
+                return type_err("not an ArrayBuffer");
+            };
+            let n = st.buffers[bi as usize].len();
+            let a = clamp_index(num_of(argv!(1))?, n, 0);
+            let b = if argv!(2).is_undefined() {
+                n
+            } else {
+                clamp_index(num_of(argv!(2))?, n, n)
+            };
+            let part = if b > a {
+                st.buffers[bi as usize][a..b].to_vec()
+            } else {
+                Vec::new()
+            };
+            let out = new_array_buffer(st, part.len());
+            let obi = buffer_index(st, out).expect("just made one");
+            st.buffers[obi as usize] = part;
+            Ok(out)
+        }
+        TA_IS_VIEW => Ok(Value::boolean(view_of(st, argv!(0)).is_some())),
+        TA_REGISTER => {
+            // The prelude owns the prototypes; the constructors that
+            // hand out buffers and views are native and need to know
+            // what to hang them off.
+            st.known.array_buffer_proto = argv!(0);
+            let list = argv!(1);
+            if list.is_object() {
+                let li = list.index() as usize;
+                for i in 0..st.objects[li].elems.len().min(10) {
+                    st.known.typed_protos[i] = st.objects[li].elems[i];
+                }
+            }
+            st.known.typed_protos[9] = argv!(2);
+            Ok(Value::UNDEFINED)
+        }
+        TA_VIEW_NEW => {
+            // (buffer, byteOffset, length, kind)
+            let buf = argv!(0);
+            let Some(bi) = buffer_index(st, buf) else {
+                return type_err("first argument is not an ArrayBuffer");
+            };
+            let kind = kind_from_index(num_of(argv!(3))? as usize);
+            let blen = st.buffers[bi as usize].len();
+            let off = num_of(argv!(1))?;
+            let off = if off.is_finite() && off > 0.0 {
+                off as usize
+            } else {
+                0
+            };
+            let w = kind.width();
+            if off > blen || (w > 1 && off % w != 0) {
+                return range_err(
+                    "start offset is outside the buffer or misaligned");
+            }
+            let len = if argv!(2).is_undefined() {
+                (blen - off) / w
+            } else {
+                let l = num_of(argv!(2))?;
+                if l.is_finite() && l > 0.0 { l as usize } else { 0 }
+            };
+            if off + len * w > blen {
+                return range_err("view runs past the end of the buffer");
+            }
+            let v = new_plain_object(st);
+            let oi = v.index() as usize;
+            st.views.push(ViewRec { buffer: bi, offset: off, len, kind });
+            st.objects[oi].typed = (st.views.len() - 1) as u32;
+            st.objects[oi].proto =
+                st.known.typed_protos[kind_to_index(kind)];
+            Ok(v)
+        }
+        TA_INFO => {
+            // (view) -> [length, byteOffset, byteLength, bytesPerElement,
+            //            buffer]
+            let v = argv!(0);
+            let Some(t) = view_of(st, v) else {
+                return type_err("not a typed array");
+            };
+            let (len, off, kind, bi) = {
+                let r = &st.views[t as usize];
+                (r.len, r.offset, r.kind, r.buffer)
+            };
+            let w = kind.width();
+            let bytelen = if kind == ElemKind::Raw { len } else { len * w };
+            let bufv = buffer_object(st, bi);
+            Ok(new_array(st, vec![
+                Value::int(len as i32),
+                Value::int(off as i32),
+                Value::int(bytelen as i32),
+                Value::int(w as i32),
+                bufv,
+            ]))
+        }
+        TA_SET => {
+            // (view, source, offset) — copies through the buffer, so a
+            // second view of the same bytes sees it
+            let dst = argv!(0);
+            let Some(t) = view_of(st, dst) else {
+                return type_err("not a typed array");
+            };
+            let (dlen, doff, dkind, dbi) = {
+                let r = &st.views[t as usize];
+                (r.len, r.offset, r.kind, r.buffer)
+            };
+            let at = num_of(argv!(2))?;
+            let at = if at.is_finite() && at > 0.0 { at as usize } else { 0 };
+            let vals = to_number_list(st, mods, argv!(1))?;
+            if at + vals.len() > dlen {
+                return range_err("source is too large for this view");
+            }
+            let w = dkind.width();
+            for (i, x) in vals.iter().enumerate() {
+                let byte = doff + (at + i) * w;
+                write_elem(
+                    &mut st.buffers[dbi as usize], byte, dkind, true, *x,
+                );
+            }
+            Ok(Value::UNDEFINED)
+        }
+        TA_DV_GET => {
+            // (dataview, byteOffset, kindIndex, littleEndian)
+            let v = argv!(0);
+            let Some(t) = view_of(st, v) else {
+                return type_err("not a DataView");
+            };
+            let (vlen, voff, bi) = {
+                let r = &st.views[t as usize];
+                (r.len, r.offset, r.buffer)
+            };
+            let kind = kind_from_index(num_of(argv!(2))? as usize);
+            let at = num_of(argv!(1))?;
+            let at = if at.is_finite() && at >= 0.0 {
+                at as usize
+            } else {
+                return range_err("byte offset is out of range");
+            };
+            if at + kind.width() > vlen {
+                return range_err("byte offset is out of range");
+            }
+            let le = truthy(st, argv!(3));
+            Ok(Value::number(read_elem(
+                &st.buffers[bi as usize], voff + at, kind, le,
+            )))
+        }
+        TA_DV_SET => {
+            // (dataview, byteOffset, kindIndex, value, littleEndian)
+            let v = argv!(0);
+            let Some(t) = view_of(st, v) else {
+                return type_err("not a DataView");
+            };
+            let (vlen, voff, bi) = {
+                let r = &st.views[t as usize];
+                (r.len, r.offset, r.buffer)
+            };
+            let kind = kind_from_index(num_of(argv!(2))? as usize);
+            let at = num_of(argv!(1))?;
+            let at = if at.is_finite() && at >= 0.0 {
+                at as usize
+            } else {
+                return range_err("byte offset is out of range");
+            };
+            if at + kind.width() > vlen {
+                return range_err("byte offset is out of range");
+            }
+            let x = num_of(argv!(3))?;
+            let le = truthy(st, argv!(4));
+            write_elem(
+                &mut st.buffers[bi as usize], voff + at, kind, le, x,
+            );
+            Ok(Value::UNDEFINED)
+        }
         CV_GRADIENT => {
             let g = new_plain_object(st);
             let gi = g.index() as usize;
@@ -13790,6 +14354,14 @@ fn exec_loop(
                 } else if ov.is_object() && kv.is_number() {
                     let oi = ov.index() as usize;
                     let k = kv.to_number_raw();
+                    // A typed array's elements are bytes in a shared
+                    // buffer, not entries in `elems`, and an index
+                    // outside the view is undefined rather than a
+                    // prototype lookup.
+                    if st.objects[oi].typed != TYPED_NONE {
+                        reg!(dst) = typed_get(st, oi, k);
+                        continue;
+                    }
                     let mut hit = Value::UNDEFINED;
                     let in_elems = k >= 0.0
                         && k.fract() == 0.0
@@ -14082,6 +14654,15 @@ fn exec_loop(
                     let _ = internal_set(st, mods, ov, key_id, v, ov)?;
                 } else if ov.is_object() && kv.is_number() {
                     let k = kv.to_number_raw();
+                    // A write to a typed array converts to the element
+                    // type and lands in the buffer; one outside the
+                    // view is dropped, not turned into a property.
+                    let oi = ov.index() as usize;
+                    if st.objects[oi].typed != TYPED_NONE {
+                        let x = num_of(v).unwrap_or(f64::NAN);
+                        typed_set(st, oi, k, x);
+                        continue;
+                    }
                     if k < 0.0 || k.fract() != 0.0 {
                         // JS: not an element — a plain named property
                         let text = to_display(st, kv);
