@@ -6814,6 +6814,91 @@ console.log('B typeof it: ' + typeof it);
         assert!(eval(r"var \x41 = 1;").is_err());
     }
 
+    /// A regex literal builds a fresh object every time it is reached,
+    /// but not a fresh automaton. Compiling dominates the cost by three
+    /// orders of magnitude, so a literal in a loop body used to spend
+    /// all its time rebuilding a pattern it already had.
+    #[test]
+    fn regex_literals_do_not_recompile() {
+        // same pattern, many evaluations: one compiled record
+        assert_eq!(
+            n("var n = 0; \
+               for (var i = 0; i < 50; i++) { \
+                 if (/^(\\d{4})-(\\d{2})-(\\d{2})$/.test('2026-07-28')) n++; \
+               } n"),
+            50.0);
+        // distinct objects, as the spec requires — the sharing is
+        // behind them, not in front
+        assert_eq!(
+            n("function mk() { return /a(b)c/g; } \
+               var x = mk(), y = mk(); x === y ? 1 : 0"),
+            0.0);
+        // ...so lastIndex stays per-object even when the pattern is
+        // shared, which is what makes sharing safe at all
+        assert_eq!(
+            n("function mk() { return /a/g; } \
+               var x = mk(), y = mk(); \
+               x.exec('aaa'); \
+               x.lastIndex === 1 && y.lastIndex === 0 ? 1 : 0"),
+            1.0);
+        // flags are part of the identity: same source, different flags
+        assert_eq!(
+            n("var a = /x/i, b = /x/; \
+               a.ignoreCase === true && b.ignoreCase === false && \
+               a.test('X') && !b.test('X') ? 1 : 0"),
+            1.0);
+        // and a cached record still reports its own source and flags
+        assert_eq!(
+            n("function mk() { return /a(b)c/gi; } \
+               mk(); var r = mk(); \
+               r.source === 'a(b)c' && r.flags === 'gi' && \
+               r.global === true ? 1 : 0"),
+            1.0);
+    }
+
+    /// A global or sticky regex resumes from `lastIndex` and writes
+    /// back where it stopped. Without that, the idiom every reference
+    /// for `exec` shows — `while ((m = re.exec(s)) !== null)` — matches
+    /// position zero forever and never terminates.
+    #[test]
+    fn global_exec_advances_last_index() {
+        assert_eq!(
+            n("var re = /a/g, m, n = 0; \
+               while ((m = re.exec('aXaXa')) !== null) { \
+                 n++; if (n > 20) break; \
+               } n"),
+            3.0);
+        // the positions it walks through, and the reset at the end
+        assert_eq!(
+            n("var re = /a/g; re.exec('aXa'); var p = re.lastIndex; \
+               re.exec('aXa'); var q = re.lastIndex; \
+               re.exec('aXa'); \
+               p === 1 && q === 3 && re.lastIndex === 0 ? 1 : 0"),
+            1.0);
+        // a non-global regex ignores lastIndex and never sets it
+        assert_eq!(
+            n("var re = /a/; re.lastIndex = 2; \
+               var m = re.exec('aXa'); \
+               m.index === 0 && re.lastIndex === 2 ? 1 : 0"),
+            1.0);
+        // .index and .input come with the result
+        assert_eq!(
+            n("var m = /b(c)/.exec('abcd'); \
+               m.index === 1 && m.input === 'abcd' && \
+               m[0] === 'bc' && m[1] === 'c' ? 1 : 0"),
+            1.0);
+        // positions are UTF-16 units, matching String.prototype.length
+        assert_eq!(
+            n("var m = /b/.exec('\u{1F600}b'); \
+               m.index === 2 && '\u{1F600}b'.length === 3 ? 1 : 0"),
+            1.0);
+        // lastIndex past the end fails the match and resets
+        assert_eq!(
+            n("var re = /a/g; re.lastIndex = 99; \
+               re.exec('aaa') === null && re.lastIndex === 0 ? 1 : 0"),
+            1.0);
+    }
+
     /// VT and FF are WhiteSpace in the grammar, same as space and tab.
     #[test]
     fn vertical_tab_and_form_feed_are_whitespace() {

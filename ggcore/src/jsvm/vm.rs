@@ -653,6 +653,37 @@ impl CompiledRe {
             CompiledRe::Never => None,
         }
     }
+    /// Like `captures_owned`, but also reports where the whole match
+    /// sat, in bytes. `exec` needs that to advance `lastIndex` and to
+    /// fill in `.index`; without it a `/g` regex matches position zero
+    /// forever and `while ((m = re.exec(s)))` never ends.
+    #[allow(clippy::type_complexity)]
+    fn captures_at(
+        &self,
+        s: &str,
+    ) -> Option<(usize, usize, Vec<Option<String>>)> {
+        match self {
+            CompiledRe::Std(r) => r.captures(s).map(|c| {
+                let w = c.get(0).expect("group 0 always matches");
+                let v = (0..c.len())
+                    .map(|i| c.get(i).map(|m| m.as_str().to_string()))
+                    .collect();
+                (w.start(), w.end(), v)
+            }),
+            CompiledRe::Fancy(r) => {
+                r.captures(s).ok().flatten().map(|c| {
+                    let w = c.get(0).expect("group 0 always matches");
+                    let v = (0..c.len())
+                        .map(|i| {
+                            c.get(i).map(|m| m.as_str().to_string())
+                        })
+                        .collect();
+                    (w.start(), w.end(), v)
+                })
+            }
+            CompiledRe::Never => None,
+        }
+    }
     /// capture-group names by index (0 = whole match, always None);
     /// an unnamed group yields None. Empty when the regex never compiled.
     fn capture_names(&self) -> Vec<Option<String>> {
@@ -1048,6 +1079,14 @@ pub(super) struct St {
     ty_names: [Value; 6],
     /// Compiled RegExp records; an Obj.regex indexes here.
     pub(super) regexes: Vec<RegexRec>,
+    /// (pattern, flags) -> an index into `regexes`. A regex *literal*
+    /// evaluates to a fresh object every time it is reached, so a loop
+    /// body containing one used to rebuild the automaton on every
+    /// iteration — about a thousand times the cost of the match. The
+    /// record holds nothing per-object (`lastIndex` is a property on
+    /// the object), so the compiled form is shared and only the
+    /// wrapper object is new.
+    pub(super) regex_cache: HashMap<(String, String), u32>,
     // --- async runtime (P3) ---
     /// Promise records; an Obj.promise indexes here.
     pub(super) promises: Vec<PromiseRec>,
@@ -1214,6 +1253,7 @@ impl St {
             ready_state: "loading",
             ty_names: [Value::UNDEFINED; 6],
             regexes: Vec::new(),
+            regex_cache: HashMap::new(),
             promises: Vec::new(),
             rejected: Vec::new(),
             microtasks: std::collections::VecDeque::new(),
@@ -1578,6 +1618,87 @@ fn match_groups(st: &mut St, ri: usize, caps: &[Option<String>]) -> Value {
     obj
 }
 
+/// One match attempt with the statefulness the spec gives it.
+///
+/// A global or sticky regex resumes from `lastIndex` and writes back
+/// where it stopped; every other regex starts at zero and leaves
+/// `lastIndex` alone. `test` and `exec` share this because the spec
+/// defines both in terms of the same operation — and because having
+/// two copies of it is how `exec` came to ignore `lastIndex` in the
+/// first place, which makes `while ((m = re.exec(s)) !== null)` spin
+/// on position zero forever.
+///
+/// Returns the whole match's byte range within `subject` plus its
+/// capture strings.
+#[allow(clippy::type_complexity)]
+fn regex_step(
+    st: &mut St,
+    oi: usize,
+    ri: usize,
+    subject: &str,
+) -> Option<(usize, usize, Vec<Option<String>>)> {
+    let stateful =
+        st.regexes[ri].global || st.regexes[ri].flags.contains('y');
+    let li_key = st.intern_name("lastIndex");
+    let from_u16 = if stateful {
+        raw_get_prop(st, oi, li_key)
+            .and_then(|v| num_of(v).ok())
+            .filter(|n| n.is_finite())
+            .map(|n| n.max(0.0) as usize)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    if stateful && from_u16 > byte_to_u16(subject, subject.len()) {
+        raw_set_prop(st, oi, li_key, Value::int(0));
+        return None;
+    }
+    let from = u16_to_byte(subject, from_u16);
+    match st.regexes[ri].re.captures_at(&subject[from..]) {
+        None => {
+            if stateful {
+                raw_set_prop(st, oi, li_key, Value::int(0));
+            }
+            None
+        }
+        Some((s0, e0, gs)) => {
+            if stateful {
+                let end = byte_to_u16(subject, from + e0) as i32;
+                raw_set_prop(st, oi, li_key, Value::int(end));
+            }
+            Some((from + s0, from + e0, gs))
+        }
+    }
+}
+
+/// Build the array `exec` answers with: the captures, plus the
+/// `.index` and `.input` that callers reporting a match position read.
+fn regex_result(
+    st: &mut St,
+    ri: usize,
+    subject: &str,
+    start: usize,
+    gs: &[Option<String>],
+) -> Value {
+    let vals: Vec<Value> = gs
+        .iter()
+        .map(|g| match g {
+            Some(s) => push_str(st, s.clone()),
+            None => Value::UNDEFINED,
+        })
+        .collect();
+    let arr = new_array(st, vals);
+    attach_groups(st, arr, ri, gs);
+    let ai = arr.index() as usize;
+    let idx = byte_to_u16(subject, start) as i32;
+    let ik = st.intern_name("index");
+    raw_set_prop(st, ai, ik, Value::int(idx));
+    let inp = push_str(st, subject.to_string());
+    let nk = st.intern_name("input");
+    raw_set_prop(st, ai, nk, inp);
+    arr
+}
+
 /// Attach `.groups` to a freshly built match-result array.
 fn attach_groups(st: &mut St, arr: Value, ri: usize, caps: &[Option<String>]) {
     let groups = match_groups(st, ri, caps);
@@ -1591,6 +1712,13 @@ fn new_regex(
     pattern: &str,
     flags: &str,
 ) -> Result<Value, VmError> {
+    // Compiling the automaton dominates: for a pattern of a few
+    // character classes it is ~48ms against ~0.05ms to run the match.
+    // A regex literal in a loop body paid that on every iteration.
+    let cache_key = (pattern.to_string(), flags.to_string());
+    if let Some(&ri) = st.regex_cache.get(&cache_key) {
+        return Ok(wrap_regex(st, ri, pattern, flags));
+    }
     let mut inline = String::new();
     for f in ['i', 'm', 's'] {
         if flags.contains(f) {
@@ -1629,6 +1757,20 @@ fn new_regex(
         flags: flags.to_string(),
     });
     let ri = (st.regexes.len() - 1) as u32;
+    st.regex_cache.insert(cache_key, ri);
+    Ok(wrap_regex(st, ri, pattern, flags))
+}
+
+/// The per-object half of a RegExp: a fresh object pointing at an
+/// already-compiled record. Everything here is per-instance —
+/// `lastIndex` above all — which is why the record behind it can be
+/// shared between every literal that spells the same pattern.
+fn wrap_regex(
+    st: &mut St,
+    ri: u32,
+    pattern: &str,
+    flags: &str,
+) -> Value {
     st.objects.push(Obj {
         shape: 0,
         slots: Vec::new(),
@@ -1661,7 +1803,7 @@ fn new_regex(
     }
     let lk = st.intern_name("lastIndex");
     raw_set_prop(st, oi, lk, Value::int(0));
-    Ok(rv)
+    rv
 }
 
 // ===================== async runtime (P3) =====================
@@ -2374,6 +2516,27 @@ fn str_len(st: &St, i: u32) -> usize {
 /// UTF-16 code-unit length of a string value, memoized. Strings are
 /// immutable, so the cached count never goes stale — this turns a hot
 /// `s.length` (recounted O(n) each read) into O(1) amortized.
+/// Byte offset of the UTF-16 code-unit position `n`, clamped to the
+/// end of `s`. JS counts string positions in UTF-16 units — `length`,
+/// `lastIndex` and a match's `.index` all agree on that — while a Rust
+/// `str` is indexed in bytes, so anything that crosses between the two
+/// goes through here.
+fn u16_to_byte(s: &str, n: usize) -> usize {
+    let mut u = 0usize;
+    for (b, c) in s.char_indices() {
+        if u >= n {
+            return b;
+        }
+        u += c.len_utf16();
+    }
+    s.len()
+}
+
+/// The inverse: UTF-16 position of a byte offset.
+fn byte_to_u16(s: &str, b: usize) -> usize {
+    s[..b.min(s.len())].chars().map(char::len_utf16).sum()
+}
+
 fn str_u16_len(st: &mut St, i: u32) -> usize {
     if let Some(&n) = st.ulen_cache.get(&i) {
         return n as usize;
@@ -3844,20 +4007,11 @@ fn method_ref_dispatch(
                 .first()
                 .map(|&v| to_display(st, v))
                 .unwrap_or_default();
-            let groups = st.regexes[ri].re.captures_owned(&subject);
-            Ok(match groups {
+            let oi = recv.index() as usize;
+            Ok(match regex_step(st, oi, ri, &subject) {
                 None => Value::NULL,
-                Some(gs) => {
-                    let vals: Vec<Value> = gs
-                        .iter()
-                        .map(|g| match g {
-                            Some(s) => push_str(st, s.clone()),
-                            None => Value::UNDEFINED,
-                        })
-                        .collect();
-                    let arr = new_array(st, vals);
-                    attach_groups(st, arr, ri, &gs);
-                    arr
+                Some((s0, _, gs)) => {
+                    regex_result(st, ri, &subject, s0, &gs)
                 }
             })
         }
@@ -11933,32 +12087,16 @@ fn exec_loop(
                         };
                         let r = match method.as_str() {
                             "test" => {
-                                Value::boolean(
-                                    st.regexes[ri].re.is_match(&subject),
-                                )
+                                let hit =
+                                    regex_step(st, oi, ri, &subject);
+                                Value::boolean(hit.is_some())
                             }
                             "exec" => {
-                                // collect owned strings first to release
-                                // the regex borrow before push_str mutates st
-                                let groups = st.regexes[ri]
-                                    .re
-                                    .captures_owned(&subject);
-                                match groups {
+                                match regex_step(st, oi, ri, &subject) {
                                     None => Value::NULL,
-                                    Some(gs) => {
-                                        let vals: Vec<Value> = gs
-                                            .iter()
-                                            .map(|g| match g {
-                                                Some(s) => {
-                                                    push_str(st, s.clone())
-                                                }
-                                                None => Value::UNDEFINED,
-                                            })
-                                            .collect();
-                                        let arr = new_array(st, vals);
-                                        attach_groups(st, arr, ri, &gs);
-                                        arr
-                                    }
+                                    Some((s0, _, gs)) => regex_result(
+                                        st, ri, &subject, s0, &gs,
+                                    ),
                                 }
                             }
                             other => {
