@@ -859,6 +859,37 @@ check("an empty word survives every transform",
       == ["", "", ""])
 
 
+# filter: opacity() composes with the property; clip-path: inset()
+check("filter: opacity multiplies with the opacity property",
+      (_oo(_N(**{"filter": "opacity(0.5)"})),
+       _oo(_N(**{"filter": "opacity(50%)"})),
+       _oo(_N(opacity="0.5", **{"filter": "opacity(0.5)"})))
+      == (0.5, 0.5, 0.25))
+check("another filter function is not mistaken for opacity",
+      _oo(_N(**{"filter": "grayscale(1)"})) is None)
+
+from browser.layout import clip_path_inset as _cpi
+check("inset() with one value insets all four sides",
+      _cpi(_N(**{"clip-path": "inset(10px)"}), 16, 0, 0, 100, 50)
+      == (10.0, 10.0, 90.0, 40.0))
+check("inset() fills the shorthand the CSS way",
+      _cpi(_N(**{"clip-path": "inset(10px 20px)"}), 16, 0, 0, 100, 50)
+      == (20.0, 10.0, 80.0, 40.0))
+check("inset() percentages resolve per axis",
+      _cpi(_N(**{"clip-path": "inset(10% 25%)"}), 16, 0, 0, 100, 50)
+      == (25.0, 5.0, 75.0, 45.0))
+check("a rounded inset still clips its rect",
+      _cpi(_N(**{"clip-path": "inset(10px round 5px)"}), 16, 0, 0, 100, 50)
+      == (10.0, 10.0, 90.0, 40.0))
+check("a non-rectangular clip-path is left alone, not approximated",
+      [_cpi(_N(**{"clip-path": v}), 16, 0, 0, 100, 50) for v in
+       ("circle(50%)", "polygon(0 0, 100% 0, 50% 100%)", "none")]
+      == [None, None, None])
+check("an over-large inset collapses instead of inverting",
+      _cpi(_N(**{"clip-path": "inset(80px)"}), 16, 0, 0, 100, 50)
+      == (80.0, 80.0, 80.0, 80.0))
+
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",

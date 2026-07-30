@@ -5456,33 +5456,96 @@ def _transform_origin(box, w, h):
     return left + w * fx, top + h * fy
 
 
+_FILTER_OPACITY_RE = re.compile(
+    r"opacity\(\s*([0-9.]+)(%?)\s*\)", re.I)
+
+
 def own_opacity(node):
-    """The element's own `opacity`, or None when it is fully opaque."""
-    raw = (getattr(node, "style", None) or {}).get("opacity")
-    if raw is None:
+    """The element's own `opacity`, or None when it is fully opaque.
+
+    `filter: opacity()` composes with it: the filter function is
+    defined as doing what the property does, so the two multiply, and
+    supporting it here costs nothing now that the property works.
+    Every other filter function needs a per-pixel colour transform
+    this rasterizer has no command for and is still ignored.
+    """
+    style = getattr(node, "style", None) or {}
+    value = 1.0
+    raw = style.get("opacity")
+    if raw is not None:
+        try:
+            value *= max(float(str(raw).strip()), 0.0)
+        except (TypeError, ValueError):
+            pass
+    m = _FILTER_OPACITY_RE.search(style.get("filter") or "")
+    if m:
+        try:
+            found = float(m.group(1))
+            value *= max(found / 100.0 if m.group(2) else found, 0.0)
+        except ValueError:
+            pass
+    return None if value >= 1.0 else value
+
+
+_INSET_RE = re.compile(r"inset\(([^)]*)\)", re.I)
+
+
+def clip_path_inset(node, em, x1, y1, x2, y2):
+    """The rect a rectangular `clip-path` clips to, or None.
+
+    Only `inset()` is handled, and it is handled exactly: it is a
+    rectangle, which is the one shape this display list has a clip
+    command for. circle(), ellipse() and polygon() need a real shape
+    clip and are still ignored rather than approximated by their
+    bounding box — a box is not a circle, and drawing one where the
+    author asked for the other is worse than drawing nothing special.
+    """
+    spec = (getattr(node, "style", None) or {}).get("clip-path") or ""
+    m = _INSET_RE.search(spec)
+    if not m:
         return None
-    try:
-        value = float(str(raw).strip())
-    except (TypeError, ValueError):
+    parts = m.group(1).split("round")[0].split()
+    if not parts:
         return None
-    if value >= 1.0:
-        return None
-    return max(value, 0.0)
+    w, h = x2 - x1, y2 - y1
+    sides = []
+    for i in range(4):
+        # top right bottom left, filled in the CSS shorthand way
+        token = parts[i] if i < len(parts) else \
+            parts[i - 2] if i >= 2 and len(parts) > i - 2 else \
+            parts[1] if i == 3 and len(parts) > 1 else parts[0]
+        value = parse_size(token, h if i % 2 == 0 else w, em)
+        sides.append(0.0 if value is None else value)
+    top, right, bottom, left = sides
+    return (x1 + left, y1 + top, max(x2 - right, x1 + left),
+            max(y2 - bottom, y1 + top))
 
 
 def paint_tree(layout_object, display_list):
     # opacity fades the whole subtree, so it brackets everything the box
     # paints rather than tinting one command
-    alpha = (own_opacity(layout_object.node)
-             if isinstance(layout_object, BlockLayout) else None)
-    if alpha is not None:
-        inner = _paint_tree_uncomposited(layout_object, [])
-        if inner:
-            display_list.append(DrawOpacityPush(alpha))
-            display_list.extend(inner)
-            display_list.append(DrawOpacityPop())
+    if not isinstance(layout_object, BlockLayout):
+        return _paint_tree_uncomposited(layout_object, display_list)
+    alpha = own_opacity(layout_object.node)
+    box = layout_object
+    clip = clip_path_inset(
+        box.node,
+        parse_px((getattr(box.node, "style", None) or {}).get(
+            "font-size", "16px"), 16.0),
+        box.x - box.pl - box.bl, box.y - box.pt - box.bt,
+        box.x + box.width + box.pr + box.br,
+        box.y + box.height + box.pb + box.bb)
+    if alpha is None and clip is None:
+        return _paint_tree_uncomposited(layout_object, display_list)
+    inner = _paint_tree_uncomposited(layout_object, [])
+    if not inner:
         return display_list
-    return _paint_tree_uncomposited(layout_object, display_list)
+    if clip is not None:
+        inner = [DrawClipPush(*clip)] + inner + [DrawClipPop()]
+    if alpha is not None:
+        inner = [DrawOpacityPush(alpha)] + inner + [DrawOpacityPop()]
+    display_list.extend(inner)
+    return display_list
 
 
 def _paint_tree_uncomposited(layout_object, display_list):
