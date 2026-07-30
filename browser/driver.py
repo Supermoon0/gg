@@ -104,6 +104,7 @@ class Page:
         self.url = None
         self.title = None
         self._doc = None
+        self._root = None
         self._css_sources = []
         self._console = []
         self._styles_dirty = False   # a handler mutated the DOM
@@ -147,20 +148,36 @@ class Page:
         self.url = final_url
 
         try:
+            # Defer the page's scripts so layout can run first: script
+            # that reads offsetWidth at load time — which is every WPT
+            # check-layout test — must not be measuring a page that has
+            # never been laid out.
             root, doc, css_sources, logs = self._renderer.commit(
-                self.url, body, cancel_token=token)
+                self.url, body, cancel_token=token, defer_scripts=True)
         except Exception:
             if self._navigation_token is token:
                 self._navigation_token = None
             raise
 
         self._doc = doc
+        self._root = root
         self._css_sources = css_sources
         self._console = list(logs)
         self._form_defaults = forms.capture_defaults(root)
         self._ver += 1
         self._export_cache = None
         self._styles_dirty = False
+        self._push_layout_rects()
+        # now let the deferred scripts run, with real geometry in hand
+        try:
+            update = self._renderer.tick(0)
+        except Exception:
+            update = None
+        if update is not None and getattr(update, "logs", None):
+            self._console.extend(update.logs)
+            self._ver += 1
+            self._export_cache = None
+            self._push_layout_rects()
         if settle:
             self.settle()
         self.title = self._compute_title()
@@ -195,7 +212,71 @@ class Page:
             self._renderer.refresh()
             self._ver += 1
             self._export_cache = None
+            self._push_layout_rects()
         self.pump_frames()
+
+    def _push_layout_rects(self, width=1280, height=800):
+        """Lay the page out and feed the geometry back to the engine, so
+        `offsetWidth`, `offsetLeft` and getBoundingClientRect answer real
+        numbers to page script.
+
+        The shells do this on every frame; headless never did, so every
+        element in this path measured 0x0. That is not a small gap for
+        assertions: WPT's check-layout-th.js reads exactly these
+        properties, and about nine thousand of its subtests were
+        comparing a real expectation against a zero.
+        """
+        if self._doc is None or self._root is None:
+            return
+        try:
+            from .layout import (BlockLayout, DocumentLayout, ImageLayout,
+                                 TextLayout, layout_tree_to_list)
+            from .html_parser import Element
+        except Exception:
+            return
+        try:
+            document = DocumentLayout(self._root)
+            document.layout(width, height)
+            objects = layout_tree_to_list(document, [])
+        except Exception:
+            return                      # a layout crash must not fail goto
+        boxes = {}
+
+        def add(ridx, x, y, w, h):
+            if ridx is None:
+                return
+            b = boxes.get(ridx)
+            if b is None:
+                boxes[ridx] = [x, y, x + w, y + h]
+            else:
+                b[0] = min(b[0], x)
+                b[1] = min(b[1], y)
+                b[2] = max(b[2], x + w)
+                b[3] = max(b[3], y + h)
+
+        for o in objects:
+            node = getattr(o, "node", None)
+            if isinstance(o, (BlockLayout, ImageLayout)):
+                add(getattr(node, "_ridx", None), o.x, o.y, o.width,
+                    o.height)
+            elif isinstance(o, TextLayout):
+                # inline elements are laid out as words and own no box;
+                # attribute each word to its element ancestors
+                cur, depth = node, 0
+                while cur is not None and depth < 6:
+                    if isinstance(cur, Element):
+                        add(getattr(cur, "_ridx", None), o.x, o.y,
+                            o.width, o.height)
+                    cur = getattr(cur, "parent", None)
+                    depth += 1
+        rects = [(r, float(b[0]), float(b[1]),
+                  float(b[2] - b[0]), float(b[3] - b[1]))
+                 for r, b in boxes.items()]
+        if rects:
+            try:
+                self._renderer.set_layout_rects(rects)
+            except Exception:
+                pass
 
     def pump_frames(self, rounds=4):
         """Advance child frames and route cross-document messages.
