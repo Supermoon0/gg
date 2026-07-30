@@ -4,13 +4,14 @@ DocumentLayout -> BlockLayout (block or inline mode)
               -> LineLayout -> TextLayout (one word each)
 """
 
+import math
 import re
 import tkinter.font
 
 from . import textengine
-from .colors import NAMED
-from .draw import (DrawBgImage, DrawClipPop, DrawClipPush, DrawImage,
-                   DrawLine, DrawOval, DrawRect, DrawStickyPop,
+from .colors import NAMED, to_rgb
+from .draw import (DrawBgImage, DrawClipPop, DrawClipPush, DrawGradient,
+                   DrawImage, DrawLine, DrawOval, DrawRect, DrawStickyPop,
                    DrawStickyPush, DrawText,
                    translate_cmds)
 from .html_parser import Element, Text, tree_to_list
@@ -461,6 +462,176 @@ def gradient_color(value, default=""):
         if c:
             return c
     return default
+
+
+def _split_commas(text):
+    """Split on commas, ignoring those inside parentheses.
+    rgba(0, 0, 0, .5) is one stop, not four."""
+    out, depth, start = [], 0, 0
+    for i, ch in enumerate(text):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            out.append(text[start:i])
+            start = i + 1
+    out.append(text[start:])
+    return [p.strip() for p in out if p.strip()]
+
+
+_ANGLE_UNITS = {"deg": 1.0, "grad": 0.9, "rad": 180.0 / math.pi,
+                "turn": 360.0}
+
+
+def _angle_deg(token):
+    """A CSS <angle> in degrees, or None if the token is not one."""
+    t = token.strip().casefold()
+    for unit, scale in _ANGLE_UNITS.items():
+        if t.endswith(unit):
+            try:
+                return float(t[:-len(unit)]) * scale
+            except ValueError:
+                return None
+    return None
+
+
+def _gradient_direction(head, w, h):
+    """The gradient's angle in degrees from its first argument.
+
+    `to <corner>` is not a fixed angle: the line has to be tilted so
+    that the corner-to-corner edge stays perpendicular to it, which
+    depends on the box's own proportions. Without that, a
+    `to bottom right` gradient in a wide box points visibly wrong.
+    """
+    if head is None:
+        return 180.0                              # to bottom
+    angle = _angle_deg(head)
+    if angle is not None:
+        return angle
+    words = head.casefold().split()
+    if not words or words[0] != "to":
+        return None
+    sides = set(words[1:])
+    if not sides or not sides <= {"top", "bottom", "left", "right"}:
+        return None
+    if len(sides) == 1:
+        return {"top": 0.0, "right": 90.0,
+                "bottom": 180.0, "left": 270.0}[sides.pop()]
+    if w <= 0 or h <= 0:
+        return 180.0
+    corner = math.degrees(math.atan2(w, h))
+    if sides == {"top", "right"}:
+        return corner
+    if sides == {"bottom", "right"}:
+        return 180.0 - corner
+    if sides == {"bottom", "left"}:
+        return 180.0 + corner
+    if sides == {"top", "left"}:
+        return 360.0 - corner
+    return None
+
+
+def _stop_offset(token, line_len):
+    """A stop position as a 0..1 fraction of the gradient line."""
+    t = token.strip().casefold()
+    if t.endswith("%"):
+        try:
+            return float(t[:-1]) / 100.0
+        except ValueError:
+            return None
+    px = parse_size(t)
+    if px is None or line_len <= 0:
+        return None
+    return px / line_len
+
+
+def parse_linear_gradient(value, w, h):
+    """(angle_deg, [(offset, (r, g, b), alpha)]) for a linear-gradient.
+
+    None for anything else — radial and conic sweeps still fall back to
+    the solid approximation, and so does a gradient whose colours this
+    engine cannot parse.
+    """
+    if not value:
+        return None
+    text = value.strip()
+    low = text.casefold()
+    start = low.find("linear-gradient(")
+    if start < 0:
+        return None
+    # repeating-linear-gradient repeats the stop list past its end;
+    # drawing one period of it is wrong, so leave it to the fallback
+    if low[:start].endswith("repeating-"):
+        return None
+    depth, end = 0, -1
+    for i in range(start + len("linear-gradient"), len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end < 0:
+        return None
+    args = _split_commas(text[start + len("linear-gradient("):end])
+    if not args:
+        return None
+    head = args[0]
+    angle = _gradient_direction(
+        head if (_angle_deg(head) is not None
+                 or head.casefold().startswith("to ")) else None, w, h)
+    if angle is None:
+        return None
+    if _angle_deg(head) is not None or head.casefold().startswith("to "):
+        args = args[1:]
+    if len(args) < 2:
+        return None
+    rad = math.radians(angle)
+    line_len = abs(w * math.sin(rad)) + abs(h * math.cos(rad))
+
+    stops = []
+    for arg in args:
+        parts = arg.split()
+        color = safe_color(parts[0], default="")
+        if not color:
+            # a bare position with no colour is an interpolation hint;
+            # anything else is a colour this engine does not know, and
+            # guessing at it would paint the box a colour nobody asked for
+            if len(parts) == 1 and _stop_offset(parts[0], line_len) \
+                    is not None:
+                continue
+            return None
+        alpha = _color_alpha(parts[0])
+        # `<color> <p1> <p2>` is shorthand for two stops at both ends
+        for pos in (parts[1:] or [None]):
+            stops.append([_stop_offset(pos, line_len) if pos else None,
+                          to_rgb(color), alpha])
+    if len(stops) < 2:
+        return None
+
+    # positions default per CSS Images 3 s3.4.3: ends anchor, unpositioned
+    # runs spread evenly between their positioned neighbours, and the list
+    # is forced non-decreasing so a smaller position never runs backwards
+    if stops[0][0] is None:
+        stops[0][0] = 0.0
+    if stops[-1][0] is None:
+        stops[-1][0] = 1.0
+    i = 0
+    while i < len(stops):
+        if stops[i][0] is not None:
+            stops[i][0] = max(stops[i][0], stops[i - 1][0] if i else 0.0)
+            i += 1
+            continue
+        run = i
+        while stops[run][0] is None:
+            run += 1
+        lo, hi = stops[i - 1][0], stops[run][0]
+        for k in range(i, run):
+            stops[k][0] = lo + (hi - lo) * (k - i + 1) / (run - i + 1)
+        i = run
+    return angle, [(o, rgb, a) for o, rgb, a in stops]
 
 
 def _child_is_block_level(child):
@@ -1671,14 +1842,6 @@ class DocumentLayout:
             right = parse_size(st.get("right"), cb_w, em)
             top = parse_size(st.get("top"), cb_h, em)
             bottom = parse_size(st.get("bottom"), cb_h, em)
-            if left is None and right is None and top is None \
-                    and bottom is None:
-                # no offsets: an absolute box used only to leave the flow.
-                # Rendering it at its static position tends to overlay
-                # hidden/duplicated overlay panels, so skip it (a box with
-                # any explicit offset is positioned and does get placed).
-                continue
-
             box = BlockLayout(node, self, None)
             # fixed boxes are viewport-anchored: ancestor clips don't cut
             box._abs_clips = \
@@ -3721,18 +3884,32 @@ class BlockLayout:
                     x1 + dx, y1 + dy, x2 + dx, y2 + dy, scolor,
                     radius=radius))
 
+            # a real gradient replaces the solid approximation; the
+            # first-stop fallback stays for radial/conic/repeating and
+            # for stop lists this parser cannot resolve
+            grad = None
+            for prop in ("background-image", "background"):
+                grad = parse_linear_gradient(
+                    self.node.style.get(prop, ""), x2 - x1, y2 - y1)
+                if grad:
+                    break
+
+            def bg_fill(bx1, by1, bx2, by2, r):
+                if grad:
+                    return DrawGradient(bx1, by1, bx2, by2,
+                                        grad[0], grad[1], radius=r)
+                return DrawRect(bx1, by1, bx2, by2, color, radius=r)
+
             if radius > 0 and self.bt > 0 and uniform_border and color:
                 # rounded box: border ring = outer rounded fill,
                 # then the background inset by the border width
                 b = self.bt
                 cmds.append(DrawRect(x1 - b, y1 - b, x2 + b, y2 + b,
                                      side_colors[0], radius=radius + b))
-                cmds.append(DrawRect(x1, y1, x2, y2, color,
-                                     radius=radius))
+                cmds.append(bg_fill(x1, y1, x2, y2, radius))
             else:
                 if color:
-                    cmds.append(DrawRect(x1, y1, x2, y2, color,
-                                         radius=radius))
+                    cmds.append(bg_fill(x1, y1, x2, y2, radius))
                 if self.bt > 0 and side_colors[0]:
                     cmds.append(DrawRect(
                         x1 - self.bl, y1 - self.bt, x2 + self.br, y1,

@@ -10,7 +10,7 @@ fn px_range(a: f64, b: f64, limit: usize) -> std::ops::Range<i32> {
 }
 
 /// Colour at position `t` along a sorted stop list, clamped at the ends.
-fn sample_stops(stops: &[(f64, (u8, u8, u8))], t: f64) -> (u8, u8, u8) {
+fn sample_stops(stops: &[(f64, (u8, u8, u8, u8))], t: f64) -> (u8, u8, u8, u8) {
     if t <= stops[0].0 {
         return stops[0].1;
     }
@@ -29,6 +29,7 @@ fn sample_stops(stops: &[(f64, (u8, u8, u8))], t: f64) -> (u8, u8, u8) {
                 lerp(a.1.0, b.1.0, f),
                 lerp(a.1.1, b.1.1, f),
                 lerp(a.1.2, b.1.2, f),
+                lerp(a.1.3, b.1.3, f),
             );
         }
     }
@@ -418,17 +419,26 @@ impl Raster {
         x2: f64,
         y2: f64,
         angle_deg: f64,
-        stops: &[(f64, (u8, u8, u8))],
+        stops: &[(f64, (u8, u8, u8, u8))],
         radius: f64,
     ) {
         if stops.is_empty() {
             return;
         }
         if stops.len() == 1 {
+            let (r, g, b, a) = stops[0].1;
             if radius > 0.5 {
-                self.fill_round_rect(x1, y1, x2, y2, stops[0].1, radius);
+                self.fill_round_rect(x1, y1, x2, y2, (r, g, b), radius);
+            } else if a == 255 {
+                self.fill_rect(x1, y1, x2, y2, (r, g, b));
             } else {
-                self.fill_rect(x1, y1, x2, y2, stops[0].1);
+                let xs = px_range(x1, x2, self.width);
+                let ys = px_range(y1, y2, self.height);
+                for y in ys {
+                    for x in xs.clone() {
+                        self.blend(x, y, (r, g, b), a);
+                    }
+                }
             }
             return;
         }
@@ -457,7 +467,8 @@ impl Raster {
                     continue;
                 }
                 let t = (((px - cx) * dx + (py - cy) * dy) - start) / len;
-                self.blend(x, y, sample_stops(stops, t), 255);
+                let (r, g, b, a) = sample_stops(stops, t);
+                self.blend(x, y, (r, g, b), a);
             }
         }
     }

@@ -150,6 +150,44 @@ class DrawRect:
                 to_rgb(self.color), float(self.radius), 0, "")
 
 
+class DrawGradient:
+    """A linear-gradient background fill.
+
+    The stops ride across the binding as text ("<angle> r,g,b,a@off ...")
+    rather than as new fields, because the display list is one
+    fixed-shape tuple per command and a gradient carries an unbounded
+    number of colours. The tk fallback has no gradient primitive, so it
+    paints the first stop the way this engine did everywhere before.
+    """
+
+    def __init__(self, x1, y1, x2, y2, angle, stops, radius=0.0):
+        self.left = x1
+        self.top = y1
+        self.right = x2
+        self.bottom = y2
+        self.angle = angle
+        self.stops = stops          # [(offset, (r, g, b), alpha)]
+        self.radius = radius
+
+    def _spec(self):
+        return " ".join(
+            [f"{self.angle:.4f}"]
+            + [f"{r},{g},{b},{max(0, min(255, round(a * 255)))}@{o:.5f}"
+               for o, (r, g, b), a in self.stops])
+
+    def execute(self, scroll, canvas):
+        r, g, b = self.stops[0][1]
+        canvas.create_rectangle(
+            self.left, self.top - scroll, self.right, self.bottom - scroll,
+            width=0, fill=f"#{r:02x}{g:02x}{b:02x}",
+        )
+
+    def native(self, scroll, hscroll=0.0):
+        return (10, self.left - hscroll, self.top - scroll,
+                self.right - hscroll, self.bottom - scroll,
+                (0, 0, 0), float(self.radius), 0, self._spec())
+
+
 class DrawLine:
     def __init__(self, x1, y1, x2, y2, color, thickness=1):
         self.left = x1

@@ -25,6 +25,35 @@ mod window;
 /// 6/7=clip push/pop, 8/9=vertical sticky push/pop
 type Cmd = (u8, f64, f64, f64, f64, (u8, u8, u8), f64, u32, String);
 
+/// "<angle> r,g,b,a@offset ..." -> (angle, stops).
+///
+/// The stop list rides in the command's text field rather than in new
+/// tuple slots, because the display list is one fixed-shape tuple that
+/// crosses the binding for every command on every frame and a gradient
+/// needs an unbounded number of colours. Parsing here is cheap next to
+/// the per-pixel work that follows it.
+fn parse_gradient(
+    text: &str,
+) -> Option<(f64, Vec<(f64, (u8, u8, u8, u8))>)> {
+    let mut parts = text.split_whitespace();
+    let angle: f64 = parts.next()?.parse().ok()?;
+    let mut stops = Vec::new();
+    for tok in parts {
+        let (rgba, off) = tok.split_once('@')?;
+        let mut c = rgba.split(',');
+        let r = c.next()?.parse().ok()?;
+        let g = c.next()?.parse().ok()?;
+        let b = c.next()?.parse().ok()?;
+        let a = c.next()?.parse().ok()?;
+        stops.push((off.parse().ok()?, (r, g, b, a)));
+    }
+    if stops.is_empty() {
+        None
+    } else {
+        Some((angle, stops))
+    }
+}
+
 #[pyclass]
 struct TextEngine {
     store: fonts::FontStore,
@@ -385,6 +414,15 @@ impl TextEngine {
                                 p[4] != 0.0, p[5] != 0.0,
                             );
                         }
+                    }
+                }
+                // kind 10: linear gradient over the box; aux is the
+                // border-radius and text is "<angle> r,g,b,a@off ..."
+                10 => {
+                    if let Some((angle, stops)) = parse_gradient(text) {
+                        r.fill_linear_gradient(
+                            *x1, *y1, *x2, *y2, angle, &stops, *aux,
+                        );
                     }
                 }
                 // kind 6: push clip (x1,y1,x2,y2 = rect); kind 7: pop

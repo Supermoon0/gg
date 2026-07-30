@@ -327,9 +327,49 @@ grad_dom = _styled(
 _gdoc = DocumentLayout(grad_dom)
 _gdoc.layout(400)
 _gcmds = paint_tree(_gdoc, [])
-check("gradient box paints a solid fill",
-      any(getattr(c, "color", "") == "#03c75a" for c in _gcmds),
-      str([getattr(c, "color", None) for c in _gcmds]))
+_gnat = [c.native(0) for c in _gcmds]
+check("gradient box paints a real gradient, not a solid fill",
+      any(c[0] == 10 and c[8].startswith("90.0000 3,199,90,255@0")
+          for c in _gnat), str(_gnat))
+
+# the gradient parser: angles, corner keywords, stop defaulting
+from browser.layout import parse_linear_gradient as _plg
+check("a bare gradient runs top to bottom",
+      _plg("linear-gradient(red, blue)", 100, 100)
+      == (180.0, [(0.0, (255, 0, 0), 1.0), (1.0, (0, 0, 255), 1.0)]))
+check("angle units all reach degrees",
+      [_plg(f"linear-gradient({a}, red, blue)", 100, 100)[0]
+       for a in ("90deg", "0.25turn", "100grad")] == [90.0, 90.0, 90.0])
+check("a corner keyword tilts with the box, not to 45",
+      round(_plg("linear-gradient(to bottom right, red, blue)",
+                 200, 100)[0], 2) == 116.57)
+check("unpositioned stops spread evenly between their neighbours",
+      [o for o, _c, _a in _plg(
+          "linear-gradient(red, lime, blue, black)", 100, 100)[1]]
+      == [0.0, 1 / 3, 2 / 3, 1.0])
+check("a two-position stop expands to both ends",
+      [o for o, _c, _a in _plg(
+          "linear-gradient(red 0 50%, blue 50% 100%)", 100, 100)[1]]
+      == [0.0, 0.5, 0.5, 1.0])
+check("px stop positions resolve against the gradient line",
+      all(abs(got - want) < 1e-9 for got, want in zip(
+          [o for o, _c, _a in _plg(
+              "linear-gradient(red 20px, blue 80px)", 100, 100)[1]],
+          [0.2, 0.8])))
+check("a stop list that runs backwards is clamped forward",
+      [o for o, _c, _a in _plg(
+          "linear-gradient(red 60%, blue 20%)", 100, 100)[1]] == [0.6, 0.6])
+check("rgba stops keep their alpha",
+      _plg("linear-gradient(rgba(255,0,0,0.5), blue)", 100, 100)[1][0][2]
+      == 0.5)
+check("radial, conic and repeating stay on the solid fallback",
+      all(_plg(v, 100, 100) is None for v in (
+          "radial-gradient(red, blue)",
+          "conic-gradient(red, blue)",
+          "repeating-linear-gradient(red, blue)")))
+check("a colour this engine cannot parse does not become a guess",
+      _plg("linear-gradient(color-mix(in srgb, red, blue), lime)",
+           100, 100) is None)
 
 # line-height, white-space:nowrap, text-overflow:ellipsis, box-shadow
 from browser.layout import (line_height_factor as _lhf,
@@ -439,6 +479,25 @@ _pwl = _lines("div{font-size:20px;width:80px;white-space:pre-wrap}", _RUN)
 check("pre-wrap hangs the same run past the edge instead",
       len({round(c[2]) for c in _pwl if not c[8].strip()}) == 1,
       str(_pwl[:6]))
+
+def _lines_all(css, html):
+    from browser import native
+    from browser.layout import DocumentLayout, paint_tree
+    nodes, _doc, _cs, _lg = native.load_document(
+        "<style>" + css + "</style>" + html, lambda _h: {}, None)
+    doc = DocumentLayout(nodes)
+    doc.layout(800, 600)
+    return [c.native(0) for c in paint_tree(doc, [])]
+
+
+
+# an absolute box with no offsets sits at its static position
+_abs_cmds = _lines_all(
+    "div{width:100px;height:100px;background:green;position:absolute}",
+    "<body><p>x</p><div></div></body>")
+check("position:absolute with no offsets still paints, in flow order",
+      any(c[0] == 0 and c[5] == (0, 128, 0) and round(c[2]) > 0
+          for c in _abs_cmds), str(_abs_cmds))
 
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
