@@ -78,6 +78,16 @@ pub struct Raster {
     pub buf: Vec<u8>, // RGB
     /// current clip rect (x1, y1, x2, y2); pixels outside are skipped
     clip: (i32, i32, i32, i32),
+    /// CSS opacity in force, 0..=255, applied to every pixel written.
+    ///
+    /// This is per-command alpha, not group compositing: two
+    /// overlapping children inside one faded subtree each blend with
+    /// what is under them, so where they overlap the lower one shows
+    /// through. Real group opacity needs an offscreen buffer for the
+    /// whole subtree. The difference only shows where a faded
+    /// subtree's own children overlap; the common case — a faded
+    /// overlay, a disabled control, a hover fade — is exact.
+    opacity: u8,
 }
 
 impl Raster {
@@ -93,6 +103,7 @@ impl Raster {
             height,
             buf,
             clip: (0, 0, width as i32, height as i32),
+            opacity: 255,
         }
     }
 
@@ -124,7 +135,29 @@ impl Raster {
     }
 
     #[inline]
+    pub fn opacity(&self) -> u8 {
+        self.opacity
+    }
+
+    /// Multiply the opacity in force and return the previous value so
+    /// the caller can restore it; nesting composes the way CSS does.
+    pub fn push_opacity(&mut self, factor: f64) -> u8 {
+        let prev = self.opacity;
+        let scaled = prev as f64 * factor.clamp(0.0, 1.0);
+        self.opacity = scaled.round().clamp(0.0, 255.0) as u8;
+        prev
+    }
+
+    pub fn set_opacity(&mut self, value: u8) {
+        self.opacity = value;
+    }
+
     fn blend(&mut self, x: i32, y: i32, color: (u8, u8, u8), alpha: u8) {
+        let alpha = if self.opacity == 255 {
+            alpha
+        } else {
+            ((alpha as u32 * self.opacity as u32) / 255) as u8
+        };
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32
         {
             return;
@@ -158,6 +191,14 @@ impl Raster {
         let y1 = (y1.round() as i32).max(0).max(self.clip.1);
         let x2 = (x2.round() as i32).min(self.width as i32).min(self.clip.2);
         let y2 = (y2.round() as i32).min(self.height as i32).min(self.clip.3);
+        if self.opacity != 255 {
+            for y in y1..y2 {
+                for x in x1..x2 {
+                    self.blend(x, y, color, 255);
+                }
+            }
+            return;
+        }
         for y in y1..y2 {
             let row = y as usize * self.width;
             for x in x1..x2 {

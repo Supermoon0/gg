@@ -291,6 +291,39 @@ class DrawBgImage:
                 (0, 0, 0), 0.0, self.image_id, params)
 
 
+class DrawOpacityPush:
+    """CSS opacity for a subtree: everything between this and its pop
+    is drawn at `alpha` times whatever opacity was already in force.
+
+    The tk fallback has no compositing, so it draws nothing for the
+    bracket and the subtree comes out opaque — the same thing this
+    engine did everywhere before.
+    """
+
+    def __init__(self, alpha):
+        self.alpha = alpha
+        self.left = self.top = -1e9
+        self.right = self.bottom = 1e9
+
+    def execute(self, scroll, canvas):
+        pass
+
+    def native(self, scroll, hscroll=0.0):
+        return (11, 0.0, 0.0, 0.0, 0.0, (0, 0, 0), float(self.alpha), 0, "")
+
+
+class DrawOpacityPop:
+    def __init__(self):
+        self.left = self.top = -1e9
+        self.right = self.bottom = 1e9
+
+    def execute(self, scroll, canvas):
+        pass
+
+    def native(self, scroll, hscroll=0.0):
+        return (12, 0.0, 0.0, 0.0, 0.0, (0, 0, 0), 0.0, 0, "")
+
+
 class DrawClipPush:
     """Intersect the clip region with this rect until the matching pop.
     Always survives viewport culling (top/bottom span the page) so the

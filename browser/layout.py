@@ -11,7 +11,8 @@ import tkinter.font
 from . import textengine
 from .colors import NAMED, to_rgb
 from .draw import (DrawBgImage, DrawClipPop, DrawClipPush, DrawGradient,
-                   DrawImage, DrawLine, DrawOval, DrawRect, DrawStickyPop,
+                   DrawImage, DrawLine, DrawOpacityPop, DrawOpacityPush,
+                   DrawOval, DrawRect, DrawStickyPop,
                    DrawStickyPush, DrawText,
                    scale_cmds_about, translate_cmds)
 from .html_parser import Element, Text, tree_to_list
@@ -5400,7 +5401,36 @@ def _transform_origin(box, w, h):
     return left + w * fx, top + h * fy
 
 
+def own_opacity(node):
+    """The element's own `opacity`, or None when it is fully opaque."""
+    raw = (getattr(node, "style", None) or {}).get("opacity")
+    if raw is None:
+        return None
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if value >= 1.0:
+        return None
+    return max(value, 0.0)
+
+
 def paint_tree(layout_object, display_list):
+    # opacity fades the whole subtree, so it brackets everything the box
+    # paints rather than tinting one command
+    alpha = (own_opacity(layout_object.node)
+             if isinstance(layout_object, BlockLayout) else None)
+    if alpha is not None:
+        inner = _paint_tree_uncomposited(layout_object, [])
+        if inner:
+            display_list.append(DrawOpacityPush(alpha))
+            display_list.extend(inner)
+            display_list.append(DrawOpacityPop())
+        return display_list
+    return _paint_tree_uncomposited(layout_object, display_list)
+
+
+def _paint_tree_uncomposited(layout_object, display_list):
     # transform applies to an element's principal box (blocks only —
     # line/text boxes share their block's node and must not re-apply)
     if isinstance(layout_object, BlockLayout):

@@ -22,7 +22,8 @@ mod window;
 
 /// (kind, x1, y1, x2, y2, rgb, aux, font_id, text)
 /// kind: 0=rect 1=text(aux=size) 2=line(aux=thickness) 3=oval 4=image,
-/// 6/7=clip push/pop, 8/9=vertical sticky push/pop
+/// 6/7=clip push/pop, 8/9=vertical sticky push/pop,
+/// 10=linear gradient, 11/12=opacity push/pop (aux = 0..1)
 type Cmd = (u8, f64, f64, f64, f64, (u8, u8, u8), f64, u32, String);
 
 /// "<angle> r,g,b,a@offset ..." -> (angle, stops).
@@ -230,7 +231,9 @@ impl TextEngine {
         let (kind, x1, y1, x2, y2, color, aux, font, text) = cmd;
         let (kind, x1, y1, x2, y2) = (*kind, *x1, *y1, *x2, *y2);
         match kind {
-            6 | 7 => Some((
+            // brackets carry no geometry of their own and must survive
+            // culling, or a push loses its pop and the state leaks
+            6 | 7 | 11 | 12 => Some((
                 kind,
                 x1 - dx,
                 y1 - dy,
@@ -376,6 +379,7 @@ impl TextEngine {
             bg,
         );
         let mut clip_stack: Vec<(i32, i32, i32, i32)> = Vec::new();
+        let mut opacity_stack: Vec<u8> = Vec::new();
         for (kind, x1, y1, x2, y2, color, aux, font, text) in cmds {
             match kind {
                 // rect; aux is the border-radius (0 = square)
@@ -423,6 +427,13 @@ impl TextEngine {
                         r.fill_linear_gradient(
                             *x1, *y1, *x2, *y2, angle, &stops, *aux,
                         );
+                    }
+                }
+                // kind 11: push CSS opacity (aux = 0..1); kind 12: pop
+                11 => opacity_stack.push(r.push_opacity(*aux)),
+                12 => {
+                    if let Some(prev) = opacity_stack.pop() {
+                        r.set_opacity(prev);
                     }
                 }
                 // kind 6: push clip (x1,y1,x2,y2 = rect); kind 7: pop

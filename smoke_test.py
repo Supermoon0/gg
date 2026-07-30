@@ -795,6 +795,20 @@ check("a font shorthand with no family is not a font shorthand",
       _fontstyle("font: 25px")["font-size"] == "16px")
 
 
+# opacity fades the subtree instead of being culled at zero
+from browser.layout import own_opacity as _oo
+check("only a partial opacity brackets the subtree",
+      (_oo(_N(opacity="0.5")), _oo(_N(opacity="1")), _oo(_N()),
+       _oo(_N(opacity="junk"))) == (0.5, None, None, None))
+_opl = _lines_all("body{margin:0}div{width:100px;height:50px;"
+                  "background:green;opacity:0.5}", "<div></div>")
+check("a faded box is bracketed by an opacity push and pop",
+      [c[0] for c in _opl][:1] == [11] and [c[0] for c in _opl][-1] == 12,
+      str([c[0] for c in _opl]))
+check("the push carries the alpha",
+      _opl[0][6] == 0.5, str(_opl[0]))
+
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",
