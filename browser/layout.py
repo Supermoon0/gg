@@ -4306,7 +4306,25 @@ class TextLayout:
                         hi = mid - 1
                 word = word[:lo] + "…"
         cmds = [DrawText(self.x, self.y, word, self.font, color)]
-        decoration = self.node.style.get("text-decoration", "none")
+        # text-decoration is not an inherited property — it *propagates*
+        # to in-flow descendants, which is a different rule. Reading it
+        # off the text node found nothing, so nothing was ever
+        # underlined: not `text-decoration: underline`, and not `<a>`
+        # either, whose underline comes from the UA sheet on the
+        # element rather than on the text inside it.
+        decoration = "none"
+        anc = self.node
+        while anc is not None:
+            if isinstance(anc, Element):
+                got = anc.style.get("text-decoration", "")
+                if got and got != "none":
+                    decoration = got
+                    break
+                # a block container ends the propagation
+                if anc.style.get("display", "inline") not in (
+                        "inline", "inline-block", "list-item"):
+                    break
+            anc = anc.parent
         if "underline" in decoration:
             y = self.y + self.font.gg_ascent + 2
             cmds.append(DrawLine(self.x, y, self.x + self.width, y, color))

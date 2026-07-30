@@ -8,6 +8,13 @@ use std::hash::{Hash, Hasher};
 use crate::css::{CssParser, Rule, Simple};
 use crate::dom::{bloom_slot, Document, BLOOM_WORDS};
 
+/// (property, initial value) for every property that inherits.
+///
+/// This list was eight entries long, which meant `line-height: 2` on
+/// the body reached nothing below it — one of the most common lines of
+/// CSS anyone writes. Same for letter-spacing, text-transform,
+/// list-style-type and the rest: they were parsed, stored on the
+/// element that declared them, and never seen by a descendant.
 const INHERITED: &[(&str, &str)] = &[
     ("font-size", "16px"),
     ("font-style", "normal"),
@@ -17,6 +24,18 @@ const INHERITED: &[(&str, &str)] = &[
     ("text-align", "left"),
     ("white-space", "normal"),
     ("visibility", "visible"),
+    ("line-height", "normal"),
+    ("letter-spacing", "normal"),
+    ("word-spacing", "normal"),
+    ("text-transform", "none"),
+    ("text-indent", "0"),
+    ("list-style-type", "disc"),
+    ("cursor", "auto"),
+    ("direction", "ltr"),
+    ("word-break", "normal"),
+    ("overflow-wrap", "normal"),
+    ("font-variant", "normal"),
+    ("text-shadow", "none"),
 ];
 
 fn parse_px(value: &str, default: f64) -> f64 {
