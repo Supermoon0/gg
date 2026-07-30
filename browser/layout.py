@@ -79,6 +79,34 @@ def get_font(size, weight, slant, family="default"):
     return _FONT_CACHE[key][0]
 
 
+def transformed_text(node, word):
+    """`text-transform` applied. It inherits, so the text node carries
+    it — but nothing ever read it, so the property was inert."""
+    how = node.style.get("text-transform", "none")
+    if how == "uppercase":
+        return word.upper()
+    if how == "lowercase":
+        return word.lower()
+    if how == "capitalize":
+        return word[:1].upper() + word[1:] if word else word
+    return word
+
+
+def letter_spacing_px(node, font_size):
+    """`letter-spacing` in px, 0 for the initial `normal`."""
+    raw = str(node.style.get("letter-spacing", "normal")).strip()
+    if not raw or raw == "normal":
+        return 0.0
+    try:
+        if raw.endswith("em"):
+            return float(raw[:-2]) * font_size
+        if raw.endswith("px"):
+            return float(raw[:-2])
+        return float(raw)
+    except ValueError:
+        return 0.0
+
+
 def measure(font, text):
     """Memoized font.measure — each unique word is measured once."""
     width = font.gg_widths.get(text)
@@ -4274,7 +4302,14 @@ class TextLayout:
             self.x = self.previous.x + self.previous.width + space
         else:
             self.x = self.parent.x
-        self.width = measure(self.font, self.word)
+        shown = transformed_text(self.node, self.word)
+        self.spacing = letter_spacing_px(self.node, self.font.size)
+        self.width = measure(self.font, shown)
+        if self.spacing:
+            # one advance per character, including after the last —
+            # which is what every engine does and what makes a
+            # letter-spaced word wider than its glyphs
+            self.width += self.spacing * len(shown)
         self.height = self.font.gg_linespace
 
     def paint(self):
@@ -4305,7 +4340,18 @@ class TextLayout:
                     else:
                         hi = mid - 1
                 word = word[:lo] + "…"
-        cmds = [DrawText(self.x, self.y, word, self.font, color)]
+        word = transformed_text(self.node, word)
+        spacing = getattr(self, "spacing", 0.0)
+        if spacing:
+            # spread the glyphs: one DrawText per character, since the
+            # text primitive has no spacing of its own
+            cmds = []
+            x = self.x
+            for ch in word:
+                cmds.append(DrawText(x, self.y, ch, self.font, color))
+                x += measure(self.font, ch) + spacing
+        else:
+            cmds = [DrawText(self.x, self.y, word, self.font, color)]
         # text-decoration is not an inherited property — it *propagates*
         # to in-flow descendants, which is a different rule. Reading it
         # off the text node found nothing, so nothing was ever

@@ -19,7 +19,7 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
 |---|---|---|
 | HTML 파서 | **1796/1796 (100%)** | html5lib-tests, cargo test |
 | JS 엔진 | **27,379/102,655 (26.67%)** | Test262, baseline regression=0 |
-| CSS | **4,307/24,862 (17.32%)** | WPT css, baseline regression=0 |
+| CSS | **4,344/24,862 (17.47%)** | WPT css, baseline regression=0 |
 | CSS (자체) | 23/23 | css_gauntlet |
 | JS 계약 | 28/31 | jsvm_gauntlet (3건은 문서화된 GAP) |
 | 내장 계약 | 9/9 | conformance |
@@ -40,7 +40,7 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
 - [x] Windows/Linux CI, 실패 시 exit code를 내는 게이트 체계
 - [x] 실사이트 바스켓 정기 실행
 
-## 2단계 — 렌더링 파이프라인 (구조는 완료, 정합성은 17.32%)
+## 2단계 — 렌더링 파이프라인 (구조는 완료, 정합성은 17.47%)
 
 - [x] HTML5 명세 파서 — 토크나이저, 23개 insertion mode, adoption
       agency, foreign content, fragment parsing, quirks
@@ -118,7 +118,7 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
 - [x] `Date.parse` 형식 1개 → 4개 + 유효성 검사
 - [x] **타입드 배열 9종 + DataView를 실제 바이트 위에** (66 → 867)
 
-## 3.5단계 — CSS 정합성 (진행 중, **17.32%**)
+## 3.5단계 — CSS 정합성 (진행 중, **17.47%**)
 
 점수판: `validation/wpt_css_conformance.py`. WPT의 testharness 기반
 7,293 파일 / 24,862 서브테스트. 나머지 16,368개는 레퍼런스 렌더와
@@ -158,9 +158,17 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
 - [ ] **`initial` 해석** — 키워드를 문자열로 저장할 뿐 초기값으로
       풀지 않는다. 프로퍼티별 초기값표가 필요하다
 - [ ] **정규 직렬화** — `red`가 `rgb(255, 0, 0)`으로 읽혀야 한다
-- [ ] **미구현 프로퍼티** — border-radius, outline, text-decoration,
-      letter-spacing, text-transform, list-style-type, order,
-      writing-mode, column-count, filter, clip-path
+- [x] **상속 프로퍼티 8개 → 20개** — `line-height`·`letter-spacing`·
+      `text-transform`·`list-style-type` 등 12개가 상속되지 않았다.
+      `body { line-height: 2 }`가 자식에게 안 갔다
+- [x] **`text-decoration` 전파** — 상속이 아니라 in-flow 후손 전파라는
+      별개 규칙. 텍스트 노드에서 읽고 있어서 `<a>`조차 밑줄이 없었다
+- [ ] **미구현 프로퍼티** — outline, letter-spacing(상속은 되나 측정에
+      미반영), text-transform(같음), list-style-type, order,
+      aspect-ratio, writing-mode, column-count, filter, clip-path,
+      opacity(가시성 컬링만, 알파 합성 없음)
+      *주의: 이 목록은 두 번 틀렸다. 프로퍼티마다 조건을 지어 확인할 것 —
+      배경 없는 div는 rect를 안 그리고 짧은 텍스트는 줄바꿈이 없다*
 - [ ] **reftest 16,368개** — 픽셀 비교 하네스가 필요하다
 
 ## 4단계 — 웹 플랫폼 (부분)
