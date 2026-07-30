@@ -928,6 +928,35 @@ check("align-content works on the block axis too",
       == [(0, 77, 50, 100), (50, 77, 100, 100)])
 
 
+# a flex line stretches to a definite container height first
+_FLEX = ("body{margin:0}.f{display:flex;width:300px;height:100px;%s}"
+         ".f>div{width:50px;height:20px;background:green}")
+def _fys(css):
+    return sorted({round(c[2]) for c in _lines_all(
+        _FLEX % css, "<div class=f><div></div><div></div></div>")
+        if c[0] == 0 and c[5] == (0, 128, 0)})
+check("align-items centres inside the container, not inside the line",
+      _fys("align-items:center") == [40], str(_fys("align-items:center")))
+check("align-items:flex-end reaches the container's bottom",
+      _fys("align-items:flex-end") == [80])
+check("flex-start and stretch leave a sized item where it was",
+      (_fys("align-items:flex-start"), _fys("align-items:stretch"))
+      == ([0], [0]))
+
+_WRAP = ("body{margin:0}.f{display:flex;flex-wrap:wrap;width:110px;"
+         "height:200px;%s}.f>div{width:50px;height:20px;background:green}")
+def _wys(css):
+    return sorted({round(c[2]) for c in _lines_all(
+        _WRAP % css,
+        "<div class=f>" + "<div></div>" * 4 + "</div>")
+        if c[0] == 0 and c[5] == (0, 128, 0)})
+check("align-content defaults to stretching the lines apart",
+      _wys("") == [0, 100], str(_wys("")))
+check("align-content packs the lines when asked",
+      (_wys("align-content:flex-end"), _wys("align-content:space-between"))
+      == ([160, 180], [0, 180]))
+
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",

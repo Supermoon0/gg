@@ -3354,6 +3354,38 @@ class BlockLayout:
             rows.append((row_boxes, row_h))
         self.height = (row_y + row_h) - self.y
 
+        # align-content: a flex container with a definite height has
+        # cross-axis room its lines have not used. The default is
+        # `stretch`, which is why align-items:center inside a 100px-tall
+        # flex row was centring inside the 20px line instead of the
+        # container — the line has to grow first, and nothing grew it.
+        if self.definite_height is not None and rows and not measuring:
+            used = (sum(h for _b, h in rows)
+                    + row_gap * max(len(rows) - 1, 0))
+            free = self.definite_height - used
+            content = (node.style.get("align-content")
+                       or "").strip().casefold()
+            if free > 0:
+                if content in ("", "normal", "stretch"):
+                    grow_each = free / len(rows)
+                    shifted = 0.0
+                    stretched = []
+                    for boxes, height in rows:
+                        if shifted:
+                            for b in boxes:
+                                translate(b, 0, shifted)
+                        stretched.append((boxes, height + grow_each))
+                        shifted += grow_each
+                    rows = stretched
+                else:
+                    lead, spread = distribute_free_space(
+                        free, len(rows), content)
+                    if lead or spread:
+                        for i, (boxes, _h) in enumerate(rows):
+                            for b in boxes:
+                                translate(b, 0, lead + spread * i)
+            self.height = self.definite_height
+
         # justify-content: distribute each row's leftover main-axis
         # space (unless auto margins already absorbed it);
         # align-items/align-self: cross-axis position within the row.
