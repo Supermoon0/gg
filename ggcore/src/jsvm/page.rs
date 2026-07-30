@@ -387,9 +387,28 @@ function matchMedia(q) {
     removeEventListener: function () {},
     dispatchEvent: function () { return false; } };
 }
+// The *computed* style — what the cascade decided — not the inline
+// style attribute, which is what this used to return. A plain div has
+// no inline style at all, so `getComputedStyle(d).display` was empty
+// where it should say "block".
+//
+// A snapshot rather than a live view: the engine recomputes styles on
+// its own schedule and a live object would need a read hook on every
+// property, which is three interpreter paths and a method-call path
+// for something nobody reads in a loop.
 function getComputedStyle(el) {
-  var s = (el && el.style) || {};
-  return s;
+  var map = __ggComputed(el) || {};
+  map.getPropertyValue = function (p) {
+    var v = this[('' + p).replace(/-([a-z])/g,
+      function (_, c) { return c.toUpperCase() })];
+    if (v === undefined) v = this['' + p];
+    return v === undefined ? '' : '' + v;
+  };
+  map.getPropertyPriority = function () { return '' };
+  map.setProperty = function () {
+    throw new TypeError('computed style is read-only');
+  };
+  return map;
 }
 var customElements = {
   define: function () {}, get: function () {},
@@ -1752,6 +1771,7 @@ impl PageVm {
             ("__ggDvSet", host::TA_DV_SET),
             ("__ggIsView", host::TA_IS_VIEW),
             ("__ggRegisterProtos", host::TA_REGISTER),
+            ("__ggComputed", host::CSS_COMPUTED),
         ] {
             let f = make_native(&mut vm.st, Native::HostFn(id));
             vm.set_global(nm, f);
@@ -3021,6 +3041,7 @@ impl PageVm {
             self.st.ready_state = "complete";
             self.dispatch_simple(vm::DOC_NODE, "readystatechange");
             self.dispatch_simple(vm::WINDOW_NODE, "load");
+            self.fire_body_event_attr("load");
             self.dispatch_simple(vm::DOC_NODE, "load");
             logs.extend(std::mem::take(&mut self.st.logs));
             return logs;
@@ -3028,8 +3049,39 @@ impl PageVm {
         self.st.ready_state = "complete";
         self.dispatch_simple(vm::DOC_NODE, "readystatechange");
         self.dispatch_simple(vm::WINDOW_NODE, "load");
+        self.fire_body_event_attr("load");
         self.dispatch_simple(vm::DOC_NODE, "load");
         std::mem::take(&mut self.st.logs)
+    }
+
+    /// `<body onload="...">` is a window handler, not a body one: the
+    /// spec maps a handful of body attributes onto the Window object.
+    /// Nothing did that here, so the attribute was inert — and 1122
+    /// WPT css files start their work from exactly that attribute.
+    fn fire_body_event_attr(&mut self, ty: &str) {
+        let Some(doc) = self.st.doc.clone() else { return };
+        let name = format!("on{ty}");
+        let found = {
+            let d = doc.borrow();
+            d.nodes.iter().enumerate().find_map(|(i, n)| {
+                if n.tag.as_deref() == Some("body")
+                    || n.tag.as_deref() == Some("frameset")
+                {
+                    n.attr(&name).map(|src| (i, src.to_string()))
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some((_idx, src)) = found {
+            // same shape as an inline handler anywhere else: a function
+            // body taking `event`
+            let wrapped =
+                format!("(function (event) {{ {src}\n }})(undefined)");
+            if let Err(e) = self.run_source(&wrapped) {
+                self.st.logs.push(format!("[gg-js error] {e}"));
+            }
+        }
     }
 
     fn dispatch_simple(&mut self, node: u32, ty: &str) {

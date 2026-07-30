@@ -594,6 +594,8 @@ pub(super) mod host {
     pub const TA_BUF_SLICE: u16 = 136;
     pub const TA_IS_VIEW: u16 = 137;
     pub const TA_REGISTER: u16 = 138;
+    /// getComputedStyle: the cascade's result for one node.
+    pub const CSS_COMPUTED: u16 = 140;
 }
 
 /// Hidden class: property layout shared by every object that acquired
@@ -8524,6 +8526,38 @@ fn host_fn(
             let out = new_array_buffer(st, part.len());
             let obi = buffer_index(st, out).expect("just made one");
             st.buffers[obi as usize] = part;
+            Ok(out)
+        }
+        CSS_COMPUTED => {
+            // The cascade already wrote its answer into the node, so
+            // this reads it rather than recomputing. getComputedStyle
+            // used to hand back the *inline* style attribute, which is
+            // a different thing entirely: `display` on a plain div came
+            // back empty instead of "block".
+            let el = argv!(0);
+            if !el.is_dom_node() {
+                return Ok(new_plain_object(st));
+            }
+            let node = el.index() as usize;
+            let doc = need_doc(st)?;
+            let pairs: Vec<(String, String)> = {
+                let d = doc.borrow();
+                match d.nodes.get(node) {
+                    Some(n) => n
+                        .style
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                    None => Vec::new(),
+                }
+            };
+            let out = new_plain_object(st);
+            let oi = out.index() as usize;
+            for (k, v) in pairs {
+                let key = st.intern_name(&k);
+                let val = push_str(st, v);
+                raw_set_prop(st, oi, key, val);
+            }
             Ok(out)
         }
         TA_IS_VIEW => Ok(Value::boolean(view_of(st, argv!(0)).is_some())),
