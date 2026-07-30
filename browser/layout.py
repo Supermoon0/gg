@@ -1108,10 +1108,19 @@ def _split_top_level(spec):
 
 
 def _grid_track_size(token, avail, em):
-    """One grid track -> ('fr', n) for flexible tracks or ('fixed', px)
-    for a resolved length. auto/min-content/max-content and unresolved
-    values become a flexible 1fr so the track still shares space rather
-    than collapsing."""
+    """One grid track, as one of
+
+        ("fixed", px)              a resolved length or percentage
+        ("fr", n)                  flexible, takes a share of free space
+        ("intrinsic", lo, hi)      sized from the content it holds
+
+    where lo/hi are "min", "max", or a px cap. auto, min-content,
+    max-content, fit-content() and minmax() all land in the third form:
+    they are the tracks whose size is a question about their items, and
+    treating them as 1fr (which this did) gives a column its share of
+    the container instead of the width of what is in it — `auto 1fr`,
+    the ordinary sidebar-and-content shape, came out as a 50/50 split.
+    """
     t = token.strip().casefold()
     if t.endswith("fr"):
         try:
@@ -1119,17 +1128,41 @@ def _grid_track_size(token, avail, em):
         except ValueError:
             return ("fr", 1.0)
     if t.startswith("minmax(") and t.endswith(")"):
-        parts = t[7:-1].split(",")
+        parts = _split_commas(t[7:-1])
         if len(parts) == 2:
-            return _grid_track_size(parts[1], avail, em)  # the max
+            lo = _grid_track_size(parts[0], avail, em)
+            hi = _grid_track_size(parts[1], avail, em)
+            # a flexible minimum is not a thing; a flexible maximum is
+            # the track growing into free space after its floor is met
+            if hi[0] == "fr":
+                return ("fr", hi[1]) if lo[0] == "fr" else \
+                    ("frmin", hi[1], _track_bound(lo, "min"))
+            return ("intrinsic", _track_bound(lo, "min"),
+                    _track_bound(hi, "max"))
     if t.startswith("fit-content(") and t.endswith(")"):
-        return _grid_track_size(t[12:-1], avail, em)
-    if t in ("auto", "min-content", "max-content", "fit-content"):
-        return ("fr", 1.0)
+        cap = parse_size(t[12:-1], avail, em)
+        return ("intrinsic", "min", cap if cap is not None else "max")
+    if t == "auto":
+        # "auto" is max-content as a growth limit, but unlike
+        # max-content it also stretches into leftover space
+        return ("intrinsic", "min", "auto")
+    if t in ("min-content", "fit-content"):
+        return ("intrinsic", "min", "min")
+    if t == "max-content":
+        return ("intrinsic", "max", "max")
     px = parse_size(token, avail, em)
     if px is not None:
         return ("fixed", max(px, 0.0))
-    return ("fr", 1.0)
+    return ("intrinsic", "min", "max")
+
+
+def _track_bound(track, side):
+    """One end of a minmax() as a bound the sizer understands."""
+    if track[0] == "fixed":
+        return track[1]
+    if track[0] == "intrinsic":
+        return track[1] if side == "min" else track[2]
+    return side
 
 
 def _parse_aspect_ratio(value):
@@ -1161,7 +1194,7 @@ def _parse_grid_areas(spec):
     return rows
 
 
-def _parse_grid_template(spec, avail, em):
+def _parse_grid_template(spec, avail, em, gap=0.0):
     """Parse a grid track template.
 
     Returns ``(tracks, line_names)`` where line names map to every matching
@@ -1187,12 +1220,15 @@ def _parse_grid_template(spec, avail, em):
                 comma = inner.find(",")
                 if comma < 0:
                     continue
+                sub = _split_top_level(inner[comma + 1:].strip())
                 try:
                     count = int(inner[:comma].strip())
                 except ValueError:
-                    count = 1          # auto-fill/auto-fit: one pass
-                count = max(1, min(count, 64))
-                sub = _split_top_level(inner[comma + 1:].strip())
+                    # auto-fill/auto-fit: as many copies of the pattern as
+                    # fit the container. Repeating it once (which this did)
+                    # turned every responsive card grid into one column.
+                    count = _auto_repeat_count(sub, avail, gap, em)
+                count = max(1, min(count, 1000))
                 for _ in range(count):
                     add_parts(sub)
                 continue
@@ -1202,9 +1238,116 @@ def _parse_grid_template(spec, avail, em):
     return tracks, line_names
 
 
-def _parse_grid_tracks(spec, avail, em):
+def _parse_grid_tracks(spec, avail, em, gap=0.0):
     """Compatibility helper for callers interested only in track sizes."""
-    return _parse_grid_template(spec, avail, em)[0]
+    return _parse_grid_template(spec, avail, em, gap)[0]
+
+
+def _auto_repeat_count(sub, avail, gap, em):
+    """How many copies of a repeat(auto-fill, ...) pattern fit.
+
+    Only a definitely-sized pattern can be counted; an intrinsic track
+    has no width until its items are known, and the spec says such a
+    repeat resolves to a single copy.
+    """
+    sizes = []
+    for part in sub:
+        p = part.strip()
+        if p.startswith("[") and p.endswith("]"):
+            continue
+        track = _grid_track_size(p, avail, em)
+        if track[0] == "fixed":
+            sizes.append(track[1])
+        elif track[0] == "frmin" and not isinstance(track[2], str):
+            sizes.append(float(track[2]))
+        else:
+            return 1
+    span = sum(sizes) + gap * len(sizes)
+    if span <= 0 or avail <= 0:
+        return 1
+    return max(1, int((avail + gap) // span))
+
+
+def _size_grid_tracks(tracks, avail, gap, contributions,
+                      stretch=True):
+    """Resolve a track list to pixel sizes (CSS Grid 1 s12, abridged).
+
+    `contributions[i]` is (min_content, max_content) for the items whose
+    span ends in track i — a spanning item's demand is spread over the
+    tracks it covers before this is called, which is where the real
+    algorithm is far more careful about which track absorbs it.
+
+    The order matters and is the spec's: intrinsic tracks reach their
+    base size first, free space then grows them toward their limit, and
+    only what is left after that goes to the fr tracks. Doing it the
+    other way round gives every fr track the whole container and leaves
+    the content-sized ones at zero.
+    """
+    n = len(tracks)
+    if not n:
+        return []
+    base = [0.0] * n
+    limit = [float("inf")] * n
+
+    def bound(spec, lo, hi):
+        if spec == "min":
+            return lo
+        if spec in ("max", "auto"):
+            return hi
+        return float(spec)
+
+    for i, track in enumerate(tracks):
+        lo, hi = contributions[i] if i < len(contributions) else (0.0, 0.0)
+        kind = track[0]
+        if kind == "fixed":
+            base[i] = limit[i] = track[1]
+        elif kind == "fr":
+            base[i] = 0.0
+        elif kind == "frmin":
+            base[i] = bound(track[2], lo, hi)
+        else:                                    # intrinsic
+            base[i] = bound(track[1], lo, hi)
+            limit[i] = max(bound(track[2], lo, hi), base[i])
+
+    free = avail - gap * max(n - 1, 0) - sum(base)
+
+    # grow intrinsic tracks toward their growth limit, evenly, until
+    # either the limits or the free space run out
+    growable = [i for i, t in enumerate(tracks)
+                if t[0] == "intrinsic" and limit[i] > base[i]]
+    while free > 1e-6 and growable:
+        share = free / len(growable)
+        stalled = []
+        for i in growable:
+            room = limit[i] - base[i]
+            take = min(share, room)
+            base[i] += take
+            free -= take
+            if limit[i] - base[i] > 1e-6:
+                stalled.append(i)
+        if len(stalled) == len(growable):
+            break                                # nothing hit its limit
+        growable = stalled
+
+    flex = [i for i, t in enumerate(tracks) if t[0] in ("fr", "frmin")]
+    if flex and free > 0:
+        total = sum(tracks[i][1] for i in flex)
+        if total > 0:
+            for i in flex:
+                base[i] += free * tracks[i][1] / total
+        return base
+
+    # CSS Grid 1 s12.8: with no flexible track to soak it up, leftover
+    # space is shared equally by the auto-max tracks -- which is why
+    # `grid-template-columns: auto auto` fills its container instead of
+    # hugging two words. max-content tracks are explicitly not stretched.
+    if stretch and free > 1e-6:
+        auto = [i for i, t in enumerate(tracks)
+                if t[0] == "intrinsic" and t[2] == "auto"]
+        if auto:
+            for i in auto:
+                base[i] += free / len(auto)
+    return base
 
 
 def translate(layout_obj, dx, dy):
@@ -3154,13 +3297,8 @@ class BlockLayout:
                     rows_spec = shorthand.split("/", 1)[0]
         if "/" in cols_spec:              # a shorthand leaked into the key
             cols_spec = cols_spec.split("/", 1)[1]
-        tracks, col_lines = _parse_grid_template(cols_spec, self.width, em)
-        if not tracks:
-            tracks = [("fr", 1.0)]
-        ncols = len(tracks)
-        row_tracks, row_lines = _parse_grid_template(
-            rows_spec, self.definite_height or self.width, em)
-
+        # gaps first: repeat(auto-fill, ...) counts how many copies of its
+        # pattern fit, which it cannot do without knowing the gutter
         col_gap = parse_size(
             style.get("column-gap") or style.get("grid-column-gap")
             or self._gap_shorthand(style, 1), self.width, em) or 0.0
@@ -3168,24 +3306,13 @@ class BlockLayout:
             style.get("row-gap") or style.get("grid-row-gap")
             or self._gap_shorthand(style, 0), self.width, em) or 0.0
 
-        # resolve column widths: fixed tracks keep their px, fr tracks
-        # split the remaining space
-        gap_total = col_gap * max(ncols - 1, 0)
-        fixed = sum(v for kind, v in ((t[0], t[1] if len(t) > 1 else 0.0)
-                                      for t in tracks) if kind == "fixed")
-        fr_sum = sum(t[1] for t in tracks if t[0] == "fr")
-        free = max(self.width - gap_total - fixed, 0.0)
-        col_w = []
-        for t in tracks:
-            if t[0] == "fixed":
-                col_w.append(t[1])
-            else:
-                col_w.append(free * t[1] / fr_sum if fr_sum > 0 else 0.0)
-        col_x = []
-        cx = 0.0
-        for i in range(ncols):
-            col_x.append(cx)
-            cx += col_w[i] + col_gap
+        tracks, col_lines = _parse_grid_template(
+            cols_spec, self.width, em, col_gap)
+        if not tracks:
+            tracks = [("fr", 1.0)]
+        ncols = len(tracks)
+        row_tracks, row_lines = _parse_grid_template(
+            rows_spec, self.definite_height or self.width, em, row_gap)
 
         place = style.get("place-items", "").split()
         align_items = (style.get("align-items")
@@ -3309,12 +3436,53 @@ class BlockLayout:
                 cursor_r, cursor_c = r + 1, 0
 
         placed = [p for p in placed_by_index if p is not None]
+
+        # Column widths can only be resolved now: a content-sized track
+        # is sized by the items that landed in it, and which items those
+        # are is what placement just decided.
+        needs_content = any(t[0] in ("intrinsic", "frmin") for t in tracks)
+        contributions = [(0.0, 0.0)] * ncols
+        if needs_content:
+            demand = [[0.0, 0.0] for _ in range(ncols)]
+            for child, c0, cspan, _r0, _rs in placed:
+                try:
+                    lo = _measure_min_width(child, doc)
+                    hi = _measure_content_width(child, doc)
+                except Exception:
+                    continue
+                spec_w = parse_size(child.style.get("width"), 0.0, em)
+                if spec_w is not None:
+                    lo = hi = spec_w
+                # a spanning item is spread evenly over its tracks; the
+                # full algorithm distributes only the excess over what
+                # the spanned tracks already ask for, which needs a
+                # second pass this does not do
+                for c in range(c0, min(c0 + cspan, ncols)):
+                    demand[c][0] = max(demand[c][0], lo / cspan)
+                    demand[c][1] = max(demand[c][1], hi / cspan)
+            contributions = [tuple(d) for d in demand]
+        # justify-content decides whether leftover space stretches the
+        # auto tracks or is left as a gap the alignment then uses
+        jc = (style.get("justify-content") or "").strip().casefold()
+        col_w = _size_grid_tracks(
+            tracks, self.width, col_gap, contributions,
+            stretch=jc in ("", "normal", "stretch"))
+        col_x = []
+        cx = 0.0
+        for i in range(ncols):
+            col_x.append(cx)
+            cx += col_w[i] + col_gap
+
         nrows = max(len(row_tracks), len(areas),
                     max((p[3] + p[4] for p in placed), default=0))
         row_h = [0.0] * nrows
         for i, track in enumerate(row_tracks):
             if track[0] == "fixed":
                 row_h[i] = track[1]
+            elif track[0] == "frmin" and not isinstance(track[2], str):
+                row_h[i] = float(track[2])       # minmax(<len>, <n>fr)
+            elif track[0] == "intrinsic" and not isinstance(track[1], str):
+                row_h[i] = float(track[1])       # minmax(<len>, ...)
         for p in placed:
             child, c0, cspan, r0, rspan = p
             w = sum(col_w[c0:c0 + cspan]) + col_gap * (cspan - 1)
@@ -3351,7 +3519,7 @@ class BlockLayout:
         # logo track instead of its 92px content minimum.
         if self.definite_height is not None and nrows:
             fr_rows = [i for i, track in enumerate(row_tracks)
-                       if track[0] == "fr"]
+                       if track[0] in ("fr", "frmin")]
             if fr_rows:
                 fixed_h = sum(row_h[i] for i in range(nrows)
                               if i not in fr_rows)
