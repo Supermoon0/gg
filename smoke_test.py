@@ -809,6 +809,35 @@ check("the push carries the alpha",
       _opl[0][6] == 0.5, str(_opl[0]))
 
 
+# order reorders flex and grid items without touching the document
+from browser.layout import order_items as _ord
+class _ON:
+    def __init__(self, name, **s): self.name = name; self.style = s
+_o = [_ON("a", order="2"), _ON("b", order="1"), _ON("c")]
+check("order sorts items, unset counting as 0",
+      [n.name for n in _ord(_o)] == ["c", "b", "a"])
+check("the sort is stable for equal orders",
+      [n.name for n in _ord([_ON("a"), _ON("b"), _ON("c", order="0")])]
+      == ["a", "b", "c"])
+check("a negative order moves one item to the front",
+      [n.name for n in _ord([_ON("a"), _ON("b", order="-1"), _ON("c")])]
+      == ["b", "a", "c"])
+check("a list with no order at all is returned untouched",
+      _ord(_o[2:]) is _o[2:] or [n.name for n in _ord([_ON("a"), _ON("b")])]
+      == ["a", "b"])
+check("an unparsable order is 0, not a crash",
+      [n.name for n in _ord([_ON("a", order="junk"), _ON("b", order="-1")])]
+      == ["b", "a"])
+
+_flexord = [(round(c[1]), c[5]) for c in _lines_all(
+    "body{margin:0}.f{display:flex;width:300px}.f>div{width:100px;"
+    "height:20px}.a{background:#ff0000;order:2}.b{background:#008000}",
+    "<div class=f><div class=a></div><div class=b></div></div>")
+    if c[0] == 0 and c[5] != (255, 255, 255)]
+check("a flex item with a higher order moves after its sibling",
+      _flexord == [(0, (0, 128, 0)), (100, (255, 0, 0))], str(_flexord))
+
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",

@@ -1030,6 +1030,30 @@ def _ch_width(node):
         return None
 
 
+def order_items(children):
+    """Flex and grid items in `order` sequence.
+
+    `order` reorders the boxes without touching the document: paint
+    order, tab order and the accessibility tree all still follow source
+    order, which is exactly why the sort has to be stable. An item that
+    does not set it sits at 0, so a single `order: -1` moves one item
+    to the front without renumbering the rest — which is the whole way
+    the property gets used.
+    """
+    if not any((getattr(c, "style", None) or {}).get("order")
+               for c in children):
+        return children
+
+    def key(child):
+        raw = ((getattr(child, "style", None) or {}).get("order") or "")
+        try:
+            return int(float(raw.strip()))
+        except ValueError:
+            return 0
+
+    return sorted(children, key=key)
+
+
 def is_visible(node):
     if node.style.get("display", "inline") == "none":
         return False
@@ -3056,6 +3080,7 @@ class BlockLayout:
             if isinstance(child, Text) and not child.text.strip():
                 continue
             kid_nodes.append(child)
+        kid_nodes = order_items(kid_nodes)
 
         # gap / row-gap / column-gap reserve fixed space between flex
         # items before any free space is distributed (CSS Box Alignment
@@ -3624,6 +3649,7 @@ class BlockLayout:
                 self._queue_abs(child, self.x, self.y)
                 continue
             items.append(child)
+        items = order_items(items)
 
         # placement: [child, col_start, col_span, row_start, row_span]
         areas = _parse_grid_areas(style.get("grid-template-areas", ""))
