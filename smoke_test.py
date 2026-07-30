@@ -756,6 +756,14 @@ _ar_min0 = [tuple(round(v) for v in c[1:5]) for c in _lines_all(
 check("an explicit min-height lets the ratio cut the content short",
       _ar_min0 == [(0, 0, 100, 50)], str(_ar_min0))
 
+check("ch is measured from the element's own font, not guessed",
+      [tuple(round(v) for v in c[1:5]) for c in _lines_all(
+          "body{margin:0}div{background:green;height:10px;"
+          "font-size:16px;width:10ch}", "<div></div>")
+       if c[0] == 0 and c[5] == (0, 128, 0)] == [(0, 0, 102, 10)])
+check("a ch_base overrides the half-em fallback",
+      (_psz("4ch", 0, 25, 25.0), _psz("4ch", 0, 25)) == (100.0, 50.0))
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",

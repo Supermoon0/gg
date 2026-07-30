@@ -115,6 +115,9 @@ def px_str(value):
 # `width: 50ch` became `auto` and filled the container.
 _CH_PER_EM = 0.5
 _EX_PER_EM = 0.5
+# x-height relative to the digit advance, when the digit advance is
+# measured but the x-height is not
+_EX_PER_CH = 0.8
 
 
 def _split_args(text):
@@ -132,8 +135,15 @@ def _split_args(text):
     return [p.strip() for p in out if p.strip()]
 
 
-def parse_size(value, percent_base=0.0, em_base=16.0):
-    """Resolve a CSS length to px. Returns None for auto/unsupported."""
+def parse_size(value, percent_base=0.0, em_base=16.0, ch_base=None):
+    """Resolve a CSS length to px. Returns None for auto/unsupported.
+
+    `ch_base` is the advance width of "0" in the element's own font.
+    Callers that have the font pass it; the rest fall back to half an
+    em, which is wrong by a factor of two for a monospace face and by
+    a quarter for the usual proportional one — `ch` means "how many
+    digits fit", and that is a question only the font can answer.
+    """
     if not value:
         return None
     v = value.strip().casefold()
@@ -149,7 +159,8 @@ def parse_size(value, percent_base=0.0, em_base=16.0):
             args = _split_args(v[len(name):-1])
             if arity is not None and len(args) != arity:
                 return None
-            sizes = [parse_size(a, percent_base, em_base) for a in args]
+            sizes = [parse_size(a, percent_base, em_base, ch_base)
+                     for a in args]
             if not sizes or any(s is None for s in sizes):
                 return None
             if name == "min(":
@@ -185,9 +196,10 @@ def parse_size(value, percent_base=0.0, em_base=16.0):
                 elif unit == "em":
                     number *= em_base
                 elif unit == "ch":
-                    number *= em_base * _CH_PER_EM
+                    number *= ch_base if ch_base else em_base * _CH_PER_EM
                 elif unit == "ex":
-                    number *= em_base * _EX_PER_EM
+                    number *= (ch_base * _EX_PER_CH if ch_base
+                               else em_base * _EX_PER_EM)
                 elif unit in ("%", "vw", "vh"):
                     number *= percent_base / 100.0
                 elif unit not in ("", "px"):
@@ -203,9 +215,10 @@ def parse_size(value, percent_base=0.0, em_base=16.0):
         elif v.endswith("em"):
             out = float(v[:-2]) * em_base
         elif v.endswith("ch"):
-            out = float(v[:-2]) * em_base * _CH_PER_EM
+            out = float(v[:-2]) * (ch_base or em_base * _CH_PER_EM)
         elif v.endswith("ex"):
-            out = float(v[:-2]) * em_base * _EX_PER_EM
+            out = float(v[:-2]) * (ch_base * _EX_PER_CH if ch_base
+                                   else em_base * _EX_PER_EM)
         elif v.endswith("%"):
             out = float(v[:-1]) / 100.0 * percent_base
         elif v.endswith("vw") or v.endswith("vh"):

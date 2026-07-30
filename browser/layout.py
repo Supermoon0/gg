@@ -1020,6 +1020,15 @@ def block_ellipsis(style):
     return spec
 
 
+def _ch_width(node):
+    """The advance of "0" in a node's own font, which is what `ch`
+    means. None when there is no measurable font to ask."""
+    try:
+        return measure(cached_font(node), "0") or None
+    except Exception:
+        return None
+
+
 def is_visible(node):
     if node.style.get("display", "inline") == "none":
         return False
@@ -2411,7 +2420,13 @@ class BlockLayout:
         avail = self.parent.width
 
         def size(prop, base=avail):
-            return parse_size(st.get(prop), base, em)
+            raw = st.get(prop)
+            # only pay for the font measurement when the value is
+            # actually font-relative in a way `em` cannot answer
+            ch = None
+            if raw and ("ch" in raw or "ex" in raw):
+                ch = _ch_width(node)
+            return parse_size(raw, base, em, ch)
 
         self.pt = size("padding-top") or 0
         self.pr = size("padding-right") or 0
