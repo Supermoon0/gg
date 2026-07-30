@@ -48,6 +48,52 @@ _REF_RE = re.compile(
     r"""<link\s[^>]*rel\s*=\s*["']?(match|mismatch)["']?[^>]*>""",
     re.I | re.S)
 _HREF_RE = re.compile(r"""href\s*=\s*["']([^"']+)["']""", re.I)
+_FUZZY_RE = re.compile(
+    r"""<meta\s[^>]*name\s*=\s*["']?fuzzy["']?[^>]*>""", re.I | re.S)
+_CONTENT_RE = re.compile(r"""content\s*=\s*["']([^"']*)["']""", re.I)
+_RANGE_RE = re.compile(r"(\d+)\s*(?:-\s*(\d+))?")
+
+
+def fuzzy(path: Path):
+    """(max channel difference, differing pixels) a test declares it may
+    still have, or (0, 0).
+
+    A reftest that antialiases a curve, or rounds a subpixel edge, says
+    so in the file: `<meta name=fuzzy content="maxDifference=0-1;
+    totalPixels=0-6000">`. Ignoring that and demanding exact equality
+    fails the test for the reason its author already excused, so 808
+    files in this corpus were being scored against a stricter bar than
+    the one they were written to.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0, 0
+    diff = pixels = 0
+    for m in _FUZZY_RE.finditer(text):
+        content = _CONTENT_RE.search(m.group(0))
+        if not content:
+            continue
+        # a per-reference form ("ref.html:0-1;0-600") narrows the meta to
+        # one reference; the limits are the same either way, and taking
+        # the loosest keeps this from being stricter than the file asks
+        spec = content.group(1).rsplit(":", 1)[-1]
+        for part in spec.split(";"):
+            r = _RANGE_RE.search(part)
+            if not r:
+                continue
+            hi = int(r.group(2) if r.group(2) is not None else r.group(1))
+            if "totalpixels" in part.casefold():
+                pixels = max(pixels, hi)
+            elif "maxdifference" in part.casefold():
+                diff = max(diff, hi)
+            elif "maxdifference" not in spec.casefold():
+                # bare "0-1;0-600": difference first, then pixel count
+                if diff == 0:
+                    diff = hi
+                else:
+                    pixels = max(pixels, hi)
+    return diff, pixels
 
 
 def references(path: Path):
@@ -219,12 +265,15 @@ def render(page: Path, corpus: Path):
         WIDTH, HEIGHT, (255, 255, 255), cmds))
 
 
-def differing_pixels(a: bytes, b: bytes) -> int:
+def differing_pixels(a: bytes, b: bytes, max_channel: int = 0) -> int:
+    """Pixels differing by more than `max_channel` on any channel."""
     if len(a) != len(b):
         return max(len(a), len(b))
     n = 0
     for i in range(0, len(a), 3):
-        if a[i] != b[i] or a[i + 1] != b[i + 1] or a[i + 2] != b[i + 2]:
+        if (abs(a[i] - b[i]) > max_channel
+                or abs(a[i + 1] - b[i + 1]) > max_channel
+                or abs(a[i + 2] - b[i + 2]) > max_channel):
             n += 1
     return n
 
@@ -251,12 +300,13 @@ def run_one(corpus: Path, rel: str, tolerance: int):
             rows.append((ident, False,
                          f"reference render failed: {type(exc).__name__}"))
             continue
-        diff = differing_pixels(got, want)
+        max_channel, allowed = fuzzy(path)
+        diff = differing_pixels(got, want, max_channel)
         if kind == "match":
-            ok = diff <= tolerance
+            ok = diff <= max(tolerance, allowed)
             why = "" if ok else f"{diff} pixels differ"
         else:
-            ok = diff > tolerance
+            ok = diff > max(tolerance, allowed)
             why = "" if ok else "renders identically to the mismatch ref"
         rows.append((ident, ok, why))
     return rows
