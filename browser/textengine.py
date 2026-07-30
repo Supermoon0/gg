@@ -126,15 +126,37 @@ def rasterize_svg(svg):
                 paths.append((path, rgb))
     if not paths:
         return None
-    # these inputs fully determine the raster, so the same icon
-    # redrawn next tick reuses the handle instead of minting one
-    key = (vx, vy, vw, vh, out_w, out_h,
+    # A vector image has no resolution of its own, but this store holds
+    # rasters, so it gets rasterized once and scaled by the image
+    # sampler afterwards. Rasterizing at the intrinsic size and scaling
+    # up is what made a two-colour SVG background come out with a
+    # blended band across its colour boundary. Rasterizing larger and
+    # letting the sampler come *down* keeps the edge: the supersample
+    # is the closest this can get to re-rasterizing at the used size,
+    # which is what the intrinsic size being a lie about the pixels
+    # buys us — the caller is told the CSS size either way.
+    ss = _supersample(out_w, out_h)
+    key = (vx, vy, vw, vh, out_w * ss, out_h * ss,
            tuple((d, tuple(rgb)) for d, rgb in paths))
     handle = _svg_cache.get(key)
     if handle is None:
-        handle = _engine.load_svg((vx, vy, vw, vh), out_w, out_h, paths)
+        handle = _engine.load_svg(
+            (vx, vy, vw, vh), out_w * ss, out_h * ss, paths)
         _svg_cache[key] = handle
-    return handle
+    # report the CSS size; the sampler reads the raster's real one
+    return (handle[0], out_w, out_h)
+
+
+# The rasterizer caps a side at 512, and a supersampled icon is pure
+# memory in the image store, so the factor shrinks as the image grows.
+_SS_LIMIT = 512
+
+
+def _supersample(w, h):
+    for factor in (4, 2):
+        if w * factor <= _SS_LIMIT and h * factor <= _SS_LIMIT:
+            return factor
+    return 1
 
 
 def _length(text):

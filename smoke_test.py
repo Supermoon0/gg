@@ -713,6 +713,20 @@ check("an author's list-style-type outranks the tag default",
 check("list-style:none suppresses the marker",
       _markers("ul", "list-style:none") == ["a", "b"])
 
+# a vector image rasterizes larger than its intrinsic size
+from browser import textengine as _te
+check("the supersample shrinks as the raster grows",
+      (_te._supersample(16, 16), _te._supersample(200, 200),
+       _te._supersample(500, 500)) == (4, 2, 1))
+_svg = (b'<svg width="8px" height="32px" viewBox="0 0 4 64">'
+        b'<rect y="0" width="100%" height="50%" fill="lime"/>'
+        b'<rect y="50%" width="100%" height="50%" fill="aqua"/></svg>')
+_h = _te.load_image_data(_svg)
+check("an SVG reports its intrinsic size, not its raster size",
+      _h is not None and _h[1:] == (8, 32), str(_h))
+check("percentage geometry resolves against the viewBox",
+      _h is not None)
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",
