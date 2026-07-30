@@ -416,6 +416,7 @@ class _ScriptLoader:
         self.async_pending = {}
         self.ordered_dynamic = []
         self.dynamic_inline = []
+        self._draining = False
         self.dynamic_modules = []
         self.logs = []
         self.budget_reported = False
@@ -528,9 +529,20 @@ class _ScriptLoader:
         self._run_code(record, code, external=True)
 
     def _run_dynamic_inline(self):
-        while self.dynamic_inline:
-            record = self.dynamic_inline.pop(0)
-            self._run_code(record, record[2])
+        # _run_code drains this queue when it finishes, and running a
+        # script can add more to it — so a page that appends a script
+        # from a script nested one Python frame per script until the
+        # stack gave out. One drainer at a time: the outer loop picks
+        # up whatever the inner run queued.
+        if self._draining:
+            return
+        self._draining = True
+        try:
+            while self.dynamic_inline:
+                record = self.dynamic_inline.pop(0)
+                self._run_code(record, record[2])
+        finally:
+            self._draining = False
 
     def _discover_dynamic(self):
         for raw in self.doc.script_records():

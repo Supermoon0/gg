@@ -391,6 +391,19 @@ def _vector_tile_size(spec, box_w, box_h, svg):
     box — `background-size: contain` on it fills the element rather
     than fitting a made-up 24x24 square into a corner of it.
     """
+    def sane(w, h):
+        # A viewBox of `0 0 2147483647 1` is a real file in the corpus,
+        # and `cover` on it asks for a tile two billion pixels wide.
+        # The rasterizer takes u32s, so the ask has to be bounded
+        # before it gets there — the visible result is the same either
+        # way, since only the part over the box is ever sampled.
+        cap = 1e5
+        if not (math.isfinite(w) and math.isfinite(h)) \
+                or w > cap or h > cap:
+            return (min(w, cap) if math.isfinite(w) else box_w,
+                    min(h, cap) if math.isfinite(h) else box_h)
+        return w, h
+
     iw, ih, ratio = textengine.svg_intrinsic(svg)
     size = spec["size"]
     kw = size[0].casefold() if size else "auto"
@@ -398,25 +411,25 @@ def _vector_tile_size(spec, box_w, box_h, svg):
         if not ratio:
             return box_w, box_h
         h = (max if kw == "cover" else min)(box_h, box_w / ratio)
-        return h * ratio, h
+        return sane(h * ratio, h)
     w = _bg_size_token(size[0] if size else None, box_w)
     h = _bg_size_token(size[1] if len(size) > 1 else None, box_h)
     if w is not None and h is not None:
-        return w, h
+        return sane(w, h)
     if w is not None:
-        return w, (w / ratio if ratio else ih or box_h)
+        return sane(w, (w / ratio if ratio else ih or box_h))
     if h is not None:
-        return (h * ratio if ratio else iw or box_w), h
+        return sane((h * ratio if ratio else iw or box_w), h)
     if iw and ih:                       # `auto auto`: the intrinsic size
-        return iw, ih
+        return sane(iw, ih)
     if ratio:                           # one dimension, or none: use it
         if iw:
-            return iw, iw / ratio
+            return sane(iw, iw / ratio)
         if ih:
-            return ih * ratio, ih
+            return sane(ih * ratio, ih)
         h = min(box_h, box_w / ratio)   # ratio constrained by the area
-        return h * ratio, h
-    return iw or box_w, ih or box_h
+        return sane(h * ratio, h)
+    return sane(iw or box_w, ih or box_h)
 
 
 def paint_background_image(node, x1, y1, x2, y2):
