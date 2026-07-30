@@ -4142,6 +4142,20 @@ class BlockLayout:
                 if grad:
                     break
 
+            # background-clip: the background's default box is the
+            # border box, not the padding box — it paints *under* the
+            # border, which is only invisible while the border is opaque
+            clip = (self.node.style.get("background-clip")
+                    or "").strip().casefold()
+            if clip == "content-box":
+                cx1, cy1 = self.x, self.y
+                cx2, cy2 = self.x + self.width, self.y + self.height
+            elif clip in ("padding-box", "text"):
+                cx1, cy1, cx2, cy2 = x1, y1, x2, y2
+            else:
+                cx1, cy1 = x1 - self.bl, y1 - self.bt
+                cx2, cy2 = x2 + self.br, y2 + self.bb
+
             def bg_fill(bx1, by1, bx2, by2, r):
                 if grad:
                     return DrawGradient(bx1, by1, bx2, by2,
@@ -4157,7 +4171,7 @@ class BlockLayout:
                 cmds.append(bg_fill(x1, y1, x2, y2, radius))
             else:
                 if color:
-                    cmds.append(bg_fill(x1, y1, x2, y2, radius))
+                    cmds.append(bg_fill(cx1, cy1, cx2, cy2, radius))
                 if self.bt > 0 and side_colors[0]:
                     cmds.append(DrawRect(
                         x1 - self.bl, y1 - self.bt, x2 + self.br, y1,

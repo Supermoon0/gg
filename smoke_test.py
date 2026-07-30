@@ -563,6 +563,22 @@ check("a justified line reaches the far edge, the last one does not",
       _jrows[_first][0] == _jrows[_last][0]
       and max(_jrows[_first]) > max(_jrows[_last]), str(_jrows))
 
+# background-clip: the default box is the border box, not the padding box
+_BGC = ("div{width:100px;height:50px;padding:10px;"
+        "border:5px solid transparent;background-color:green;%s}")
+_bgboxes = [
+    [tuple(round(v) for v in c[1:5]) for c in
+     _lines_all(_BGC % extra, "<body style='margin:0'><div></div></body>")
+     if c[0] == 0 and c[5] == (0, 128, 0)]
+    for extra in ("", "background-clip:padding-box",
+                  "background-clip:content-box")]
+check("background-clip defaults to the border box",
+      _bgboxes[0] == [(0, 0, 130, 80)], str(_bgboxes[0]))
+check("background-clip:padding-box stops at the padding edge",
+      _bgboxes[1] == [(5, 5, 125, 75)], str(_bgboxes[1]))
+check("background-clip:content-box stops at the content edge",
+      _bgboxes[2] == [(15, 15, 115, 65)], str(_bgboxes[2]))
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",
