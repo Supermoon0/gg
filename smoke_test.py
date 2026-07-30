@@ -653,6 +653,34 @@ check("nested commas inside an argument do not split it",
 check("calc() accepts ch and ex too",
       _psz("calc(10ch + 5px)", 0, 16) == 85.0)
 
+# outline: a ring outside the border box that takes no space
+from browser.layout import outline_ring as _ring
+check("outline-style:none means no ring",
+      _ring({"outline": "2px"}) == (0.0, "", 0.0)
+      and _ring({"outline": "none"}) == (0.0, "", 0.0))
+check("the shorthand yields width, colour and style",
+      _ring({"outline": "3px solid red"}) == (3.0, "red", 0.0))
+check("width keywords have a scale",
+      [_ring({"outline": k + " solid"})[0]
+       for k in ("thin", "medium", "thick")] == [1.0, 3.0, 5.0])
+check("longhands work without the shorthand",
+      _ring({"outline-style": "solid", "outline-width": "2px",
+             "outline-color": "blue"}) == (2.0, "blue", 0.0))
+check("outline-offset comes through",
+      _ring({"outline": "1px solid red",
+             "outline-offset": "4px"})[2] == 4.0)
+check("invert falls back to the element's colour",
+      _ring({"outline": "1px solid", "outline-color": "invert",
+             "color": "blue"})[1] == "blue")
+
+_ol = [tuple(round(v) for v in c[1:5]) for c in _lines_all(
+    "body{margin:0}div{width:100px;height:50px;background:green;"
+    "outline:3px solid red}", "<div></div>")
+    if c[0] == 0 and c[5] == (255, 0, 0)]
+check("the ring is drawn outside the border box on all four sides",
+      _ol == [(-3, -3, 103, 0), (-3, 50, 103, 53),
+              (-3, 0, 0, 50), (100, 0, 103, 50)], str(_ol))
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",

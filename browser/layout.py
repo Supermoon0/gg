@@ -386,6 +386,55 @@ def _color_alpha(tok):
     return 1.0
 
 
+_OUTLINE_STYLES = {"solid", "dashed", "dotted", "double", "groove",
+                   "ridge", "inset", "outset", "auto"}
+
+
+def outline_ring(style, em=16.0):
+    """(width, color, offset) for an element's outline, or (0, "", 0).
+
+    An outline is a ring drawn outside the border box that occupies no
+    space, which is what makes it the focus indicator: it cannot shift
+    the layout it is drawn around. `outline: none` and the initial
+    `outline-style: none` both mean nothing is drawn, and the width is
+    the keyword scale a UA picks for thin/medium/thick.
+    """
+    shorthand = (style.get("outline") or "").strip()
+    width = style.get("outline-width")
+    color = style.get("outline-color")
+    line = (style.get("outline-style") or "").strip().casefold()
+    if shorthand:
+        for token in shorthand.split():
+            low = token.casefold()
+            if low in _OUTLINE_STYLES:
+                line = line or low
+            elif low in ("none", "hidden"):
+                line = line or "none"
+            elif width is None and (
+                    low in ("thin", "medium", "thick")
+                    or low[:1].isdigit() or low.startswith(".")):
+                width = token
+            elif color is None:
+                color = token
+    if not line or line in ("none", "hidden"):
+        return 0.0, "", 0.0
+    keyword = {"thin": 1.0, "medium": 3.0, "thick": 5.0}
+    raw = (width or "medium").strip().casefold()
+    px = keyword.get(raw)
+    if px is None:
+        px = parse_size(raw, 0.0, em)
+    if px is None or px <= 0:
+        return 0.0, "", 0.0
+    offset = parse_size(style.get("outline-offset"), 0.0, em) or 0.0
+    # `outline-color: invert` has no inverting rasterizer here; the
+    # currentColor fallback is what the property's own initial value
+    # resolves to in engines that dropped invert
+    raw_color = (color or "").strip()
+    if not raw_color or raw_color.casefold() == "invert":
+        raw_color = style.get("color", "black")
+    return px, safe_color(raw_color, default="black"), offset
+
+
 def box_shadow(value):
     """Parse the first paintable box-shadow layer to (dx, dy, color), or
     None. Blur/spread are ignored (we paint a flat offset rect), so a
@@ -4208,6 +4257,24 @@ class BlockLayout:
             bg_img = paint_background_image(self.node, x1, y1, x2, y2)
             if bg_img:
                 cmds.append(bg_img)
+
+            # outline: a ring outside the border box that takes up no
+            # space. It is the focus indicator on every keyboard-driven
+            # page, and it was drawing nothing at all.
+            ow, ocolor, ooffset = outline_ring(
+                self.node.style,
+                parse_px(self.node.style.get("font-size", "16px"), 16.0))
+            if ow > 0 and ocolor:
+                o1x = x1 - self.bl - ooffset
+                o1y = y1 - self.bt - ooffset
+                o2x = x2 + self.br + ooffset
+                o2y = y2 + self.bb + ooffset
+                cmds.append(DrawRect(o1x - ow, o1y - ow, o2x + ow, o1y,
+                                     ocolor))
+                cmds.append(DrawRect(o1x - ow, o2y, o2x + ow, o2y + ow,
+                                     ocolor))
+                cmds.append(DrawRect(o1x - ow, o1y, o1x, o2y, ocolor))
+                cmds.append(DrawRect(o2x, o1y, o2x + ow, o2y, ocolor))
 
             # an <iframe>'s box embeds its child document's painted
             # output (browser/frames.py), clipped to the frame rect
