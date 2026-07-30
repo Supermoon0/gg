@@ -228,6 +228,14 @@ class Page:
         """
         if self._doc is None or self._root is None:
             return
+        # Fill the engine-side cascade map. The Python tree gets its
+        # styles from commit, but ggcore's own Document does not, and
+        # getComputedStyle reads that one — so `display` on a plain div
+        # answered "" instead of "block".
+        try:
+            self._doc.compute_styles(list(self._css_sources or ()), 1280.0)
+        except Exception:
+            pass
         try:
             from .layout import (BlockLayout, DocumentLayout, ImageLayout,
                                  TextLayout, layout_tree_to_list)
