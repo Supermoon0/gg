@@ -879,6 +879,48 @@ DataView.prototype = {};
 })();
 __ggRegisterProtos(ArrayBuffer.prototype, __ggTAProtos,
                    DataView.prototype);
+// The CSS namespace object. `CSS.supports` gates every WPT
+// *-computed test through computed-testcommon.js, so its absence hid
+// 456 files behind one ReferenceError.
+//
+// Honesty matters in which direction it errs. The helper asserts
+// supports() is *true* before checking the computed value, so a false
+// negative fails a test we would otherwise pass, while a false
+// positive just lets the real assertion do the judging. So: answer
+// from whether the declaration survives the engine's own parser, and
+// do not pretend to validate values the engine does not validate.
+var CSS = {
+  escape: function (s) {
+    s = '' + s;
+    var out = '';
+    for (var i = 0; i < s.length; i++) {
+      var c = s[i], n = s.charCodeAt(i);
+      if (n === 0) { out += '�'; continue; }
+      var alnum = (n >= 48 && n <= 57) || (n >= 65 && n <= 90)
+        || (n >= 97 && n <= 122);
+      if (alnum || n >= 0x80 || c === '-' || c === '_') { out += c; }
+      else if (i === 0 && n >= 48 && n <= 57) {
+        out += '\\' + n.toString(16) + ' ';
+      } else { out += '\\' + c; }
+    }
+    return out;
+  },
+  supports: function (a, b) {
+    if (arguments.length >= 2) {
+      var prop = '' + a, val = '' + b;
+      if (!prop || !val) return false;
+      // a declaration the engine keeps is one the engine supports
+      var probe = document.createElement('div');
+      probe.style.setProperty(prop, val);
+      return probe.style.getPropertyValue(prop) !== '';
+    }
+    // condition form: CSS.supports("(display: flex)")
+    var cond = ('' + a).trim();
+    var m = /^\(\s*([-\w]+)\s*:\s*([^)]+)\)$/.exec(cond);
+    if (m) return CSS.supports(m[1], m[2].trim());
+    return false;
+  }
+};
 function __ggBytes(src) {
   var out = [], i;
   if (src === undefined || src === null) return out;

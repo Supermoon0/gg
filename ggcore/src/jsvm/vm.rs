@@ -403,6 +403,10 @@ pub(super) enum Native {
     PerfNow,
     /// element.classList.<op>; op: 0=add 1=remove 2=contains 3=toggle
     ClassList { node: u32, op: u8 },
+    /// CSSOMStyleDeclaration methods on `el.style`. ops:
+    /// 0 getPropertyValue, 1 setProperty, 2 removeProperty,
+    /// 3 getPropertyPriority, 4 item.
+    StyleDecl { node: u32, op: u8 },
     /// window.addEventListener / removeEventListener (listeners keyed
     /// on WINDOW_NODE so lifecycle events can find them)
     WinEvent { add: bool },
@@ -4727,6 +4731,22 @@ fn camel_to_kebab(s: &str) -> String {
 }
 
 /// One declaration's value out of an inline style string, or "".
+/// `el.style` doubles as a property bag and an object with methods.
+/// The proxy answers every read out of the style attribute, so these
+/// names have to be recognised before that or `getPropertyValue`
+/// reads back as the empty string and then fails to be callable —
+/// which is what blocked every WPT css parsing test on its first line.
+fn style_decl_method(name: &str) -> Option<u8> {
+    match name {
+        "getPropertyValue" => Some(0),
+        "setProperty" => Some(1),
+        "removeProperty" => Some(2),
+        "getPropertyPriority" => Some(3),
+        "item" => Some(4),
+        _ => None,
+    }
+}
+
 fn style_attr_get(style: &str, prop: &str) -> String {
     for decl in style.split(';') {
         if let Some((k, v)) = decl.split_once(':') {
@@ -5389,6 +5409,11 @@ fn internal_get(
             let doc = need_doc(st)?;
             let cur = doc.borrow().nodes[node as usize]
                 .attr("style").unwrap_or("").to_string();
+            if let Some(op) = style_decl_method(&name) {
+                return Ok(memo_native(
+                    st, 7, node, op as u32,
+                    Native::StyleDecl { node, op }));
+            }
             let out = if name == "cssText" {
                 cur
             } else {
@@ -7607,6 +7632,54 @@ fn do_native(
         } else {
             st.perf_origin.elapsed().as_secs_f64() * 1000.0
         })),
+        Native::StyleDecl { node, op } => {
+            let doc = need_doc(st)?;
+            let cur = doc.borrow().nodes[node as usize]
+                .attr("style").unwrap_or("").to_string();
+            let args: Vec<String> = (0..argc as usize)
+                .map(|k| to_display(st, st.regs[args_base + k]))
+                .collect();
+            let arg = |i: usize| args.get(i).cloned().unwrap_or_default();
+            match op {
+                // getPropertyValue(name)
+                0 => {
+                    let out = style_attr_get(&cur, &camel_to_kebab(&arg(0)));
+                    Ok(push_str(st, out))
+                }
+                // setProperty(name, value, priority)
+                1 => {
+                    let prop = camel_to_kebab(&arg(0));
+                    let next = style_attr_set(&cur, &prop, &arg(1));
+                    doc.borrow_mut().set_attr(node as usize, "style", &next);
+                    Ok(Value::UNDEFINED)
+                }
+                // removeProperty(name) -> the value it had
+                2 => {
+                    let prop = camel_to_kebab(&arg(0));
+                    let had = style_attr_get(&cur, &prop);
+                    let next = style_attr_set(&cur, &prop, "");
+                    doc.borrow_mut().set_attr(node as usize, "style", &next);
+                    Ok(push_str(st, had))
+                }
+                // getPropertyPriority: !important is not tracked yet, so
+                // the honest answer is always "" rather than a guess
+                3 => Ok(push_str(st, String::new())),
+                // item(i): the i-th declared property name
+                _ => {
+                    let i = args.first()
+                        .and_then(|a| a.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let name = cur
+                        .split(';')
+                        .filter_map(|d| d.split_once(':'))
+                        .map(|(k, _)| k.trim().to_string())
+                        .filter(|k| !k.is_empty())
+                        .nth(i)
+                        .unwrap_or_default();
+                    Ok(push_str(st, name))
+                }
+            }
+        }
         Native::ClassList { node, op } => {
             let doc = need_doc(st)?;
             let current = doc
@@ -12591,6 +12664,28 @@ fn exec_loop(
                     )?;
                     continue;
                 }
+                // `el.style.getPropertyValue(...)`. A method call does
+                // not go through GetProp, so recognising these on the
+                // read paths alone left them un-callable — which is
+                // where every WPT css parsing test stopped.
+                if ov.is_object() {
+                    if let Some(&node) = st.style_nodes.get(&ov.index()) {
+                        let name = st.names[key as usize].clone();
+                        if let Some(op) = style_decl_method(&name) {
+                            let f = memo_native(
+                                st, 7, node, op as u32,
+                                Native::StyleDecl { node, op });
+                            let args: Vec<Value> = (0..argc as usize)
+                                .map(|i| {
+                                    st.regs[base + obj as usize + 1 + i]
+                                })
+                                .collect();
+                            reg!(obj) = call_value_this(
+                                st, mods, f, Some(ov), &args)?;
+                            continue;
+                        }
+                    }
+                }
                 // Function.prototype.call / apply (backs spread calls)
                 if ov.is_function() {
                     // Function.prototype.bind: package this + partials
@@ -14481,6 +14576,12 @@ fn exec_loop(
                             .attr("style")
                             .unwrap_or("")
                             .to_string();
+                        if let Some(op) = style_decl_method(&text) {
+                            reg!(dst) = memo_native(
+                                st, 7, node, op as u32,
+                                Native::StyleDecl { node, op });
+                            continue;
+                        }
                         let out = if text == "cssText" {
                             cur
                         } else {
@@ -14880,6 +14981,12 @@ fn exec_loop(
                             .attr("style")
                             .unwrap_or("")
                             .to_string();
+                        if let Some(op) = style_decl_method(&name) {
+                            reg!(dst) = memo_native(
+                                st, 7, node, op as u32,
+                                Native::StyleDecl { node, op });
+                            continue;
+                        }
                         let out = if name == "cssText" {
                             cur
                         } else {
