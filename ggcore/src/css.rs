@@ -332,17 +332,39 @@ impl<'a> CssParser<'a> {
         self.vw = vw;
     }
 
+/// Markup that is legal around a stylesheet's contents but is not CSS.
+///
+/// `<!--` and `-->` are the CDO/CDC tokens CSS has always told parsers
+/// to skip at the top level (they let a 1996 stylesheet hide from
+/// browsers that would have shown it as text). `<![CDATA[` and `]]>`
+/// are the XHTML spelling of the same idea, and the CSS corpus is full
+/// of `.xht` references that wrap their whole stylesheet in one --
+/// 2437 test files point at those references, and every one of them
+/// was rendering unstyled because the rule after the delimiter never
+/// parsed.
+fn leading_noise(rest: &str) -> Option<usize> {
+    for token in ["<![CDATA[", "]]>", "<!--", "-->"] {
+        if rest.starts_with(token) {
+            return Some(token.len());
+        }
+    }
+    None
+}
+
     fn whitespace(&mut self) {
         loop {
             while self.i < self.b.len() && self.b[self.i].is_ascii_whitespace()
             {
                 self.i += 1;
             }
-            if self.s[self.i.min(self.s.len())..].starts_with("/*") {
+            let rest = &self.s[self.i.min(self.s.len())..];
+            if rest.starts_with("/*") {
                 match self.s[self.i + 2..].find("*/") {
                     Some(e) => self.i = self.i + 2 + e + 2,
                     None => self.i = self.b.len(),
                 }
+            } else if let Some(skip) = Self::leading_noise(rest) {
+                self.i += skip;
             } else {
                 break;
             }

@@ -525,6 +525,44 @@ check("a clamped block keeps N lines and marks the last",
       [c[8] for c in _clamped if c[0] == 1] == ["alpha", "beta\u2026"],
       str([c[8] for c in _clamped if c[0] == 1]))
 
+# text-align: start/end/match-parent/justify, and text-align-last
+from browser.layout import resolved_text_align as _rta
+class _AN:  # node stub with a parent chain
+    def __init__(self, parent=None, **s): self.style = s; self.parent = parent
+check("the initial text-align is start, which is left in ltr",
+      _rta(_AN()) == "left")
+check("start/end follow direction",
+      (_rta(_AN(**{"text-align": "start", "direction": "rtl"})),
+       _rta(_AN(**{"text-align": "end"})),
+       _rta(_AN(**{"text-align": "end", "direction": "rtl"})))
+      == ("right", "right", "left"))
+check("left stays left in rtl",
+      _rta(_AN(**{"text-align": "left", "direction": "rtl"})) == "left")
+_par = _AN(**{"text-align": "end", "direction": "rtl"})
+check("match-parent resolves in the parent's direction",
+      _rta(_AN(_par, **{"text-align": "match-parent"})) == "left")
+check("justify leaves its last line ragged",
+      (_rta(_AN(**{"text-align": "justify"}), False),
+       _rta(_AN(**{"text-align": "justify"}), True))
+      == ("justify", "left"))
+check("text-align-last styles only the last line",
+      (_rta(_AN(**{"text-align": "left", "text-align-last": "center"}),
+            False),
+       _rta(_AN(**{"text-align": "left", "text-align-last": "center"}),
+            True)) == ("left", "center"))
+check("match-parent cannot loop forever",
+      _rta(_AN(**{"text-align": "match-parent"})) == "left")
+
+_just = _lines_all("div{width:200px;font-size:16px;text-align:justify}",
+                   "<div>alpha beta gamma delta epsilon zeta eta</div>")
+_jrows = {}
+for _c in _just:
+    _jrows.setdefault(round(_c[2]), []).append(round(_c[1]))
+_first, _last = min(_jrows), max(_jrows)
+check("a justified line reaches the far edge, the last one does not",
+      _jrows[_first][0] == _jrows[_last][0]
+      and max(_jrows[_first]) > max(_jrows[_last]), str(_jrows))
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",

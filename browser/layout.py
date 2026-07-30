@@ -890,6 +890,48 @@ def white_space(style):
     return _WS_FROM_LONGHANDS.get((collapse, wraps), ws)
 
 
+_PHYSICAL_ALIGN = {"left", "right", "center", "justify"}
+
+
+def resolved_text_align(node, is_last_line=False):
+    """The physical alignment of one line: left, right, center, justify.
+
+    `start`/`end` are the writing-mode-relative spellings and are the
+    initial value's real name, so a block that sets neither is `start`.
+    `match-parent` resolves against the parent's own value, which is the
+    only way to say "inherit, but resolve start/end in the parent's
+    direction". And the final line of a block takes text-align-last
+    instead, which is what makes `justify` leave its last line ragged
+    rather than stretching three words across the column.
+    """
+    style = getattr(node, "style", None) or {}
+    align = (style.get("text-align") or "start").strip().casefold()
+    if is_last_line:
+        last = (style.get("text-align-last") or "").strip().casefold()
+        if last and last != "auto":
+            align = last
+        elif align == "justify":
+            align = "start"
+    rtl = (style.get("direction") or "ltr").strip().casefold() == "rtl"
+    for _ in range(8):
+        if align in _PHYSICAL_ALIGN:
+            return align
+        if align in ("start", "normal", ""):
+            return "right" if rtl else "left"
+        if align == "end":
+            return "left" if rtl else "right"
+        if align != "match-parent":
+            return "left"
+        parent = getattr(node, "parent", None)
+        pstyle = getattr(parent, "style", None) or {}
+        align = (pstyle.get("text-align") or "start").strip().casefold()
+        rtl = (pstyle.get("direction") or "ltr").strip().casefold() == "rtl"
+        node = parent
+        if node is None:
+            return "right" if rtl else "left"
+    return "left"
+
+
 def line_clamp_count(style):
     """How many lines this element clamps to, or None.
 
@@ -4551,6 +4593,27 @@ class LineLayout:
         self.margin_top = 0
         self.margin_bottom = 0
 
+    def _is_last_line(self):
+        """Is this the final line of its block? text-align-last styles
+        it, and `justify` deliberately does not stretch it — a justified
+        paragraph whose last line were stretched too would have three
+        words spread across the full column."""
+        lines = getattr(self.parent, "children", None)
+        return not lines or lines[-1] is self
+
+    def _justify(self, free):
+        """Spread `free` px across the gaps between the line's atoms.
+
+        The gaps are the word boundaries, so a line of one word has none
+        and stays where it is. Each atom moves by the total inserted to
+        its left, which keeps the words themselves unstretched."""
+        gaps = len(self.children) - 1
+        if gaps < 1:
+            return
+        step = free / gaps
+        for i, word in enumerate(self.children):
+            word.x += step * i
+
     def layout(self):
         self.width = self.parent.width
         self.x = self.parent.x
@@ -4649,19 +4712,22 @@ class LineLayout:
         # text-align — skipped during intrinsic-width measurement, where
         # the line box is _MAXCONTENT-wide and a right/center shift would
         # push the words out to that width and inflate the measured extent
-        align = self.node.style.get("text-align", "left")
         try:
             measuring = self.parent._document()._measuring
         except Exception:
             measuring = False
-        if not measuring and align in ("center", "right") and self.children:
+        align = resolved_text_align(self.node, self._is_last_line())
+        if not measuring and self.children and align != "left":
             last = self.children[-1]
             used = (last.x + last.width) - self.x
             free = self.width - used
             if free > 0:
-                shift = free / 2 if align == "center" else free
-                for word in self.children:
-                    word.x += shift
+                if align == "justify":
+                    self._justify(free)
+                else:
+                    shift = free / 2 if align == "center" else free
+                    for word in self.children:
+                        word.x += shift
 
         # inline-block boxes re-anchor their inner block once x (incl. any
         # text-align shift) and the baseline y are final
