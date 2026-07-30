@@ -123,6 +123,70 @@ def transformed_text(node, word):
     return word
 
 
+def text_indent_px(style, width, font_size):
+    """(indent in px, hanging) for a block's `text-indent`.
+
+    `hanging` inverts which lines get it: every line except the first,
+    which is how a dictionary entry or a bibliography is set.
+    `each-line` re-indents after every forced break as well as at the
+    start of the block. The two compose: `each-line hanging` indents
+    every line that is not the first of a paragraph or of a <br>
+    segment.
+    """
+    raw = str(style.get("text-indent", "0")).strip()
+    if not raw or raw == "0":
+        return 0.0, False, False
+    tokens = raw.casefold().split()
+    value = parse_size(tokens[0], width, font_size)
+    if value is None:
+        return 0.0, False, False
+    return value, "hanging" in tokens, "each-line" in tokens
+
+
+_INLINE_LEAD = ("margin-left", "border-left-width", "padding-left")
+_INLINE_TRAIL = ("margin-right", "border-right-width", "padding-right")
+
+
+def inline_insets(node, avail):
+    """(leading, trailing) px an inline box opens around its content.
+
+    Only the horizontal edges: an inline box's vertical margin and
+    padding do not affect line height, which is why this is the half
+    that matters and the half that was missing entirely — a padded
+    <span> badge drew its text flush against whatever came before it.
+    """
+    style = getattr(node, "style", None) or {}
+    if (style.get("display") or "inline").strip().casefold() != "inline":
+        return 0.0, 0.0
+    em = parse_px(style.get("font-size", "16px"), 16.0)
+
+    def total(props):
+        out = 0.0
+        for prop in props:
+            value = parse_size(style.get(prop), avail, em)
+            if value:
+                out += value
+        return out
+
+    return total(_INLINE_LEAD), total(_INLINE_TRAIL)
+
+
+def word_spacing_px(node, font_size, space_advance=0.0):
+    """`word-spacing` in px, added to each inter-word space.
+
+    The initial `normal` adds nothing; a length (including a negative
+    one, which tightens) is added to the space's own advance. A
+    percentage is of the font size, not of the space — CSS Text 4 says
+    so explicitly, and guessing the space's own advance as the basis
+    gets a 100% value wrong by whatever the font's space happens to
+    be."""
+    raw = str(node.style.get("word-spacing", "normal")).strip()
+    if not raw or raw.casefold() == "normal":
+        return 0.0
+    value = parse_size(raw, font_size, font_size)
+    return value if value is not None else 0.0
+
+
 def letter_spacing_px(node, font_size):
     """`letter-spacing` in px, 0 for the initial `normal`."""
     raw = str(node.style.get("letter-spacing", "normal")).strip()
@@ -970,6 +1034,7 @@ def white_space(style):
 
 
 _PHYSICAL_ALIGN = {"left", "right", "center", "justify"}
+_JUSTIFY_ALL = "justify-all"
 
 
 def resolved_text_align(node, is_last_line=False):
@@ -985,6 +1050,10 @@ def resolved_text_align(node, is_last_line=False):
     """
     style = getattr(node, "style", None) or {}
     align = (style.get("text-align") or "start").strip().casefold()
+    if align == "justify-all":
+        # justify-all is justify that also stretches the last line, so
+        # it is the one value text-align-last cannot override
+        return "justify"
     if is_last_line:
         last = (style.get("text-align-last") or "").strip().casefold()
         if last and last != "auto":
@@ -4196,7 +4265,19 @@ class BlockLayout:
     def new_line(self):
         self.cursor_x = 0
         last = self.children[-1] if self.children else None
-        self.children.append(LineLayout(self.node, self, last))
+        line = LineLayout(self.node, self, last)
+        indent, hanging, each_line = text_indent_px(
+            self.node.style, self.width,
+            parse_px(self.node.style.get("font-size", "16px"), 16.0))
+        # which lines the indent lands on: the first one, or with
+        # `each-line` the first after every forced break too, and
+        # `hanging` swaps the answer for every line
+        indented = last is None or (
+            each_line and getattr(self, "_forced_break", False))
+        if indent and indented != hanging:
+            line.indent = indent
+            self.cursor_x = indent
+        self.children.append(line)
 
     def recurse(self, node):
         if isinstance(node, Text):
@@ -4257,7 +4338,9 @@ class BlockLayout:
                 self.inline_block(node)
                 return
             if node.tag == "br":
+                self._forced_break = True
                 self.new_line()
+                self._forced_break = False
             elif node.tag == "img":
                 self.image(node)
             elif node.tag == "svg":
@@ -4286,8 +4369,23 @@ class BlockLayout:
                         ImageLayout(node, w, h, line, prev))
                     self.cursor_x += w
                     return
+            lead, trail = inline_insets(node, self.width)
+            if lead:
+                self._inline_spacer(node, lead)
             for child in node.children:
                 self.recurse(child)
+            if trail:
+                self._inline_spacer(node, trail)
+
+    def _inline_spacer(self, node, width):
+        """Open `width` px on the current line for an inline box's own
+        margin/border/padding edge."""
+        if not self.children:
+            self.new_line()
+        line = self.children[-1]
+        prev = line.children[-1] if line.children else None
+        line.children.append(InlineSpacer(node, width, line, prev))
+        self.cursor_x += width
 
     def word(self, node, word, space_before=True):
         font = cached_font(node)
@@ -4318,8 +4416,15 @@ class BlockLayout:
                 return
         line = self.children[-1]
         # a leading space only when the source had whitespace here and we
-        # are not at the start of a line
-        sp = measure(font, " ") if (space_before and line.children) else 0.0
+        # are not at the start of a line. word-spacing is added to that
+        # space, which is what makes it apply between words and not at
+        # the edges of a line.
+        sp = 0.0
+        if space_before and line.children:
+            advance = measure(font, " ")
+            sp = advance + word_spacing_px(
+                node, parse_px(node.style.get("font-size", "16px"), 16.0),
+                advance)
         # a line may only break at a break OPPORTUNITY: source whitespace,
         # a CJK boundary (either side), or after a replaced atom. Without
         # one, adjacent tokens stick — naver's <strong>27.1</strong>°
@@ -5030,7 +5135,7 @@ class InlineBlockLayout:
         if self.previous:
             self.x = self.previous.x + self.previous.width
         else:
-            self.x = self.parent.x
+            self.x = self.parent.x + getattr(self.parent, "indent", 0.0)
 
     def place_inner(self):
         self.inner.flex_origin = (self.x, self.y)
@@ -5052,6 +5157,7 @@ class LineLayout:
         self.height = 0
         self.margin_top = 0
         self.margin_bottom = 0
+        self.indent = 0.0
 
     def _is_last_line(self):
         """Is this the final line of its block? text-align-last styles
@@ -5249,6 +5355,45 @@ class LineLayout:
         return cmds
 
 
+class InlineSpacer:
+    """Zero-height horizontal space on a line.
+
+    An inline box's own margin, border and padding open a gap before its
+    first atom and after its last one, but the inline box has no layout
+    object of its own here — only its text does. This is that gap, so it
+    participates in line breaking and in text-align like any other atom
+    while drawing nothing.
+    """
+
+    __slots__ = ("node", "parent", "previous", "children", "x", "y",
+                 "width", "height", "margin_top", "margin_bottom",
+                 "font", "word", "keep_spaces")
+
+    def __init__(self, node, width, parent, previous):
+        self.node = node
+        self.parent = parent
+        self.previous = previous
+        self.children = []
+        self.x = 0
+        self.y = 0
+        self.width = width
+        self.height = 0
+        self.margin_top = 0
+        self.margin_bottom = 0
+        self.font = None
+        self.word = ""
+        self.keep_spaces = True
+
+    def layout(self):
+        if self.previous:
+            self.x = self.previous.x + self.previous.width
+        else:
+            self.x = self.parent.x + getattr(self.parent, "indent", 0.0)
+
+    def paint(self):
+        return []
+
+
 class TextLayout:
     def __init__(self, node, word, parent, previous, keep_spaces=False):
         self.node = node
@@ -5270,10 +5415,13 @@ class TextLayout:
         if self.previous:
             # previous may be an image (font=None): use our own font
             prev_font = self.previous.font or self.font
-            space = 0 if self.keep_spaces else measure(prev_font, " ")
+            advance = measure(prev_font, " ")
+            space = 0 if self.keep_spaces else (
+                advance + word_spacing_px(
+                    self.node, self.font.size, advance))
             self.x = self.previous.x + self.previous.width + space
         else:
-            self.x = self.parent.x
+            self.x = self.parent.x + getattr(self.parent, "indent", 0.0)
         shown = transformed_text(self.node, self.word)
         self.spacing = letter_spacing_px(self.node, self.font.size)
         self.width = measure(self.font, shown)
@@ -5370,7 +5518,7 @@ class ImageLayout:
         if self.previous:
             self.x = self.previous.x + self.previous.width
         else:
-            self.x = self.parent.x
+            self.x = self.parent.x + getattr(self.parent, "indent", 0.0)
 
     def _object_position(self, free_x, free_y):
         """object-position -> (dx, dy) offset of the scaled image inside

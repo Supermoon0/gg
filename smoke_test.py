@@ -1007,6 +1007,63 @@ check("its own align-self wins over the container's align-items",
       or _absbox("align-items:start") == [(0, 0, 50, 50)])
 
 
+# text-indent, word-spacing, inline insets, justify-all
+from browser.layout import (text_indent_px as _tip,
+                            word_spacing_px as _wsp,
+                            inline_insets as _ins)
+check("text-indent resolves lengths, em and percentages",
+      [_tip({"text-indent": v}, 200, 16)[0]
+       for v in ("20px", "2em", "10%", "-10px")]
+      == [20.0, 32.0, 20.0, -10.0])
+check("hanging and each-line are reported, not swallowed",
+      (_tip({"text-indent": "1em hanging"}, 200, 16),
+       _tip({"text-indent": "1em each-line"}, 200, 16),
+       _tip({"text-indent": "1em each-line hanging"}, 200, 16))
+      == ((16.0, True, False), (16.0, False, True), (16.0, True, True)))
+check("no indent is the initial value",
+      _tip({}, 200, 16) == (0.0, False, False))
+
+check("word-spacing adds to the space, percentages off the font size",
+      (_wsp(_N(**{"word-spacing": "10px"}), 20),
+       _wsp(_N(**{"word-spacing": "50%"}), 20),
+       _wsp(_N(**{"word-spacing": "-2px"}), 20),
+       _wsp(_N(**{"word-spacing": "normal"}), 20))
+      == (10.0, 10.0, -2.0, 0.0))
+
+check("an inline box opens its own horizontal margin/border/padding",
+      _ins(_N(**{"display": "inline", "padding-left": "10px",
+                 "margin-left": "5px", "padding-right": "20px"}), 100)
+      == (15.0, 20.0))
+check("a block-level box's insets are its own box's job, not the line's",
+      _ins(_N(**{"display": "block", "padding-left": "10px"}), 100)
+      == (0.0, 0.0))
+
+check("justify-all justifies the last line too",
+      (_rta(_AN(**{"text-align": "justify-all"}), True),
+       _rta(_AN(**{"text-align": "justify"}), True))
+      == ("justify", "left"))
+
+_IND = ("body{margin:0}div{width:200px;%s}")
+def _indent_rows(css):
+    rows = {}
+    for c in _lines_all(_IND % css, "<div>alpha beta gamma delta epsilon"
+                                    " zeta eta theta</div>"):
+        if c[0] == 1:
+            rows.setdefault(round(c[2]), []).append(round(c[1]))
+    return [v[0] for _k, v in sorted(rows.items())]
+check("text-indent moves the first line and nothing else",
+      _indent_rows("text-indent:20px")[:2] == [20, 0],
+      str(_indent_rows("text-indent:20px")))
+check("hanging moves every line but the first",
+      _indent_rows("text-indent:20px hanging")[:2] == [0, 20])
+
+_SPAN = [(round(c[1]), c[8]) for c in _lines_all(
+    "body{margin:0}div{width:300px}span{padding-left:40px}",
+    "<div><span>aaa</span> bbb</div>") if c[0] == 1]
+check("a padded inline span pushes its own text along",
+      _SPAN and _SPAN[0][0] == 40, str(_SPAN))
+
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",
