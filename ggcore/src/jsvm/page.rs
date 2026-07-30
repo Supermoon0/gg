@@ -410,6 +410,49 @@ function getComputedStyle(el) {
   };
   return map;
 }
+// FontFaceSet. Nothing here loads a font — the engine picks faces
+// from the host at paint time — but `document.fonts.ready` is how a
+// page waits for text to be measurable, and reading `.ready` of
+// undefined threw before any of the page's own code ran.
+function FontFace(family, source, descriptors) {
+  this.family = '' + family;
+  this.style = 'normal'; this.weight = 'normal'; this.stretch = 'normal';
+  this.unicodeRange = 'U+0-10FFFF'; this.variant = 'normal';
+  this.featureSettings = 'normal'; this.display = 'auto';
+  this.status = 'unloaded';
+  if (descriptors) {
+    for (var k in descriptors) {
+      if (descriptors.hasOwnProperty(k)) this[k] = descriptors[k];
+    }
+  }
+  var self = this;
+  this.loaded = Promise.resolve(self);
+  this.load = function () { self.status = 'loaded'; return self.loaded };
+}
+function __ggFontFaceSet() {
+  var faces = [];
+  return {
+    ready: Promise.resolve(undefined),
+    status: 'loaded',
+    size: 0,
+    add: function (f) { faces.push(f); this.size = faces.length; return this },
+    delete: function (f) {
+      var i = faces.indexOf(f);
+      if (i < 0) return false;
+      faces.splice(i, 1); this.size = faces.length; return true;
+    },
+    clear: function () { faces.length = 0; this.size = 0 },
+    has: function (f) { return faces.indexOf(f) >= 0 },
+    forEach: function (fn, t) {
+      for (var i = 0; i < faces.length; i++) fn.call(t, faces[i], faces[i], this);
+    },
+    // the host always has a face to draw with, so a query resolves
+    check: function () { return true },
+    load: function () { return Promise.resolve([]) },
+    addEventListener: function () {}, removeEventListener: function () {},
+    dispatchEvent: function () { return false }
+  };
+}
 var customElements = {
   define: function () {}, get: function () {},
   whenDefined: function () { return Promise.resolve(); }
@@ -898,6 +941,10 @@ DataView.prototype = {};
 })();
 __ggRegisterProtos(ArrayBuffer.prototype, __ggTAProtos,
                    DataView.prototype);
+// one FontFaceSet per document, installed as an expando
+if (typeof document !== 'undefined' && document) {
+  document.fonts = __ggFontFaceSet();
+}
 // The CSS namespace object. `CSS.supports` gates every WPT
 // *-computed test through computed-testcommon.js, so its absence hid
 // 456 files behind one ReferenceError.
