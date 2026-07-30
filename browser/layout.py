@@ -81,16 +81,45 @@ def get_font(size, weight, slant, family="default"):
     return _FONT_CACHE[key][0]
 
 
+# Halfwidth forms and ASCII map onto the fullwidth block one for one;
+# the ASCII range starts at U+FF01 and the space is its own codepoint.
+_FULLWIDTH_OFFSET = 0xFF01 - ord("!")
+
+
+def _fullwidth(word):
+    out = []
+    for ch in word:
+        code = ord(ch)
+        if ch == " ":
+            out.append("\u3000")
+        elif 0x21 <= code <= 0x7E:
+            out.append(chr(code + _FULLWIDTH_OFFSET))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def transformed_text(node, word):
     """`text-transform` applied. It inherits, so the text node carries
     it — but nothing ever read it, so the property was inert."""
-    how = node.style.get("text-transform", "none")
+    how = (node.style.get("text-transform") or "none").strip().casefold()
+    if how == "none":
+        return word
     if how == "uppercase":
         return word.upper()
     if how == "lowercase":
         return word.lower()
     if how == "capitalize":
-        return word[:1].upper() + word[1:] if word else word
+        # titlecase, not uppercase: the first letter of `ǆ` is `ǅ` and
+        # of the `ﬁ` ligature is `Fi`. Only the first character is
+        # touched — str.title() would also lowercase the rest, which
+        # capitalize is not allowed to do.
+        if not word:
+            return word
+        head = word[0].title()
+        return head + word[1:]
+    if how == "full-width":
+        return _fullwidth(word)
     return word
 
 

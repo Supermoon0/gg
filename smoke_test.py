@@ -838,6 +838,27 @@ check("a flex item with a higher order moves after its sibling",
       _flexord == [(0, (0, 128, 0)), (100, (255, 0, 0))], str(_flexord))
 
 
+# text-transform: titlecase, not uppercase, and full-width
+from browser.layout import transformed_text as _tt
+def _T(how, word): return _tt(_N(**{"text-transform": how}), word)
+check("uppercase and lowercase are plain case mappings",
+      (_T("uppercase", "hello"), _T("lowercase", "HeLLo"))
+      == ("HELLO", "hello"))
+check("capitalize touches the first character and leaves the rest",
+      (_T("capitalize", "hello"), _T("capitalize", "wORLD"))
+      == ("Hello", "WORLD"))
+check("capitalize uses the title mapping, not the upper one",
+      (_T("capitalize", "\u01c6"), _T("capitalize", "\ufb01"))
+      == ("\u01c5", "Fi"))
+check("full-width maps ASCII into the fullwidth block",
+      _T("full-width", "ab 1") == "\uff41\uff42\u3000\uff11")
+check("full-width leaves what is already wide alone",
+      _T("full-width", "\u3042") == "\u3042")
+check("an empty word survives every transform",
+      [_T(h, "") for h in ("uppercase", "capitalize", "full-width")]
+      == ["", "", ""])
+
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",
