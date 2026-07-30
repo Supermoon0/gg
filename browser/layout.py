@@ -5410,7 +5410,13 @@ class BlockLayout:
             return True
         # Explicitly transparent backgrounds and zero/none borders are
         # author styling too: they intentionally remove the native face.
-        if any(disables_native_appearance(prop) for prop in style):
+        # Checkboxes, radios and range sliders are the exception —
+        # their native widget survives being given a background or a
+        # border, which is why WPT's fallback references leave those
+        # three alone while giving every other control `appearance:
+        # none`.
+        if self._input_type() not in ("checkbox", "radio", "range") \
+                and any(disables_native_appearance(prop) for prop in style):
             return True
         for prop in ("appearance", "-webkit-appearance"):
             value = (style.get(prop) or "").strip().casefold()
