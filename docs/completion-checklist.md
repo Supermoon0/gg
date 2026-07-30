@@ -20,7 +20,7 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
 | HTML 파서 | **1796/1796 (100%)** | html5lib-tests, cargo test |
 | JS 엔진 | **27,379/102,655 (26.67%)** | Test262, baseline regression=0 |
 | CSS (script) | **4,344/24,862 (17.47%)** | WPT css testharness |
-| CSS (render) | **5,020/17,263 (29.08%)** | WPT css reftest, 픽셀 비교 |
+| CSS (render) | **5,178/17,263 (29.99%)** | WPT css reftest, 픽셀 비교 |
 | CSS (자체) | 23/23 | css_gauntlet |
 | JS 계약 | 28/31 | jsvm_gauntlet (3건은 문서화된 GAP) |
 | 내장 계약 | 9/9 | conformance |
@@ -164,17 +164,20 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
       `body { line-height: 2 }`가 자식에게 안 갔다
 - [x] **`text-decoration` 전파** — 상속이 아니라 in-flow 후손 전파라는
       별개 규칙. 텍스트 노드에서 읽고 있어서 `<a>`조차 밑줄이 없었다
-- [ ] **미구현 프로퍼티** — outline, letter-spacing(상속은 되나 측정에
-      미반영), text-transform(같음), list-style-type, order,
-      aspect-ratio, writing-mode, column-count, filter, clip-path,
-      opacity(가시성 컬링만, 알파 합성 없음)
+- [ ] **미구현 프로퍼티** — 이번 아크에서 outline · list-style-type ·
+      aspect-ratio · opacity · background-clip · linear-gradient ·
+      `font` 단축 · `ch`/`ex`/`min()`/`max()`/`clamp()` ·
+      `transform: scale`/`transform-origin` · `text-align-last` ·
+      `white-space: break-spaces`가 닫혔다. 남은 것: order,
+      writing-mode, column-count, filter, clip-path, 회전/스큐
+      transform, CSS 카운터
       *주의: 이 목록은 두 번 틀렸다. 프로퍼티마다 조건을 지어 확인할 것 —
       배경 없는 div는 rect를 안 그리고 짧은 텍스트는 줄바꿈이 없다*
 - [x] **reftest 픽셀 하네스** — `validation/wpt_css_reftest.py`.
       16,929 파일 / 17,263 비교. 저장된 이미지가 아니라 *같은 엔진의 두
       렌더*를 비교하므로 골든 파일도 폰트 일치도 필요 없다
 
-#### 궤적: 28.25% → 27.47% → 29.08%
+#### 궤적: 28.25% → 27.47% → 29.99%
 
 부풀린 숫자에서 정직한 숫자로 내려간 다음, 엔진 수정으로 올라갔다.
 
@@ -253,6 +256,13 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
 - [x] **`font` 단축 속성** — `font: 25px/1 Ahem`이 통째로 무시되고
       있었다. css-text의 Ahem 테스트 전체가 16px 기본 폰트로
       렌더되고 있었다. white-space 5/60 → 27/60
+- [x] **`opacity`** — `opacity: 0.05` 미만 컬링 한 곳에서만 읽히고
+      그 위는 전부 불투명하게 그렸다. 래스터라이저가 opacity를 들고,
+      디스플레이 리스트가 페이드된 서브트리를 push/pop(kind 11/12)로
+      감싼다. 중첩은 CSS대로 곱해진다 (0.5 안의 0.5 = 0.25).
+      *주의: 그룹 합성이 아니라 명령별 알파다. 페이드된 서브트리 안에서
+      자식끼리 겹치면 아래가 비친다 — 진짜 그룹 opacity는 서브트리
+      전용 오프스크린 버퍼가 필요하다*
 - [ ] **break-spaces의 선행 브레이크** — 보존된 공백 시퀀스의 *첫 글자
       앞*에도 브레이크 기회가 있다. white-space 실패 73건
 - [ ] **회전·스큐 transform** — 폴리곤 필과 회전 글리프 래스터가 필요
@@ -260,6 +270,10 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
       font-palette, scrollbar-color, shaping, 회전 transform
 - [ ] **fragmentation (css-break/*)** — 560건. 화면 브라우저에는 낮은 가치
 - [ ] **css-ui 위젯 렌더 802건 / grid-lanes(Grid L3 masonry) 806건**
+- [ ] **CSS 카운터** — `counter-increment`/`counters()`/`@counter-style`.
+      `<ol reversed>`의 시작값이 counter-increment에 의존하는 케이스가
+      여기 걸려 있다 (css-lists 7건)
+- [ ] **CJK 줄바꿈 (UAX 14)** — css-text/i18n 158건이 전부 여기
 
 ## 4단계 — 웹 플랫폼 (부분)
 
