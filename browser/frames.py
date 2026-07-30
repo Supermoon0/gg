@@ -476,7 +476,7 @@ class FrameDocument:
             except Exception:
                 data = b""
             try:
-                self._img_by_src[src] = engine.load_image(data) if data else None
+                self._img_by_src[src] = textengine.load_image_data(data)
             except Exception:
                 self._img_by_src[src] = None
             loaded = True

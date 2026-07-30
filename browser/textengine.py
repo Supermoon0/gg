@@ -45,52 +45,71 @@ def clear_image_caches():
     _bg_cache.clear()
 
 
-def load_svgs(nodes):
-    """Rasterize every inline <svg> to an image handle (node._img),
-    so layout/paint treat it exactly like an <img>. Fill resolution:
-    computed style `fill` (inline style attr included via the cascade)
-    beats the presentation attribute; the svg element's fill inherits
-    to shapes; default is black. `fill: none` shapes are skipped.
+def rasterize_svg(svg):
+    """Rasterize one <svg> element to an image handle, or None.
+
+    Fill resolution: computed style `fill` (inline style attr included
+    via the cascade) beats the presentation attribute; the svg
+    element's fill inherits to shapes; default is black. `fill: none`
+    shapes are skipped.
 
     The native rasterizer consumes path data, so basic circle and rect
     elements are lowered to equivalent paths before crossing the binding.
     """
     if _engine is None:
-        return
+        return None
     from .colors import to_rgb
     from .html_parser import Element, tree_to_list
 
+    def style_of(node):
+        return getattr(node, "style", None) or {}
+
     def fill_of(path_node, svg_node):
-        for cand in (path_node.style.get("fill"),
+        for cand in (style_of(path_node).get("fill"),
                      path_node.attributes.get("fill"),
-                     svg_node.style.get("fill"),
+                     style_of(svg_node).get("fill"),
                      svg_node.attributes.get("fill")):
             if cand and cand.strip():
                 c = cand.strip()
                 if c == "currentColor":
-                    c = svg_node.style.get("color", "black")
+                    c = style_of(svg_node).get("color", "black")
                 return None if c == "none" else to_rgb(c)
         return to_rgb("black")
 
-    def number(node, name, default=0.0):
+    # Geometry is expressed in the viewBox's coordinate system, and a
+    # percentage there resolves against the viewport the viewBox sets
+    # up — so the box has to be known before any shape is lowered.
+    vx, vy, vw, vh, out_w, out_h = _svg_viewport(svg)
+    if vw <= 0 or vh <= 0:
+        return None
+
+    def number(node, name, basis, default=0.0):
+        raw = node.attributes.get(name)
+        if raw is None:
+            return default
+        raw = raw.strip()
         try:
-            return float(node.attributes.get(name, default))
-        except (TypeError, ValueError):
+            if raw.endswith("%"):
+                return float(raw[:-1]) * basis / 100.0
+            return _length(raw)
+        except ValueError:
             return default
 
     def shape_path(node):
         if node.tag == "path":
             return node.attributes.get("d") or None
         if node.tag == "rect":
-            x, y = number(node, "x"), number(node, "y")
-            width, height = number(node, "width"), number(node, "height")
+            x, y = number(node, "x", vw), number(node, "y", vh)
+            width = number(node, "width", vw)
+            height = number(node, "height", vh)
             if width <= 0 or height <= 0:
                 return None
-            return (f"M{x} {y}H{x + width}V{y + height}"
-                    f"H{x}Z")
+            return (f"M{x + vx} {y + vy}H{x + vx + width}"
+                    f"V{y + vy + height}H{x + vx}Z")
         if node.tag == "circle":
-            cx, cy, radius = (number(node, "cx"), number(node, "cy"),
-                              number(node, "r"))
+            diag = (vw * vw + vh * vh) ** 0.5 / (2 ** 0.5)
+            cx, cy = number(node, "cx", vw), number(node, "cy", vh)
+            radius = number(node, "r", diag)
             if radius <= 0:
                 return None
             return (f"M{cx - radius} {cy}"
@@ -98,45 +117,115 @@ def load_svgs(nodes):
                     f"A{radius} {radius} 0 1 0 {cx - radius} {cy}Z")
         return None
 
+    paths = []
+    for n in tree_to_list(svg, []):
+        path = shape_path(n) if isinstance(n, Element) else None
+        if path:
+            rgb = fill_of(n, svg)
+            if rgb is not None:
+                paths.append((path, rgb))
+    if not paths:
+        return None
+    # these inputs fully determine the raster, so the same icon
+    # redrawn next tick reuses the handle instead of minting one
+    key = (vx, vy, vw, vh, out_w, out_h,
+           tuple((d, tuple(rgb)) for d, rgb in paths))
+    handle = _svg_cache.get(key)
+    if handle is None:
+        handle = _engine.load_svg((vx, vy, vw, vh), out_w, out_h, paths)
+        _svg_cache[key] = handle
+    return handle
+
+
+def _length(text):
+    """Bare user units out of an SVG length ("100", "100px", "1em").
+    Percentages have no basis here, so they raise like any other
+    non-number and the caller decides what to do."""
+    text = (text or "").strip().lower()
+    for unit, scale in (("px", 1.0), ("pt", 4 / 3), ("pc", 16.0),
+                        ("mm", 96 / 25.4), ("cm", 96 / 2.54),
+                        ("in", 96.0), ("em", 16.0), ("ex", 8.0)):
+        if text.endswith(unit):
+            return float(text[:-len(unit)].strip()) * scale
+    return float(text)
+
+
+def _svg_viewport(svg):
+    """(vx, vy, vw, vh, out_w, out_h) for an <svg> element.
+
+    The viewBox gives the coordinate system the shapes are drawn in;
+    width/height give the intrinsic size, which is what the CSS sizing
+    algorithms scale from and what `background-size: auto` reads its
+    aspect ratio out of. They are frequently different — a 4x64
+    viewBox in an 8px-by-32px image is a legitimate 1:4 picture, and
+    rasterizing at the viewBox size instead would claim 1:16.
+    """
+    vb = (svg.attributes.get("viewbox")
+          or svg.attributes.get("viewBox") or "").replace(",", " ").split()
+    try:
+        vx, vy, vw, vh = (float(v) for v in vb)
+    except ValueError:
+        vx = vy = vw = vh = 0.0
+    try:
+        iw = _length(svg.attributes.get("width", ""))
+    except ValueError:
+        iw = 0.0
+    try:
+        ih = _length(svg.attributes.get("height", ""))
+    except ValueError:
+        ih = 0.0
+    if vw <= 0 or vh <= 0:
+        vw, vh = (iw, ih) if iw > 0 and ih > 0 else (24.0, 24.0)
+        vx = vy = 0.0
+    out_w = iw if iw > 0 else vw
+    out_h = ih if ih > 0 else vh
+    # the raster is only ever scaled up from here, so keep it modest
+    return vx, vy, vw, vh, max(1, round(out_w)), max(1, round(out_h))
+
+
+def load_svgs(nodes):
+    """Rasterize every inline <svg> in the tree to node._img, so
+    layout and paint treat it exactly like an <img>."""
+    if _engine is None:
+        return
+    from .html_parser import Element, tree_to_list
+
     for svg in tree_to_list(nodes, []):
-        if not (isinstance(svg, Element) and svg.tag == "svg"):
-            continue
-        paths = []
-        for n in tree_to_list(svg, []):
-            if isinstance(n, Element):
-                path = shape_path(n)
-            else:
-                path = None
-            if path:
-                rgb = fill_of(n, svg)
-                if rgb is not None:
-                    paths.append((path, rgb))
-        vb = (svg.attributes.get("viewbox")
-              or svg.attributes.get("viewBox") or "").split()
-        try:
-            vx, vy, vw, vh = (float(v) for v in vb)
-        except ValueError:
-            try:
-                vw = float(svg.attributes.get("width", ""))
-                vh = float(svg.attributes.get("height", ""))
-            except ValueError:
-                vw, vh = 24.0, 24.0
-            vx, vy = 0.0, 0.0
-        if vw <= 0 or vh <= 0 or not paths:
-            svg._img = None
-            continue
-        out_w = max(1, round(vw))
-        out_h = max(1, round(vh))
-        # these inputs fully determine the raster, so the same icon
-        # redrawn next tick reuses the handle instead of minting one
-        key = (vx, vy, vw, vh, out_w, out_h,
-               tuple((d, tuple(rgb)) for d, rgb in paths))
-        handle = _svg_cache.get(key)
-        if handle is None:
-            handle = _engine.load_svg(
-                (vx, vy, vw, vh), out_w, out_h, paths)
-            _svg_cache[key] = handle
-        svg._img = handle
+        if isinstance(svg, Element) and svg.tag == "svg":
+            svg._img = rasterize_svg(svg)
+
+
+def looks_like_svg(data):
+    """Is this byte string an SVG document? Content sniffing, because
+    the file extension is not always there and never trustworthy."""
+    if not data:
+        return False
+    head = data[:512].lstrip()
+    if head.startswith(b"<?xml") or head.startswith(b"<!--"):
+        head = data[:2048]
+    return b"<svg" in head[:2048].lower()
+
+
+def load_image_data(data):
+    """Decode image bytes to a (id, w, h) handle, SVG included.
+
+    The raster decoder is the `image` crate, which has no SVG support,
+    so an SVG file reaching it fails and the element draws nothing.
+    Route those through the same path lowering that inline <svg> uses:
+    parse the markup, rasterize at the viewBox's own size (that is the
+    intrinsic size the CSS sizing algorithms then scale)."""
+    if _engine is None or not data:
+        return None
+    if not looks_like_svg(data):
+        return _engine.load_image(data)
+    from .html_parser import Element, HTMLParser, tree_to_list
+
+    text = data.decode("utf-8", errors="replace")
+    root = HTMLParser(text).parse()
+    for node in tree_to_list(root, []):
+        if isinstance(node, Element) and node.tag == "svg":
+            return rasterize_svg(node)
+    return None
 
 
 def load_background_images(nodes, fetch_raw):
@@ -166,7 +255,7 @@ def load_background_images(nodes, fetch_raw):
     for u in missing:
         data = raw.get(u)
         try:
-            _bg_cache[u] = _engine.load_image(data) if data else None
+            _bg_cache[u] = load_image_data(data)
         except Exception:
             _bg_cache[u] = None
     for n, spec in jobs:

@@ -582,7 +582,7 @@ class Browser:
             for src, data in raw.items():
                 try:
                     self._img_by_src[src] = (
-                        engine.load_image(data) if data else None)
+                        textengine.load_image_data(data))
                 except Exception:
                     self._img_by_src[src] = None
         for node in img_nodes:

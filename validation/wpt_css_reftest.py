@@ -85,22 +85,98 @@ def discover(corpus: Path, filters, limit):
     return out
 
 
+def resolve(href: str, base: Path, corpus: Path):
+    """Local file a reftest's href names, or None if it names none.
+
+    WPT is served with the corpus root as `/`, so a root-relative href
+    is corpus-relative and everything else is relative to the page.
+    Anything that escapes the corpus is refused rather than read: the
+    corpus is full of `../../support/...` and one `../../../../etc`
+    would have the harness reading the machine.
+    """
+    href = href.split("#")[0].split("?")[0].strip()
+    if not href or ":" in href.split("/")[0]:
+        return None
+    try:
+        path = ((corpus / href.lstrip("/")) if href.startswith("/")
+                else (base / href)).resolve()
+        path.relative_to(corpus.resolve())
+    except (ValueError, OSError):
+        return None
+    return path if path.is_file() else None
+
+
+def _text_fetcher(base: Path, corpus: Path):
+    def fetch(hrefs):
+        out = {}
+        for href in hrefs:
+            path = resolve(href, base, corpus)
+            if path is None:
+                continue
+            try:
+                out[href] = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+        return out
+    return fetch
+
+
+def _bytes_fetcher(base: Path, corpus: Path):
+    def fetch(urls):
+        out = {}
+        for u in urls:
+            path = resolve(u, base, corpus)
+            if path is None:
+                continue
+            try:
+                out[u] = path.read_bytes()
+            except OSError:
+                pass
+        return out
+    return fetch
+
+
 def render(page: Path, corpus: Path):
     """Raw RGB bytes for one page, or None if it will not render."""
     from browser import native, textengine
+    from browser.html_parser import Element, tree_to_list
     from browser.layout import DocumentLayout, paint_tree
 
     html = page.read_text(encoding="utf-8", errors="replace")
+    base = page.parent
 
-    def fetch(_hrefs):
-        return {}
+    # Every page starts from an empty image store. The background cache
+    # is keyed by the raw CSS url, so `url(support/1x1.png)` from two
+    # different directories would otherwise collide — and one worker
+    # renders thousands of pages from all over the corpus.
+    engine = textengine.engine()
+    engine.clear_images()
+    textengine.clear_image_caches()
 
     nodes, doc, css_sources, _logs = native.load_document(
-        html, fetch, None)
+        html, _text_fetcher(base, corpus), None)
+
+    fetch_bytes = _bytes_fetcher(base, corpus)
+    img_nodes = [n for n in tree_to_list(nodes, [])
+                 if isinstance(n, Element) and n.tag == "img"
+                 and n.attributes.get("src")]
+    if img_nodes:
+        raw = fetch_bytes(sorted({n.attributes["src"] for n in img_nodes}))
+        decoded = {}
+        for src, data in raw.items():
+            try:
+                decoded[src] = engine.load_image(data)
+            except Exception:
+                decoded[src] = None
+        for node in img_nodes:
+            node._img = decoded.get(node.attributes["src"])
+    textengine.load_svgs(nodes)
+    textengine.load_background_images(nodes, fetch_bytes)
+
     document = DocumentLayout(nodes)
     document.layout(WIDTH, HEIGHT)
     cmds = [c.native(0) for c in paint_tree(document, [])]
-    return bytes(textengine.engine().render_raw(
+    return bytes(engine.render_raw(
         WIDTH, HEIGHT, (255, 255, 255), cmds))
 
 

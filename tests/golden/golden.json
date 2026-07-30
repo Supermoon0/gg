@@ -1,42 +1,42 @@
 {
  "boxes": {
   "cmds": 28,
-  "height": 349.28,
-  "raster": "0fa508fd9c60748d4c6a79edcd6c78d7a7c8829430fcfc5d6dcd99827ebd841c"
+  "height": 351.28,
+  "raster": "a00fe4965f92d71bf49ed551f06f5d7d5bd1a52530db493ff53a24f31d1f9d08"
  },
  "flex-dashboard": {
   "cmds": 43,
   "height": 348.0,
-  "raster": "4c29071ae1a0b06a1b22fcc15a87c2988d08740277b7e7a1523825dcb3da7fe7"
+  "raster": "2b17f1e68974c9959e24be3a5641c128305f49d405792e836451c4c40e728b70"
  },
  "form-controls": {
   "cmds": 68,
-  "height": 328.25,
-  "raster": "945ef0f634b475be6d2119d3334f3da995a35b64095e019c6d8a4208d5a9729f"
+  "height": 276.25,
+  "raster": "9cd30cb7f5e9be22bdd3cb1d1e6a44594adebcc2159130449d6732ee04a7e510"
  },
  "form-page": {
   "cmds": 27,
-  "height": 207.84,
-  "raster": "cc595fa3a5a322147314df5afbcc4d60e9809848de0ea66d1842910910dd8064"
+  "height": 213.84,
+  "raster": "5938b51b31aa81c3d3aca400448d37e58d93f14f70a09d933b1e9065f529b887"
  },
  "news-list": {
   "cmds": 49,
-  "height": 301.48,
-  "raster": "612e1dd4912f10a7d0e99d47f429e32e74730687bc90f77d9df72cace40ef390"
+  "height": 285.83,
+  "raster": "7188941afc7d63e44c28d772e356b9cdc0003f9b74030b790a9f49b56ad54a7a"
  },
  "replaced": {
   "cmds": 21,
-  "height": 263.28,
-  "raster": "c703b7dfc3e8bf55d61cd0bb8a42cd3e7422307855bc58a1723fdf753f956727"
+  "height": 231.28,
+  "raster": "73722f566be327eb7221930eeecaca99611aec0859df844711c7f1451af8402f"
  },
  "transform-page": {
   "cmds": 13,
   "height": 278.0,
-  "raster": "45137c156d0528ed9e9489dcd4ac3dac5ff6778401520a7b65793e1dbe9819d2"
+  "raster": "50cbbcfee3ef2b1d7764e641dbfd7a62de83c78a31154bb5a1bfc7a58a5981a8"
  },
  "typography": {
   "cmds": 69,
   "height": 412.07,
-  "raster": "29ada1fd64ec1e742c41fe59d0e77471ade9e2e37ccaf7ce9b88ee2e7fc8edcf"
+  "raster": "85b63b5ecc92e22b3ebfc8d4c857fe6aab75831459b3bcbb2e654ea0dc5d6563"
  }
 }
