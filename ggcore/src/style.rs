@@ -748,6 +748,80 @@ fn resolve_var_refs(
     Some(out)
 }
 
+/// `font: [style] [variant] [weight] <size>[/<line-height>] <family>`
+///
+/// The size is the pivot: everything before it is the optional
+/// style/variant/weight prefix and everything after it is the family
+/// list. The shorthand also resets the longhands it does not mention,
+/// which is why `font: 25px/1 Ahem` has to write font-style and
+/// font-weight back to normal rather than leaving whatever was there.
+///
+/// System font keywords (`caption`, `menu`, ...) name a font this
+/// engine has no table for, so they are left alone rather than
+/// resolved to a guess.
+fn expand_font(style: &mut HashMap<String, String>, value: &str) {
+    let v = value.trim();
+    let lower = v.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "caption" | "icon" | "menu" | "message-box" | "small-caption"
+            | "status-bar" | "inherit" | "initial" | "unset"
+    ) {
+        return;
+    }
+    // the size is the first token that starts with a digit or a dot,
+    // or one of the absolute-size keywords
+    let tokens: Vec<&str> = v.split_whitespace().collect();
+    let size_at = tokens.iter().position(|t| {
+        let s = t.trim_start_matches(['+', '-']);
+        s.starts_with(|c: char| c.is_ascii_digit() || c == '.')
+            || matches!(
+                t.to_ascii_lowercase().as_str(),
+                "xx-small" | "x-small" | "small" | "medium" | "large"
+                    | "x-large" | "xx-large" | "larger" | "smaller"
+            )
+    });
+    let Some(size_at) = size_at else { return };
+    if size_at + 1 >= tokens.len() {
+        return; // no family: not a valid font shorthand
+    }
+    let (size, line_height) = match tokens[size_at].split_once('/') {
+        Some((s, lh)) => (s, Some(lh)),
+        None => (tokens[size_at], None),
+    };
+    for (prop, initial) in [
+        ("font-style", "normal"),
+        ("font-variant", "normal"),
+        ("font-weight", "normal"),
+        ("line-height", "normal"),
+    ] {
+        style.insert(prop.into(), initial.into());
+    }
+    for token in &tokens[..size_at] {
+        let t = token.to_ascii_lowercase();
+        match t.as_str() {
+            "italic" | "oblique" => {
+                style.insert("font-style".into(), t);
+            }
+            "small-caps" => {
+                style.insert("font-variant".into(), t);
+            }
+            "bold" | "bolder" | "lighter" | "100" | "200" | "300"
+            | "400" | "500" | "600" | "700" | "800" | "900" => {
+                style.insert("font-weight".into(), t);
+            }
+            _ => {}
+        }
+    }
+    style.insert("font-size".into(), size.to_string());
+    if let Some(lh) = line_height {
+        if !lh.is_empty() {
+            style.insert("line-height".into(), lh.to_string());
+        }
+    }
+    style.insert("font-family".into(), tokens[size_at + 1..].join(" "));
+}
+
 fn expand_box(style: &mut HashMap<String, String>, prefix: &str, value: &str) {
     let parts: Vec<&str> = value.split_whitespace().collect();
     let (t, r, b, l) = match parts.len() {
@@ -1279,6 +1353,8 @@ fn apply(style: &mut HashMap<String, String>, prop: &str, value: &str) {
         expand_axis(style, "left", "right", value);
     } else if prop == "inset-block" {
         expand_axis(style, "top", "bottom", value);
+    } else if prop == "font" {
+        expand_font(style, value);
     } else if prop == "margin" {
         expand_box(style, "margin", value);
     } else if prop == "padding" {

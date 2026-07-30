@@ -20,7 +20,7 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
 | HTML 파서 | **1796/1796 (100%)** | html5lib-tests, cargo test |
 | JS 엔진 | **27,379/102,655 (26.67%)** | Test262, baseline regression=0 |
 | CSS (script) | **4,344/24,862 (17.47%)** | WPT css testharness |
-| CSS (render) | **4,742/17,263 (27.47%)** | WPT css reftest, 픽셀 비교 |
+| CSS (render) | **5,020/17,263 (29.08%)** | WPT css reftest, 픽셀 비교 |
 | CSS (자체) | 23/23 | css_gauntlet |
 | JS 계약 | 28/31 | jsvm_gauntlet (3건은 문서화된 GAP) |
 | 내장 계약 | 9/9 | conformance |
@@ -174,6 +174,10 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
       16,929 파일 / 17,263 비교. 저장된 이미지가 아니라 *같은 엔진의 두
       렌더*를 비교하므로 골든 파일도 폰트 일치도 필요 없다
 
+#### 궤적: 28.25% → 27.47% → 29.08%
+
+부풀린 숫자에서 정직한 숫자로 내려간 다음, 엔진 수정으로 올라갔다.
+
 #### 하네스가 먼저 틀렸다 (28.25% → 27.47%)
 
 첫 측정의 28.25%는 **부풀려진 숫자였다.** `fetch`가 `{}`를 돌려주고
@@ -231,6 +235,26 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
 - [x] **`transform: scale` + `transform-origin`** — translate만 읽고
       나머지를 버리고 있었다. 회전/스큐는 rect를 quad로 만들어서 이
       디스플레이 리스트에 명령이 없다 — 여전히 미구현
+- [x] **`aspect-ratio`** — 파서만 있고 읽는 곳이 없었다. width가 있고
+      height가 auto면 비율로 높이를 준다. min-height의 초기값 `auto`는
+      비율 박스에서 "콘텐츠 기반 최소"라서, 비율이 콘텐츠를 자르려 하면
+      콘텐츠가 이긴다 (17/80 → 29/80, 넓힌 샘플 44/120 → 50/120)
+- [x] **`ch`·`ex`·`min()`·`max()`·`clamp()`** — 전부 None(=auto)이었다.
+      `max-width: min(100%, 1200px)`가 아무것도 안 좁혔다. ch는 요소
+      자신의 폰트에서 "0"을 재서 푼다 (Ahem에서 1em, 기본 폰트에서
+      0.64em — 0.5em 근사는 2배까지 틀렸다)
+- [x] **`outline`** — 없었다. 모든 키보드 포커스 링이 안 보였다
+- [x] **리스트 마커** — `<ol>`이 점을 그렸다. decimal/alpha/roman/
+      square/circle + `<ol start>`·`reversed`·`<li value>` + 모르는
+      @counter-style 이름은 decimal로 폴백
+- [x] **SVG 슈퍼샘플** — intrinsic 크기로 래스터화한 뒤 확대하면
+      색 경계에 블렌딩 띠가 생긴다. 크게 굽고 샘플러가 내려오게
+      (10/80 → 16/80)
+- [x] **`font` 단축 속성** — `font: 25px/1 Ahem`이 통째로 무시되고
+      있었다. css-text의 Ahem 테스트 전체가 16px 기본 폰트로
+      렌더되고 있었다. white-space 5/60 → 27/60
+- [ ] **break-spaces의 선행 브레이크** — 보존된 공백 시퀀스의 *첫 글자
+      앞*에도 브레이크 기회가 있다. white-space 실패 73건
 - [ ] **회전·스큐 transform** — 폴리곤 필과 회전 글리프 래스터가 필요
 - [ ] **mismatch인데 동일하게 렌더** — 달라야 하는데 같다. 남은 큰 덩어리는
       font-palette, scrollbar-color, shaping, 회전 transform

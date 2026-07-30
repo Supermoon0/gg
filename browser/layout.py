@@ -2807,7 +2807,15 @@ class BlockLayout:
                 # loses to the content instead of clipping it. An
                 # explicit min-height (0 included) says otherwise.
                 raw_min = (st.get("min-height") or "auto").strip().casefold()
-                if raw_min == "auto":
+                # ...and a scroll container has no automatic minimum at
+                # all: `overflow: hidden` means the content is meant to
+                # be clipped, so the ratio holds and the overflow goes
+                # where the author put it
+                scrolls = any(
+                    (st.get(prop) or "visible").strip().casefold()
+                    not in ("visible", "clip")
+                    for prop in ("overflow", "overflow-y"))
+                if raw_min == "auto" and not scrolls:
                     from_ratio = max(from_ratio, self.height)
                 self.height = from_ratio
 

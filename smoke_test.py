@@ -764,6 +764,37 @@ check("ch is measured from the element's own font, not guessed",
 check("a ch_base overrides the half-em fallback",
       (_psz("4ch", 0, 25, 25.0), _psz("4ch", 0, 25)) == (100.0, 50.0))
 
+# the `font` shorthand
+def _fontstyle(decl):
+    from browser import native
+    from browser.html_parser import tree_to_list, Element
+    nodes, _d, _c, _l = native.load_document(
+        "<style>div{" + decl + "}</style><div>x</div>", lambda _h: {}, None)
+    for n in tree_to_list(nodes, []):
+        if isinstance(n, Element) and n.tag == "div":
+            return {k: n.style.get(k) for k in
+                    ("font-size", "font-family", "line-height",
+                     "font-weight", "font-style")}
+    return {}
+check("font: <size>/<line-height> <family> expands",
+      _fontstyle("font: 25px/1 Ahem") == {
+          "font-size": "25px", "font-family": "Ahem", "line-height": "1",
+          "font-weight": "normal", "font-style": "normal"},
+      str(_fontstyle("font: 25px/1 Ahem")))
+check("the prefix carries style, variant and weight",
+      _fontstyle("font: italic bold 12px/30px Georgia, serif") == {
+          "font-size": "12px", "font-family": "Georgia, serif",
+          "line-height": "30px", "font-weight": "bold",
+          "font-style": "italic"})
+check("the shorthand resets what it does not name",
+      _fontstyle("font-weight:bold; font: 20px serif")["font-weight"]
+      == "normal")
+check("a system font keyword is left alone",
+      _fontstyle("font: menu")["font-size"] == "16px")
+check("a font shorthand with no family is not a font shorthand",
+      _fontstyle("font: 25px")["font-size"] == "16px")
+
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",
