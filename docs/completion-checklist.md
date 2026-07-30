@@ -20,7 +20,7 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
 | HTML 파서 | **1796/1796 (100%)** | html5lib-tests, cargo test |
 | JS 엔진 | **27,379/102,655 (26.67%)** | Test262, baseline regression=0 |
 | CSS (script) | **4,344/24,862 (17.47%)** | WPT css testharness |
-| CSS (render) | **5,181/17,263 (30.01%)** | WPT css reftest, 픽셀 비교 |
+| CSS (render) | **5,783/17,263 (33.50%)** | WPT css reftest, 픽셀 비교 |
 | CSS (자체) | 23/23 | css_gauntlet |
 | JS 계약 | 28/31 | jsvm_gauntlet (3건은 문서화된 GAP) |
 | 내장 계약 | 9/9 | conformance |
@@ -177,7 +177,7 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
       16,929 파일 / 17,263 비교. 저장된 이미지가 아니라 *같은 엔진의 두
       렌더*를 비교하므로 골든 파일도 폰트 일치도 필요 없다
 
-#### 궤적: 28.25% → 27.47% → 30.01%
+#### 궤적: 28.25% → 27.47% → 30.01% → 31.53% → 33.50%
 
 부풀린 숫자에서 정직한 숫자로 내려간 다음, 엔진 수정으로 올라갔다.
 
@@ -272,17 +272,48 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
       박스로 근사하지 않고 그냥 둔다 — 박스는 원이 아니다
 - [x] **`text-transform`의 타이틀케이스** — `capitalize`가 upper 매핑을
       써서 ǆ가 Ǆ(→ǅ여야), ﬁ가 FI(→Fi여야)가 됐다. `full-width` 추가
+- [x] **CSS의 공백 정의** — 텍스트를 파이썬 `str.split()`으로 쪼개고
+      있었다. 파이썬은 U+00A0·U+3000·U+000C까지 공백으로 먹는다. CSS가
+      접는 것은 space·tab·개행뿐이다. 접히는 집합(`CSS_SPACE`)과
+      줄바꿈/행잉 집합(`BREAK_SPACE`, Zs에서 non-breaking을 뺀 것)을
+      분리했다. no-break space가 일반 공백처럼 접히던 실제 버그다
+- [x] **CJK 줄바꿈 (UAX 14)** — 여는 괄호 뒤·닫는 괄호와 구두점 앞에서는
+      끊기지 않는다. `中中‚文`가 `中中‚`/`文`로 끊겨 여는 따옴표가 줄
+      끝에 남았다. css-text/i18n 0/158이던 원인. 부분 표본 +54
+- [x] **그리드 `align-self: stretch`** — 초기값 `normal`이 그리드
+      항목에서는 stretch다. 빈 항목이 높이 0이라 받은 트랙이 아무것도
+      그리지 않았다 (css-grid/alignment 11/165 → 47/165)
+- [x] **벡터 배경의 고유 크기** — 퍼센트 width에 viewBox 없는 SVG는
+      고유 크기도 비율도 없다 (CSS Images 3 §5.1). `background-size:
+      contain`이 박스를 채워야 하는데 24×24 추측값을 구석에 넣고
+      있었다. background-size/vector +136
+- [x] **gap decorations** — `column-rule`/`row-rule`이 grid·flex의 각
+      간격 한가운데를 지난다. grid는 이미 잰 트랙을, flex는 배치된
+      항목을 읽는다. `*-rule-break`/`*-rule-inset`은 아직 없다
+- [x] **`line-clamp`** — out-of-flow 자식이 컨테이너를 블록 흐름으로
+      밀어넣어 줄들이 clamp를 든 요소 밖으로 나가 있었다. `line-clamp:
+      auto` + `lh` 단위 + `-webkit-box`가 쌓는 블록들을 가로지르는
+      줄 세기까지. 부분 표본 +32/-3
+- [x] **스코어보드가 스크립트를 실행** — reftest 러너가 JS fetcher를
+      안 넘겨서 페이지 스크립트가 한 번도 안 돌았다. 자기 케이스를
+      스크립트로 만드는 테스트는 빈 페이지로 렌더됐다. 여기서 오른
+      몫은 엔진이 좋아진 게 아니라 코퍼스를 더 많이 재는 것이다
+- [x] **`getComputedStyle`의 초기값** — 어떤 규칙도 안 쓴 속성은 ""가
+      아니라 *초기값*을 돌려줘야 한다. css-ui의 802건짜리 위젯 스위트가
+      전부 그 값을 읽어 작성자 선언으로 되돌려 놓는 방식이다 (+264)
 - [ ] **break-spaces의 선행 브레이크** — 보존된 공백 시퀀스의 *첫 글자
-      앞*에도 브레이크 기회가 있다. white-space 실패 73건
+      앞*에도 브레이크 기회가 있다
 - [ ] **회전·스큐 transform** — 폴리곤 필과 회전 글리프 래스터가 필요
 - [ ] **mismatch인데 동일하게 렌더** — 달라야 하는데 같다. 남은 큰 덩어리는
       font-palette, scrollbar-color, shaping, 회전 transform
-- [ ] **fragmentation (css-break/*)** — 560건. 화면 브라우저에는 낮은 가치
-- [ ] **css-ui 위젯 렌더 802건 / grid-lanes(Grid L3 masonry) 806건**
+- [ ] **fragmentation (css-break/*)** — 491건. 화면 브라우저에는 낮은 가치
+- [ ] **grid-lanes (Grid L3 masonry) 641건**
+- [ ] **shape-outside 200건 · clip-path 비직사각형 146건 · mask-image 100건**
 - [ ] **CSS 카운터** — `counter-increment`/`counters()`/`@counter-style`.
-      `<ol reversed>`의 시작값이 counter-increment에 의존하는 케이스가
-      여기 걸려 있다 (css-lists 7건)
-- [ ] **CJK 줄바꿈 (UAX 14)** — css-text/i18n 158건이 전부 여기
+      `content: counter()`를 쓰는 코퍼스 파일이 199개다. 지금은 카운터가
+      섞인 content 목록 전체를 빈 상자로 만든다 (구분자만 그리지 않도록)
+- [ ] **multicol** — `columns`. line-clamp와 겹치는 케이스가 있다
+- [ ] **`zoom`** — css-viewport/zoom 79건
 
 ## 4단계 — 웹 플랫폼 (부분)
 
