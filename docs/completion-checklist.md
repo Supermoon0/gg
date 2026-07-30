@@ -19,7 +19,8 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
 |---|---|---|
 | HTML 파서 | **1796/1796 (100%)** | html5lib-tests, cargo test |
 | JS 엔진 | **27,379/102,655 (26.67%)** | Test262, baseline regression=0 |
-| CSS | 23/23 | css_gauntlet |
+| CSS | **4,307/24,862 (17.32%)** | WPT css, baseline regression=0 |
+| CSS (자체) | 23/23 | css_gauntlet |
 | JS 계약 | 28/31 | jsvm_gauntlet (3건은 문서화된 GAP) |
 | 내장 계약 | 9/9 | conformance |
 | Rust 단위 | 280 | cargo test |
@@ -39,7 +40,7 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
 - [x] Windows/Linux CI, 실패 시 exit code를 내는 게이트 체계
 - [x] 실사이트 바스켓 정기 실행
 
-## 2단계 — 렌더링 파이프라인 (완료)
+## 2단계 — 렌더링 파이프라인 (구조는 완료, 정합성은 17.32%)
 
 - [x] HTML5 명세 파서 — 토크나이저, 23개 insertion mode, adoption
       agency, foreign content, fragment parsing, quirks
@@ -116,6 +117,51 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
 - [x] `Object.create`를 `defineProperties`와 같은 경로로
 - [x] `Date.parse` 형식 1개 → 4개 + 유효성 검사
 - [x] **타입드 배열 9종 + DataView를 실제 바이트 위에** (66 → 867)
+
+## 3.5단계 — CSS 정합성 (진행 중, **17.32%**)
+
+점수판: `validation/wpt_css_conformance.py`. WPT의 testharness 기반
+7,293 파일 / 24,862 서브테스트. 나머지 16,368개는 레퍼런스 렌더와
+픽셀 비교가 필요한 reftest라 아직 채점 불가.
+
+이 축은 2026-07-30에 처음 측정했다. 그전까지 "CSS가 된다"는 자체
+작성 23개 케이스를 뜻했고, 완성도를 물었을 때 직접 만든 탐침이
+100% → 44%로 두 번 다른 답을 냈다. 탐침은 자기가 재는 것만 잰다.
+
+### 배관 (완료) — 여기까지가 CSS가 아니었다
+
+- [x] **CSSOM** — `el.style`에 메서드가 없어 parsing 계열 1,000개가
+      첫 줄에서 죽었다. getPropertyValue/setProperty/removeProperty/
+      getPropertyPriority/item + `CSS` 네임스페이스. 3.93% → 20.55%
+- [x] **`<body onload>`** — 1,122 파일이 이 속성으로 시작하는데
+      무반응이었다. 서브테스트 10,870 → 18,437 (침묵은 0%가 아니라
+      미측정)
+- [x] **`getComputedStyle`** — 인라인 style 속성을 그대로 돌려주고
+      있었다. 이제 캐스케이드 + 인라인 오버레이
+- [x] **`split`의 캡처 그룹** — testharness가 모든 단언 메시지를
+      캡처 정규식 split으로 만든다. 캡처를 버려서 11,201건이 전부
+      `"expected "`에서 잘렸다. JS 엔진 버그를 CSS 점수판이 찾았다
+- [x] **헤드리스 레이아웃** — 드라이버가 레이아웃을 아예 안 돌려서
+      모든 요소가 0×0이었다. 기하 단언 9,097건 중 9,090건이 0과
+      비교 중. 레이아웃 → rect 푸시 → 그 다음 스크립트 순서로 수정
+- [x] **`document.fonts`** — `.ready` of undefined가 페이지 코드보다
+      먼저 던져서 파일 전체가 침묵했다. 18,437 → 24,862
+
+### 여기부터가 CSS 본체 (미착수)
+
+- [ ] **레이아웃 정확도 8,857건** — got≠0인 실제 오차. grid alignment,
+      flex, sizing
+- [ ] **`got==0` 4,803건** — abspos의 writing-mode/auto-position 변형,
+      `width: stretch` (548), `aspect-ratio` (348)
+- [ ] **값 검증** — `e.style.x = '잘못된값'`이 설정된다. 거부하려면
+      프로퍼티별 문법표가 필요하다
+- [ ] **`initial` 해석** — 키워드를 문자열로 저장할 뿐 초기값으로
+      풀지 않는다. 프로퍼티별 초기값표가 필요하다
+- [ ] **정규 직렬화** — `red`가 `rgb(255, 0, 0)`으로 읽혀야 한다
+- [ ] **미구현 프로퍼티** — border-radius, outline, text-decoration,
+      letter-spacing, text-transform, list-style-type, order,
+      writing-mode, column-count, filter, clip-path
+- [ ] **reftest 16,368개** — 픽셀 비교 하네스가 필요하다
 
 ## 4단계 — 웹 플랫폼 (부분)
 
