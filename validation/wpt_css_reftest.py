@@ -43,6 +43,7 @@ DEFAULT_BASELINE = (
 DEFAULT_OUTPUT = Path(__file__).with_name("out") / "wpt_css_reftest.json"
 
 WIDTH, HEIGHT = 800, 600
+JS_BUDGET = 1.0   # seconds per document; a reftest's scripts are setup
 
 _REF_RE = re.compile(
     r"""<link\s[^>]*rel\s*=\s*["']?(match|mismatch)["']?[^>]*>""",
@@ -237,8 +238,14 @@ def render(page: Path, corpus: Path):
     engine.clear_images()
     textengine.clear_image_caches()
 
+    # Scripts run. A reftest that sets up its own case in JS — the whole
+    # css-ui widget suite does, and it is 800 comparisons on its own —
+    # renders as an empty page without them. The budget is per document
+    # and there are two documents per comparison, so it is small: these
+    # are setup scripts, not applications.
     nodes, doc, css_sources, _logs = native.load_document(
-        html, _text_fetcher(base, corpus), None)
+        html, _text_fetcher(base, corpus), _text_fetcher(base, corpus),
+        js_budget=JS_BUDGET)
 
     fetch_bytes = _bytes_fetcher(base, corpus)
     _load_fonts(css_sources, base, corpus)

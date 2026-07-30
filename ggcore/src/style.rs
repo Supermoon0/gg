@@ -881,6 +881,31 @@ fn expand_font(style: &mut HashMap<String, String>, value: &str) {
     ) {
         return;
     }
+    // `font: 16px / 32px serif` is the same declaration as
+    // `font: 16px/32px serif` -- CSS allows white space around the
+    // slash, and splitting on white space first would leave the size
+    // and the line height in different tokens and the family reading
+    // "/ 32px serif".
+    let joined: String = if v.contains('/') {
+        let parts: Vec<&str> = v.split('/').collect();
+        let last = parts.len() - 1;
+        let mut out = String::with_capacity(v.len());
+        for (i, part) in parts.iter().enumerate() {
+            let mut p: &str = part;
+            if i > 0 {
+                p = p.trim_start();
+                out.push('/');
+            }
+            if i < last {
+                p = p.trim_end();
+            }
+            out.push_str(p);
+        }
+        out
+    } else {
+        v.to_string()
+    };
+    let v = joined.as_str();
     // the size is the first token that starts with a digit or a dot,
     // or one of the absolute-size keywords
     let tokens: Vec<&str> = v.split_whitespace().collect();

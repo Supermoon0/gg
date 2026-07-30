@@ -915,6 +915,13 @@ def _child_is_block_level(child):
     grid of inline-block cards would stack vertically."""
     if not isinstance(child, Element):
         return False
+    # An out-of-flow child is not in the flow it would have to break:
+    # `<div style="line-clamp:2"><div style="position:absolute"></div>
+    # text</div>` is still a block with only inline content, and
+    # wrapping the text in an anonymous block instead loses the clamp.
+    if child.style.get("position", "static").strip().casefold() in (
+            "absolute", "fixed"):
+        return False
     # a floated element is block-level (float computes display to block),
     # so `<p><img style="float:left">text</p>` puts the container in block
     # flow and the image actually floats instead of sitting inline
@@ -1311,6 +1318,44 @@ def distribute_free_space(free, count, mode):
         gap = free / (count + 1)
         return gap, gap
     return 0.0, 0.0
+
+
+def gap_rule(style, axis, em):
+    """(width, colour) of a gap decoration rule, or None.
+
+    CSS Gap Decorations paints a rule down the middle of each gap of a
+    grid or flex container: `column-rule-*` in the column gaps,
+    `row-rule-*` in the row gaps. Longhands win over the shorthand,
+    and a rule with no style, no width or no colour draws nothing —
+    the same three-part test a border passes.
+    """
+    prefix = f"{axis}-rule"
+    width = style.get(f"{prefix}-width")
+    line = style.get(f"{prefix}-style")
+    color = style.get(f"{prefix}-color")
+    short = (style.get(prefix) or "").split()
+    for token in short:
+        t = token.strip().casefold()
+        if t in _BORDER_STYLES:
+            line = line or t
+        elif safe_color(t, default=""):
+            color = color or t
+        else:
+            width = width or t
+    if (line or "none").strip().casefold() in ("none", "hidden"):
+        return None
+    px = parse_size(width, 0, em) if width else 3.0
+    if px is None or px <= 0:
+        return None
+    rgb = safe_color(color, default="") if color else ""
+    if not rgb:
+        rgb = safe_color(style.get("color"), default="") or "#000000"
+    return px, rgb
+
+
+_BORDER_STYLES = frozenset((
+    "none", "hidden", "dotted", "dashed", "solid", "double",
+    "groove", "ridge", "inset", "outset"))
 
 
 def auto_size(style, prop):
@@ -2452,6 +2497,32 @@ def _measure_min_content_width(node, doc):
     return m
 
 
+_FACE_OFF_BACKGROUND = frozenset((
+    "background", "background-attachment", "background-clip",
+    "background-color", "background-image", "background-origin",
+    "background-position", "background-position-x",
+    "background-position-y", "background-size",
+))
+
+
+def disables_native_appearance(prop):
+    """Does styling `prop` turn off a form control's native widget?
+
+    CSS UI 4 leaves the list to the UA and every engine settled on the
+    same one; WPT's compute-kind-widget suite enumerates it. It is the
+    background longhands plus every border colour, style, width,
+    radius and border-image longhand — physical and logical alike.
+    Touching any part of a control's box means the page has taken over
+    drawing that box, so the native face steps aside.
+    """
+    if prop in _FACE_OFF_BACKGROUND:
+        return True
+    if not prop.startswith("border"):
+        return False
+    return (prop == "border" or prop.startswith("border-image-")
+            or prop.endswith(("-color", "-style", "-width", "-radius")))
+
+
 def intrinsic_width_keyword(raw):
     """`min-content`, `max-content` or `fit-content` out of a width
     value, or None. These are sizes only the content can answer, so
@@ -2699,6 +2770,13 @@ class DocumentLayout:
                 except Exception:
                     mc = cb_w
                 box.forced_width = max(min(mc, cb_w), 0.0)
+            # The vertical twin (CSS 2.1 §10.6.4): an auto height with
+            # both offsets given is over-constrained the useful way —
+            # the box stretches between them. Without this a
+            # `top:0; bottom:0; height:auto` overlay was content-tall.
+            if auto_size(st, "height") \
+                    and top is not None and bottom is not None:
+                box.forced_height = max(cb_h - top - bottom, 0.0)
             self.children.append(box)
             box.layout()
 
@@ -2967,6 +3045,17 @@ class BlockLayout:
         # and the box measures itself. The trial layout that answers is
         # the one box whose parent is the throwaway holder, so it takes
         # the constraint the holder imposes instead of asking again.
+        # aspect-ratio, the other way round: a definite block size and
+        # an auto inline size give the inline size (CSS Sizing 4 §4).
+        # `height: 100px; aspect-ratio: 1/1` is a 100px square, not a
+        # full-width band 100px tall. The value goes in as `spec`, so
+        # box-sizing lands it on whichever box it names.
+        if spec is None and self.forced_width is None:
+            ratio = _parse_aspect_ratio(st.get("aspect-ratio"))
+            if ratio and ratio > 0:
+                from_h = self._specified_height(st, em)
+                if from_h is not None:
+                    spec = max(from_h, 0.0) * ratio
         intrinsic_w = None
         intrinsic = intrinsic_width_keyword(st.get("width"))
         if intrinsic and not isinstance(self.parent, _MeasureHolder):
@@ -3885,7 +3974,46 @@ class BlockLayout:
                     if fill > b.height:
                         b.height = fill
                 # flex-start / baseline: top edge, no change
+        self._flex_gap_rules(node, em)
         apply_relative_offsets(self.children)
+
+    def _flex_gap_rules(self, node, em):
+        """Gap decorations for a flex container, read back off the laid
+        out items: a rule down the middle of every gap between two
+        items on a line, and across every gap between two lines. Flex
+        has no track grid to consult, so the boxes are the record of
+        where the gaps ended up."""
+        col_rule = gap_rule(node.style, "column", em)
+        row_rule = gap_rule(node.style, "row", em)
+        self._gap_rules = rules = []
+        if not (col_rule or row_rule) or not self.children:
+            return
+
+        def edges(b):
+            left = b.x - b.pl - b.bl - b.ml
+            top = b.y - b.pt - b.bt - b.margin_top
+            return (left, top, left + b.outer_width(), top + b.outer_height())
+
+        lines = {}
+        for b in self.children:
+            lines.setdefault(round(edges(b)[1], 1), []).append(b)
+        keys = sorted(lines)
+        if col_rule:
+            w, rgb = col_rule
+            for key in keys:
+                row = sorted(lines[key], key=lambda b: edges(b)[0])
+                for prev, nxt in zip(row, row[1:]):
+                    mid = (edges(prev)[2] + edges(nxt)[0]) / 2.0
+                    top = min(edges(b)[1] for b in row)
+                    bot = max(edges(b)[3] for b in row)
+                    rules.append((mid - w / 2, top, mid + w / 2, bot, rgb))
+        if row_rule:
+            w, rgb = row_rule
+            for a, b in zip(keys, keys[1:]):
+                mid = (max(edges(x)[3] for x in lines[a])
+                       + min(edges(x)[1] for x in lines[b])) / 2.0
+                rules.append((self.x, mid - w / 2,
+                              self.x + self.width, mid + w / 2, rgb))
 
     def _layout_table(self, node, em):
         """CSS table layout (auto algorithm). Rows are flattened through
@@ -4521,6 +4649,24 @@ class BlockLayout:
         self.height = max(
             self.definite_height if self.definite_height is not None
             else total_h, 0.0)
+        # Gap decorations: a rule down the middle of every gap, spanning
+        # the container's content box in the other axis.
+        rules = []
+        col_rule = gap_rule(style, "column", em)
+        if col_rule and col_gap > 0:
+            w, rgb = col_rule
+            for i in range(ncols - 1):
+                mid = self.x + (col_x[i] + col_w[i] + col_x[i + 1]) / 2.0
+                rules.append((mid - w / 2, self.y, mid + w / 2,
+                              self.y + self.height, rgb))
+        row_rule = gap_rule(style, "row", em)
+        if row_rule and row_gap > 0:
+            w, rgb = row_rule
+            for i in range(nrows - 1):
+                mid = self.y + (row_y[i] + row_h[i] + row_y[i + 1]) / 2.0
+                rules.append((self.x, mid - w / 2,
+                              self.x + self.width, mid + w / 2, rgb))
+        self._gap_rules = rules
         apply_relative_offsets(self.children)
 
     def _gap_shorthand(self, style, index):
@@ -5125,6 +5271,11 @@ class BlockLayout:
             if bg_img:
                 cmds.append(bg_img)
 
+            # gap decorations sit above the container's own background
+            # and below its items, the way a grid line would
+            for rx1, ry1, rx2, ry2, rgb in getattr(self, "_gap_rules", ()):
+                cmds.append(DrawRect(rx1, ry1, rx2, ry2, rgb))
+
             # outline: a ring outside the border box that takes up no
             # space. It is the focus indicator on every keyboard-driven
             # page, and it was drawing nothing at all.
@@ -5218,12 +5369,7 @@ class BlockLayout:
             return True
         # Explicitly transparent backgrounds and zero/none borders are
         # author styling too: they intentionally remove the native face.
-        if any(prop in style for prop in (
-                "border-width", "border-top-width", "border-right-width",
-                "border-bottom-width", "border-left-width",
-                "border-style", "border-top-style", "border-right-style",
-                "border-bottom-style", "border-left-style",
-                "background-color", "background", "background-image")):
+        if any(disables_native_appearance(prop) for prop in style):
             return True
         for prop in ("appearance", "-webkit-appearance"):
             value = (style.get(prop) or "").strip().casefold()

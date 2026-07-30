@@ -396,8 +396,68 @@ function matchMedia(q) {
 // its own schedule and a live object would need a read hook on every
 // property, which is three interpreter paths and a method-call path
 // for something nobody reads in a loop.
+// A property the cascade never had to write down still has a computed
+// value: its initial one. `getComputedStyle(d).getPropertyValue(
+// 'background-attachment')` is "scroll" on a plain div, not "". The
+// cascade only records what a rule set, so the gaps are filled here.
+// Longhands only, and only the ones a page reads back; `currentcolor`
+// resolves against the element's own colour the way a border does.
+var __ggInitialStyle = {
+  'background-attachment': 'scroll', 'background-clip': 'border-box',
+  'background-color': 'rgba(0, 0, 0, 0)', 'background-image': 'none',
+  'background-origin': 'padding-box', 'background-position': '0% 0%',
+  'background-position-x': '0%', 'background-position-y': '0%',
+  'background-repeat': 'repeat', 'background-size': 'auto',
+  'border-image-outset': '0', 'border-image-repeat': 'stretch',
+  'border-image-slice': '100%', 'border-image-source': 'none',
+  'border-image-width': '1',
+  'box-shadow': 'none', 'outline-color': 'currentcolor',
+  'outline-offset': '0px', 'outline-style': 'none', 'outline-width': '0px'
+};
+(function () {
+  // A border with no style computes to zero width whatever the
+  // `medium` initial value says, so both are constants here.
+  var sides = ['top', 'right', 'bottom', 'left'];
+  var logical = ['block-start', 'block-end', 'inline-start', 'inline-end'];
+  var corners = ['top-left', 'top-right', 'bottom-right', 'bottom-left',
+                 'start-start', 'start-end', 'end-start', 'end-end'];
+  for (var i = 0; i < sides.length; i++) {
+    __ggInitialStyle['border-' + sides[i] + '-style'] = 'none';
+    __ggInitialStyle['border-' + sides[i] + '-width'] = '0px';
+    __ggInitialStyle['border-' + sides[i] + '-color'] = 'currentcolor';
+  }
+  for (var j = 0; j < logical.length; j++) {
+    __ggInitialStyle['border-' + logical[j] + '-style'] = 'none';
+    __ggInitialStyle['border-' + logical[j] + '-width'] = '0px';
+    __ggInitialStyle['border-' + logical[j] + '-color'] = 'currentcolor';
+  }
+  for (var k = 0; k < corners.length; k++) {
+    __ggInitialStyle['border-' + corners[k] + '-radius'] = '0px';
+  }
+})();
+function __ggCamel(p) {
+  return ('' + p).replace(/-([a-z])/g,
+    function (_, c) { return c.toUpperCase() });
+}
+// [kebab, camel, value] once, not a regex per property per call:
+// getComputedStyle is called thousands of times by a live page and
+// this runs on every one of them.
+var __ggInitialTriples = [];
+(function () {
+  for (var p in __ggInitialStyle) {
+    __ggInitialTriples.push([p, __ggCamel(p), __ggInitialStyle[p]]);
+  }
+})();
 function getComputedStyle(el) {
   var map = __ggComputed(el) || {};
+  for (var i = 0; i < __ggInitialTriples.length; i++) {
+    var t = __ggInitialTriples[i];
+    if (map[t[1]] !== undefined || map[t[0]] !== undefined) continue;
+    var v = t[2];
+    if (v === 'currentcolor') v = map.color || 'rgb(0, 0, 0)';
+    map[t[1]] = v;
+    map[t[0]] = v;
+  }
   map.getPropertyValue = function (p) {
     var v = this[('' + p).replace(/-([a-z])/g,
       function (_, c) { return c.toUpperCase() })];

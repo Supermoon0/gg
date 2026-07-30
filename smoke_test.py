@@ -932,6 +932,46 @@ check("align-content works on the block axis too",
       _gcols("align-content:end")
       == [(0, 77, 50, 100), (50, 77, 100, 100)])
 
+# grid-auto-columns creates the implicit tracks a placement needs
+_IMPL = ("body{margin:0}.g{display:grid;width:100px;"
+         "grid-auto-columns:9px 14px 22px;gap:2px}.g>div{background:green}")
+check("a placement past the explicit grid creates implicit columns",
+      [tuple(round(v) for v in c[1:5]) for c in _lines_all(
+          _IMPL, "<div class=g><div style='grid-column:5/span 2;"
+                 "height:10px'>x</div></div>")
+       if c[0] == 0 and c[5] == (0, 128, 0)] == [(62, 0, 100, 10)])
+
+# gap decorations paint a rule down the middle of every gap
+_RULE = ("body{margin:0}.g{display:grid;width:100px;height:100px;"
+         "grid-template-columns:45px 45px;column-gap:10px;"
+         "column-rule:10px solid blue}")
+check("column-rule paints in the column gap of a grid",
+      [tuple(round(v) for v in c[1:5]) for c in _lines_all(
+          _RULE, "<div class=g><div></div><div></div></div>")
+       if c[0] == 0 and c[5] == (0, 0, 255)] == [(45, 0, 55, 100)])
+check("a rule with no style draws nothing",
+      [c for c in _lines_all(
+          _RULE.replace("column-rule:10px solid blue",
+                        "column-rule-width:10px;column-rule-color:blue"),
+          "<div class=g><div></div><div></div></div>")
+       if c[0] == 0 and c[5] == (0, 0, 255)] == [])
+
+# an auto inline size comes from a definite block size and the ratio
+check("aspect-ratio sizes the width from a definite height",
+      [tuple(round(v) for v in c[1:5]) for c in _lines_all(
+          "body{margin:0}", "<div style='background:green;height:40px;"
+          "aspect-ratio:2/1'></div>")
+       if c[0] == 0 and c[5] == (0, 128, 0)] == [(0, 0, 80, 40)])
+
+# top+bottom with an auto height stretch the box between them
+check("an absolute box with both offsets and auto height stretches",
+      [tuple(round(v) for v in c[1:5]) for c in _lines_all(
+          "body{margin:0}.cb{position:relative;height:60px;width:60px}"
+          ".a{position:absolute;top:10px;bottom:10px;left:0;right:0;"
+          "background:green}",
+          "<div class=cb><div class=a></div></div>")
+       if c[0] == 0 and c[5] == (0, 128, 0)] == [(0, 10, 60, 50)])
+
 
 # a flex line stretches to a definite container height first
 _FLEX = ("body{margin:0}.f{display:flex;width:300px;height:100px;%s}"
