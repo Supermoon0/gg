@@ -1218,6 +1218,25 @@ def resolved_text_align(node, is_last_line=False):
     return "left"
 
 
+def lh_unit(node, em):
+    """The px the `lh` unit measures: the element's used line-height,
+    falling back to the font's own line spacing when line-height is
+    `normal` (which is what `normal` means)."""
+    target = line_height_px(node, em)
+    if target is not None:
+        return target
+    try:
+        return cached_font(node).gg_linespace
+    except Exception:
+        return em * 1.2
+
+
+def line_clamp_auto(style):
+    """`line-clamp: auto` — clamp to whatever the box's own height
+    allows rather than to a line count (CSS Overflow 4)."""
+    return (style.get("line-clamp") or "").strip().casefold() == "auto"
+
+
 def line_clamp_count(style):
     """How many lines this element clamps to, or None.
 
@@ -3014,10 +3033,12 @@ class BlockLayout:
             raw = st.get(prop)
             # only pay for the font measurement when the value is
             # actually font-relative in a way `em` cannot answer
-            ch = None
+            ch = lh = None
             if raw and ("ch" in raw or "ex" in raw):
                 ch = _ch_width(node)
-            return parse_size(raw, base, em, ch)
+            if raw and "lh" in raw:
+                lh = lh_unit(node, em)
+            return parse_size(raw, base, em, ch, lh)
 
         self.pt = size("padding-top") or 0
         self.pr = size("padding-right") or 0
@@ -3384,6 +3405,18 @@ class BlockLayout:
             # mark the overflow with an ellipsis (card titles clamp to 2
             # lines so a grid of cards stays uniform height).
             n_lines = line_clamp_count(st)
+            if n_lines is None and line_clamp_auto(st):
+                # `auto`: as many lines as the box's own height allows.
+                # Line boxes are uniform here, so the count comes off
+                # the line height rather than out of a layout pass the
+                # cut below would have to redo.
+                room = self._content_height_limit(st.get("max-height"), em)
+                if room is None:
+                    room = self.definite_height
+                if room is not None:
+                    lh = lh_unit(node, em)
+                    if lh > 0:
+                        n_lines = max(int(room / lh + 1e-6), 1)
             if n_lines and len(self.children) > n_lines:
                 self.children = self.children[:n_lines]
                 last = self.children[-1]
@@ -3542,7 +3575,8 @@ class BlockLayout:
                 base = self.parent.definite_height
             box = parse_size(raw, base, em) if base is not None else None
         else:
-            box = parse_size(raw, 0, em)
+            box = parse_size(raw, 0, em, None,
+                             lh_unit(self.node, em) if "lh" in raw else None)
         if box is None:
             return None
         return max(box - self.pt - self.pb - self.bt - self.bb, 0.0)

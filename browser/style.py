@@ -140,8 +140,13 @@ def _split_args(text):
     return [p.strip() for p in out if p.strip()]
 
 
-def parse_size(value, percent_base=0.0, em_base=16.0, ch_base=None):
+def parse_size(value, percent_base=0.0, em_base=16.0, ch_base=None,
+               lh_base=None):
     """Resolve a CSS length to px. Returns None for auto/unsupported.
+
+    `lh_base` is the element's used line-height, the basis for `lh`
+    and `rlh`. `max-height: 4lh` is how a page says "four lines", and
+    without it the declaration resolved to nothing at all.
 
     `ch_base` is the advance width of "0" in the element's own font.
     Callers that have the font pass it; the rest fall back to half an
@@ -164,7 +169,7 @@ def parse_size(value, percent_base=0.0, em_base=16.0, ch_base=None):
             args = _split_args(v[len(name):-1])
             if arity is not None and len(args) != arity:
                 return None
-            sizes = [parse_size(a, percent_base, em_base, ch_base)
+            sizes = [parse_size(a, percent_base, em_base, ch_base, lh_base)
                      for a in args]
             if not sizes or any(s is None for s in sizes):
                 return None
@@ -215,6 +220,10 @@ def parse_size(value, percent_base=0.0, em_base=16.0, ch_base=None):
             out = total
         elif v.endswith("px"):
             out = float(v[:-2])
+        elif v.endswith("rlh"):
+            out = float(v[:-3]) * (lh_base or em_base * 1.2)
+        elif v.endswith("lh"):
+            out = float(v[:-2]) * (lh_base or em_base * 1.2)
         elif v.endswith("rem"):
             out = float(v[:-3]) * 16.0
         elif v.endswith("em"):

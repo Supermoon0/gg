@@ -5616,4 +5616,19 @@ check("a static grid item still paints in z-index order",
           _ZG, "<div class=g><div class=b></div><div class=a></div></div>")
        if c[0] == 0 and c[5] in ((255, 0, 0), (0, 128, 0))][-1]
       == (0, 128, 0))
+
+# lh / rlh resolve against the used line-height, and line-clamp: auto
+# clamps to what the box's own height allows
+from browser.layout import lh_unit as _lhu
+check("lh measures the used line-height",
+      (_lhu(_N(**{"line-height": "32px"}), 16.0),
+       _lhu(_N(**{"line-height": "2"}), 16.0)) == (32.0, 32.0))
+check("4lh is four line boxes",
+      parse_size("4lh", 0, 16, None, 32.0) == 128.0)
+_LCA = ("body{margin:0}.c{line-clamp:auto;max-height:2lh;"
+        "font:16px/32px serif;white-space:pre;width:200px}")
+check("line-clamp: auto keeps the lines the height allows",
+      len([c for c in _lines_all(
+          _LCA, "<div class=c>L1\nL2\nL3\nL4</div>") if c[0] == 1]) == 2)
+
 print(f"\n{passed} checks passed - engine pipeline OK")
