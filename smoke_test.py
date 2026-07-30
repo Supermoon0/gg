@@ -890,6 +890,44 @@ check("an over-large inset collapses instead of inverting",
       == (80.0, 80.0, 80.0, 80.0))
 
 
+# justify-content / align-content distribute a grid's leftover space
+from browser.layout import distribute_free_space as _dfs
+check("start and normal leave the leftover at the end",
+      [_dfs(200, 2, m) for m in ("", "normal", "start", "stretch")]
+      == [(0.0, 0.0)] * 4)
+check("end and center place the whole leftover",
+      (_dfs(200, 2, "end"), _dfs(200, 2, "center"))
+      == ((200.0, 0.0), (100.0, 0.0)))
+check("space-between puts it all between the tracks",
+      (_dfs(200, 2, "space-between"), _dfs(200, 1, "space-between"))
+      == ((0.0, 200.0), (0.0, 0.0)))
+check("space-around gives the ends half a gap",
+      _dfs(200, 2, "space-around") == (50.0, 100.0))
+check("space-evenly gives every gap the same size",
+      _dfs(300, 2, "space-evenly") == (100.0, 100.0))
+check("no leftover means no distribution",
+      (_dfs(0, 3, "center"), _dfs(-50, 3, "center"))
+      == ((0.0, 0.0), (0.0, 0.0)))
+check("an overflow-position prefix is ignored, not misread",
+      _dfs(200, 2, "safe center") == (100.0, 0.0))
+
+_GRID = ("body{margin:0}.g{display:grid;width:300px;height:100px;"
+         "grid-template-columns:50px 50px;%s}.g>div{background:green}")
+def _gcols(css):
+    return [tuple(round(v) for v in c[1:5]) for c in _lines_all(
+        _GRID % css, "<div class=g><div>a</div><div>b</div></div>")
+        if c[0] == 0 and c[5] == (0, 128, 0)]
+check("justify-content:center centres the track set",
+      _gcols("justify-content:center")
+      == [(100, 0, 150, 23), (150, 0, 200, 23)], str(_gcols("justify-content:center")))
+check("justify-content:space-between pushes the tracks apart",
+      _gcols("justify-content:space-between")
+      == [(0, 0, 50, 23), (250, 0, 300, 23)])
+check("align-content works on the block axis too",
+      _gcols("align-content:end")
+      == [(0, 77, 50, 100), (50, 77, 100, 100)])
+
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",

@@ -1059,6 +1059,34 @@ def _ch_width(node):
         return None
 
 
+def distribute_free_space(free, count, mode):
+    """(leading offset, extra gap) for a content-distribution keyword.
+
+    This is the CSS Box Alignment §5 job of `justify-content` and
+    `align-content` on a grid container: the tracks are already sized,
+    and whatever is left over is placed around them. `normal`/`stretch`
+    leave it alone — track sizing has already had its chance to absorb
+    it, and anything it did not take stays at the end.
+    """
+    if free <= 0 or count < 1:
+        return 0.0, 0.0
+    mode = (mode or "").strip().casefold().split()[-1:]
+    mode = mode[0] if mode else ""
+    if mode in ("end", "flex-end", "right"):
+        return free, 0.0
+    if mode == "center":
+        return free / 2, 0.0
+    if mode == "space-between":
+        return (0.0, free / (count - 1)) if count > 1 else (0.0, 0.0)
+    if mode == "space-around":
+        gap = free / count
+        return gap / 2, gap
+    if mode == "space-evenly":
+        gap = free / (count + 1)
+        return gap, gap
+    return 0.0, 0.0
+
+
 def order_items(children):
     """Flex and grid items in `order` sequence.
 
@@ -3815,11 +3843,14 @@ class BlockLayout:
         col_w = _size_grid_tracks(
             tracks, self.width, col_gap, contributions,
             stretch=jc in ("", "normal", "stretch"))
+        lead, spread = distribute_free_space(
+            self.width - (sum(col_w) + col_gap * max(ncols - 1, 0)),
+            ncols, jc)
         col_x = []
-        cx = 0.0
+        cx = lead
         for i in range(ncols):
             col_x.append(cx)
-            cx += col_w[i] + col_gap
+            cx += col_w[i] + col_gap + spread
 
         nrows = max(len(row_tracks), len(areas),
                     max((p[3] + p[4] for p in placed), default=0))
@@ -3882,11 +3913,16 @@ class BlockLayout:
                             available * row_tracks[i][1] / fr_total)
 
         row_y = [0.0] * nrows
-        y = 0.0
+        ac = (style.get("align-content") or "").strip().casefold()
+        used_h = sum(row_h) + row_gap * max(nrows - 1, 0)
+        v_lead, v_spread = distribute_free_space(
+            (self.definite_height - used_h)
+            if self.definite_height is not None else 0.0, nrows, ac)
+        y = v_lead
         for r in range(nrows):
             row_y[r] = y
-            y += row_h[r] + row_gap
-        total_h = (y - row_gap) if nrows else 0.0
+            y += row_h[r] + row_gap + v_spread
+        total_h = (y - row_gap - v_spread) if nrows else 0.0
 
         self.children = []
         for child, c0, cspan, r0, rspan, box in placed:
