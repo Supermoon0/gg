@@ -1658,10 +1658,19 @@ fn buffer_object(st: &mut St, bi: u32) -> Value {
     Value::UNDEFINED
 }
 
-/// `a` clamped into 0..=n, counting from the end when negative.
-fn clamp_index(a: f64, n: usize, dflt: usize) -> usize {
-    if !a.is_finite() {
-        return if a == f64::NEG_INFINITY { 0 } else { dflt };
+/// ToIntegerOrInfinity, then clamped into 0..=n counting from the end
+/// when negative. NaN is zero — it is *not* "the argument was absent",
+/// which is a separate case the caller handles before getting here:
+/// `slice(0, NaN)` is an empty slice, `slice(0)` runs to the end.
+fn clamp_index(a: f64, n: usize) -> usize {
+    if a.is_nan() {
+        return 0;
+    }
+    if a == f64::INFINITY {
+        return n;
+    }
+    if a == f64::NEG_INFINITY {
+        return 0;
     }
     let a = a.trunc();
     if a < 0.0 {
@@ -8415,7 +8424,7 @@ fn host_fn(
             Ok(m)
         }
         TA_BUF_NEW => {
-            let n = num_of(argv!(0))?;
+            let n = to_number(st, mods, argv!(0))?;
             let n = if n.is_finite() && n > 0.0 { n as usize } else { 0 };
             if n > MAX_STR_BYTES {
                 return range_err("ArrayBuffer is too large");
@@ -8428,11 +8437,11 @@ fn host_fn(
                 return type_err("not an ArrayBuffer");
             };
             let n = st.buffers[bi as usize].len();
-            let a = clamp_index(num_of(argv!(1))?, n, 0);
+            let a = clamp_index(to_number(st, mods, argv!(1))?, n);
             let b = if argv!(2).is_undefined() {
                 n
             } else {
-                clamp_index(num_of(argv!(2))?, n, n)
+                clamp_index(to_number(st, mods, argv!(2))?, n)
             };
             let part = if b > a {
                 st.buffers[bi as usize][a..b].to_vec()
@@ -8468,7 +8477,7 @@ fn host_fn(
             };
             let kind = kind_from_index(num_of(argv!(3))? as usize);
             let blen = st.buffers[bi as usize].len();
-            let off = num_of(argv!(1))?;
+            let off = to_number(st, mods, argv!(1))?;
             let off = if off.is_finite() && off > 0.0 {
                 off as usize
             } else {
@@ -8482,7 +8491,7 @@ fn host_fn(
             let len = if argv!(2).is_undefined() {
                 (blen - off) / w
             } else {
-                let l = num_of(argv!(2))?;
+                let l = to_number(st, mods, argv!(2))?;
                 if l.is_finite() && l > 0.0 { l as usize } else { 0 }
             };
             if off + len * w > blen {

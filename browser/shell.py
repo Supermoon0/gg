@@ -436,6 +436,11 @@ class Shell:
     def load_images(self, keep_cache):
         if not keep_cache:
             self.engine.clear_images()
+            # the SVG/background handles name ids in the store we just
+            # emptied, so they have to go with it — every clear_images()
+            # needs this, and the one caller that reaches here today
+            # passes keep_cache=True, which is what has hidden it
+            textengine.clear_image_caches()
             self._img_by_src = {}
         img_nodes = [n for n in tree_to_list(self.nodes, [])
                      if isinstance(n, Element) and n.tag == "img"
