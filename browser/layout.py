@@ -99,9 +99,31 @@ def _fullwidth(word):
     return "".join(out)
 
 
+# C0 and C1 controls that carry no white-space meaning. Tab, line feed
+# and carriage return are excluded: white-space processing owns those.
+_CONTROLS = frozenset(
+    [chr(c) for c in range(0x00, 0x20) if c not in (0x09, 0x0A, 0x0D)]
+    + [chr(c) for c in range(0x7F, 0xA0)])
+
+
+def visible_controls(word):
+    """Control characters rendered as something you can see.
+
+    CSS Text 3 §white-space-processing requires a control character to
+    be visible — a font draws most of them as nothing at all, so a
+    document containing one would silently lose it. U+FFFD is the
+    substitution every engine ends up making in some form.
+    """
+    if not word or not any(ch in _CONTROLS for ch in word):
+        return word
+    return "".join("\ufffd" if ch in _CONTROLS else ch for ch in word)
+
+
 def transformed_text(node, word):
-    """`text-transform` applied. It inherits, so the text node carries
-    it — but nothing ever read it, so the property was inert."""
+    """`text-transform` applied, with control characters made visible.
+    It inherits, so the text node carries it — but nothing ever read
+    it, so the property was inert."""
+    word = visible_controls(word)
     how = (node.style.get("text-transform") or "none").strip().casefold()
     if how == "none":
         return word

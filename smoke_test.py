@@ -1106,6 +1106,25 @@ check("text-align's initial value is start, so rtl aligns right",
       _rta(_AN(**{"direction": "rtl"})) == "right")
 
 
+# control characters must be visible, and a zero escape is U+FFFD
+from browser.layout import visible_controls as _vc
+check("C0 and C1 controls become the replacement character",
+      (_vc("a" + chr(1) + "b"), _vc(chr(0x7f)), _vc(chr(0x9f)))
+      == ("a\ufffdb", "\ufffd", "\ufffd"))
+check("tab, newline and carriage return are left to white-space",
+      _vc("a\tb\nc\rd") == "a\tb\nc\rd")
+check("ordinary text is returned untouched",
+      _vc("hello") == "hello" and _vc("") == "")
+check("an escape of zero is U+FFFD, not a NUL that draws nothing",
+      _gen("#t::before{content:\"" + chr(92) + "0000\"}",
+           "<div id=t>z</div>") == ["\ufffd", "z"])
+check("a content list with an unresolvable part renders nothing",
+      (_gen("#t::before{content:counter(a) \",\" counter(b)}",
+            "<div id=t>z</div>"),
+       _gen("#t::before{content:\"x\" counter(a)}",
+            "<div id=t>z</div>")) == (["z"], ["z"]))
+
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",

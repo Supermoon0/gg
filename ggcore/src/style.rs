@@ -402,12 +402,17 @@ fn content_text(raw: &str, attrs: &dyn Fn(&str) -> Option<String>) -> Option<Str
                 if k < b.len() && b[k].is_whitespace() {
                     k += 1;
                 }
-                if let Some(ch) = u32::from_str_radix(&hex, 16)
-                    .ok()
-                    .and_then(char::from_u32)
-                {
-                    out.push(ch);
-                }
+                // CSS Syntax 3 §4.3.7: zero, a surrogate, or a value
+                // past the last code point all become U+FFFD. `\0` is
+                // not "nothing" — the corpus has a test per control
+                // character asserting each one is *visible*.
+                out.push(
+                    u32::from_str_radix(&hex, 16)
+                        .ok()
+                        .filter(|&n| n != 0)
+                        .and_then(char::from_u32)
+                        .unwrap_or('\u{fffd}'),
+                );
                 j = k;
             }
             i = j + 1;
@@ -436,7 +441,17 @@ fn content_text(raw: &str, attrs: &dyn Fn(&str) -> Option<String>) -> Option<Str
             }
             let inner: String = b[arg_start..i.min(b.len())].iter().collect();
             i += 1;
-            if name == "attr" {
+            if name != "attr" {
+                // A component this engine cannot resolve — counter(),
+                // counters(), url(), image() — makes the whole value
+                // unresolvable. Emitting the string parts around it
+                // would draw the separators of a value whose contents
+                // are missing: `counter(a) "," counter(b)` would come
+                // out as a bare comma. An empty box is the honest
+                // rendering, and it is what this did before attr().
+                return Some(String::new());
+            }
+            {
                 // attr(name) or attr(name type?, fallback)
                 let (head, fallback) = match inner.split_once(',') {
                     Some((h, f)) => (h, f.trim().trim_matches(['"', '\''])),
