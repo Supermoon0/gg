@@ -633,6 +633,26 @@ check("the ratio sizes the box box-sizing names",
 check("min-height still clamps a ratio-derived height",
       _arbox("aspect-ratio:1;min-height:300px") == [(0, 0, 200, 300)])
 
+# ch/ex units and the min()/max()/clamp() comparison functions
+from browser.style import parse_size as _psz
+check("ch and ex resolve off the font size",
+      (_psz("10ch", 0, 16), _psz("10ex", 0, 16)) == (80.0, 80.0))
+check("min() takes the smallest resolvable argument",
+      _psz("min(100px, 10em, 50%)", 400, 16) == 100.0)
+check("max() takes the largest",
+      _psz("max(100px, 10%)", 400, 16) == 100.0)
+check("clamp() orders low/value/high",
+      (_psz("clamp(50px, 10%, 100px)", 400, 16),
+       _psz("clamp(50px, 90%, 100px)", 400, 16)) == (50.0, 100.0))
+check("clamp() with the wrong argument count is unresolvable",
+      _psz("clamp(50px, 100px)", 400, 16) is None)
+check("an unresolvable argument makes the whole comparison unresolvable",
+      _psz("min(100px, anchor-size(width))", 400, 16) is None)
+check("nested commas inside an argument do not split it",
+      _psz("min(calc(10px + 5px), 100px)", 400, 16) == 15.0)
+check("calc() accepts ch and ex too",
+      _psz("calc(10ch + 5px)", 0, 16) == 85.0)
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",

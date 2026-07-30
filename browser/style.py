@@ -107,6 +107,31 @@ def px_str(value):
     return f"{value!r}px"
 
 
+# Font-relative units this engine resolves off the font size rather
+# than off real font metrics: `ch` is the advance of "0" and `ex` the
+# x-height, and both are close to half an em in the faces a page
+# actually uses. Approximating them is far better than the previous
+# behaviour, which was to treat the whole declaration as unsupported —
+# `width: 50ch` became `auto` and filled the container.
+_CH_PER_EM = 0.5
+_EX_PER_EM = 0.5
+
+
+def _split_args(text):
+    """Split a function's arguments on commas, ignoring nested ones."""
+    out, depth, start = [], 0, 0
+    for i, ch in enumerate(text):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            out.append(text[start:i])
+            start = i + 1
+    out.append(text[start:])
+    return [p.strip() for p in out if p.strip()]
+
+
 def parse_size(value, percent_base=0.0, em_base=16.0):
     """Resolve a CSS length to px. Returns None for auto/unsupported."""
     if not value:
@@ -115,6 +140,24 @@ def parse_size(value, percent_base=0.0, em_base=16.0):
     if v in ("auto", "none", "inherit", "initial", "unset",
              "min-content", "max-content", "fit-content"):
         return None
+    # min()/max()/clamp() are comparison functions over lengths, and each
+    # argument is itself a length this function already knows how to
+    # resolve. An argument it cannot resolve makes the whole comparison
+    # unanswerable rather than silently dropping a bound.
+    for name, arity in (("min(", None), ("max(", None), ("clamp(", 3)):
+        if v.startswith(name) and v.endswith(")"):
+            args = _split_args(v[len(name):-1])
+            if arity is not None and len(args) != arity:
+                return None
+            sizes = [parse_size(a, percent_base, em_base) for a in args]
+            if not sizes or any(s is None for s in sizes):
+                return None
+            if name == "min(":
+                return min(sizes)
+            if name == "max(":
+                return max(sizes)
+            lo, mid, hi = sizes
+            return max(lo, min(mid, hi))
     try:
         if v.startswith("calc(") and v.endswith(")"):
             # The overwhelmingly common calc() form in page layout is a
@@ -126,7 +169,7 @@ def parse_size(value, percent_base=0.0, em_base=16.0):
             inner = v[5:-1]
             term = re.compile(
                 r"\s*([+-]?)\s*((?:\d+(?:\.\d*)?|\.\d+))"
-                r"(rem|px|em|vw|vh|%)?")
+                r"(rem|px|em|ch|ex|vw|vh|%)?")
             pos = 0
             total = 0.0
             first = True
@@ -141,6 +184,10 @@ def parse_size(value, percent_base=0.0, em_base=16.0):
                     number *= 16.0
                 elif unit == "em":
                     number *= em_base
+                elif unit == "ch":
+                    number *= em_base * _CH_PER_EM
+                elif unit == "ex":
+                    number *= em_base * _EX_PER_EM
                 elif unit in ("%", "vw", "vh"):
                     number *= percent_base / 100.0
                 elif unit not in ("", "px"):
@@ -155,6 +202,10 @@ def parse_size(value, percent_base=0.0, em_base=16.0):
             out = float(v[:-3]) * 16.0
         elif v.endswith("em"):
             out = float(v[:-2]) * em_base
+        elif v.endswith("ch"):
+            out = float(v[:-2]) * em_base * _CH_PER_EM
+        elif v.endswith("ex"):
+            out = float(v[:-2]) * em_base * _EX_PER_EM
         elif v.endswith("%"):
             out = float(v[:-1]) / 100.0 * percent_base
         elif v.endswith("vw") or v.endswith("vh"):
