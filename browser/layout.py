@@ -675,6 +675,50 @@ def _visually_hidden(node):
     return False
 
 
+_WS_KEYWORDS = ("normal", "pre", "nowrap", "pre-wrap", "pre-line",
+                "break-spaces")
+# (white-space-collapse, wraps) -> the white-space keyword that means it
+_WS_FROM_LONGHANDS = {
+    ("collapse", True): "normal",
+    ("collapse", False): "nowrap",
+    ("preserve", True): "pre-wrap",
+    ("preserve", False): "pre",
+    ("preserve-breaks", True): "pre-line",
+    ("preserve-breaks", False): "pre",
+    ("break-spaces", True): "break-spaces",
+    ("break-spaces", False): "pre",
+}
+
+
+def white_space(style):
+    """The effective white-space keyword for a style dict.
+
+    CSS Text 4 turned white-space into a shorthand over
+    white-space-collapse and text-wrap-mode (spelled text-wrap in the
+    older drafts, and both spellings are still in the corpus). Layout
+    only ever wants the one answer, so the longhands are folded back
+    into the keyword they are equivalent to, and a longhand set
+    directly wins over the shorthand — which is what the cascade would
+    do anyway if the shorthand expanded properly.
+    """
+    ws = (style.get("white-space") or "normal").strip().casefold()
+    if ws not in _WS_KEYWORDS:
+        ws = "normal"
+    collapse = (style.get("white-space-collapse") or "").strip().casefold()
+    wrap = (style.get("text-wrap-mode")
+            or style.get("text-wrap") or "").strip().casefold()
+    if not collapse and not wrap:
+        return ws
+    if not collapse:
+        collapse = {"pre": "preserve", "pre-wrap": "preserve",
+                    "break-spaces": "break-spaces",
+                    "pre-line": "preserve-breaks"}.get(ws, "collapse")
+    # text-wrap also carries balance/pretty/stable, which are wrapping
+    # *styles*: they all still wrap
+    wraps = wrap != "nowrap" if wrap else ws not in ("pre", "nowrap")
+    return _WS_FROM_LONGHANDS.get((collapse, wraps), ws)
+
+
 def is_visible(node):
     if node.style.get("display", "inline") == "none":
         return False
@@ -2043,8 +2087,7 @@ class BlockLayout:
                     # widget board lines up 420px pages inside an
                     # overflow:hidden 420px wrap — page 2 must overflow
                     # rightward and be clipped, not stack below)
-                    nowrap = node.style.get("white-space", "") \
-                        .strip().casefold() in ("nowrap", "pre")
+                    nowrap = white_space(node.style) in ("nowrap", "pre")
                     if not nowrap and ib_x > 0 \
                             and ib_x + box.outer_width() > self.width:
                         # wrap: re-anchor on the next row
@@ -3343,13 +3386,16 @@ class BlockLayout:
 
     def recurse(self, node):
         if isinstance(node, Text):
-            ws = node.style.get("white-space", "normal")
+            ws = white_space(node.style)
             if ws == "pre":
                 self.preformatted(node)
-            elif ws in ("pre-wrap", "pre-line"):
-                # both honor source newlines and still wrap; pre-line
-                # collapses runs of whitespace, pre-wrap preserves them
-                self.pre_wrapped(node, collapse=(ws == "pre-line"))
+            elif ws in ("pre-wrap", "pre-line", "break-spaces"):
+                # all three honor source newlines and still wrap;
+                # pre-line collapses runs of whitespace, pre-wrap
+                # preserves them, break-spaces preserves them and may
+                # also break inside one
+                self.pre_wrapped(node, collapse=(ws == "pre-line"),
+                                 break_spaces=(ws == "break-spaces"))
             else:
                 # collapse whitespace, but remember whether the source had
                 # any at each boundary so a space is inserted only where one
@@ -3432,7 +3478,7 @@ class BlockLayout:
     def word(self, node, word, space_before=True):
         font = cached_font(node)
         w = measure(font, word)
-        nowrap = node.style.get("white-space") in ("nowrap", "pre")
+        nowrap = white_space(node.style) in ("nowrap", "pre")
         # A run wider than the whole line can't fit however it wraps. Break
         # it between characters when the script allows: CJK/Hangul/Kana
         # always break between ideographs, and word-break:break-all /
@@ -3574,11 +3620,18 @@ class BlockLayout:
             line.children.append(text)
             self.cursor_x += measure(font, raw_line)
 
-    def pre_wrapped(self, node, collapse):
-        """white-space: pre-wrap / pre-line. Each source newline forces a
-        break and long lines still wrap. pre-line collapses runs of
-        whitespace (emit split words); pre-wrap preserves them (emit
-        whitespace and word tokens verbatim, breaking between them)."""
+    def pre_wrapped(self, node, collapse, break_spaces=False):
+        """white-space: pre-wrap / pre-line / break-spaces. Each source
+        newline forces a break and long lines still wrap. pre-line
+        collapses runs of whitespace (emit split words); pre-wrap
+        preserves them (emit whitespace and word tokens verbatim,
+        breaking between them).
+
+        break-spaces differs from pre-wrap in what happens to a space
+        run that reaches the edge: pre-wrap hangs it past the line box,
+        break-spaces measures it like any other content and takes a
+        break opportunity after every single preserved space, so the
+        run itself splits across lines."""
         font = cached_font(node)
         for i, raw in enumerate(node.text.split("\n")):
             if i > 0:
@@ -3588,15 +3641,25 @@ class BlockLayout:
                     self.word(node, word)
                 continue
             for token in re.findall(r"\s+|\S+", raw):
-                w = measure(font, token)
-                if token.strip() and self.cursor_x + w > self.width \
-                        and self.cursor_x > 0:
-                    self.new_line()
-                line = self.children[-1]
-                prev = line.children[-1] if line.children else None
-                line.children.append(
-                    TextLayout(node, token, line, prev, keep_spaces=True))
-                self.cursor_x += w
+                # a space run only has to be split apart when it is what
+                # overflows; whole runs that fit stay one layout object
+                pieces = [token]
+                if break_spaces and not token.strip() \
+                        and self.cursor_x + measure(font, token) \
+                        > self.width:
+                    pieces = list(token)
+                for piece in pieces:
+                    w = measure(font, piece)
+                    wraps = piece.strip() or break_spaces
+                    if wraps and self.cursor_x + w > self.width \
+                            and self.cursor_x > 0:
+                        self.new_line()
+                    line = self.children[-1]
+                    prev = line.children[-1] if line.children else None
+                    line.children.append(
+                        TextLayout(node, piece, line, prev,
+                                   keep_spaces=True))
+                    self.cursor_x += w
 
     # ----- painting -----
 
@@ -4328,7 +4391,7 @@ class TextLayout:
                 break
             anc = anc.parent
         if ancestor_to == "ellipsis" \
-                and self.node.style.get("white-space") == "nowrap":
+                and white_space(self.node.style) == "nowrap":
             avail = (self.parent.x + self.parent.width) - self.x
             if avail > 0 and self.width > avail:
                 ell = measure(self.font, "…")

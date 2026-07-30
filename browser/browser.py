@@ -778,9 +778,11 @@ class Browser:
                 if isinstance(n, Element) and n.tag == "style":
                     css_texts.append(" ".join(
                         c.text for c in n.children if isinstance(c, Text)))
-        def fetch(u):
+        def fetch(u, base=None):
+            # a relative src belongs to the stylesheet that wrote it
+            target = url.resolve(base).resolve(u) if base else url.resolve(u)
             _, body = self.network.request_raw(
-                url.resolve(u), site_for_cookies=url,
+                target, site_for_cookies=url,
                 top_level_navigation=False,
                 timeout=self.navigation_timeout,
                 cancel_token=self._loading_token,

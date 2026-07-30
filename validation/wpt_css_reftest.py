@@ -62,8 +62,8 @@ def references(path: Path):
         if not href:
             continue
         target = href.group(1).split("#")[0]
-        if not target or target.startswith(("http:", "https:", "data:")):
-            continue
+        if not target or ":" in target.split("/")[0]:
+            continue  # http:, data:, about:blank — nothing local to read
         out.append((m.group(1).lower(), target))
     return out
 
@@ -136,6 +136,44 @@ def _bytes_fetcher(base: Path, corpus: Path):
     return fetch
 
 
+_fonts_seen = set()
+
+
+def _load_fonts(css_sources, base: Path, corpus: Path):
+    """Register the @font-face fonts a page asks for.
+
+    Ahem is the reason this exists: 3444 files in the CSS corpus set
+    `font-family: Ahem`, whose every glyph is a solid em square, so a
+    reftest written against it asserts an exact pixel layout instead
+    of whatever the fallback font happens to measure. Without it the
+    test and its reference both fall back and the comparison is
+    testing the fallback.
+    """
+    from browser import textengine, webfonts
+    from browser import layout as layout_mod
+
+    loaded = 0
+    for family, bold, italic, url, sheet in webfonts.parse_font_faces(
+            css_sources):
+        # a relative src belongs to the sheet that wrote it
+        sheet_path = resolve(sheet, base, corpus) if sheet else None
+        font = resolve(url, sheet_path.parent if sheet_path else base, corpus)
+        if font is None:
+            continue
+        key = (family, bold, italic, str(font))
+        if key in _fonts_seen:
+            continue
+        try:
+            data = font.read_bytes()
+        except OSError:
+            continue
+        if textengine.engine().load_font(family, bold, italic, data):
+            _fonts_seen.add(key)
+            loaded += 1
+    if loaded:
+        layout_mod._FONT_CACHE.clear()
+
+
 def render(page: Path, corpus: Path):
     """Raw RGB bytes for one page, or None if it will not render."""
     from browser import native, textengine
@@ -157,6 +195,7 @@ def render(page: Path, corpus: Path):
         html, _text_fetcher(base, corpus), None)
 
     fetch_bytes = _bytes_fetcher(base, corpus)
+    _load_fonts(css_sources, base, corpus)
     img_nodes = [n for n in tree_to_list(nodes, [])
                  if isinstance(n, Element) and n.tag == "img"
                  and n.attributes.get("src")]
@@ -202,13 +241,8 @@ def run_one(corpus: Path, rel: str, tolerance: int):
     rows = []
     for kind, target in refs:
         ident = f"{rel}#{kind}:{target}"
-        ref_path = (path.parent / target).resolve()
-        try:
-            ref_path.relative_to(corpus.resolve())
-        except ValueError:
-            rows.append((ident, False, "reference escapes the corpus"))
-            continue
-        if not ref_path.is_file():
+        ref_path = resolve(target, path.parent, corpus)
+        if ref_path is None:
             rows.append((ident, False, "reference is missing"))
             continue
         try:

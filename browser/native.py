@@ -729,6 +729,25 @@ def run_page_scripts(doc, fetch_js, *, js_budget=8.0, page_url=None,
     return logs
 
 
+class Stylesheet(str):
+    """CSS text that remembers the href it was fetched from.
+
+    A url() inside a stylesheet resolves against the stylesheet, not
+    against the page — /assets/site.css asking for url(font.ttf) means
+    /assets/font.ttf, and every site that keeps its fonts next to its
+    CSS depends on that. The style engine only ever wants the text, so
+    this stays a plain str everywhere else and carries the base along
+    for the one caller that needs it.
+    """
+
+    __slots__ = ("base",)
+
+    def __new__(cls, text, base=None):
+        sheet = super().__new__(cls, text)
+        sheet.base = base
+        return sheet
+
+
 def load_document(html, fetch_css, fetch_js=None, js_budget=8.0,
                   page_url=None, viewport_width=1280.0, timings=None,
                   network_backend=None, network_timeout=15.0,
@@ -872,7 +891,8 @@ def load_document(html, fetch_css, fetch_js=None, js_budget=8.0,
     for kind, value in entries:
         css = value if kind == "inline" else fetched.get(value, "")
         if css:
-            css_sources.append(css)
+            css_sources.append(
+                css if kind == "inline" else Stylesheet(css, value))
 
     stage_started = time.perf_counter()
     doc.compute_styles(css_sources, viewport_width)

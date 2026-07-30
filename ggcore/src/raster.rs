@@ -9,6 +9,68 @@ fn px_range(a: f64, b: f64, limit: usize) -> std::ops::Range<i32> {
     lo..hi.max(lo)
 }
 
+/// Colour at position `t` along a sorted stop list, clamped at the ends.
+fn sample_stops(stops: &[(f64, (u8, u8, u8))], t: f64) -> (u8, u8, u8) {
+    if t <= stops[0].0 {
+        return stops[0].1;
+    }
+    let last = stops[stops.len() - 1];
+    if t >= last.0 {
+        return last.1;
+    }
+    for pair in stops.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if t <= b.0 {
+            let span = b.0 - a.0;
+            // a hard stop (two stops at the same offset) is the sharp
+            // colour boundary that fakes stripes and checkerboards
+            let f = if span <= 0.0 { 1.0 } else { (t - a.0) / span };
+            return (
+                lerp(a.1.0, b.1.0, f),
+                lerp(a.1.1, b.1.1, f),
+                lerp(a.1.2, b.1.2, f),
+            );
+        }
+    }
+    last.1
+}
+
+fn lerp(a: u8, b: u8, f: f64) -> u8 {
+    (a as f64 + (b as f64 - a as f64) * f).round().clamp(0.0, 255.0) as u8
+}
+
+/// Is (px, py) inside a rounded rect? Corners only -- the straight
+/// edges are a plain bounds test.
+fn inside_round_rect(
+    px: f64,
+    py: f64,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    r: f64,
+) -> bool {
+    if px < x1 || py < y1 || px > x2 || py > y2 {
+        return false;
+    }
+    let cx = if px < x1 + r {
+        x1 + r
+    } else if px > x2 - r {
+        x2 - r
+    } else {
+        return true;
+    };
+    let cy = if py < y1 + r {
+        y1 + r
+    } else if py > y2 - r {
+        y2 - r
+    } else {
+        return true;
+    };
+    let (dx, dy) = (px - cx, py - cy);
+    dx * dx + dy * dy <= r * r
+}
+
 pub struct Raster {
     pub width: usize,
     pub height: usize,
@@ -333,6 +395,69 @@ impl Raster {
                 if hits > 0 {
                     self.blend(x, y, color, (hits * 255 / 4) as u8);
                 }
+            }
+        }
+    }
+
+    /// Fill a box with a linear gradient.
+    ///
+    /// `angle` follows the CSS convention, not the mathematical one: 0
+    /// points up and it turns clockwise, so 180deg runs top-to-bottom,
+    /// which is what a bare `linear-gradient(a, b)` means. Stops are
+    /// (offset in 0..=1, colour) and must already be sorted and
+    /// resolved -- the parser owns the defaulting rules, this owns the
+    /// pixels.
+    ///
+    /// The gradient line is sized so the corners of the box land on
+    /// its ends (CSS Images 3 s3.4.1): the projection of the box's
+    /// half-diagonal onto the gradient direction.
+    pub fn fill_linear_gradient(
+        &mut self,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+        angle_deg: f64,
+        stops: &[(f64, (u8, u8, u8))],
+        radius: f64,
+    ) {
+        if stops.is_empty() {
+            return;
+        }
+        if stops.len() == 1 {
+            if radius > 0.5 {
+                self.fill_round_rect(x1, y1, x2, y2, stops[0].1, radius);
+            } else {
+                self.fill_rect(x1, y1, x2, y2, stops[0].1);
+            }
+            return;
+        }
+        let (w, h) = (x2 - x1, y2 - y1);
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let rad = angle_deg.to_radians();
+        // CSS angle -> unit vector, y growing downward
+        let (dx, dy) = (rad.sin(), -rad.cos());
+        let len = (w * dx).abs() + (h * dy).abs();
+        if len <= 0.0 {
+            return;
+        }
+        let (cx, cy) = ((x1 + x2) / 2.0, (y1 + y2) / 2.0);
+        // distance along the gradient line of the starting corner
+        let start = -len / 2.0;
+        let xs = px_range(x1, x2, self.width);
+        let ys = px_range(y1, y2, self.height);
+        let rr = radius.min(w / 2.0).min(h / 2.0);
+        for y in ys {
+            for x in xs.clone() {
+                let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+                if rr > 0.5 && !inside_round_rect(px, py, x1, y1, x2, y2, rr)
+                {
+                    continue;
+                }
+                let t = (((px - cx) * dx + (py - cy) * dy) - start) / len;
+                self.blend(x, y, sample_stops(stops, t), 255);
             }
         }
     }

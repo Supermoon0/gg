@@ -22,9 +22,13 @@ _LOADABLE = (".ttf", ".otf")
 
 
 def parse_font_faces(css_texts):
-    """[(family, bold, italic, url)] for every loadable @font-face."""
+    """[(family, bold, italic, url, base)] for every loadable
+    @font-face. `base` is the href the sheet came from (None for an
+    inline <style>), because a relative src resolves against the
+    stylesheet rather than the page."""
     faces = []
     for css in css_texts:
+        base = getattr(css, "base", None)
         for m in _FACE_RE.finditer(css):
             body = m.group(1)
             fam = _DECL_RE["family"].search(body)
@@ -54,20 +58,21 @@ def parse_font_faces(css_texts):
                     bold = w == "bold"
             sm = _DECL_RE["style"].search(body)
             italic = bool(sm) and "italic" in sm.group(1).casefold()
-            faces.append((family, bold, italic, url))
+            faces.append((family, bold, italic, url, base))
     return faces
 
 
 def load_web_fonts(css_texts, fetch):
-    """Fetch + register each loadable @font-face; fetch(url) -> bytes
-    (resolution against the page URL is the caller's). Returns the
+    """Fetch + register each loadable @font-face; fetch(url, base) ->
+    bytes, where base is the stylesheet the src was written in (None
+    for an inline <style>) and resolution is the caller's. Returns the
     number of fonts actually registered."""
     if not textengine.available():
         return 0
     loaded = 0
-    for family, bold, italic, url in parse_font_faces(css_texts):
+    for family, bold, italic, url, base in parse_font_faces(css_texts):
         try:
-            data = fetch(url)
+            data = fetch(url, base)
         except Exception:
             continue
         if data and textengine.engine().load_font(

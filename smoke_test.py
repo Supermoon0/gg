@@ -381,14 +381,64 @@ check("box-shadow paints an offset rect behind the box",
 from browser.webfonts import parse_font_faces
 _faces = parse_font_faces(["""@font-face { font-family: 'My Face'; src: url('fonts/a.woff2') format('woff2'), url(fonts/a.ttf) format('truetype'); }@font-face { font-family: IconFont; font-weight: 700; src: url(icons.otf); }@font-face { font-family: WoffOnly; src: url(x.woff2); }@font-face { font-family: DataFont; src: url(data:font/ttf;base64,AAAA); }"""])
 check("@font-face picks the loadable source",
-      ("my face", False, False, "fonts/a.ttf") in _faces, str(_faces))
+      ("my face", False, False, "fonts/a.ttf", None) in _faces, str(_faces))
 check("@font-face numeric weight maps to bold",
-      ("iconfont", True, False, "icons.otf") in _faces, str(_faces))
+      ("iconfont", True, False, "icons.otf", None) in _faces, str(_faces))
 check("woff2-only faces are skipped",
       not any(f[0] == "woffonly" for f in _faces), str(_faces))
 check("data: font sources are accepted",
       any(f[0] == "datafont" and f[3].startswith("data:")
           for f in _faces), str(_faces))
+
+from browser.native import Stylesheet
+_based = parse_font_faces([Stylesheet(
+    "@font-face { font-family: Sheet; src: url(f.ttf); }",
+    "/assets/site.css")])
+check("a font src carries the stylesheet it was written in",
+      _based == [("sheet", False, False, "f.ttf", "/assets/site.css")],
+      str(_based))
+
+# white-space, and the CSS Text 4 longhands it became a shorthand over
+from browser.layout import white_space as _ws
+check("white-space keywords pass through",
+      [_ws({"white-space": k}) for k in
+       ("normal", "pre", "nowrap", "pre-wrap", "pre-line", "break-spaces")]
+      == ["normal", "pre", "nowrap", "pre-wrap", "pre-line",
+          "break-spaces"])
+check("an unset longhand leaves the shorthand alone",
+      _ws({"white-space": "pre", "white-space-collapse": "",
+           "text-wrap": ""}) == "pre")
+check("white-space-collapse:preserve alone means pre-wrap",
+      _ws({"white-space-collapse": "preserve"}) == "pre-wrap")
+check("preserve + nowrap is pre",
+      _ws({"white-space-collapse": "preserve",
+           "text-wrap-mode": "nowrap"}) == "pre")
+check("text-wrap-mode:wrap unwraps a pre shorthand",
+      _ws({"white-space": "pre", "text-wrap-mode": "wrap"}) == "pre-wrap")
+check("text-wrap:balance still wraps",
+      _ws({"text-wrap": "balance"}) == "normal")
+check("an unknown white-space value falls back to normal",
+      _ws({"white-space": "sideways"}) == "normal")
+
+def _lines(css, html):
+    from browser import native
+    from browser.layout import DocumentLayout, paint_tree
+    nodes, _doc, _cs, _lg = native.load_document(
+        "<style>" + css + "</style>" + html, lambda _h: {}, None)
+    doc = DocumentLayout(nodes)
+    doc.layout(800, 600)
+    return [c.native(0) for c in paint_tree(doc, []) if c.native(0)[0] == 1]
+
+
+_RUN = "<div>ab" + " " * 40 + "cd</div>"
+_bsl = _lines("div{font-size:20px;width:80px;white-space:break-spaces}",
+              _RUN)
+check("break-spaces wraps inside an over-wide space run",
+      len({round(c[2]) for c in _bsl if not c[8].strip()}) > 1, str(_bsl[:6]))
+_pwl = _lines("div{font-size:20px;width:80px;white-space:pre-wrap}", _RUN)
+check("pre-wrap hangs the same run past the edge instead",
+      len({round(c[2]) for c in _pwl if not c[8].strip()}) == 1,
+      str(_pwl[:6]))
 
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "

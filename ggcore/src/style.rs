@@ -36,6 +36,17 @@ const INHERITED: &[(&str, &str)] = &[
     ("overflow-wrap", "normal"),
     ("font-variant", "normal"),
     ("text-shadow", "none"),
+    // CSS Text 4 split white-space into these two. Both spellings of
+    // the wrapping half are still in use, and both are inherited, so
+    // a text node has to be able to see them the way it sees
+    // white-space itself. Their initial value is left empty rather
+    // than spelled out ("collapse"/"wrap"), because layout has to be
+    // able to tell "the author set this" from "nobody set this": the
+    // shorthand is not expanded here, so `white-space: pre` alone
+    // would otherwise be overruled by an initial value nobody wrote.
+    ("white-space-collapse", ""),
+    ("text-wrap-mode", ""),
+    ("text-wrap", ""),
 ];
 
 fn parse_px(value: &str, default: f64) -> f64 {
