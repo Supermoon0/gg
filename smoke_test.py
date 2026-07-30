@@ -579,6 +579,39 @@ check("background-clip:padding-box stops at the padding edge",
 check("background-clip:content-box stops at the content edge",
       _bgboxes[2] == [(15, 15, 115, 65)], str(_bgboxes[2]))
 
+# transform: scale and transform-origin
+from browser.layout import parse_transform as _ptf
+check("translate still parses",
+      _ptf("translate(10px, 20px)", 100, 50)[:2] == (10.0, 20.0))
+check("scale reaches the sx/sy fields",
+      _ptf("scale(2, 3)", 100, 50)[2:4] == (2.0, 3.0))
+check("a single scale argument applies to both axes",
+      _ptf("scale(2)", 100, 50)[2:4] == (2.0, 2.0))
+check("a zero scale still hides the subtree",
+      _ptf("scale(0)", 100, 50)[4] is True)
+check("a rotation-free matrix contributes its scale",
+      _ptf("matrix(2,0,0,3,10,20)", 100, 50)[:4] == (10.0, 20.0, 2.0, 3.0))
+check("a matrix with rotation in it contributes no scale",
+      _ptf("matrix(1,0.5,0,1,0,0)", 100, 50)[2:4] == (1.0, 1.0))
+
+_TFD = ("body{margin:0}div{width:100px;height:50px;background:green;"
+        "transform:scale(2);%s}")
+_tfboxes = {
+    org or "default": [tuple(round(v) for v in c[1:5]) for c in
+                       _lines_all(_TFD % org, "<div></div>")
+                       if c[0] == 0 and c[5] == (0, 128, 0)]
+    for org in ("", "transform-origin:top left",
+                "transform-origin:left top", "transform-origin:100% 50%")}
+check("scale is applied about the centre by default",
+      _tfboxes["default"] == [(-50, -25, 150, 75)], str(_tfboxes))
+check("transform-origin keywords name their own axis, in either order",
+      _tfboxes["transform-origin:top left"]
+      == _tfboxes["transform-origin:left top"] == [(0, 0, 200, 100)],
+      str(_tfboxes))
+check("a percentage origin resolves against the border box",
+      _tfboxes["transform-origin:100% 50%"] == [(-100, -25, 100, 75)],
+      str(_tfboxes))
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",

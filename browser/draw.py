@@ -102,6 +102,34 @@ def translate_cmds(cmds, dx, dy):
     return cmds
 
 
+def scale_cmds_about(cmds, sx, sy, ox, oy):
+    """Scale painted commands in place about (ox, oy).
+
+    An axis-aligned scale is the one transform beyond translation that
+    this display list can express exactly: rects stay rects, images
+    keep their target box, and a glyph run scales by scaling its font
+    size, which is what a linearly-scaled outline font does anyway.
+    Rotation and skew turn a rect into a quad and are still ignored.
+    """
+    for c in cmds:
+        c.left = ox + (c.left - ox) * sx
+        c.top = oy + (c.top - oy) * sy
+        if hasattr(c, "right"):
+            c.right = ox + (c.right - ox) * sx
+        c.bottom = oy + (c.bottom - oy) * sy
+        if hasattr(c, "clip_top"):
+            c.clip_top = oy + (c.clip_top - oy) * sy
+            c.clip_bottom = oy + (c.clip_bottom - oy) * sy
+        # an image's x2/y2 are its target size, not a corner
+        if isinstance(c, (DrawImage, DrawBgImage)):
+            c.width *= sx
+            c.height *= sy
+        font = getattr(c, "font", None)
+        if font is not None and hasattr(font, "scaled"):
+            c.font = font.scaled((abs(sx) + abs(sy)) / 2)
+    return cmds
+
+
 class DrawText:
     def __init__(self, x, y, text, font, color):
         self.left = x

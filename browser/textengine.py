@@ -280,6 +280,23 @@ class NativeFont:
         self.gg_linespace = linespace
         self.gg_widths = {}
 
+    def scaled(self, factor):
+        """The same face at `factor` times the size. A scaled glyph run
+        is what an axis-aligned CSS transform does to text, and an
+        outline font renders it identically either way."""
+        if factor == 1.0 or factor <= 0:
+            return self
+        clone = NativeFont.__new__(NativeFont)
+        clone.id = self.id
+        clone.size = self.size * factor
+        ascent, descent, linespace = _engine.metrics(
+            self.id, float(clone.size))
+        clone.gg_ascent = ascent
+        clone.gg_descent = descent
+        clone.gg_linespace = linespace
+        clone.gg_widths = {}
+        return clone
+
     def measure(self, text):
         return _engine.measure(self.id, float(self.size), text)
 

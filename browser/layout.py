@@ -13,7 +13,7 @@ from .colors import NAMED, to_rgb
 from .draw import (DrawBgImage, DrawClipPop, DrawClipPush, DrawGradient,
                    DrawImage, DrawLine, DrawOval, DrawRect, DrawStickyPop,
                    DrawStickyPush, DrawText,
-                   translate_cmds)
+                   scale_cmds_about, translate_cmds)
 from .html_parser import Element, Text, tree_to_list
 from .style import parse_px, parse_size
 
@@ -5036,14 +5036,18 @@ def _z_index(obj):
 
 
 def parse_transform(value, w, h):
-    """CSS transform -> (dx, dy, hidden). The translate components of
-    translate/translateX/translateY/translate3d/matrix are honored
-    (percentages resolve against the element's own border box, the
-    spec's reference box for translate); a zero scale hides the
-    subtree. Rotation, skew, and non-zero scales are ignored —
-    sprite sheets position with translate, which is what ×646 of
-    naver's usage is."""
+    """CSS transform -> (dx, dy, sx, sy, hidden).
+
+    Translation and axis-aligned scale are honoured; percentages in a
+    translate resolve against the element's own border box, which is
+    the spec's reference box for it. A zero scale hides the subtree.
+
+    Rotation and skew are still ignored, and that is a real gap rather
+    than a shrug: they turn a rect into a quad, which this display
+    list has no command for and this rasterizer no polygon fill.
+    """
     dx = dy = 0.0
+    sx = sy = 1.0
     hidden = False
 
     def px(v, base):
@@ -5073,12 +5077,72 @@ def parse_transform(value, w, h):
         elif fn == "matrix" and len(args) == 6:
             dx += px(args[4], w)
             dy += px(args[5], h)
-            if px(args[0], 1) == 0 and px(args[3], 1) == 0:
+            a, b = px(args[0], 1), px(args[1], 1)
+            c, d = px(args[2], 1), px(args[3], 1)
+            if a == 0 and d == 0:
                 hidden = True
-        elif fn in ("scale", "scale3d", "scalex", "scaley"):
-            if all(px(a, 1) == 0 for a in args[:2]):
+            elif b == 0 and c == 0:      # no rotation or skew in it
+                sx *= a
+                sy *= d
+        elif fn in ("scale", "scale3d"):
+            fx = px(args[0], 1)
+            fy = px(args[1], 1) if len(args) > 1 else fx
+            if fx == 0 or fy == 0:
                 hidden = True
-    return dx, dy, hidden
+            else:
+                sx *= fx
+                sy *= fy
+        elif fn == "scalex":
+            fx = px(args[0], 1)
+            hidden = hidden or fx == 0
+            sx *= fx or 1.0
+        elif fn == "scaley":
+            fy = px(args[0], 1)
+            hidden = hidden or fy == 0
+            sy *= fy or 1.0
+    return dx, dy, sx, sy, hidden
+
+
+_ORIGIN_KEYWORDS = {"left": 0.0, "top": 0.0, "center": 0.5,
+                    "right": 1.0, "bottom": 1.0}
+
+
+def _transform_origin(box, w, h):
+    """Absolute (x, y) a transform is applied about. Defaults to the
+    centre of the border box, which is what `50% 50%` means."""
+    spec = (getattr(box.node, "style", None) or {}).get(
+        "transform-origin", "")
+    parts = [p.strip().casefold() for p in spec.split()[:2]]
+    fx = fy = None
+    # `top left` and `left top` mean the same thing, so a side keyword
+    # names its own axis rather than the position it was written in
+    rest = []
+    for part in parts:
+        if part in ("left", "right"):
+            fx = _ORIGIN_KEYWORDS[part]
+        elif part in ("top", "bottom"):
+            fy = _ORIGIN_KEYWORDS[part]
+        else:
+            rest.append(part)
+    for part in rest:
+        axis_x = fx is None
+        if part == "center":
+            value = 0.5
+        else:
+            val = parse_size(part, w if axis_x else h)
+            base = w if axis_x else h
+            if val is None or not base:
+                continue
+            value = val / base
+        if axis_x:
+            fx = value
+        elif fy is None:
+            fy = value
+    fx = 0.5 if fx is None else fx
+    fy = 0.5 if fy is None else fy
+    left = box.x - box.pl - box.bl
+    top = box.y - box.pt - box.bt
+    return left + w * fx, top + h * fy
 
 
 def paint_tree(layout_object, display_list):
@@ -5108,9 +5172,12 @@ def paint_tree(layout_object, display_list):
                       + ancestor.pr + ancestor.br)
                 ah = (ancestor.bt + ancestor.pt + ancestor.height
                       + ancestor.pb + ancestor.bb)
-                dx, dy, hidden = parse_transform(atf, aw, ah)
+                dx, dy, sx, sy, hidden = parse_transform(atf, aw, ah)
                 if hidden:
                     return display_list
+                if sx != 1.0 or sy != 1.0:
+                    ox, oy = _transform_origin(ancestor, aw, ah)
+                    scale_cmds_about(sub, sx, sy, ox, oy)
                 if dx or dy:
                     translate_cmds(sub, dx, dy)
             if tf and tf != "none":
@@ -5120,10 +5187,12 @@ def paint_tree(layout_object, display_list):
                 bh = (layout_object.bt + layout_object.pt
                       + layout_object.height + layout_object.pb
                       + layout_object.bb)
-                dx, dy, hidden = parse_transform(
-                    tf, bw, bh)
+                dx, dy, sx, sy, hidden = parse_transform(tf, bw, bh)
                 if hidden:
                     return display_list
+                if sx != 1.0 or sy != 1.0:
+                    ox, oy = _transform_origin(layout_object, bw, bh)
+                    scale_cmds_about(sub, sx, sy, ox, oy)
                 if dx or dy:
                     translate_cmds(sub, dx, dy)
             if aclips:
