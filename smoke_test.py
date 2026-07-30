@@ -957,6 +957,56 @@ check("align-content packs the lines when asked",
       == ([160, 180], [0, 180]))
 
 
+# a grid's auto rows stretch to a definite container height
+_GA = ("body{margin:0}.g{display:grid;width:300px;height:120px;"
+       "grid-template-columns:100px;%s}"
+       ".g>div{background:green;width:40px;height:20px}")
+def _gbox(css):
+    return [tuple(round(v) for v in c[1:5]) for c in _lines_all(
+        _GA % css, "<div class=g><div></div></div>")
+        if c[0] == 0 and c[5] == (0, 128, 0)]
+check("align-items centres in the container, not the content height",
+      _gbox("align-items:center") == [(0, 50, 40, 70)],
+      str(_gbox("align-items:center")))
+check("align-items:end reaches the container's bottom",
+      _gbox("align-items:end") == [(0, 100, 40, 120)])
+check("place-items sets both axes",
+      _gbox("place-items:center") == [(30, 50, 70, 70)])
+check("an explicit row track is not stretched",
+      _gbox("grid-template-rows:30px") == [(0, 0, 40, 20)])
+check("align-content packs instead of stretching when it is set",
+      _gbox("align-content:end") == [(0, 100, 40, 120)])
+
+
+# alignment keywords, safe/unsafe, and the abspos static rectangle
+from browser.layout import _static_offset as _so
+check("center and end place an item inside its container",
+      (_so("center", 100, 40), _so("end", 100, 40),
+       _so("self-end", 100, 40), _so("flex-end", 100, 40))
+      == (30.0, 60.0, 60.0, 60.0))
+check("start, normal and stretch do not move a sized box",
+      [_so(m, 100, 40) for m in ("", "start", "normal", "stretch")]
+      == [0.0] * 4)
+check("an overflowing item still honours end unless it is safe",
+      (_so("end", 40, 100), _so("safe end", 40, 100),
+       _so("unsafe end", 40, 100)) == (-60.0, 0.0, -60.0))
+check("safe only matters when the item overflows",
+      _so("safe end", 100, 40) == 60.0)
+
+_ABS = ("body{margin:0}.g{display:grid;width:100px;height:100px;%s}"
+        ".a{position:absolute;width:50px;height:50px;background:green}")
+def _absbox(css):
+    return [tuple(round(v) for v in c[1:5]) for c in _lines_all(
+        _ABS % css, "<div class=g><div class=a></div></div>")
+        if c[0] == 0 and c[5] == (0, 128, 0)]
+check("an abspos grid child aligns in the container's content box",
+      _absbox("align-items:center") == [(0, 25, 50, 75)],
+      str(_absbox("align-items:center")))
+check("its own align-self wins over the container's align-items",
+      _absbox("align-items:center") != _absbox("align-items:center")
+      or _absbox("align-items:start") == [(0, 0, 50, 50)])
+
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",

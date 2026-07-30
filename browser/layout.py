@@ -1059,6 +1059,32 @@ def _ch_width(node):
         return None
 
 
+def _static_offset(mode, available, used):
+    """How far an item is pushed inside its alignment container by an
+    alignment keyword. `stretch`/`normal` do not move a box that has a
+    size of its own, which an out-of-flow box always does.
+
+    An item bigger than the container has negative free space, and the
+    keyword still applies to it — `end` on an overflowing box hangs it
+    off the start edge. That is what the `safe` overflow-position
+    exists to prevent: with `safe`, an overflowing item falls back to
+    start so its beginning stays reachable.
+    """
+    tokens = (mode or "").strip().casefold().split()
+    if not tokens:
+        return 0.0
+    safe = "safe" in tokens
+    keyword = tokens[-1]
+    free = available - used
+    if free < 0 and safe:
+        return 0.0
+    if keyword == "center":
+        return free / 2
+    if keyword in ("end", "flex-end", "right", "self-end"):
+        return free
+    return 0.0
+
+
 def distribute_free_space(free, count, mode):
     """(leading offset, extra gap) for a content-distribution keyword.
 
@@ -2386,18 +2412,40 @@ class DocumentLayout:
                 else:
                     box.margin_bottom = leftover_v
 
+            # An out-of-flow child of a flex or grid container does not
+            # fall back to a point: its static position rectangle is the
+            # container's content box, and the container's item
+            # alignment places it inside that rectangle (CSS Position 3
+            # §4.1, CSS Align 3 §5.2). Without this an abspos child of
+            # an `align-items: center` grid sat in the top-left corner.
+            sx, sy = static_x, static_y
+            align_from = getattr(node, "_static_align", None)
+            if align_from is not None:
+                jmode, amode, holder, self_inline = align_from
+                # the child's own -self value wins over the container's
+                # -items default, the same way it would in flow
+                if self_inline:
+                    jmode = (st.get("justify-self")
+                             or "").strip().casefold() or jmode
+                amode = (st.get("align-self") or "").strip().casefold() \
+                    or amode
+                sx += _static_offset(
+                    jmode, holder.width, box.outer_width())
+                sy += _static_offset(
+                    amode, holder.height, box.outer_height())
+
             if left is not None:
                 target_x = cb_x + left
             elif right is not None:
                 target_x = cb_x + cb_w - right - box.outer_width()
             else:
-                target_x = static_x
+                target_x = sx
             if top is not None:
                 target_y = cb_y + top
             elif bottom is not None:
                 target_y = cb_y + cb_h - bottom - box.outer_height()
             else:
-                target_y = static_y
+                target_y = sy
             translate(box,
                       target_x - (box.x - box.pl - box.bl - box.ml),
                       target_y - (box.y - box.pt - box.bt
@@ -3132,6 +3180,14 @@ class BlockLayout:
             if not is_visible(child):
                 continue
             if is_out_of_flow(child):
+                # a flex item has no justify-self — the main axis is
+                # the container's justify-content and nothing else, so
+                # the child's own value must not be consulted
+                child._static_align = (
+                    (node.style.get("justify-content") or "").strip()
+                    .casefold(),
+                    (node.style.get("align-items") or "").strip().casefold(),
+                    self, False)
                 self._queue_abs(child, self.x, self.y)
                 continue
             if isinstance(child, Text) and not child.text.strip():
@@ -3735,6 +3791,8 @@ class BlockLayout:
             if not (isinstance(child, Element) and is_visible(child)):
                 continue
             if is_out_of_flow(child):
+                child._static_align = (
+                    justify_items, align_items, self, True)
                 self._queue_abs(child, self.x, self.y)
                 continue
             items.append(child)
@@ -3947,6 +4005,22 @@ class BlockLayout:
         row_y = [0.0] * nrows
         ac = (style.get("align-content") or "").strip().casefold()
         used_h = sum(row_h) + row_gap * max(nrows - 1, 0)
+        if self.definite_height is not None \
+                and ac in ("", "normal", "stretch") \
+                and self.definite_height > used_h:
+            # CSS Grid 1 §12.8 again, on the block axis: with no
+            # explicit distribution the auto rows share the container's
+            # leftover height. Without this an `align-items: center`
+            # item centres inside its own content height, which is to
+            # say it does not move.
+            auto_rows = [r for r in range(nrows)
+                         if r >= len(row_tracks)
+                         or row_tracks[r][0] == "intrinsic"]
+            if auto_rows:
+                grow_each = (self.definite_height - used_h) / len(auto_rows)
+                for r in auto_rows:
+                    row_h[r] += grow_each
+                used_h = sum(row_h) + row_gap * max(nrows - 1, 0)
         v_lead, v_spread = distribute_free_space(
             (self.definite_height - used_h)
             if self.definite_height is not None else 0.0, nrows, ac)
@@ -3972,24 +4046,17 @@ class BlockLayout:
             mr_auto = child.style.get("margin-right", "").strip() == "auto"
             mt_auto = child.style.get("margin-top", "").strip() == "auto"
             mb_auto = child.style.get("margin-bottom", "").strip() == "auto"
+            # auto margins eat the free space before alignment gets it
             if ml_auto or mr_auto:
                 dx = (free_x / 2 if ml_auto and mr_auto
                       else free_x if ml_auto else 0.0)
-            elif justify_self == "center":
-                dx = free_x / 2
-            elif justify_self in ("end", "flex-end", "right"):
-                dx = free_x
             else:
-                dx = 0.0
+                dx = _static_offset(justify_self, area_w, area_w - free_x)
             if mt_auto or mb_auto:
                 dy = (free_y / 2 if mt_auto and mb_auto
                       else free_y if mt_auto else 0.0)
-            elif align_self == "center":
-                dy = free_y / 2
-            elif align_self in ("end", "flex-end"):
-                dy = free_y
             else:
-                dy = 0.0
+                dy = _static_offset(align_self, area_h, area_h - free_y)
             box.flex_origin = (
                 self.x + col_x[c0] + dx,
                 self.y + row_y[r0] + dy)
