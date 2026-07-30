@@ -7665,6 +7665,51 @@ console.log('B typeof it: ' + typeof it);
         assert_eq!(n("new ArrayBuffer(NaN).byteLength"), 0.0);
     }
 
+    /// `split` with a regex splices the separator's capture groups
+    /// between the pieces. Dropping them truncated every testharness
+    /// assertion message at its first placeholder, so 11201 WPT
+    /// failures all read "expected " and nothing else.
+    #[test]
+    fn split_keeps_regex_capture_groups() {
+        assert_eq!(
+            n(r#"JSON.stringify("a1b2c".split(/([0-9])/))
+                   === '["a","1","b","2","c"]' ? 1 : 0"#),
+            1.0);
+        // the shape testharness.js formats its messages with
+        assert_eq!(
+            n(r#"JSON.stringify(
+                   "expected ${a} but got ${b}".split(/\$\{([^ }]*)\}/g))
+                 === '["expected ","a"," but got ","b",""]' ? 1 : 0"#),
+            1.0);
+        // a group that did not participate is undefined, not ""
+        assert_eq!(
+            n(r#"var r = "ab".split(/(x)|(b)/);
+                 r.length === 4 && r[0] === "a" && r[1] === undefined
+                   && r[3] === "" ? 1 : 0"#),
+            1.0);
+        // no groups is unchanged
+        assert_eq!(
+            n(r#"JSON.stringify("a1b2c".split(/[0-9]/))
+                   === '["a","b","c"]' ? 1 : 0"#),
+            1.0);
+        // an empty match never fires at position == length
+        assert_eq!(
+            n(r#"JSON.stringify("abc".split(/(?:)/))
+                   === '["a","b","c"]' ? 1 : 0"#),
+            1.0);
+        // a separator at the very end still leaves a trailing piece
+        assert_eq!(
+            n(r#"JSON.stringify("ab".split(/b/)) === '["a",""]' ? 1 : 0"#),
+            1.0);
+        assert_eq!(
+            n(r#"JSON.stringify(",a,".split(",")) === '["","a",""]'
+                 ? 1 : 0"#),
+            1.0);
+        assert_eq!(
+            n(r#"JSON.stringify("abc".split(/z/)) === '["abc"]' ? 1 : 0"#),
+            1.0);
+    }
+
     /// VT and FF are WhiteSpace in the grammar, same as space and tab.
     #[test]
     fn vertical_tab_and_form_feed_are_whitespace() {

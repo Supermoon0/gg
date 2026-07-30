@@ -854,18 +854,46 @@ impl CompiledRe {
         }
         out
     }
-    fn split_vec(&self, s: &str) -> Vec<String> {
-        match self {
-            CompiledRe::Std(r) => {
-                r.split(s).map(|p| p.to_string()).collect()
+    /// `String.prototype.split` with a regex, including the separator's
+    /// capture groups in the output.
+    ///
+    /// That last part is the whole reason this is not `r.split(s)`: the
+    /// spec splices every capture between the pieces, and code leans on
+    /// it. testharness.js formats every assertion message by splitting
+    /// on `/\$\{([^ }]*)\}/` and reading the captures back out of the
+    /// result — without them, every failure message in the suite came
+    /// out truncated at the first placeholder.
+    ///
+    /// `None` for a group that did not participate, which the caller
+    /// turns into `undefined`.
+    fn split_captures(&self, s: &str) -> Vec<Option<String>> {
+        let mut out: Vec<Option<String>> = Vec::new();
+        let mut last = 0usize;
+        let mut at = 0usize;
+        // the spec never attempts a match at position == length, which
+        // is what keeps "abc".split(/(?:)/) from trailing an empty
+        while at < s.len() {
+            let Some((ms, me, caps)) = self.captures_at(&s[at..]) else {
+                break;
+            };
+            let (ms, me) = (at + ms, at + me);
+            // a zero-width match at the current position would spin
+            if me == ms && ms == last {
+                at = match s[at..].chars().next() {
+                    Some(c) => at + c.len_utf8(),
+                    None => break,
+                };
+                continue;
             }
-            CompiledRe::Fancy(r) => r
-                .split(s)
-                .filter_map(|p| p.ok())
-                .map(|p| p.to_string())
-                .collect(),
-            CompiledRe::Never => vec![s.to_string()],
+            out.push(Some(s[last..ms].to_string()));
+            for c in caps.iter().skip(1) {
+                out.push(c.clone());
+            }
+            last = me;
+            at = if me == ms { me + 1 } else { me };
         }
+        out.push(Some(s[last.min(s.len())..].to_string()));
+        out
     }
 }
 
@@ -4247,12 +4275,15 @@ fn method_ref_dispatch(
             let pat = args.first().copied().unwrap_or(Value::UNDEFINED);
             let parts: Vec<Value> = if let Some(ri) = regex_index(st, pat)
             {
-                let raw = st.regexes[ri].re.split_vec(&s);
+                let raw = st.regexes[ri].re.split_captures(&s);
                 if raw.len() > MAX_MATERIALIZE {
                     return range_err("too many split results");
                 }
                 raw.into_iter()
-                    .map(|p| make_string(st, p))
+                    .map(|p| match p {
+                        Some(t) => make_string(st, t),
+                        None => Value::UNDEFINED,
+                    })
                     .collect()
             } else if pat.is_undefined() {
                 vec![make_string(st, s.clone())]
@@ -14130,14 +14161,19 @@ fn exec_loop(
                         "split" => {
                             let mut vals: Vec<Value> =
                                 if let Some(ri) = regex_index(st, av0) {
-                                    let parts =
-                                        st.regexes[ri].re.split_vec(&s);
+                                    let parts = st.regexes[ri]
+                                        .re
+                                        .split_captures(&s);
                                     if parts.len() > MAX_MATERIALIZE {
                                         return range_err(
                                             "too many split results");
                                     }
                                     parts.into_iter()
-                                        .map(|p| push_str(st, p)).collect()
+                                        .map(|p| match p {
+                                            Some(t) => push_str(st, t),
+                                            None => Value::UNDEFINED,
+                                        })
+                                        .collect()
                                 } else if argc == 0 {
                                     vec![push_str(st, s.clone())]
                                 } else {
