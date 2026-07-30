@@ -612,6 +612,27 @@ check("a percentage origin resolves against the border box",
       _tfboxes["transform-origin:100% 50%"] == [(-100, -25, 100, 75)],
       str(_tfboxes))
 
+# aspect-ratio gives an auto height a definite one
+def _arbox(css):
+    return [tuple(round(v) for v in c[1:5]) for c in
+            _lines_all("body{margin:0}div{background:green;width:200px;"
+                       + css + "}", "<div></div>")
+            if c[0] == 0 and c[5] == (0, 128, 0)]
+check("aspect-ratio sizes the auto axis",
+      _arbox("aspect-ratio:2") == [(0, 0, 200, 100)], str(_arbox("aspect-ratio:2")))
+check("a ratio with a slash parses",
+      _arbox("aspect-ratio:16/9") == [(0, 0, 200, 112)])
+check("a specified height outranks the ratio",
+      _arbox("aspect-ratio:1;height:60px") == [(0, 0, 200, 60)])
+check("aspect-ratio:auto does nothing",
+      _arbox("aspect-ratio:auto") == [(0, 0, 200, 0)])
+check("the ratio sizes the box box-sizing names",
+      (_arbox("aspect-ratio:2;padding:10px"),
+       _arbox("aspect-ratio:2;padding:10px;box-sizing:border-box"))
+      == ([(0, 0, 220, 120)], [(0, 0, 200, 100)]))
+check("min-height still clamps a ratio-derived height",
+      _arbox("aspect-ratio:1;min-height:300px") == [(0, 0, 200, 300)])
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",

@@ -2607,6 +2607,24 @@ class BlockLayout:
         if self.definite_height is not None:
             self.height = self.definite_height
 
+        # aspect-ratio gives an auto height a definite one, derived from
+        # the width the box already has. It only applies when the other
+        # axis is auto — a box with both width and height specified is
+        # that size and the ratio is ignored (CSS Sizing 4 §4).
+        if spec_h is None and self.definite_height is None:
+            ratio = _parse_aspect_ratio(st.get("aspect-ratio"))
+            if ratio and ratio > 0:
+                # the ratio sizes whichever box box-sizing names, so
+                # padding and border join the ratio under border-box and
+                # sit outside it under the content-box default
+                if border_box:
+                    from_ratio = (
+                        self.bl + self.pl + self.width + self.pr + self.br
+                    ) / ratio - (self.pt + self.pb + self.bt + self.bb)
+                else:
+                    from_ratio = self.width / ratio
+                self.height = max(from_ratio, 0.0)
+
         # min-height / max-height clamp the used content height
         # (CSS 2.1 §10.7)
         maxh = self._content_height_limit(st.get("max-height"), em)
