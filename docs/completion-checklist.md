@@ -19,7 +19,8 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
 |---|---|---|
 | HTML 파서 | **1796/1796 (100%)** | html5lib-tests, cargo test |
 | JS 엔진 | **27,379/102,655 (26.67%)** | Test262, baseline regression=0 |
-| CSS | **4,344/24,862 (17.47%)** | WPT css, baseline regression=0 |
+| CSS (script) | **4,344/24,862 (17.47%)** | WPT css testharness |
+| CSS (render) | **4,879/17,271 (28.25%)** | WPT css reftest, 픽셀 비교 |
 | CSS (자체) | 23/23 | css_gauntlet |
 | JS 계약 | 28/31 | jsvm_gauntlet (3건은 문서화된 GAP) |
 | 내장 계약 | 9/9 | conformance |
@@ -169,7 +170,15 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
       opacity(가시성 컬링만, 알파 합성 없음)
       *주의: 이 목록은 두 번 틀렸다. 프로퍼티마다 조건을 지어 확인할 것 —
       배경 없는 div는 rect를 안 그리고 짧은 텍스트는 줄바꿈이 없다*
-- [ ] **reftest 16,368개** — 픽셀 비교 하네스가 필요하다
+- [x] **reftest 픽셀 하네스** — `validation/wpt_css_reftest.py`.
+      16,937 파일 / 17,271 비교, **4,879 통과 (28.25%)**. 저장된 이미지가
+      아니라 *같은 엔진의 두 렌더*를 비교하므로 골든 파일도 폰트 일치도
+      필요 없다. 이제 렌더링 수정이 숫자로 보인다
+- [ ] **픽셀 불일치 11,690건** — 480,000픽셀 중 중앙값 10,000(약 2%)이
+      어긋난다. 여기가 레이아웃·페인트 정확도의 본체
+- [ ] **mismatch인데 동일하게 렌더 365건** — 달라야 하는데 같다
+- [ ] **참조가 코퍼스 밖 308건** — sparse checkout에 `/common/` 등이
+      빠져 있다. 하네스가 아니라 코퍼스 문제
 
 ## 4단계 — 웹 플랫폼 (부분)
 
