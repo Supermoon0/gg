@@ -499,6 +499,32 @@ check("position:absolute with no offsets still paints, in flow order",
       any(c[0] == 0 and c[5] == (0, 128, 0) and round(c[2]) > 0
           for c in _abs_cmds), str(_abs_cmds))
 
+# -webkit-line-clamp only applies inside the legacy box
+from browser.layout import line_clamp_count as _lcc, block_ellipsis as _be
+check("-webkit-line-clamp alone does not clamp",
+      _lcc({"-webkit-line-clamp": "3"}) is None)
+check("-webkit-line-clamp clamps inside -webkit-box",
+      _lcc({"-webkit-line-clamp": "3", "display": "-webkit-box",
+            "-webkit-box-orient": "vertical"}) == 3)
+check("a horizontal -webkit-box does not clamp",
+      _lcc({"-webkit-line-clamp": "3", "display": "-webkit-box",
+            "-webkit-box-orient": "horizontal"}) is None)
+check("line-clamp applies to any block container",
+      _lcc({"line-clamp": "2"}) == 2)
+check("line-clamp:none defers to the legacy trigger",
+      _lcc({"line-clamp": "none", "-webkit-line-clamp": "2"}) is None)
+check("block-ellipsis picks the marker",
+      (_be({}), _be({"block-ellipsis": "none"}),
+       _be({"block-ellipsis": "'...'"})) == ("\u2026", "", "..."))
+
+_clamped = _lines_all(
+    "div{width:80px;font-size:16px;display:-webkit-box;"
+    "-webkit-box-orient:vertical;-webkit-line-clamp:2}",
+    "<div>alpha beta gamma delta epsilon zeta</div>")
+check("a clamped block keeps N lines and marks the last",
+      [c[8] for c in _clamped if c[0] == 1] == ["alpha", "beta\u2026"],
+      str([c[8] for c in _clamped if c[0] == 1]))
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",

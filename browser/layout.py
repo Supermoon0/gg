@@ -890,6 +890,45 @@ def white_space(style):
     return _WS_FROM_LONGHANDS.get((collapse, wraps), ws)
 
 
+def line_clamp_count(style):
+    """How many lines this element clamps to, or None.
+
+    The two spellings do not have the same trigger. `-webkit-line-clamp`
+    is the legacy property and only applies inside the legacy box
+    (`display: -webkit-box` with `-webkit-box-orient: vertical`) — an
+    element that merely names it is not clamped, which is exactly what
+    the corpus tests. `line-clamp` is the CSS Overflow 4 property and
+    applies to any block container.
+    """
+    modern = (style.get("line-clamp") or "").strip().casefold()
+    legacy = (style.get("-webkit-line-clamp") or "").strip().casefold()
+    value = modern
+    if not value or value == "none":
+        display = (style.get("display") or "").strip().casefold()
+        orient = (style.get("-webkit-box-orient")
+                  or style.get("box-orient") or "").strip().casefold()
+        if display not in ("-webkit-box", "-webkit-inline-box") \
+                or orient != "vertical":
+            return None
+        value = legacy
+    if not value.isdigit():
+        return None
+    return int(value) or None
+
+
+def block_ellipsis(style):
+    """The string that marks a clamped line. `block-ellipsis` can name
+    its own, and `none` means the line just ends."""
+    spec = (style.get("block-ellipsis") or "").strip()
+    if not spec or spec.casefold() == "auto":
+        return "…"
+    if spec.casefold() == "none":
+        return ""
+    if len(spec) >= 2 and spec[0] == spec[-1] and spec[0] in "\"'":
+        return spec[1:-1]
+    return spec
+
+
 def is_visible(node):
     if node.style.get("display", "inline") == "none":
         return False
@@ -2495,16 +2534,15 @@ class BlockLayout:
             # -webkit-line-clamp: N — keep the first N wrapped lines and
             # mark the overflow with an ellipsis (card titles clamp to 2
             # lines so a grid of cards stays uniform height).
-            clamp = st.get("-webkit-line-clamp") or st.get("line-clamp")
-            if clamp and clamp.strip().isdigit():
-                n_lines = int(clamp)
-                if n_lines >= 1 and len(self.children) > n_lines:
-                    self.children = self.children[:n_lines]
-                    last = self.children[-1]
-                    words = [w for w in last.children
-                             if isinstance(w, TextLayout)]
-                    if words:
-                        words[-1].word = words[-1].word.rstrip() + "…"
+            n_lines = line_clamp_count(st)
+            if n_lines and len(self.children) > n_lines:
+                self.children = self.children[:n_lines]
+                last = self.children[-1]
+                words = [w for w in last.children
+                         if isinstance(w, TextLayout)]
+                if words:
+                    words[-1].word = words[-1].word.rstrip() \
+                        + block_ellipsis(st)
             for line in self.children:
                 line.layout()
             self.height = sum(line.height for line in self.children)
