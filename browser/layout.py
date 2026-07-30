@@ -1218,27 +1218,37 @@ def list_style_type(node):
     return "disc"
 
 
+def _int_attr(el, name, default):
+    try:
+        return int(str(el.attributes.get(name, "")).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 def _list_item_index(node):
-    """1-based position of an <li> among its list siblings, honouring a
-    `value` attribute the way the HTML parser's counter would."""
+    """The counter value an <li> shows.
+
+    Counting starts at the list's `start` attribute (1 by default, and
+    the count runs backwards from the item total when the list is
+    `reversed`), and any item's own `value` attribute resets it. All
+    three are ordinary HTML that a numbered list uses the moment it is
+    split across two <ol>s or counts down.
+    """
     parent = getattr(node, "parent", None)
     if not isinstance(parent, Element):
         return 1
-    index = 0
-    for child in parent.children:
-        if not (isinstance(child, Element) and child.tag == "li"):
-            continue
-        raw = child.attributes.get("value")
-        if raw is not None:
-            try:
-                index = int(str(raw).strip())
-            except ValueError:
-                index += 1
-        else:
-            index += 1
+    items = [c for c in parent.children
+             if isinstance(c, Element) and c.tag == "li"]
+    reverse = parent.attributes.get("reversed") is not None
+    index = _int_attr(parent, "start",
+                      len(items) if reverse else 1)
+    step = -1 if reverse else 1
+    for child in items:
+        index = _int_attr(child, "value", index)
         if child is node:
             return index
-    return max(index, 1)
+        index += step
+    return index
 
 
 def _alpha_label(n, upper=False):
@@ -1278,7 +1288,11 @@ def marker_label(kind, index):
     elif kind == "upper-roman":
         text = _roman_label(index, upper=True)
     else:
-        return ""
+        # An unknown name is a @counter-style this engine does not
+        # define, and the spec's fallback for one is decimal — not
+        # "draw nothing", which is what returning "" here would do to
+        # every list whose style came from an at-rule.
+        text = str(index)
     return text + "."
 
 
@@ -2771,7 +2785,16 @@ class BlockLayout:
                     ) / ratio - (self.pt + self.pb + self.bt + self.bb)
                 else:
                     from_ratio = self.width / ratio
-                self.height = max(from_ratio, 0.0)
+                from_ratio = max(from_ratio, 0.0)
+                # min-height's initial value is auto, and for a box with
+                # a preferred aspect ratio auto is the content-based
+                # minimum — so a ratio that would cut the content short
+                # loses to the content instead of clipping it. An
+                # explicit min-height (0 included) says otherwise.
+                raw_min = (st.get("min-height") or "auto").strip().casefold()
+                if raw_min == "auto":
+                    from_ratio = max(from_ratio, self.height)
+                self.height = from_ratio
 
         # min-height / max-height clamp the used content height
         # (CSS 2.1 §10.7)

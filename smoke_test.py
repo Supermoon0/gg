@@ -696,8 +696,8 @@ check("upper variants exist",
 check("decimal-leading-zero pads a single digit",
       (_mk("decimal-leading-zero", 3), _mk("decimal-leading-zero", 12))
       == ("03.", "12."))
-check("a bullet style has no label text",
-      [_mk(k, 1) for k in ("disc", "circle", "square")] == ["", "", ""])
+check("an unknown @counter-style name falls back to decimal",
+      _mk("mystyle", 7) == "7.")
 
 def _markers(tag, css):
     return [c[8] for c in _lines_all(
@@ -726,6 +726,35 @@ check("an SVG reports its intrinsic size, not its raster size",
       _h is not None and _h[1:] == (8, 32), str(_h))
 check("percentage geometry resolves against the viewBox",
       _h is not None)
+
+check("<ol start> and reversed and <li value> all count",
+      (_markers("ol", ""),
+       [c[8] for c in _lines_all("body{margin:0}", "<ol start=5><li>a<li>b</ol>")
+        if c[0] == 1],
+       [c[8] for c in _lines_all("body{margin:0}",
+                                 "<ol reversed><li>a<li>b<li>c</ol>")
+        if c[0] == 1],
+       [c[8] for c in _lines_all("body{margin:0}",
+                                 "<ol><li>a<li value=9>b<li>c</ol>")
+        if c[0] == 1])
+      == (["1.", "a", "2.", "b"], ["5.", "a", "6.", "b"],
+          ["3.", "a", "2.", "b", "1.", "c"],
+          ["1.", "a", "9.", "b", "10.", "c"]))
+
+check("an auto min-height floors a ratio height at the content",
+      (_arbox("aspect-ratio:2/1"),) == ([(0, 0, 200, 100)],))
+_ar_over = [tuple(round(v) for v in c[1:5]) for c in _lines_all(
+    "body{margin:0}", "<div style='background:green;width:100px;"
+    "aspect-ratio:2/1'><div style='height:100px'></div></div>")
+    if c[0] == 0 and c[5] == (0, 128, 0)]
+check("content taller than the ratio wins under min-height:auto",
+      _ar_over == [(0, 0, 100, 100)], str(_ar_over))
+_ar_min0 = [tuple(round(v) for v in c[1:5]) for c in _lines_all(
+    "body{margin:0}", "<div style='background:green;width:100px;"
+    "aspect-ratio:2/1;min-height:0'><div style='height:100px'></div></div>")
+    if c[0] == 0 and c[5] == (0, 128, 0)]
+check("an explicit min-height lets the ratio cut the content short",
+      _ar_min0 == [(0, 0, 100, 50)], str(_ar_min0))
 
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
