@@ -5,6 +5,13 @@
 
 ## 현재 진행 요약
 
+> 전체 궤적(처음부터 완성까지)과 완성의 정의는
+> [completion-checklist.md](completion-checklist.md)에 있다. 이 문서는
+> 기능 단위의 상세 이력을 담는다. 두 축을 혼동하지 않기 위해 적어두면 —
+> 아래 "P0 9/9, P1 8/8, P2 17/17 완료"는 *기능* 축이고, *정합성* 축은
+> Test262 26.67%로 별개다.
+
+
 - 완료: P0 9/9, P1 8/8, P2 17/17, Boa 제거와 gg-js 단일화
 - 진행할 핵심: renderer crash isolation 완료 → shared frame/network service →
   renderer sandbox/quota → P3 제품화
