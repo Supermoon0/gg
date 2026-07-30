@@ -5596,4 +5596,24 @@ check("overflow: a nested clip rect scrolls with its content",
               - 30.0) < 0.01,
       repr((_sc_clip_before[0].clip_top, _sc_clip_after[0].clip_top)))
 
+
+
+# UAX 14: a line may break between ideographs, but not after an
+# opening bracket and not before a closing one or a full stop
+from browser.layout import break_segments as _bs
+check("ideographs break apart, closers and openers stay attached",
+      (_bs("中中‚文"), _bs("中文。中"), _bs("「中」文"))
+      == (["中", "中", "‚文"], ["中", "文。", "中"], ["「中」", "文"]))
+check("keep-all suppresses the ideograph breaks but not the spaces",
+      (_bs("字字　字字", cjk=False), _bs("字字　字字"))
+      == (["字字　", "字字"], ["字", "字　", "字", "字"]))
+
+# a grid item's z-index orders painting even when it is not positioned
+_ZG = ("body{margin:0}.g{display:grid}.g>div{grid-area:1/1;height:20px}"
+       ".a{background:red}.b{background:green;z-index:1}")
+check("a static grid item still paints in z-index order",
+      [c[5] for c in _lines_all(
+          _ZG, "<div class=g><div class=b></div><div class=a></div></div>")
+       if c[0] == 0 and c[5] in ((255, 0, 0), (0, 128, 0))][-1]
+      == (0, 128, 0))
 print(f"\n{passed} checks passed - engine pipeline OK")

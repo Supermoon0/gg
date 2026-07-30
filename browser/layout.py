@@ -1562,6 +1562,29 @@ def hang_trim(word):
     return word[:i]
 
 
+# UAX 14, the part that matters once a line may break between any two
+# ideographs: some characters refuse to be left dangling. Nothing
+# breaks after an opening bracket or quote (class OP), and nothing
+# breaks before a closing one, a full stop, a comma, a small kana or a
+# sound mark (classes CL, CP, EX, IS, NS). Without this `中中‚文` in a
+# box three ideographs wide wraps as `中中‚` / `文`, stranding the
+# opening quote at the end of a line where no typesetter would leave it.
+_LB_NO_BREAK_AFTER = frozenset(
+    "([{‘“‚„〈《「『【〔"
+    "〖〘〚〝（［｛｟｢⦅"
+    "$£¥€￡￥＄＃")
+_LB_NO_BREAK_BEFORE = frozenset(
+    ")]}’”〉》」』】〕〗〙"
+    "〛〞）］｝｠｣⦆"
+    "!?！？‼⁇⁈⁉"
+    ",.:;、。，．：；"
+    "ー〜ゝゞヽヾ々‐–—・"
+    "ぁぃぅぇぉっゃゅょゎ"
+    "ァィゥェォッャュョヮ"
+    "ヵヶ"
+    "%‰°′″℃¢")
+
+
 def break_segments(word, cjk=True):
     """`word` cut at its break opportunities.
 
@@ -1573,17 +1596,17 @@ def break_segments(word, cjk=True):
     name, ideographic space is a space, not an ideograph.
     """
     segs, buf = [], ""
-    for ch in word:
+    for i, ch in enumerate(word):
         if ch in BREAK_SPACE:
             segs.append(buf + ch)
             buf = ""
-        elif cjk and _is_cjk(ch):
-            if buf:
-                segs.append(buf)
-            segs.append(ch)
+            continue
+        opens = cjk and (_is_cjk(ch) or (buf and _is_cjk(buf[-1])))
+        if opens and buf and buf[-1] not in _LB_NO_BREAK_AFTER \
+                and ch not in _LB_NO_BREAK_BEFORE:
+            segs.append(buf)
             buf = ""
-        else:
-            buf += ch
+        buf += ch
     if buf:
         segs.append(buf)
     return segs
@@ -2774,8 +2797,14 @@ class DocumentLayout:
             # both offsets given is over-constrained the useful way —
             # the box stretches between them. Without this a
             # `top:0; bottom:0; height:auto` overlay was content-tall.
+            # An aspect ratio outranks the stretch: with a ratio and a
+            # resolved inline size the block size comes from the ratio
+            # and `bottom` is the over-constrained offset (CSS Sizing 4
+            # §4), so a 1/1 box inset to 0 in a 100x500 block is a
+            # 100px square rather than a 100x500 column.
             if auto_size(st, "height") \
-                    and top is not None and bottom is not None:
+                    and top is not None and bottom is not None \
+                    and not _parse_aspect_ratio(st.get("aspect-ratio")):
                 box.forced_height = max(cb_h - top - bottom, 0.0)
             self.children.append(box)
             box.layout()
@@ -4287,7 +4316,14 @@ class BlockLayout:
             cols_spec, self.width, em, col_gap)
         explicit_cols = len(tracks)
         if not tracks:
-            tracks = [("fr", 1.0)]
+            # No template: the one implicit column is sized by
+            # grid-auto-columns, whose initial value is `auto`. An auto
+            # track still stretches into the container, so a bare
+            # `display: grid` looks the same — but unlike the 1fr this
+            # used, it carries the items' min-content floor, so a grid
+            # narrower than its content stops clipping the item's box
+            # to the track.
+            tracks = [("intrinsic", "min", "auto")]
         ncols = len(tracks)
         row_tracks, row_lines = _parse_grid_template(
             rows_spec, self.definite_height or self.width, em, row_gap)
@@ -4863,7 +4899,12 @@ class BlockLayout:
             # own children must flow here instead of re-queuing it
             if node is not self.node and is_out_of_flow(node):
                 line = self.children[-1] if self.children else None
-                sy = line.y if line is not None else self.y
+                # A line's y is only real once it has been laid out, and
+                # the inline walk that queues this box runs before that.
+                # Falling back to the box's own top edge keeps an
+                # out-of-flow child of an inline-formatting block at its
+                # static position instead of the page origin.
+                sy = line.y if line is not None and line.y else self.y
                 self._queue_abs(node, self.x + self.cursor_x, sy)
                 return
             if node is self.node and node.tag in REPLACED_CONTROLS:
@@ -6187,7 +6228,17 @@ def _z_index(obj):
     if not isinstance(node, Element):
         return 0
     if node.style.get("position", "static") == "static":
-        return 0  # z-index has no effect on static boxes
+        # A grid or flex item paints in z-index order whether or not it
+        # is positioned (CSS Grid 1 §6.1, Flexbox §5.4) — two items
+        # sharing one grid area is exactly the case that needs it.
+        parent = getattr(node, "parent", None)
+        if isinstance(parent, Element) \
+                and layout_mode(parent) in ("grid", "flex"):
+            try:
+                return int(node.style.get("z-index", "auto"))
+            except (ValueError, TypeError):
+                return 0
+        return 0  # z-index has no effect on other static boxes
     cur = node
     for _ in range(32):
         if not isinstance(cur, Element):
