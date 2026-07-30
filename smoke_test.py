@@ -917,12 +917,17 @@ def _gcols(css):
     return [tuple(round(v) for v in c[1:5]) for c in _lines_all(
         _GRID % css, "<div class=g><div>a</div><div>b</div></div>")
         if c[0] == 0 and c[5] == (0, 128, 0)]
+# The items are the container's full 100px tall, not their 23px line:
+# align-content's initial `normal` grows the auto row to fill a
+# definite container, and align-self's initial `normal` is stretch on
+# a grid item, so the item fills the row it was given.
 check("justify-content:center centres the track set",
       _gcols("justify-content:center")
-      == [(100, 0, 150, 23), (150, 0, 200, 23)], str(_gcols("justify-content:center")))
+      == [(100, 0, 150, 100), (150, 0, 200, 100)],
+      str(_gcols("justify-content:center")))
 check("justify-content:space-between pushes the tracks apart",
       _gcols("justify-content:space-between")
-      == [(0, 0, 50, 23), (250, 0, 300, 23)])
+      == [(0, 0, 50, 100), (250, 0, 300, 100)])
 check("align-content works on the block axis too",
       _gcols("align-content:end")
       == [(0, 77, 50, 100), (50, 77, 100, 100)])
@@ -1123,6 +1128,23 @@ check("a content list with an unresolvable part renders nothing",
             "<div id=t>z</div>"),
        _gen("#t::before{content:\"x\" counter(a)}",
             "<div id=t>z</div>")) == (["z"], ["z"]))
+
+
+# CSS collapses space, tab and newline -- and nothing else. Python's
+# str.split() also eats no-break and ideographic spaces, which are
+# characters that must survive to the glyph run.
+from browser.layout import BREAK_SPACE, break_runs, css_words
+check("only space, tab and newline collapse",
+      (css_words("a \t\n b"), css_words("a b"), css_words("a　b"))
+      == (["a", "b"], ["a b"], ["a　b"]))
+check("a no-break space reaches the glyph run whole",
+      _gen("", "<div>a b</div>") == ["a b"])
+check("an ideographic space is a break opportunity, not a collapse",
+      ("　" in BREAK_SPACE, " " in BREAK_SPACE,
+       " " in BREAK_SPACE) == (True, False, False))
+check("breaking runs split on ideographic space but not no-break space",
+      (break_runs("a　b"), break_runs("a b"))
+      == (["a", "　", "b"], ["a b"]))
 
 
 # CSS width/height outrank HTML attributes on replaced elements

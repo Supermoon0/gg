@@ -99,6 +99,52 @@ def _fullwidth(word):
     return "".join(out)
 
 
+# CSS Text 3 §3: the collapsible white space is exactly space, tab and
+# the segment breaks — line feed, plus the carriage return the parser
+# turns into one. Everything else is a character with a glyph.
+#
+# Python disagrees on all of it. str.split(), str.isspace() and re's
+# \s also swallow U+000B, U+000C, U+001C..U+001F, U+0085, U+00A0 and
+# the whole Unicode space block, so a no-break space was collapsing
+# exactly like an ordinary space and a form feed disappeared instead
+# of rendering. Splitting text needs CSS's set, not Python's.
+CSS_SPACE = " \t\n\r"
+_CSS_GAP_RE = re.compile("[ \t\n\r]+")
+
+# Collapsing is not the only thing "space" means. A second, wider set
+# is what a line may break at and what hangs past the end of one:
+# Unicode's space separators (Zs) plus tab, minus the ones whose whole
+# purpose is not to break — U+00A0 no-break space, U+202F narrow
+# no-break space and U+2007 figure space. U+3000 ideographic space is
+# in it, which is why `ああ　ああ` wraps after the ideographic space
+# even though nothing collapses it.
+BREAK_SPACE = (
+    " \t\u1680"                              # space, tab, ogham
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006"   # en quad .. six-per-em
+    "\u2008\u2009\u200a\u205f\u3000")            # punctuation .. ideographic
+_BRK_CLASS = "[" + "".join(
+    "\\" + c if c in "\\]^-" else c for c in BREAK_SPACE) + "]"
+_BRK_RUN_RE = re.compile(f"{_BRK_CLASS}+|(?:(?!{_BRK_CLASS}).)+")
+
+
+def css_words(text):
+    """`text` split on CSS white space, and on nothing else."""
+    return [w for w in _CSS_GAP_RE.split(text) if w]
+
+
+def break_runs(text):
+    """`text` as alternating breaking-space and other runs."""
+    return _BRK_RUN_RE.findall(text)
+
+
+def leads_with_space(text):
+    return bool(text) and text[0] in CSS_SPACE
+
+
+def ends_with_space(text):
+    return bool(text) and text[-1] in CSS_SPACE
+
+
 # C0 and C1 controls that carry no white-space meaning. Tab, line feed
 # and carriage return are excluded: white-space processing owns those.
 _CONTROLS = frozenset(
@@ -322,6 +368,57 @@ def _bg_tile_size(spec, box_w, box_h, iw, ih):
     return w, h
 
 
+def _bg_size_token(token, base):
+    """One background-size component as px, or None for auto."""
+    t = (token or "auto").casefold()
+    if t == "auto":
+        return None
+    if t.endswith("%"):
+        try:
+            return base * float(t[:-1]) / 100.0
+        except ValueError:
+            return None
+    return parse_size(t)
+
+
+def _vector_tile_size(spec, box_w, box_h, svg):
+    """background-size for an image whose intrinsic size may be absent.
+
+    CSS Images 3 §5.3, the default sizing algorithm: the background
+    positioning area is the default object size, and an image missing
+    a dimension falls back to the intrinsic ratio, then to that area.
+    A file with no width, height or viewBox therefore *becomes* the
+    box — `background-size: contain` on it fills the element rather
+    than fitting a made-up 24x24 square into a corner of it.
+    """
+    iw, ih, ratio = textengine.svg_intrinsic(svg)
+    size = spec["size"]
+    kw = size[0].casefold() if size else "auto"
+    if kw in ("cover", "contain"):
+        if not ratio:
+            return box_w, box_h
+        h = (max if kw == "cover" else min)(box_h, box_w / ratio)
+        return h * ratio, h
+    w = _bg_size_token(size[0] if size else None, box_w)
+    h = _bg_size_token(size[1] if len(size) > 1 else None, box_h)
+    if w is not None and h is not None:
+        return w, h
+    if w is not None:
+        return w, (w / ratio if ratio else ih or box_h)
+    if h is not None:
+        return (h * ratio if ratio else iw or box_w), h
+    if iw and ih:                       # `auto auto`: the intrinsic size
+        return iw, ih
+    if ratio:                           # one dimension, or none: use it
+        if iw:
+            return iw, iw / ratio
+        if ih:
+            return ih * ratio, ih
+        h = min(box_h, box_w / ratio)   # ratio constrained by the area
+        return h * ratio, h
+    return iw or box_w, ih or box_h
+
+
 def paint_background_image(node, x1, y1, x2, y2):
     """DrawBgImage for node's first background layer, or None."""
     bg = getattr(node, "_bg", None)
@@ -329,9 +426,21 @@ def paint_background_image(node, x1, y1, x2, y2):
         return None
     image_id, iw, ih, spec = bg
     box_w, box_h = x2 - x1, y2 - y1
-    if box_w <= 0 or box_h <= 0 or iw <= 0 or ih <= 0:
+    if box_w <= 0 or box_h <= 0:
         return None
-    tile_w, tile_h = _bg_tile_size(spec, box_w, box_h, iw, ih)
+    vector = getattr(node, "_bg_vector", None)
+    if vector is not None:
+        tile_w, tile_h = _vector_tile_size(spec, box_w, box_h, vector)
+        if tile_w < 1 or tile_h < 1:
+            return None
+        handle = textengine.rasterize_svg(vector, tile_w, tile_h)
+        if handle is None:
+            return None
+        image_id = handle[0]
+    else:
+        if iw <= 0 or ih <= 0:
+            return None
+        tile_w, tile_h = _bg_tile_size(spec, box_w, box_h, iw, ih)
     if tile_w < 1 or tile_h < 1:
         return None
     pos = spec["position"]
@@ -1204,6 +1313,18 @@ def distribute_free_space(free, count, mode):
     return 0.0, 0.0
 
 
+def auto_size(style, prop):
+    """Is this box's size in one axis auto?
+
+    Stretch alignment only reaches a box whose size in that axis is
+    auto (CSS Box Alignment 3 §4.2) — a specified width or height is
+    the used size and alignment then positions the box inside its area
+    instead of growing it.
+    """
+    raw = (style.get(prop) or "").strip().casefold()
+    return not raw or raw == "auto"
+
+
 def order_items(children):
     """Flex and grid items in `order` sequence.
 
@@ -1368,6 +1489,59 @@ def _is_cjk(ch):
 
 def _has_cjk(word):
     return any(_is_cjk(c) for c in word)
+
+
+def _inherited_kw(node, prop):
+    """A keyword this engine does not inherit, read off the nearest
+    ancestor that sets one. word-break, overflow-wrap and line-break
+    all inherit in CSS and none of them are in the inherited table, so
+    reading the node's own style alone finds nothing."""
+    n = node
+    while n is not None:
+        v = n.style.get(prop) if hasattr(n, "style") else None
+        if v:
+            return v.strip().casefold()
+        n = getattr(n, "parent", None)
+    return ""
+
+
+def hang_trim(word):
+    """`word` without its trailing breaking spaces.
+
+    Those hang past the end of the line (CSS Text 3 §5.2), so they are
+    not part of what has to fit: `X<U+3000>` needs room for the X.
+    """
+    i = len(word)
+    while i and word[i - 1] in BREAK_SPACE:
+        i -= 1
+    return word[:i]
+
+
+def break_segments(word, cjk=True):
+    """`word` cut at its break opportunities.
+
+    Two kinds, and they are not the same rule. A breaking space always
+    allows a break after itself, and stays on the line it ends. An
+    ideograph, kana or Hangul syllable may both start a line and end
+    one — that is the opportunity `word-break: keep-all` suppresses,
+    which is why U+3000 keeps breaking under keep-all: despite the
+    name, ideographic space is a space, not an ideograph.
+    """
+    segs, buf = [], ""
+    for ch in word:
+        if ch in BREAK_SPACE:
+            segs.append(buf + ch)
+            buf = ""
+        elif cjk and _is_cjk(ch):
+            if buf:
+                segs.append(buf)
+            segs.append(ch)
+            buf = ""
+        else:
+            buf += ch
+    if buf:
+        segs.append(buf)
+    return segs
 
 
 def _nearest_positioned(layout_box):
@@ -2238,6 +2412,54 @@ class _MeasureHolder:
 _MAXCONTENT = 100000.0
 
 
+def _measure_min_content_width(node, doc):
+    """Min-content (border-box) main size of `node`: the same trial
+    layout as the max-content one, but under a zero-width constraint so
+    every break opportunity is taken and the widest unbreakable run is
+    what comes back."""
+    cache = getattr(doc, "_min_width_cache", None)
+    if cache is None:
+        cache = doc._min_width_cache = {}
+    hit = cache.get(id(node))
+    if hit is not None:
+        return hit
+    holder = _MeasureHolder(doc, 0.0)
+    box = BlockLayout(node, holder, None)
+    saved, saved_m = doc.abs_queue, getattr(doc, "_measuring", False)
+    doc.abs_queue = []
+    doc._measuring = True
+    try:
+        box.layout()
+    finally:
+        doc.abs_queue = saved
+        doc._measuring = saved_m
+    origin, m = box.x, 0.0
+    stack = list(box.children)
+    while stack:
+        b = stack.pop()
+        if isinstance(b, (TextLayout, ImageLayout, InlineBlockLayout)):
+            w = getattr(b, "width", 0)
+            tail = getattr(b, "word", None)
+            if tail and tail[-1:] in BREAK_SPACE:
+                trimmed = hang_trim(tail)
+                w = 0.0 if not trimmed else measure(
+                    cached_font(b.node), trimmed)
+            m = max(m, (b.x + w) - origin)
+        else:
+            stack.extend(getattr(b, "children", []))
+    m += box.pl + box.pr + box.bl + box.br
+    cache[id(node)] = m
+    return m
+
+
+def intrinsic_width_keyword(raw):
+    """`min-content`, `max-content` or `fit-content` out of a width
+    value, or None. These are sizes only the content can answer, so
+    parse_size returns None for them and the box has to ask."""
+    v = (raw or "").strip().casefold()
+    return v if v in ("min-content", "max-content", "fit-content") else None
+
+
 def _measure_content_width(node, doc):
     """Max-content (border-box) main size of `node`: lay its subtree out
     under a very wide constraint so text does not wrap, then return the
@@ -2269,7 +2491,16 @@ def _measure_content_width(node, doc):
     while stack:
         b = stack.pop()
         if isinstance(b, (TextLayout, ImageLayout)):
-            m = max(m, (b.x + getattr(b, "width", 0)) - origin)
+            # a trailing breaking space hangs, so it is not part of the
+            # intrinsic size either: a box holding only U+3000 is
+            # min-content zero wide, not one ideograph wide
+            w = getattr(b, "width", 0)
+            tail = getattr(b, "word", None)
+            if tail and tail[-1:] in BREAK_SPACE:
+                trimmed = hang_trim(tail)
+                w = 0.0 if not trimmed else measure(
+                    cached_font(b.node), trimmed)
+            m = max(m, (b.x + w) - origin)
         elif isinstance(b, InlineBlockLayout):
             m = max(m, b.x + b.width - origin)
         elif isinstance(b, BlockLayout):
@@ -2417,16 +2648,26 @@ class DocumentLayout:
             # positioned ancestor or the whole (tall) page — so top:0 pins
             # to the top of the first screen and bottom:0 to the bottom of
             # the viewport (best a non-scrolling full-page render can do).
+            grid_area = False
             if st.get("position") == "fixed":
                 cb_x, cb_y = 0.0, 0.0
                 cb_w = self.viewport_width or self.width
                 cb_h = self.viewport_height or self.height
             elif isinstance(cb, BlockLayout):
-                # containing-block padding box
-                cb_x = cb.x - cb.pl
-                cb_y = cb.y - cb.pt
-                cb_w = cb.width + cb.pl + cb.pr
-                cb_h = cb.height + cb.pt + cb.pb
+                # A grid child's containing block is its grid area, when
+                # the grid is the positioned ancestor that would have
+                # supplied one anyway.
+                area = getattr(node, "_grid_cb", None)
+                if area is not None and cb.node is getattr(
+                        node, "parent", None):
+                    cb_x, cb_y, cb_w, cb_h = area
+                    grid_area = True
+                else:
+                    # containing-block padding box
+                    cb_x = cb.x - cb.pl
+                    cb_y = cb.y - cb.pt
+                    cb_w = cb.width + cb.pl + cb.pr
+                    cb_h = cb.height + cb.pt + cb.pb
             else:                     # document / initial containing block
                 cb_x, cb_y, cb_w, cb_h = self.x, self.y, self.width, \
                     self.height
@@ -2437,6 +2678,7 @@ class DocumentLayout:
             top = parse_size(st.get("top"), cb_h, em)
             bottom = parse_size(st.get("bottom"), cb_h, em)
             box = BlockLayout(node, self, None)
+            box._pct_height_base = cb_h
             # fixed boxes are viewport-anchored: ancestor clips don't cut
             box._abs_clips = \
                 [] if st.get("position") == "fixed" else abs_clips
@@ -2511,6 +2753,21 @@ class DocumentLayout:
             # an `align-items: center` grid sat in the top-left corner.
             sx, sy = static_x, static_y
             align_from = getattr(node, "_static_align", None)
+            if grid_area:
+                # With a grid area for a containing block, that area is
+                # also the rectangle the item aligns in and the corner
+                # an auto offset falls back to — not the whole grid.
+                sx, sy = cb_x, cb_y
+                if align_from is not None:
+                    jmode, amode, _holder, self_inline = align_from
+                    if self_inline:
+                        jmode = (st.get("justify-self")
+                                 or "").strip().casefold() or jmode
+                    amode = (st.get("align-self")
+                             or "").strip().casefold() or amode
+                    sx += _static_offset(jmode, cb_w, box.outer_width())
+                    sy += _static_offset(amode, cb_h, box.outer_height())
+                align_from = None
             if align_from is not None:
                 jmode, amode, holder, self_inline = align_from
                 # the child's own -self value wins over the container's
@@ -2565,6 +2822,12 @@ class BlockLayout:
         self.bw = 0
         self.bt = self.br = self.bb = self.bl = 0
         self.forced_width = None   # border-box width imposed by flex/abs
+        self.forced_height = None  # border-box height imposed by stretch
+        # An out-of-flow box's percentage height resolves against its
+        # containing block, which is not its layout parent — the
+        # absolute pass reparents it to the document, whose definite
+        # height it deliberately hides.
+        self._pct_height_base = None
         self.flex_origin = None    # (x, y) margin-edge origin from flex
         self.flex_auto_margin = 0  # px one auto margin gets on a flex line
         self.rel_dx = 0            # position:relative visual offset,
@@ -2699,7 +2962,27 @@ class BlockLayout:
 
         def to_border(v):
             return v if border_box else v + edge
-        if self.forced_width is not None:
+        # min-content / max-content / fit-content are sizes only the
+        # content can answer, so parse_size hands back None for them
+        # and the box measures itself. The trial layout that answers is
+        # the one box whose parent is the throwaway holder, so it takes
+        # the constraint the holder imposes instead of asking again.
+        intrinsic_w = None
+        intrinsic = intrinsic_width_keyword(st.get("width"))
+        if intrinsic and not isinstance(self.parent, _MeasureHolder):
+            try:
+                doc = self._document()
+                if intrinsic == "min-content":
+                    intrinsic_w = _measure_min_content_width(node, doc)
+                else:
+                    maxc = _measure_content_width(node, doc)
+                    intrinsic_w = maxc if intrinsic == "max-content" \
+                        else min(maxc, max(avail - self.ml - self.mr, 0.0))
+            except Exception:
+                intrinsic_w = None
+        if intrinsic_w is not None:
+            box_w = max(intrinsic_w, 0.0)      # already a border box
+        elif self.forced_width is not None:
             box_w = self.forced_width
         elif spec is not None:
             box_w = to_border(spec)
@@ -2797,6 +3080,14 @@ class BlockLayout:
             self.definite_height = max(
                 spec_h - (self.pt + self.pb + self.bt + self.bb)
                 if border_box else spec_h, 0)
+        elif self.forced_height is not None:
+            # A stretched grid item: the parent hands down a border-box
+            # height the same way it hands down forced_width. Only an
+            # auto height gets here — an item that says how tall it is
+            # is that tall, and alignment moves it instead.
+            self.definite_height = max(
+                self.forced_height - (self.pt + self.pb + self.bt + self.bb),
+                0)
 
         if mode == "flex":
             self._layout_flex(node, em)
@@ -3106,7 +3397,9 @@ class BlockLayout:
                     else doc.viewport_width)
             return parse_size(raw, base, em) if base is not None else None
         if "%" in raw:
-            base = self.parent.definite_height
+            base = self._pct_height_base
+            if base is None:
+                base = self.parent.definite_height
             return parse_size(raw, base, em) if base is not None else None
         return parse_size(raw, 0, em)
 
@@ -3126,7 +3419,9 @@ class BlockLayout:
                     else doc.viewport_width)
             box = parse_size(raw, base, em) if base is not None else None
         elif "%" in raw:
-            base = self.parent.definite_height
+            base = self._pct_height_base
+            if base is None:
+                base = self.parent.definite_height
             box = parse_size(raw, base, em) if base is not None else None
         else:
             box = parse_size(raw, 0, em)
@@ -3862,6 +4157,7 @@ class BlockLayout:
 
         tracks, col_lines = _parse_grid_template(
             cols_spec, self.width, em, col_gap)
+        explicit_cols = len(tracks)
         if not tracks:
             tracks = [("fr", 1.0)]
         ncols = len(tracks)
@@ -3877,7 +4173,7 @@ class BlockLayout:
                              else place[0] if place else "stretch")) \
             .strip().casefold()
 
-        items = []
+        items, out_of_flow = [], []
         for child in node.children:
             if not (isinstance(child, Element) and is_visible(child)):
                 continue
@@ -3885,6 +4181,7 @@ class BlockLayout:
                 child._static_align = (
                     justify_items, align_items, self, True)
                 self._queue_abs(child, self.x, self.y)
+                out_of_flow.append(child)
                 continue
             items.append(child)
         items = order_items(items)
@@ -3924,6 +4221,25 @@ class BlockLayout:
             row_count = max(len(row_tracks), len(areas), 1)
             r0, rs = self._grid_axis(child, "row", row_count, row_lines)
             specs.append([child, c0, cs, r0, rs])
+
+        # Implicit columns (CSS Grid 1 §8.5). A placement that reaches
+        # past the last explicit line creates the tracks it needs
+        # instead of being clamped back inside the explicit grid;
+        # grid-auto-columns sizes them, cycling if it lists several.
+        # Negative line numbers stay resolved against the explicit
+        # grid, which is why this grows only after placement is read.
+        wanted = max([c0 + cs for _c, c0, cs, _r, _rs in specs
+                      if c0 is not None] + [ncols])
+        auto_cols = _parse_grid_tracks(
+            style.get("grid-auto-columns", ""), self.width, em, col_gap)
+        if wanted > explicit_cols and auto_cols:
+            tracks = tracks[:explicit_cols] + [
+                auto_cols[i % len(auto_cols)]
+                for i in range(wanted - explicit_cols)]
+            ncols = len(tracks)
+        elif wanted > ncols:
+            tracks = tracks + [("intrinsic", "min", "auto")] * (wanted - ncols)
+            ncols = len(tracks)
 
         occupied = set()
         placed_by_index = [None] * len(specs)
@@ -4121,14 +4437,50 @@ class BlockLayout:
             y += row_h[r] + row_gap + v_spread
         total_h = (y - row_gap - v_spread) if nrows else 0.0
 
+        # An absolutely positioned child of a *positioned* grid takes
+        # its grid area as its containing block, not the grid's padding
+        # box (CSS Grid 1 §9). Each auto side of that area falls back
+        # to the padding edge, so `grid-column: 5 / 7` with no row named
+        # is a full-height band over columns five and six.
+        for child in out_of_flow:
+            c0, c1, _sr, _er = self._grid_lines(
+                child, "column", ncols, col_lines)
+            r0, r1, _sr, _er = self._grid_lines(
+                child, "row", nrows, row_lines)
+
+            x0 = (self.x + col_x[min(c0, ncols - 1)]) \
+                if c0 is not None and ncols else None
+            x1 = None
+            if c1 is not None and ncols:
+                j = min(max(c1, 1), ncols)
+                x1 = self.x + col_x[j - 1] + col_w[j - 1]
+            y0 = (self.y + row_y[min(r0, nrows - 1)]) \
+                if r0 is not None and nrows else None
+            y1 = None
+            if r1 is not None and nrows:
+                j = min(max(r1, 1), nrows)
+                y1 = self.y + row_y[j - 1] + row_h[j - 1]
+            if x0 is None and x1 is None and y0 is None and y1 is None:
+                child._grid_cb = None
+                continue
+            pad_x0, pad_y0 = self.x - self.pl, self.y - self.pt
+            pad_x1 = self.x + self.width + self.pr
+            pad_y1 = (self.y + (self.definite_height
+                                if self.definite_height is not None
+                                else total_h) + self.pb)
+            x0 = pad_x0 if x0 is None else x0
+            x1 = pad_x1 if x1 is None else x1
+            y0 = pad_y0 if y0 is None else y0
+            y1 = pad_y1 if y1 is None else y1
+            child._grid_cb = (min(x0, x1), min(y0, y1),
+                              abs(x1 - x0), abs(y1 - y0))
+
         self.children = []
         for child, c0, cspan, r0, rspan, box in placed:
             area_w = sum(col_w[c0:c0 + cspan]) \
                 + col_gap * (cspan - 1)
             area_h = sum(row_h[r0:r0 + rspan]) \
                 + row_gap * (rspan - 1)
-            free_x = max(area_w - box.outer_width(), 0.0)
-            free_y = max(area_h - box.outer_height(), 0.0)
             justify_self = (child.style.get("justify-self", "").strip()
                             .casefold() or justify_items)
             align_self = (child.style.get("align-self", "").strip()
@@ -4137,6 +4489,19 @@ class BlockLayout:
             mr_auto = child.style.get("margin-right", "").strip() == "auto"
             mt_auto = child.style.get("margin-top", "").strip() == "auto"
             mb_auto = child.style.get("margin-bottom", "").strip() == "auto"
+            # `align-self`'s initial `normal` is stretch on a grid item
+            # (CSS Grid 1 §6.2): an auto height fills the row area. An
+            # empty item was coming out zero-tall, so a track it had
+            # been given painted nothing at all.
+            stretch_y = (align_self in ("stretch", "normal", "auto", "")
+                         and not mt_auto and not mb_auto
+                         and auto_size(child.style, "height"))
+            if stretch_y:
+                box.forced_height = max(
+                    area_h - box.margin_top - box.margin_bottom, 0.0)
+            free_x = max(area_w - box.outer_width(), 0.0)
+            free_y = (0.0 if stretch_y
+                      else max(area_h - box.outer_height(), 0.0))
             # auto margins eat the free space before alignment gets it
             if ml_auto or mr_auto:
                 dx = (free_x / 2 if ml_auto and mr_auto
@@ -4172,6 +4537,31 @@ class BlockLayout:
         Lines are zero-based internally. Positive/negative CSS line
         numbers, repeated named lines, ``span N`` / ``span <name>``,
         longhands, and the four-part ``grid-area`` shorthand are accepted.
+        """
+        s, e, start_ref, end_ref = self._grid_lines(
+            child, axis, track_count, line_names)
+        if s is not None and e is not None:
+            if e < s:
+                s, e = e, s
+            return s, max(e - s, 1)
+        if s is not None:
+            return s, 1
+        if e is not None:
+            return e - 1, 1
+        # A span without an anchor still informs auto-placement width.
+        for ref in (start_ref, end_ref):
+            if ref is not None and ref[0] and ref[1] is None:
+                return None, max(ref[2] or 1, 1)
+        return None, 1
+
+    def _grid_lines(self, child, axis, track_count, line_names):
+        """``(start_line, end_line, start_ref, end_ref)`` for one axis.
+
+        Either line is None when that side is `auto`. Auto-placement
+        collapses both cases into a span, but an absolutely positioned
+        grid child does not: an auto side there means the grid
+        container's own padding edge (CSS Grid 1 §9), which is a
+        different rectangle from "one track wide".
         """
         prop = "grid-" + axis
         gc = child.style.get(prop, "").strip()
@@ -4264,19 +4654,7 @@ class BlockLayout:
             else:
                 e = s + max(number or 1, 1)
 
-        if s is not None and e is not None:
-            if e < s:
-                s, e = e, s
-            return s, max(e - s, 1)
-        if s is not None:
-            return s, 1
-        if e is not None:
-            return e - 1, 1
-        # A span without an anchor still informs auto-placement width.
-        for ref in (start_ref, end_ref):
-            if ref is not None and ref[0] and ref[1] is None:
-                return None, max(ref[2] or 1, 1)
-        return None, 1
+        return s, e, start_ref, end_ref
 
     def _grid_column(self, child, ncols):
         """Backward-compatible column placement helper."""
@@ -4319,18 +4697,18 @@ class BlockLayout:
                 # existed: "<b>a</b><b>b</b>" -> "ab", "$<b>5</b>" -> "$5",
                 # while "hello <b>world</b>" keeps its space.
                 text = node.text
-                toks = text.split()
+                toks = css_words(text)
                 if not toks:
                     if text:            # whitespace-only node: owes a space
                         self._ws_pending = True
                 else:
-                    lead = text[:1].isspace()
+                    lead = leads_with_space(text)
                     for i, word in enumerate(toks):
                         sb = (i > 0) or lead \
                             or getattr(self, "_ws_pending", False)
                         self.word(node, word, space_before=sb)
                         self._ws_pending = False
-                    self._ws_pending = text[-1:].isspace()
+                    self._ws_pending = ends_with_space(text)
         else:
             if not is_visible(node):
                 return
@@ -4412,29 +4790,52 @@ class BlockLayout:
     def word(self, node, word, space_before=True):
         font = cached_font(node)
         w = measure(font, word)
+        # trailing breaking spaces hang, so they are not part of what
+        # has to fit — only what precedes them is
+        fit = w if word[-1:] not in BREAK_SPACE \
+            else measure(font, hang_trim(word))
         nowrap = white_space(node.style) in ("nowrap", "pre")
         # A run wider than the whole line can't fit however it wraps. Break
         # it between characters when the script allows: CJK/Hangul/Kana
         # always break between ideographs, and word-break:break-all /
         # overflow-wrap:break-word|anywhere break any long token (long
         # URLs, hashes). Otherwise it overflows as one word (as before).
-        if not nowrap and w > self.width and self.width > 0:
-            # word-break / overflow-wrap are inherited properties; this
-            # engine doesn't inherit them, so read the nearest ancestor
-            # that sets one (only reached for an over-wide word, so cheap)
-            def _anc(prop):
-                n = getattr(node, "parent", None)
-                while n is not None:
-                    v = n.style.get(prop) if hasattr(n, "style") else None
-                    if v:
-                        return v.strip().casefold()
-                    n = getattr(n, "parent", None)
-                return ""
-            wb = _anc("word-break")
-            ow = _anc("overflow-wrap") or _anc("word-wrap")
-            force = wb == "break-all" or ow in ("break-word", "anywhere")
-            if force or _has_cjk(word):
-                self._emit_broken(node, word, font, cjk_only=not force)
+        # A run of nothing but breaking spaces hangs: CSS Text 3 §5.2
+        # keeps preserved trailing white space on the line it ends,
+        # past the line box, rather than measuring it or carrying it
+        # down. Only U+3000 and friends reach here — an ordinary space
+        # was already collapsed away by then.
+        if word and all(ch in BREAK_SPACE for ch in word):
+            line = self.children[-1]
+            prev = line.children[-1] if line.children else None
+            line.children.append(
+                TextLayout(node, word, line, prev, keep_spaces=True))
+            self.cursor_x += w
+            return
+        # A CJK run breaks at the *last* opportunity that still fits, so
+        # the test is the space left on this line, not the whole line —
+        # otherwise a two-ideograph run that would fit on a fresh line
+        # moves down whole and leaves a ragged hole behind it.
+        crowded = (self.width > 0
+                   and self.cursor_x + fit > self.width)
+        if not nowrap and crowded:
+            # only reached for a run that will not fit, so the ancestor
+            # walks these three keywords need are cheap here
+            wb = _inherited_kw(node, "word-break")
+            ow = (_inherited_kw(node, "overflow-wrap")
+                  or _inherited_kw(node, "word-wrap"))
+            lb = _inherited_kw(node, "line-break")
+            anywhere = wb == "break-all" or lb == "anywhere" \
+                or ow == "anywhere"
+            # break-word only breaks a run that will not fit even on a
+            # line of its own; break-all and line-break:anywhere break
+            # greedily. keep-all forbids the CJK opportunities outright,
+            # but not the ones a space in the run provides.
+            force = anywhere or (ow == "break-word" and fit > self.width)
+            cjk = wb != "keep-all" and _has_cjk(word)
+            if force or cjk or any(ch in BREAK_SPACE for ch in word):
+                self._emit_broken(node, word, font,
+                                  anywhere=force, cjk=cjk)
                 return
         line = self.children[-1]
         # a leading space only when the source had whitespace here and we
@@ -4461,7 +4862,7 @@ class BlockLayout:
                 can_break = True
         if not can_break and word and _is_cjk(word[0]):
             can_break = True
-        if not nowrap and can_break and self.cursor_x + sp + w > self.width \
+        if not nowrap and can_break and self.cursor_x + sp + fit > self.width \
                 and self.cursor_x > 0:
             self.new_line()
             sp = 0.0
@@ -4471,29 +4872,19 @@ class BlockLayout:
         line.children.append(text)
         self.cursor_x += sp + w
 
-    def _emit_broken(self, node, word, font, cjk_only):
-        """Emit a too-wide run split at break opportunities, wrapping
-        across lines. For cjk_only each CJK char is its own break point
-        while maximal runs of other characters stay whole; otherwise
-        every character may break. Segments carry no inter-segment space
-        (CJK is written without spaces)."""
-        if cjk_only:
-            segs, buf = [], ""
-            for ch in word:
-                if _is_cjk(ch):
-                    if buf:
-                        segs.append(buf)
-                        buf = ""
-                    segs.append(ch)
-                else:
-                    buf += ch
-            if buf:
-                segs.append(buf)
-        else:
-            segs = list(word)
+    def _emit_broken(self, node, word, font, anywhere=False, cjk=True):
+        """Emit a run split at its break opportunities, wrapping across
+        lines. `anywhere` breaks between any two characters (break-all,
+        line-break: anywhere, an over-wide run under break-word);
+        otherwise the opportunities are the ones the text itself gives.
+        Segments carry no inter-segment space — CJK is written without
+        them, and a breaking space stays inside its own segment."""
+        segs = list(word) if anywhere else break_segments(word, cjk=cjk)
         for seg in segs:
             sw = measure(font, seg)
-            if self.cursor_x + sw > self.width and self.cursor_x > 0:
+            sfit = sw if seg[-1:] not in BREAK_SPACE \
+                else measure(font, hang_trim(seg))
+            if self.cursor_x + sfit > self.width and self.cursor_x > 0:
                 self.new_line()
             line = self.children[-1]
             prev = line.children[-1] if line.children else None
@@ -4574,24 +4965,37 @@ class BlockLayout:
         break opportunity after every single preserved space, so the
         run itself splits across lines."""
         font = cached_font(node)
+        anywhere = _inherited_kw(node, "line-break") == "anywhere" \
+            or _inherited_kw(node, "word-break") == "break-all" \
+            or _inherited_kw(node, "overflow-wrap") == "anywhere"
+        keep_all = _inherited_kw(node, "word-break") == "keep-all"
         for i, raw in enumerate(node.text.split("\n")):
             if i > 0:
                 self.new_line()
             if collapse:
-                for word in raw.split():
+                for word in css_words(raw):
                     self.word(node, word)
                 continue
-            for token in re.findall(r"\s+|\S+", raw):
+            for token in break_runs(raw):
                 # a space run only has to be split apart when it is what
                 # overflows; whole runs that fit stay one layout object
+                blank = token[0] in BREAK_SPACE
                 pieces = [token]
-                if break_spaces and not token.strip() \
-                        and self.cursor_x + measure(font, token) \
-                        > self.width:
+                crowded = (self.cursor_x + measure(font, token) > self.width)
+                if anywhere and crowded and not blank:
                     pieces = list(token)
+                elif break_spaces and blank and crowded:
+                    pieces = list(token)
+                elif not blank and crowded and not keep_all \
+                        and _has_cjk(token):
+                    # a run of ideographs breaks between characters, so
+                    # it fills the line instead of overflowing it whole
+                    pieces = break_segments(token)
                 for piece in pieces:
                     w = measure(font, piece)
-                    wraps = piece.strip() or break_spaces
+                    # a preserved space run hangs past the end of the
+                    # line; break-spaces is the mode that says otherwise
+                    wraps = not blank or break_spaces
                     if wraps and self.cursor_x + w > self.width \
                             and self.cursor_x > 0:
                         self.new_line()

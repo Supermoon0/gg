@@ -109,9 +109,19 @@ impl TextEngine {
         out_h: u32,
         paths: Vec<(String, (u8, u8, u8))>,
     ) -> (u32, u32, u32) {
-        // icons only: keep the supersampled fill grid small
-        let w = out_w.clamp(1, 512);
-        let h = out_h.clamp(1, 512);
+        // A background image is legitimately page-sized, so a 512px
+        // side cap is not enough — a 256x768 request came back 256x512
+        // and the sampler stretched it. But a raster here is pure
+        // memory in the store, so the budget goes on area instead: 2M
+        // pixels, 8 MB of RGBA, shrunk proportionally past that.
+        let (mut w, mut h) = (out_w.max(1), out_h.max(1));
+        let area = w as u64 * h as u64;
+        const BUDGET: u64 = 2 << 20;
+        if area > BUDGET {
+            let s = (BUDGET as f64 / area as f64).sqrt();
+            w = ((w as f64 * s) as u32).max(1);
+            h = ((h as f64 * s) as u32).max(1);
+        }
         let rgba = svg::rasterize(view_box, w as usize, h as usize, &paths);
         let id = self.next_image;
         self.next_image += 1;

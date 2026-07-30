@@ -36,6 +36,7 @@ def has_family(name):
 # the ids are only valid while it keeps them.
 _svg_cache = {}
 _bg_cache = {}
+_bg_vector_cache = {}
 
 
 def clear_image_caches():
@@ -43,10 +44,18 @@ def clear_image_caches():
     engine.clear_images() — the ids outlive nothing."""
     _svg_cache.clear()
     _bg_cache.clear()
+    _bg_vector_cache.clear()
 
 
-def rasterize_svg(svg):
+def rasterize_svg(svg, out_w=None, out_h=None):
     """Rasterize one <svg> element to an image handle, or None.
+
+    `out_w`/`out_h` override the intrinsic size with the used size CSS
+    decided for the image. That matters for more than resolution: a
+    file with no viewBox draws in its viewport's own coordinate
+    system, so `width="100%"` on a shape inside it means 100% of the
+    box it was placed in, and the same file is a different picture at
+    a different size.
 
     Fill resolution: computed style `fill` (inline style attr included
     via the cascade) beats the presentation attribute; the svg
@@ -79,7 +88,7 @@ def rasterize_svg(svg):
     # Geometry is expressed in the viewBox's coordinate system, and a
     # percentage there resolves against the viewport the viewBox sets
     # up — so the box has to be known before any shape is lowered.
-    vx, vy, vw, vh, out_w, out_h = _svg_viewport(svg)
+    vx, vy, vw, vh, out_w, out_h = _svg_viewport(svg, out_w, out_h)
     if vw <= 0 or vh <= 0:
         return None
 
@@ -172,7 +181,51 @@ def _length(text):
     return float(text)
 
 
-def _svg_viewport(svg):
+def _view_box(svg):
+    """(vx, vy, vw, vh) of an <svg>'s viewBox, or None."""
+    vb = (svg.attributes.get("viewbox")
+          or svg.attributes.get("viewBox") or "").replace(",", " ").split()
+    try:
+        vx, vy, vw, vh = (float(v) for v in vb)
+    except ValueError:
+        return None
+    return (vx, vy, vw, vh) if vw > 0 and vh > 0 else None
+
+
+def _attr_length(svg, name):
+    """An <svg> sizing attribute as absolute px, or 0 when it gives no
+    absolute length — missing, unparsable, or a percentage."""
+    try:
+        return max(_length(svg.attributes.get(name, "")), 0.0)
+    except ValueError:
+        return 0.0
+
+
+def svg_intrinsic(svg):
+    """(width, height, ratio) an <svg> contributes to CSS sizing, with
+    None for each piece it does not have.
+
+    CSS Images 3 §5.1: an image's intrinsic dimensions are the ones it
+    carries on its own. A percentage width resolves against the
+    viewport the *referencing* context supplies, so it is not one of
+    them and reads as absent here — which is what makes
+    `background-size: contain` on such a file fill the whole box
+    rather than fit a 24x24 guess into it. A viewBox contributes a
+    ratio whether or not there are dimensions.
+    """
+    iw = _attr_length(svg, "width") or None
+    ih = _attr_length(svg, "height") or None
+    vb = _view_box(svg)
+    if iw and ih:
+        ratio = iw / ih
+    elif vb:
+        ratio = vb[2] / vb[3]
+    else:
+        ratio = None
+    return iw, ih, ratio
+
+
+def _svg_viewport(svg, out_w=None, out_h=None):
     """(vx, vy, vw, vh, out_w, out_h) for an <svg> element.
 
     The viewBox gives the coordinate system the shapes are drawn in;
@@ -181,28 +234,21 @@ def _svg_viewport(svg):
     aspect ratio out of. They are frequently different — a 4x64
     viewBox in an 8px-by-32px image is a legitimate 1:4 picture, and
     rasterizing at the viewBox size instead would claim 1:16.
+
+    With no viewBox there is no separate coordinate system: the
+    viewport *is* user space, so the used size doubles as the basis
+    every percentage inside the file resolves against.
     """
-    vb = (svg.attributes.get("viewbox")
-          or svg.attributes.get("viewBox") or "").replace(",", " ").split()
-    try:
-        vx, vy, vw, vh = (float(v) for v in vb)
-    except ValueError:
-        vx = vy = vw = vh = 0.0
-    try:
-        iw = _length(svg.attributes.get("width", ""))
-    except ValueError:
-        iw = 0.0
-    try:
-        ih = _length(svg.attributes.get("height", ""))
-    except ValueError:
-        ih = 0.0
-    if vw <= 0 or vh <= 0:
-        vw, vh = (iw, ih) if iw > 0 and ih > 0 else (24.0, 24.0)
-        vx = vy = 0.0
-    out_w = iw if iw > 0 else vw
-    out_h = ih if ih > 0 else vh
-    # the raster is only ever scaled up from here, so keep it modest
-    return vx, vy, vw, vh, max(1, round(out_w)), max(1, round(out_h))
+    vb = _view_box(svg)
+    iw = _attr_length(svg, "width")
+    ih = _attr_length(svg, "height")
+    used_w = out_w if out_w else (iw or (vb[2] if vb else 24.0))
+    used_h = out_h if out_h else (ih or (vb[3] if vb else 24.0))
+    if vb:
+        vx, vy, vw, vh = vb
+    else:
+        vx, vy, vw, vh = 0.0, 0.0, used_w, used_h
+    return vx, vy, vw, vh, max(1, round(used_w)), max(1, round(used_h))
 
 
 def load_svgs(nodes):
@@ -226,6 +272,24 @@ def looks_like_svg(data):
     if head.startswith(b"<?xml") or head.startswith(b"<!--"):
         head = data[:2048]
     return b"<svg" in head[:2048].lower()
+
+
+def svg_document(data):
+    """The root <svg> element of an SVG file, or None.
+
+    Kept unrasterized so the caller can decide the used size first: a
+    file with no intrinsic dimensions has no picture until CSS says
+    how big it is.
+    """
+    if not data or not looks_like_svg(data):
+        return None
+    from .html_parser import Element, HTMLParser, tree_to_list
+
+    root = HTMLParser(data.decode("utf-8", errors="replace")).parse()
+    for node in tree_to_list(root, []):
+        if isinstance(node, Element) and node.tag == "svg":
+            return node
+    return None
 
 
 def load_image_data(data):
@@ -278,12 +342,20 @@ def load_background_images(nodes, fetch_raw):
         data = raw.get(u)
         try:
             _bg_cache[u] = load_image_data(data)
+            # A vector stays available unrasterized: background-size
+            # may have to decide the used size before there is any
+            # picture to sample (CSS Images 3 §5.3).
+            _bg_vector_cache[u] = svg_document(data)
         except Exception:
             _bg_cache[u] = None
+            _bg_vector_cache[u] = None
     for n, spec in jobs:
         img = _bg_cache.get(spec["url"])
+        n._bg_vector = _bg_vector_cache.get(spec["url"])
         if img:
             n._bg = (img[0], img[1], img[2], spec)
+        elif n._bg_vector is not None:
+            n._bg = (0, 0, 0, spec)
 
 
 class NativeFont:
