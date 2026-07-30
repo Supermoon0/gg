@@ -201,6 +201,25 @@ def _attr_length(svg, name):
         return 0.0
 
 
+def svg_degenerate(svg):
+    """Does this <svg> declare a viewBox with a zero side?
+
+    A zero-width or zero-height viewBox is a degenerate intrinsic
+    ratio, and CSS Images 3 says such an image has no visible content
+    at all — not "fill the box", which is what a missing viewBox
+    means. The two look identical to _view_box, so they are told apart
+    here.
+    """
+    vb = (svg.attributes.get("viewbox")
+          or svg.attributes.get("viewBox") or "").replace(",", " ").split()
+    if len(vb) != 4:
+        return False
+    try:
+        return float(vb[2]) <= 0 or float(vb[3]) <= 0
+    except ValueError:
+        return False
+
+
 def svg_intrinsic(svg):
     """(width, height, ratio) an <svg> contributes to CSS sizing, with
     None for each piece it does not have.

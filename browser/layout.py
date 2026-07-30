@@ -404,6 +404,8 @@ def _vector_tile_size(spec, box_w, box_h, svg):
                     min(h, cap) if math.isfinite(h) else box_h)
         return w, h
 
+    if textengine.svg_degenerate(svg):
+        return 0.0, 0.0                 # no visible content at any size
     iw, ih, ratio = textengine.svg_intrinsic(svg)
     size = spec["size"]
     kw = size[0].casefold() if size else "auto"
