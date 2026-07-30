@@ -1064,6 +1064,48 @@ check("a padded inline span pushes its own text along",
       _SPAN and _SPAN[0][0] == 40, str(_SPAN))
 
 
+# content: attr(), unicode escapes, and the dir attribute
+def _gen(css, body):
+    from browser import native
+    from browser.layout import DocumentLayout, paint_tree
+    nodes, _d, _c, _l = native.load_document(
+        "<style>body{margin:0}" + css + "</style>" + body,
+        lambda _h: {}, None)
+    doc = DocumentLayout(nodes)
+    doc.layout(300, 200)
+    return [c.native(0)[8] for c in paint_tree(doc, [])
+            if c.native(0)[0] == 1]
+check("attr() puts the attribute in generated content",
+      _gen("#t::before{content:attr(data-x)}",
+           "<div id=t data-x=HI>z</div>") == ["HI", "z"])
+check("a content list concatenates its parts",
+      _gen("#t::before{content:\"[\" attr(data-x) \"]\"}",
+           "<div id=t data-x=HI>z</div>") == ["[HI]", "z"])
+check("a missing attribute contributes nothing, keeping the box",
+      _gen("#t::before{content:attr(nope)}", "<div id=t>z</div>") == ["z"])
+check("attr() takes a fallback",
+      _gen("#t::before{content:attr(nope, \"F\")}",
+           "<div id=t>z</div>") == ["F", "z"])
+check("a unicode escape is the codepoint, not its digits",
+      _gen("#t::before{content:\"" + chr(92) + "201C\"}",
+           "<div id=t>z</div>") == ["\u201c", "z"])
+check("an escaped backslash stays a backslash",
+      _gen("#t::before{content:\"" + chr(92) * 2 + "\"}",
+           "<div id=t>z</div>") == [chr(92), "z"])
+check("counters and url() still generate an empty box",
+      (_gen("#t::before{content:counter(x)}", "<div id=t>z</div>"),
+       _gen("#t::before{content:url(a.png)}", "<div id=t>z</div>"))
+      == (["z"], ["z"]))
+
+_RTL = [round(c[1]) for c in _lines_all(
+    "body{margin:0}div{width:200px}", "<div dir=rtl>alpha beta</div>")
+    if c[0] == 1]
+check("the dir attribute reaches the direction property",
+      _RTL and _RTL[0] > 100, str(_RTL))
+check("text-align's initial value is start, so rtl aligns right",
+      _rta(_AN(**{"direction": "rtl"})) == "right")
+
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",

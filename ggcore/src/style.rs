@@ -21,7 +21,10 @@ const INHERITED: &[(&str, &str)] = &[
     ("font-weight", "normal"),
     ("font-family", "default"),
     ("color", "black"),
-    ("text-align", "left"),
+    // "start", not "left": the initial value is writing-mode relative,
+    // and spelling it "left" made `direction: rtl` align its text to
+    // the left because a physical keyword has nothing to resolve.
+    ("text-align", "start"),
     ("white-space", "normal"),
     ("visibility", "visible"),
     ("line-height", "normal"),
@@ -348,19 +351,109 @@ struct Scratch {
 
 /// Strip quotes from a CSS `content` string; None when the rule makes
 /// no box (`none`/`normal`) or the value form is unsupported.
-fn content_text(raw: &str) -> Option<String> {
+/// The text a `content` value generates, or None for no box at all.
+///
+/// A content value is a *list*: `content: "[" attr(href) "]"` is three
+/// components concatenated. Quoted strings contribute their text and
+/// `attr()` contributes the element's attribute (empty when absent,
+/// which is what the spec says and what keeps a missing attribute from
+/// removing the box). Counters and images still contribute nothing —
+/// the box is generated but empty, which is what it was doing for
+/// every non-string value before.
+fn content_text(raw: &str, attrs: &dyn Fn(&str) -> Option<String>) -> Option<String> {
     let t = raw.trim();
     if t.is_empty() || t == "none" || t == "normal" {
         return None;
     }
-    let b = t.as_bytes();
-    if b.len() >= 2
-        && (b[0] == b'"' || b[0] == b'\'')
-        && b[b.len() - 1] == b[0]
-    {
-        return Some(t[1..t.len() - 1].to_string());
+    let mut out = String::new();
+    let b: Vec<char> = t.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            let mut j = i + 1;
+            while j < b.len() && b[j] != c {
+                if b[j] != '\\' || j + 1 >= b.len() {
+                    out.push(b[j]);
+                    j += 1;
+                    continue;
+                }
+                // a backslash starts either a character escape or a
+                // unicode one — `content: "\\e903"` is an icon-font
+                // codepoint, and pushing the digits as text draws
+                // "e903" on the page where a glyph belongs
+                let mut k = j + 1;
+                let mut hex = String::new();
+                while k < b.len() && hex.len() < 6 && b[k].is_ascii_hexdigit()
+                {
+                    hex.push(b[k]);
+                    k += 1;
+                }
+                if hex.is_empty() {
+                    out.push(b[j + 1]);
+                    j += 2;
+                    continue;
+                }
+                // one optional whitespace terminates the escape
+                if k < b.len() && b[k].is_whitespace() {
+                    k += 1;
+                }
+                if let Some(ch) = u32::from_str_radix(&hex, 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                {
+                    out.push(ch);
+                }
+                j = k;
+            }
+            i = j + 1;
+            continue;
+        }
+        // a function or keyword: read to its end
+        let start = i;
+        while i < b.len() && !b[i].is_whitespace() && b[i] != '(' {
+            i += 1;
+        }
+        let name: String =
+            b[start..i].iter().collect::<String>().to_ascii_lowercase();
+        if i < b.len() && b[i] == '(' {
+            let mut depth = 0;
+            let arg_start = i + 1;
+            while i < b.len() {
+                if b[i] == '(' {
+                    depth += 1;
+                } else if b[i] == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            let inner: String = b[arg_start..i.min(b.len())].iter().collect();
+            i += 1;
+            if name == "attr" {
+                // attr(name) or attr(name type?, fallback)
+                let (head, fallback) = match inner.split_once(',') {
+                    Some((h, f)) => (h, f.trim().trim_matches(['"', '\''])),
+                    None => (inner.as_str(), ""),
+                };
+                let key = head
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                out.push_str(
+                    &attrs(&key).unwrap_or_else(|| fallback.to_string()),
+                );
+            }
+        }
     }
-    Some(String::new()) // attr()/counters: render an empty box
+    Some(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -596,8 +689,12 @@ fn synthesize_pseudos(
                 }
             }
         }
-        let Some(text) =
-            style.get("content").and_then(|c| content_text(c))
+        let host_attrs = |name: &str| {
+            doc.nodes[idx].attr(name).map(|v| v.to_string())
+        };
+        let Some(text) = style
+            .get("content")
+            .and_then(|c| content_text(c, &host_attrs))
         else {
             continue; // no content -> no box
         };

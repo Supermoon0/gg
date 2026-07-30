@@ -65,6 +65,11 @@ p  { display: block; margin-top: 16px; margin-bottom: 16px; }
 
 ul, ol { display: block; margin-top: 16px; margin-bottom: 16px;
          margin-left: 24px; }
+
+/* the dir attribute is the HTML spelling of the direction property,
+   and it is how nearly every right-to-left page states it */
+[dir=rtl] { direction: rtl; }
+[dir=ltr] { direction: ltr; }
 li { display: block; margin-left: 16px; }
 
 blockquote { display: block; margin-top: 16px; margin-bottom: 16px;
