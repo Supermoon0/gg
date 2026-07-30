@@ -1157,6 +1157,12 @@ pub(super) struct St {
     /// el.style / el.dataset proxy objects -> their DOM node. Property
     /// reads/writes on these route to the style / data-* attributes.
     pub(super) style_nodes: HashMap<u32, u32>,
+    /// Objects handed out by getComputedStyle. A real computed style
+    /// carries every property the engine knows, so `'color' in
+    /// getComputedStyle(el)` is true whether or not anything set it —
+    /// and computed-testcommon.js asserts exactly that before it
+    /// checks a value.
+    pub(super) computed_objs: std::collections::HashSet<u32>,
     pub(super) dataset_nodes: HashMap<u32, u32>,
     /// The reverse: the proxy already handed out for a node. `el.style`
     /// is specified to return the *same* object on every read; minting
@@ -1351,6 +1357,7 @@ impl St {
             map_data: HashMap::new(),
             set_data: HashMap::new(),
             style_nodes: HashMap::new(),
+            computed_objs: std::collections::HashSet::new(),
             dataset_nodes: HashMap::new(),
             style_proxies: HashMap::new(),
             dataset_proxies: HashMap::new(),
@@ -3295,7 +3302,10 @@ fn has_own_property(
         let v = dom_get_prop(st, key_id, obj.index())?;
         return Ok(!v.is_undefined());
     }
-    if obj.is_object() && st.style_nodes.contains_key(&obj.index()) {
+    if obj.is_object()
+        && (st.style_nodes.contains_key(&obj.index())
+            || st.computed_objs.contains(&obj.index()))
+    {
         // jQuery probes CSS support with `prop in div.style`; the
         // proxy accepts any property name, so membership is broad
         let name = to_display(st, key);
@@ -5670,6 +5680,19 @@ fn internal_has(
     }
     if target.is_dom_node() {
         return Ok(!dom_get_prop(st, key, target.index())?.is_undefined());
+    }
+    // A computed style carries every property the engine knows, set or
+    // not — `'color' in getComputedStyle(el)` is true on a bare div.
+    // The style proxy already answers this way; the object handed out
+    // by getComputedStyle has to as well, and `in` has its own
+    // implementation separate from the one further up this file.
+    if target.is_object() && st.computed_objs.contains(&target.index()) {
+        let name = st.names[key as usize].clone();
+        return Ok(name
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic())
+            .unwrap_or(false));
     }
     if target.is_string() {
         // `Object('abc')` yields the primitive here (no wrapper
@@ -8551,6 +8574,22 @@ fn host_fn(
                     None => Vec::new(),
                 }
             };
+            // Inline declarations sit on top: they win the cascade
+            // anyway, and they are the only part that reflects writes
+            // the page made *after* styles were last computed.
+            //
+            // Known gap: in the headless driver path nothing calls
+            // compute_styles at all, so the map below is empty there
+            // and this is the whole answer. In the browser path it is
+            // the cascade plus inline, which is right.
+            let inline = {
+                let d = doc.borrow();
+                d.nodes
+                    .get(node)
+                    .and_then(|n| n.attr("style"))
+                    .unwrap_or("")
+                    .to_string()
+            };
             let out = new_plain_object(st);
             let oi = out.index() as usize;
             for (k, v) in pairs {
@@ -8558,6 +8597,18 @@ fn host_fn(
                 let val = push_str(st, v);
                 raw_set_prop(st, oi, key, val);
             }
+            for decl in inline.split(';') {
+                if let Some((k, v)) = decl.split_once(':') {
+                    let (k, v) = (k.trim(), v.trim());
+                    if k.is_empty() {
+                        continue;
+                    }
+                    let key = st.intern_name(k);
+                    let val = push_str(st, v.to_string());
+                    raw_set_prop(st, oi, key, val);
+                }
+            }
+            st.computed_objs.insert(out.index());
             Ok(out)
         }
         TA_IS_VIEW => Ok(Value::boolean(view_of(st, argv!(0)).is_some())),
