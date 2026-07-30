@@ -1183,6 +1183,105 @@ def is_out_of_flow(node):
             and node.style.get("position") in ("absolute", "fixed"))
 
 
+_BULLETS = ("disc", "circle", "square")
+_ROMAN = ((1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"),
+          (90, "xc"), (50, "l"), (40, "xl"), (10, "x"), (9, "ix"),
+          (5, "v"), (4, "iv"), (1, "i"))
+
+
+def list_style_type(node):
+    """The marker style in effect for an <li>.
+
+    It is an inherited property, so the <ul>/<ol> that sets it is
+    usually not the element being painted; and when nothing sets it,
+    the list's own tag decides — <ol> counts, <ul> bullets. That
+    default is why every ordered list on every page was drawing dots.
+    """
+    n = node
+    for _ in range(12):
+        if not isinstance(n, Element):
+            break
+        for prop in ("list-style-type", "list-style"):
+            raw = (n.style.get(prop) or "").strip().casefold()
+            if not raw:
+                continue
+            for token in raw.split():
+                if token in ("none", "inside", "outside") \
+                        or token.startswith("url("):
+                    continue
+                return token
+            if "none" in raw.split():
+                return "none"
+        if n.tag in ("ol", "ul"):
+            return "decimal" if n.tag == "ol" else "disc"
+        n = getattr(n, "parent", None)
+    return "disc"
+
+
+def _list_item_index(node):
+    """1-based position of an <li> among its list siblings, honouring a
+    `value` attribute the way the HTML parser's counter would."""
+    parent = getattr(node, "parent", None)
+    if not isinstance(parent, Element):
+        return 1
+    index = 0
+    for child in parent.children:
+        if not (isinstance(child, Element) and child.tag == "li"):
+            continue
+        raw = child.attributes.get("value")
+        if raw is not None:
+            try:
+                index = int(str(raw).strip())
+            except ValueError:
+                index += 1
+        else:
+            index += 1
+        if child is node:
+            return index
+    return max(index, 1)
+
+
+def _alpha_label(n, upper=False):
+    """1 -> a, 26 -> z, 27 -> aa. Bijective base 26, not base 26 with a
+    zero digit — there is no 'a0' in an alphabetic list."""
+    if n < 1:
+        return str(n)
+    out = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        out = chr(ord("a") + rem) + out
+    return out.upper() if upper else out
+
+
+def _roman_label(n, upper=False):
+    if not 0 < n < 4000:
+        return str(n)
+    out = ""
+    for value, sym in _ROMAN:
+        while n >= value:
+            out += sym
+            n -= value
+    return out.upper() if upper else out
+
+
+def marker_label(kind, index):
+    """The text a counting marker draws, trailing separator included."""
+    if kind in ("decimal", "decimal-leading-zero"):
+        text = f"{index:02d}" if kind.endswith("zero") and 0 <= index < 10 \
+            else str(index)
+    elif kind in ("lower-alpha", "lower-latin"):
+        text = _alpha_label(index)
+    elif kind in ("upper-alpha", "upper-latin"):
+        text = _alpha_label(index, upper=True)
+    elif kind == "lower-roman":
+        text = _roman_label(index)
+    elif kind == "upper-roman":
+        text = _roman_label(index, upper=True)
+    else:
+        return ""
+    return text + "."
+
+
 def _list_marker_visible(node):
     """Whether an <li> paints its bullet. `list-style(-type): none`
     (checked up the chain — the property inherits and sites set it on
@@ -4288,11 +4387,36 @@ class BlockLayout:
 
             if self.node.tag == "li" and _list_marker_visible(self.node):
                 font = cached_font(self.node)
-                r = 2
+                color = safe_color(self.node.style.get("color", "black"))
+                kind = list_style_type(self.node)
                 cy = self.y + font.gg_linespace / 2
-                cmds.append(DrawOval(
-                    self.x - 12, cy - r, self.x - 12 + 2 * r, cy + r,
-                    safe_color(self.node.style.get("color", "black"))))
+                if kind in ("disc", "circle", "square"):
+                    r = 2
+                    left = self.x - 12
+                    if kind == "square":
+                        cmds.append(DrawRect(left, cy - r,
+                                             left + 2 * r, cy + r, color))
+                    elif kind == "circle":
+                        # hollow: the fill is the page behind it, which
+                        # this rasterizer has no way to punch out, so the
+                        # ring is drawn as a thin oval outline
+                        cmds.append(DrawOval(left, cy - r,
+                                             left + 2 * r, cy + r, color))
+                        cmds.append(DrawOval(left + 1, cy - r + 1,
+                                             left + 2 * r - 1, cy + r - 1,
+                                             "#ffffff"))
+                    else:
+                        cmds.append(DrawOval(left, cy - r,
+                                             left + 2 * r, cy + r, color))
+                else:
+                    label = marker_label(kind, _list_item_index(self.node))
+                    if label:
+                        w = measure(font, label)
+                        cmds.append(DrawText(
+                            self.x - 8 - w,
+                            self.y + max(0.0, (font.gg_linespace
+                                               - font.gg_linespace) / 2),
+                            label, font, color))
             if self.node.tag == "hr":
                 cmds.append(DrawLine(
                     self.x, self.y + 4, self.x + self.width, self.y + 4,

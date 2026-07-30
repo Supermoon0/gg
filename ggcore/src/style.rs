@@ -29,7 +29,11 @@ const INHERITED: &[(&str, &str)] = &[
     ("word-spacing", "normal"),
     ("text-transform", "none"),
     ("text-indent", "0"),
-    ("list-style-type", "disc"),
+    // Left empty rather than "disc": <ol> and <ul> pick different
+    // markers by tag, and paint has to be able to tell an author's
+    // `list-style-type: disc` from an initial value nobody wrote —
+    // otherwise every ordered list on every page draws bullets.
+    ("list-style-type", ""),
     ("cursor", "auto"),
     ("direction", "ltr"),
     ("word-break", "normal"),

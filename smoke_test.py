@@ -681,6 +681,38 @@ check("the ring is drawn outside the border box on all four sides",
       _ol == [(-3, -3, 103, 0), (-3, 50, 103, 53),
               (-3, 0, 0, 50), (100, 0, 103, 50)], str(_ol))
 
+# list markers: <ol> counts, <ul> bullets, and the counting styles
+from browser.layout import marker_label as _mk, _alpha_label, _roman_label
+check("decimal counts",
+      [_mk("decimal", i) for i in (1, 9, 42)] == ["1.", "9.", "42."])
+check("alphabetic is bijective base 26",
+      [_alpha_label(i) for i in (1, 26, 27, 52, 53)]
+      == ["a", "z", "aa", "az", "ba"])
+check("roman covers the subtractive pairs",
+      [_roman_label(i) for i in (4, 9, 14, 40, 1987)]
+      == ["iv", "ix", "xiv", "xl", "mcmlxxxvii"])
+check("upper variants exist",
+      (_mk("upper-alpha", 3), _mk("upper-roman", 4)) == ("C.", "IV."))
+check("decimal-leading-zero pads a single digit",
+      (_mk("decimal-leading-zero", 3), _mk("decimal-leading-zero", 12))
+      == ("03.", "12."))
+check("a bullet style has no label text",
+      [_mk(k, 1) for k in ("disc", "circle", "square")] == ["", "", ""])
+
+def _markers(tag, css):
+    return [c[8] for c in _lines_all(
+        "body{margin:0}" + tag + "{" + css + "}",
+        f"<{tag}><li>a</li><li>b</li></{tag}>") if c[0] == 1]
+check("<ol> numbers and <ul> bullets by tag",
+      (_markers("ol", ""), _markers("ul", ""))
+      == (["1.", "a", "2.", "b"], ["a", "b"]),
+      str((_markers("ol", ""), _markers("ul", ""))))
+check("an author's list-style-type outranks the tag default",
+      _markers("ol", "list-style-type:lower-roman")
+      == ["i.", "a", "ii.", "b"])
+check("list-style:none suppresses the marker",
+      _markers("ul", "list-style:none") == ["a", "b"])
+
 # CSS width/height outrank HTML attributes on replaced elements
 ri_dom = _styled("img.big{width:100px; height:50px} "
                  "img.half{width:48px} img.zero{width:0;height:0}",
