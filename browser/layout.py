@@ -1231,6 +1231,59 @@ def lh_unit(node, em):
         return em * 1.2
 
 
+def clamp_lines(box, n, ellipsis):
+    """Keep the first `n` line boxes of a laid-out subtree and mark the
+    cut with `ellipsis`.
+
+    `-webkit-box` counts lines across the block children it stacks, not
+    only the ones in its own inline context, so this cut has to be made
+    on the finished tree — during the inline walk those lines belong to
+    a descendant that has not been laid out yet.
+    """
+    kept = [0]
+
+    def walk(b):
+        out = []
+        for child in b.children:
+            if isinstance(child, LineLayout):
+                if kept[0] >= n:
+                    continue
+                kept[0] += 1
+                out.append(child)
+                if kept[0] == n and ellipsis:
+                    words = [w for w in child.children
+                             if isinstance(w, TextLayout)]
+                    if words:
+                        words[-1].word = words[-1].word.rstrip() + ellipsis
+            else:
+                walk(child)
+                out.append(child)
+        b.children = out
+
+    walk(box)
+    _reheight(box)
+    return kept[0]
+
+
+def _reheight(box):
+    """Recompute a trimmed subtree's heights bottom-up: a block of line
+    boxes is as tall as they are, anything else reaches its last
+    child's bottom edge."""
+    for child in box.children:
+        if isinstance(child, BlockLayout):
+            _reheight(child)
+    if not box.children:
+        box.height = 0.0
+        return
+    if all(isinstance(c, LineLayout) for c in box.children):
+        box.height = sum(c.height for c in box.children)
+    else:
+        last = box.children[-1]
+        box.height = max(
+            (last.y + last.height + getattr(last, "pb", 0)
+             + getattr(last, "bb", 0)) - box.y, 0.0)
+
+
 def line_clamp_auto(style):
     """`line-clamp: auto` — clamp to whatever the box's own height
     allows rather than to a line count (CSS Overflow 4)."""
@@ -3396,6 +3449,20 @@ class BlockLayout:
                 (fy + fh for (_, _, fy, _, fh) in self._floats),
                 default=self.y)
             self.height = max(flow_bottom, float_bottom) - self.y
+            # A clamp on a box that ended up in block flow — the legacy
+            # `display: -webkit-box` wrapping a block — counts the lines
+            # of the whole subtree, so it is applied to the finished
+            # tree rather than to this box's own line list.
+            n_lines = line_clamp_count(st)
+            if n_lines is None and line_clamp_auto(st):
+                room = self._content_height_limit(st.get("max-height"), em)
+                if room is None:
+                    room = self.definite_height
+                lh = lh_unit(node, em)
+                if room is not None and lh > 0:
+                    n_lines = max(int(room / lh + 1e-6), 1)
+            if n_lines:
+                clamp_lines(self, n_lines, block_ellipsis(st))
             apply_relative_offsets(self.children)
         else:
             self.new_line()
