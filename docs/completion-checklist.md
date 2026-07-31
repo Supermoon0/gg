@@ -20,7 +20,7 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
 | HTML 파서 | **1796/1796 (100%)** | html5lib-tests, cargo test |
 | JS 엔진 | **27,379/102,655 (26.67%)** | Test262, baseline regression=0 |
 | CSS (script) | **4,344/24,862 (17.47%)** | WPT css testharness |
-| CSS (render) | **6,080/17,263 (35.22%)** | WPT css reftest, 픽셀 비교 |
+| CSS (render) | **6,273/17,263 (36.34%)** | WPT css reftest, 픽셀 비교 |
 | CSS (자체) | 23/23 | css_gauntlet |
 | JS 계약 | 28/31 | jsvm_gauntlet (3건은 문서화된 GAP) |
 | 내장 계약 | 9/9 | conformance |
@@ -177,7 +177,7 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
       16,929 파일 / 17,263 비교. 저장된 이미지가 아니라 *같은 엔진의 두
       렌더*를 비교하므로 골든 파일도 폰트 일치도 필요 없다
 
-#### 궤적: 28.25% → 27.47% → 30.01% → 31.53% → 33.50% → 35.22%
+#### 궤적: 28.25% → 27.47% → 30.01% → 31.53% → 33.50% → 35.22% → 35.49% → 36.23% → 36.34%
 
 부풀린 숫자에서 정직한 숫자로 내려간 다음, 엔진 수정으로 올라갔다.
 
@@ -307,7 +307,25 @@ ggcore/html5 8,247 · browser 21,858 · validation 4,571).
 - [ ] **mismatch인데 동일하게 렌더** — 달라야 하는데 같다. 남은 큰 덩어리는
       font-palette, scrollbar-color, shaping, 회전 transform
 - [ ] **fragmentation (css-break/*)** — 491건. 화면 브라우저에는 낮은 가치
-- [ ] **grid-lanes (Grid L3 masonry) 641건**
+- [x] **grid-lanes (Grid L3 masonry) 코어** — `display: grid-lanes`.
+      트랙 축은 기존 그리드 기계를 재사용, 레인 축은 최단 레인 배치
+      (+flow-tolerance, 정확한 동률은 가장 최근에 늘어난 레인 —
+      두 WPT 레퍼런스가 정확히 이 규칙 쌍을 인코딩한다). 클러스터
+      +81/-33. 남은 것: subgrid 연동 144건, fill/track-reverse·dense,
+      baseline 정렬
+- [x] **CSS 카운터** — counter-reset/-set/-increment, counter()/
+      counters(), reversed(), 암시적 list-item, display:contents 투명,
+      @counter-style `system: extends`. ::marker content까지
+- [x] **`zoom`** — 계산값 시점 스케일. 자기 규칙 값은 유효 줌,
+      상속 값은 자기 배율만. rem·뷰포트 단위도 스케일, em/%는 기반을
+      타고 스케일. `inherit` 키워드가 비상속 속성에서도 부모 계산값.
+      calc() 곱셈/나눗셈 평가기 포함. 클러스터 +40
+- [x] **clip-path 도형** — 타원 클립 명령(rim 1px 페더). circle/
+      ellipse/rect()/xywh()/직사각형 polygon/geometry-box 키워드.
+      비직사각형 polygon은 바운딩 박스로 근사하지 않고 그대로 둔다
+- [x] **margin-trim (블록)** — 컨테이너 가장자리에 닿는 자식의 블록
+      마진 제거. flex/inline 변형은 미구현
+- [ ] **grid-lanes 잔여** — subgrid 연동 144건, 방향 수정자·dense 등
 - [ ] **shape-outside 200건 · clip-path 비직사각형 146건 · mask-image 100건**
 - [ ] **CSS 카운터** — `counter-increment`/`counters()`/`@counter-style`.
       `content: counter()`를 쓰는 코퍼스 파일이 199개다. 지금은 카운터가

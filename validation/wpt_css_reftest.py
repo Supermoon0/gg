@@ -267,7 +267,28 @@ def render(page: Path, corpus: Path):
 
     document = DocumentLayout(nodes)
     document.layout(WIDTH, HEIGHT)
-    cmds = [c.native(0) for c in paint_tree(document, [])]
+
+    # Scripts scroll things — el.scrollTop, window.scrollTo — and the
+    # VM records those writes for the host to drain. A harness that
+    # never drains them renders every scroller at 0, which is exactly
+    # the state the css-position/sticky suite exists to not be in.
+    page_scroll = 0.0
+    try:
+        writes = list(doc.take_scroll_writes())
+        into_view = list(doc.take_scroll_into_view()) \
+            if hasattr(doc, "take_scroll_into_view") else []
+    except Exception:
+        writes, into_view = [], []
+    if writes or into_view:
+        from browser.layout import (apply_scroll_requests,
+                                    layout_tree_to_list)
+        _moved, page_target = apply_scroll_requests(
+            layout_tree_to_list(document, []), writes, into_view,
+            HEIGHT, 0.0)
+        if page_target is not None:
+            page_scroll = max(0.0, float(page_target[0]))
+
+    cmds = [c.native(page_scroll) for c in paint_tree(document, [])]
     return bytes(engine.render_raw(
         WIDTH, HEIGHT, (255, 255, 255), cmds))
 
