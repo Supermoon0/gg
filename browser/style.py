@@ -140,6 +140,113 @@ def _split_args(text):
     return [p.strip() for p in out if p.strip()]
 
 
+
+
+def _calc_eval(expr, percent_base, em_base, ch_base, lh_base):
+    """Evaluate a calc() body to px, or None. Grammar: sums of
+    products of parenthesised terms, lengths and numbers. A product
+    needs at least one unitless operand; length*length is not a
+    length."""
+    token_re = re.compile(
+        r"\s*(?:"
+        r"(?P<num>[+-]?(?:\d+(?:\.\d*)?|\.\d+))"
+        r"(?P<unit>rem|rlh|px|em|ch|ex|lh|vw|vh|%)?"
+        r"|(?P<op>[+\-*/()])"
+        r")\s*")
+
+    tokens = []
+    pos = 0
+    while pos < len(expr):
+        m = token_re.match(expr, pos)
+        if m is None or m.end() == pos:
+            return None
+        if m.group("num") is not None:
+            n = float(m.group("num"))
+            unit = m.group("unit") or ""
+            if unit == "":
+                tokens.append(("num", n))
+            else:
+                if unit == "rem":
+                    n *= 16.0
+                elif unit == "em":
+                    n *= em_base
+                elif unit == "ch":
+                    n *= ch_base if ch_base else em_base * _CH_PER_EM
+                elif unit == "ex":
+                    n *= (ch_base * _EX_PER_CH if ch_base
+                          else em_base * _EX_PER_EM)
+                elif unit in ("lh", "rlh"):
+                    n *= lh_base or em_base * 1.2
+                elif unit in ("%", "vw", "vh"):
+                    n *= percent_base / 100.0
+                tokens.append(("len", n))
+        else:
+            tokens.append(("op", m.group("op")))
+        pos = m.end()
+    tokens.append(("end", ""))
+    i = [0]
+
+    def peek():
+        return tokens[i[0]]
+
+    def take():
+        t = tokens[i[0]]
+        i[0] += 1
+        return t
+
+    def atom():
+        kind, v2 = peek()
+        if kind == "op" and v2 == "(":
+            take()
+            r = addsub()
+            if r is None or peek() != ("op", ")"):
+                return None
+            take()
+            return r
+        if kind in ("num", "len"):
+            take()
+            return (kind, v2)
+        return None
+
+    def muldiv():
+        left = atom()
+        if left is None:
+            return None
+        while peek()[0] == "op" and peek()[1] in "*/":
+            op = take()[1]
+            right = atom()
+            if right is None:
+                return None
+            (lk, lv), (rk, rv) = left, right
+            if op == "*":
+                if lk == "len" and rk == "len":
+                    return None          # px*px is not a length
+                left = ("len" if "len" in (lk, rk) else "num", lv * rv)
+            else:
+                if rk != "num" or rv == 0:
+                    return None          # divide by a number only
+                left = (lk, lv / rv)
+        return left
+
+    def addsub():
+        left = muldiv()
+        if left is None:
+            return None
+        while peek()[0] == "op" and peek()[1] in "+-":
+            op = take()[1]
+            right = muldiv()
+            if right is None:
+                return None
+            v2 = right[1] if op == "+" else -right[1]
+            left = ("len" if "len" in (left[0], right[0]) else "num",
+                    left[1] + v2)
+        return left
+
+    result = addsub()
+    if result is None or peek()[0] != "end":
+        return None
+    return result[1]
+
 def parse_size(value, percent_base=0.0, em_base=16.0, ch_base=None,
                lh_base=None):
     """Resolve a CSS length to px. Returns None for auto/unsupported.
@@ -181,43 +288,14 @@ def parse_size(value, percent_base=0.0, em_base=16.0, ch_base=None,
             return max(lo, min(mid, hi))
     try:
         if v.startswith("calc(") and v.endswith(")"):
-            # The overwhelmingly common calc() form in page layout is a
-            # linear sum/difference of lengths (Google's logo well uses
-            # ``calc(100% - 560px)``).  Treating it as unsupported made the
-            # declaration disappear and left min-height as the used height.
-            # Keep the evaluator deliberately small and fail closed for
-            # multiplication, division, nested functions, or stray tokens.
-            inner = v[5:-1]
-            term = re.compile(
-                r"\s*([+-]?)\s*((?:\d+(?:\.\d*)?|\.\d+))"
-                r"(rem|px|em|ch|ex|vw|vh|%)?")
-            pos = 0
-            total = 0.0
-            first = True
-            while pos < len(inner):
-                match = term.match(inner, pos)
-                if match is None or (not first and not match.group(1)):
-                    return None
-                sign = -1.0 if match.group(1) == "-" else 1.0
-                number = float(match.group(2))
-                unit = match.group(3) or ""
-                if unit == "rem":
-                    number *= 16.0
-                elif unit == "em":
-                    number *= em_base
-                elif unit == "ch":
-                    number *= ch_base if ch_base else em_base * _CH_PER_EM
-                elif unit == "ex":
-                    number *= (ch_base * _EX_PER_CH if ch_base
-                               else em_base * _EX_PER_EM)
-                elif unit in ("%", "vw", "vh"):
-                    number *= percent_base / 100.0
-                elif unit not in ("", "px"):
-                    return None
-                total += sign * number
-                pos = match.end()
-                first = False
-            out = total
+            # calc(): +, -, and the *, / forms where one operand is a
+            # unitless number (var() is substituted before this runs,
+            # so `calc(30px * var(--s))` arrives as `calc(30px * 2)`).
+            # A length appearing where a number must go fails closed.
+            out = _calc_eval(v[5:-1], percent_base, em_base,
+                             ch_base, lh_base)
+            if out is None:
+                return None
         elif v.endswith("px"):
             out = float(v[:-2])
         elif v.endswith("rlh"):

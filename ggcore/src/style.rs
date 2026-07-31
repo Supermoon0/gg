@@ -1079,6 +1079,130 @@ fn content_text_ctr(
     Some(out)
 }
 
+/// The `zoom` property's factor: a number, a percentage, or `normal`.
+fn parse_zoom(raw: Option<&str>) -> f64 {
+    let Some(raw) = raw else { return 1.0 };
+    let t = raw.trim().to_ascii_lowercase();
+    if t.is_empty() || t == "normal" {
+        return 1.0;
+    }
+    let v = if let Some(p) = t.strip_suffix('%') {
+        p.trim().parse::<f64>().map(|n| n / 100.0)
+    } else {
+        t.parse::<f64>()
+    };
+    match v {
+        Ok(n) if n > 0.0 && n.is_finite() => n,
+        _ => 1.0,
+    }
+}
+
+/// Multiply every absolute length token in a declaration value by
+/// `factor`, leaving relative units, bare numbers, strings and url()
+/// bodies alone. `10px` at zoom 2 is `20px`; `2em`, `50%` and `1.5`
+/// already scale through what they resolve against.
+fn scale_abs_lengths(value: &str, factor: f64) -> String {
+    let b: Vec<char> = value.chars().collect();
+    let mut out = String::with_capacity(value.len() + 8);
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        // skip quoted strings and url(...) bodies verbatim
+        if c == '"' || c == '\'' {
+            out.push(c);
+            i += 1;
+            while i < b.len() {
+                out.push(b[i]);
+                if b[i] == c {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c.eq_ignore_ascii_case(&'u')
+            && value[..].len() >= i + 4
+            && b[i..].iter().take(4).collect::<String>()
+                .eq_ignore_ascii_case("url(")
+            && (i == 0 || !b[i - 1].is_alphanumeric())
+        {
+            let mut depth = 0;
+            while i < b.len() {
+                out.push(b[i]);
+                if b[i] == '(' {
+                    depth += 1;
+                } else if b[i] == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            continue;
+        }
+        let starts_number = c.is_ascii_digit()
+            || (c == '.'
+                && b.get(i + 1).is_some_and(|n| n.is_ascii_digit()))
+            || ((c == '-' || c == '+')
+                && b.get(i + 1).is_some_and(|n| {
+                    n.is_ascii_digit() || *n == '.'
+                })
+                && (i == 0
+                    || !(b[i - 1].is_alphanumeric() || b[i - 1] == '.')));
+        if starts_number
+            && (i == 0 || !(b[i - 1].is_alphanumeric() || b[i - 1] == '.'))
+        {
+            let start = i;
+            if b[i] == '-' || b[i] == '+' {
+                i += 1;
+            }
+            while i < b.len() && (b[i].is_ascii_digit() || b[i] == '.') {
+                i += 1;
+            }
+            let num: String = b[start..i].iter().collect();
+            let unit_start = i;
+            while i < b.len() && b[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            let unit: String =
+                b[unit_start..i].iter().collect::<String>().to_lowercase();
+            match unit.as_str() {
+                "px" | "pt" | "pc" | "cm" | "mm" | "in" | "q"
+                | "rem" | "vw" | "vh" | "vmin" | "vmax" => {
+                    match num.parse::<f64>() {
+                        Ok(n) => {
+                            let scaled = n * factor;
+                            if (scaled - scaled.round()).abs() < 1e-9 {
+                                out.push_str(&format!(
+                                    "{}{}",
+                                    scaled.round() as i64, unit
+                                ));
+                            } else {
+                                out.push_str(&format!("{scaled}{unit}"));
+                            }
+                        }
+                        Err(_) => {
+                            out.push_str(&num);
+                            out.push_str(&unit);
+                        }
+                    }
+                }
+                _ => {
+                    out.push_str(&num);
+                    out.push_str(&unit);
+                }
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn style_node(
     doc: &mut Document,
@@ -1185,6 +1309,69 @@ fn style_node(
                 }
             }
         }
+    }
+
+    // 3.7 the CSS-wide `inherit` keyword: any declaration whose value
+    // is exactly `inherit` takes the parent's *computed* value — for
+    // non-inherited properties too, which is what the zoom reference
+    // pages lean on (`width: inherit` across a zoom boundary).
+    let explicit_inherit: Vec<String> = style
+        .iter()
+        .filter(|(_, v)| v.trim().eq_ignore_ascii_case("inherit"))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for prop in explicit_inherit {
+        match parent_style.get(&prop) {
+            Some(v) => {
+                style.insert(prop, v.clone());
+            }
+            None => {
+                style.remove(&prop);
+            }
+        }
+    }
+
+    // 3.8 CSS `zoom`: a computed-value-time scale on the subtree.
+    // A value set by a rule on this element scales by the *effective*
+    // zoom (every ancestor's factor times its own); a value inherited
+    // from the parent is already scaled to the parent's effective
+    // zoom and needs only this element's own factor on top.
+    let own_zoom = parse_zoom(style.get("zoom").map(String::as_str));
+    let parent_zoom = parent_style
+        .get("-gg-zoom")
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(1.0);
+    let effective_zoom = parent_zoom * own_zoom;
+    if (effective_zoom - 1.0).abs() > 1e-9 {
+        let keys: Vec<String> = style.keys().cloned().collect();
+        for prop in keys {
+            if prop.starts_with("--")
+                || matches!(
+                    prop.as_str(),
+                    "zoom" | "-gg-zoom" | "content" | "font-family"
+                        | "quotes" | "counter-reset" | "counter-increment"
+                        | "counter-set"
+                )
+            {
+                continue;
+            }
+            let inherited_here = INHERITED.iter().any(|(k, _)| *k == prop)
+                && parent_style.get(&prop) == style.get(&prop);
+            let factor = if inherited_here {
+                own_zoom
+            } else {
+                effective_zoom
+            };
+            if (factor - 1.0).abs() > 1e-9 {
+                let scaled = scale_abs_lengths(&style[&prop], factor);
+                style.insert(prop, scaled);
+            }
+        }
+    }
+    if (effective_zoom - 1.0).abs() > 1e-9
+        || parent_style.contains_key("-gg-zoom")
+    {
+        style.insert("-gg-zoom".into(), format!("{effective_zoom}"));
     }
 
     // 4. resolve relative font sizes against the parent
@@ -1568,7 +1755,8 @@ fn expand_font(style: &mut HashMap<String, String>, value: &str) {
 }
 
 fn expand_box(style: &mut HashMap<String, String>, prefix: &str, value: &str) {
-    let parts: Vec<&str> = value.split_whitespace().collect();
+    let owned = split_ws_top(value);
+    let parts: Vec<&str> = owned.iter().map(String::as_str).collect();
     let (t, r, b, l) = match parts.len() {
         1 => (parts[0], parts[0], parts[0], parts[0]),
         2 => (parts[0], parts[1], parts[0], parts[1]),
@@ -1588,38 +1776,72 @@ fn expand_axis(
     end: &str,
     value: &str,
 ) {
-    let parts: Vec<&str> = value.split_whitespace().collect();
+    let owned = split_ws_top(value);
+    let parts: Vec<&str> = owned.iter().map(String::as_str).collect();
     if let Some(first) = parts.first() {
         style.insert(start.into(), (*first).into());
         style.insert(end.into(), parts.get(1).unwrap_or(first).to_string());
     }
 }
 
-fn border_parts(value: &str) -> (Option<f64>, Option<String>, Option<&str>) {
-    let mut width: Option<f64> = None;
+/// Split a value on top-level whitespace: `calc(8px * 2) solid red`
+/// is three components, not five.
+fn split_ws_top(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut depth = 0i32;
+    for c in value.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                buf.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                buf.push(c);
+            }
+            c if c.is_whitespace() && depth == 0 => {
+                if !buf.is_empty() {
+                    out.push(std::mem::take(&mut buf));
+                }
+            }
+            _ => buf.push(c),
+        }
+    }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
+    out
+}
+
+fn border_parts(value: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let mut width: Option<String> = None;
     let mut line_style: Option<String> = None;
-    let mut color: Option<&str> = None;
-    for part in value.split_whitespace() {
+    let mut color: Option<String> = None;
+    for part in split_ws_top(value) {
         let p = part.to_ascii_lowercase();
         if matches!(p.as_str(), "none" | "hidden" | "solid" | "dashed"
             | "dotted" | "double" | "groove" | "ridge" | "inset"
             | "outset")
         {
             if p == "none" || p == "hidden" {
-                width = Some(0.0);
+                width = Some("0px".into());
             }
             line_style = Some(p);
+        } else if p.starts_with("calc(") {
+            // layout's length parser evaluates calc(); pass it whole
+            width = Some(part);
         } else if let Some(w) = parse_size(&p) {
-            width = Some(w);
+            width = Some(px_string(w));
         } else {
             color = Some(part);
         }
     }
     if width.is_none() && line_style.is_some() {
         width = Some(if matches!(line_style.as_deref(), Some("none" | "hidden")) {
-            0.0
+            "0px".into()
         } else {
-            1.0
+            "1px".into()
         });
     }
     (width, line_style, color)
@@ -1628,12 +1850,12 @@ fn border_parts(value: &str) -> (Option<f64>, Option<String>, Option<&str>) {
 fn set_border_side(
     style: &mut HashMap<String, String>,
     side: &str,
-    width: Option<f64>,
+    width: Option<&str>,
     line_style: Option<&str>,
     color: Option<&str>,
 ) {
     if let Some(w) = width {
-        style.insert(format!("border-{side}-width"), px_string(w));
+        style.insert(format!("border-{side}-width"), w.to_string());
     }
     if let Some(s) = line_style {
         style.insert(format!("border-{side}-style"), s.to_string());
@@ -1648,7 +1870,8 @@ fn expand_border_box(
     suffix: &str,
     value: &str,
 ) {
-    let parts: Vec<&str> = value.split_whitespace().collect();
+    let owned = split_ws_top(value);
+    let parts: Vec<&str> = owned.iter().map(String::as_str).collect();
     let values = match parts.len() {
         1 => [parts[0], parts[0], parts[0], parts[0]],
         2 => [parts[0], parts[1], parts[0], parts[1]],
@@ -2107,25 +2330,26 @@ fn apply(style: &mut HashMap<String, String>, prop: &str, value: &str) {
     } else if prop == "border" {
         let (mut width, line_style, color) = border_parts(value);
         match width {
-            Some(w) => {
-                style.insert("border-width".into(), px_string(w));
+            Some(ref w) => {
+                style.insert("border-width".into(), w.clone());
             }
             None => {
                 style
                     .entry("border-width".into())
                     .or_insert_with(|| "1px".into());
-                width = Some(1.0);
+                width = Some("1px".into());
             }
         }
         if let Some(ref s) = line_style {
             style.insert("border-style".into(), s.clone());
         }
-        if let Some(c) = color {
-            style.insert("border-color".into(), c.to_string());
+        if let Some(ref c) = color {
+            style.insert("border-color".into(), c.clone());
         }
         for side in ["top", "right", "bottom", "left"] {
             set_border_side(
-                style, side, width, line_style.as_deref(), color,
+                style, side, width.as_deref(), line_style.as_deref(),
+                color.as_deref(),
             );
         }
     } else if matches!(prop, "border-top" | "border-right"
@@ -2133,7 +2357,8 @@ fn apply(style: &mut HashMap<String, String>, prop: &str, value: &str) {
     {
         let side = &prop[7..];
         let (width, line_style, color) = border_parts(value);
-        set_border_side(style, side, width, line_style.as_deref(), color);
+        set_border_side(style, side, width.as_deref(),
+                        line_style.as_deref(), color.as_deref());
     } else if matches!(prop, "border-width" | "border-style" | "border-color") {
         let suffix = &prop[7..];
         style.insert(prop.into(), value.into());

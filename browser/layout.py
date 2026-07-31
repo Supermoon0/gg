@@ -1068,6 +1068,8 @@ def layout_mode(node):
         return "table"
     if display in ("grid", "inline-grid") and node.children:
         return "grid"
+    if node.children and "grid-lanes" in display.split():
+        return "grid-lanes"
     # -webkit-line-clamp / display:-webkit-box establish an inline context
     # whose wrapped lines we clamp; route them to inline flow (only when
     # every child is inline-level, which card titles always are).
@@ -3330,6 +3332,8 @@ class BlockLayout:
             self._layout_table(node, em)
         elif mode == "grid":
             self._layout_grid(node, em)
+        elif mode == "grid-lanes":
+            self._layout_grid_lanes(node, em)
         elif mode == "block":
             # incremental placement: floats registered by earlier
             # children must be visible while later siblings lay out
@@ -4452,6 +4456,252 @@ class BlockLayout:
                 pass
         return 2.0
 
+    def _layout_grid_lanes(self, node, em):
+        """CSS Grid Level 3 masonry (`display: grid-lanes`).
+
+        One axis has tracks, sized by the machinery _layout_grid
+        already owns; the other is the lanes axis, where each item
+        stacks after whatever its lane holds so far. An auto-placed
+        item takes the lane with the least filled extent, except that
+        `flow-tolerance` lets an earlier lane win when it is behind by
+        no more than the tolerance — that is the knob that keeps
+        reading order roughly intact on real masonry pages.
+        """
+        doc = self._document()
+        style = node.style
+        cols_spec = style.get("grid-template-columns", "")
+        rows_spec = style.get("grid-template-rows", "")
+        direction = (style.get("grid-lanes-direction")
+                     or style.get("masonry-direction") or "").casefold()
+        column_tracks = bool(cols_spec) or (
+            not rows_spec and "row" not in direction.split())
+
+        gap_parts = style.get("gap", "").split()
+        row_gap = parse_size(
+            style.get("row-gap") or style.get("grid-row-gap")
+            or (gap_parts[0] if gap_parts else ""), self.width, em) or 0.0
+        col_gap = parse_size(
+            style.get("column-gap") or style.get("grid-column-gap")
+            or (gap_parts[1] if len(gap_parts) > 1
+                else gap_parts[0] if gap_parts else ""),
+            self.width, em) or 0.0
+
+        items, out_of_flow = [], []
+        place = style.get("place-items", "").split()
+        align_items = (style.get("align-items")
+                       or (place[0] if place else "stretch")) \
+            .strip().casefold()
+        justify_items = (style.get("justify-items")
+                         or (place[1] if len(place) > 1
+                             else place[0] if place else "stretch")) \
+            .strip().casefold()
+        for child in node.children:
+            if not (isinstance(child, Element) and is_visible(child)):
+                continue
+            if is_out_of_flow(child):
+                child._static_align = (justify_items, align_items,
+                                       self, True)
+                self._queue_abs(child, self.x, self.y)
+                out_of_flow.append(child)
+                continue
+            items.append(child)
+        items = order_items(items)
+
+        tol_raw = (style.get("flow-tolerance")
+                   or style.get("masonry-flow-tolerance") or "").strip()
+        axis_size = self.width if column_tracks else (
+            self.definite_height if self.definite_height is not None
+            else self.width)
+
+        if column_tracks:
+            spec, track_gap, lane_gap = cols_spec, col_gap, row_gap
+            avail = self.width
+        else:
+            spec, track_gap, lane_gap = rows_spec, row_gap, col_gap
+            avail = self.definite_height \
+                if self.definite_height is not None else self.width
+        tolerance = parse_size(tol_raw, axis_size, em)
+        if tolerance is None:
+            tolerance = em  # `normal`
+
+        tracks, lines = _parse_grid_template(spec, avail, em, track_gap)
+        if not tracks:
+            tracks = [("intrinsic", "min", "auto")]
+        n = len(tracks)
+
+        # explicit placement in the track axis; None start = auto
+        axis = "column" if column_tracks else "row"
+        specs = []
+        for child in items:
+            t0, ts = self._grid_axis(child, axis, n, lines)
+            ts = max(1, min(ts, n))
+            if t0 is not None:
+                t0 = max(0, min(t0, n - ts))
+            specs.append((child, t0, ts))
+
+        # track sizes: fixed tracks resolve; intrinsic ones take the
+        # items' contributions (an auto-placed item can land in any
+        # track, so it contributes to all of them)
+        contributions = [[0.0, 0.0] for _ in range(n)]
+        if column_tracks:
+            need = any(t[0] in ("intrinsic", "frmin") for t in tracks)
+            if need:
+                for child, t0, ts in specs:
+                    try:
+                        lo = _measure_min_width(child, doc)
+                        hi = _measure_content_width(child, doc)
+                    except Exception:
+                        continue
+                    spec_w = parse_size(child.style.get("width"), 0.0, em)
+                    if spec_w is not None:
+                        lo = hi = spec_w
+                    cover = range(t0, t0 + ts) if t0 is not None \
+                        else range(n)
+                    for c in cover:
+                        contributions[c][0] = max(
+                            contributions[c][0], lo / ts)
+                        contributions[c][1] = max(
+                            contributions[c][1], hi / ts)
+            jc = (style.get("justify-content") or "").strip().casefold()
+            track_sizes = _size_grid_tracks(
+                tracks, avail, track_gap,
+                [tuple(c) for c in contributions],
+                stretch=jc in ("", "normal", "stretch"))
+            lead, spread = distribute_free_space(
+                avail - (sum(track_sizes) + track_gap * max(n - 1, 0)),
+                n, jc)
+        else:
+            track_sizes = [0.0] * n
+            for i, t in enumerate(tracks):
+                if t[0] == "fixed":
+                    track_sizes[i] = t[1]
+                elif t[0] == "frmin" and not isinstance(t[2], str):
+                    track_sizes[i] = float(t[2])
+            lead = spread = 0.0
+
+        # lay each item out (track-axis size imposed for column
+        # tracks under stretch, exactly as a grid item would get)
+        boxes = []
+        for child, t0, ts in specs:
+            box = BlockLayout(child, self, None)
+            if column_tracks:
+                w = (sum(track_sizes[t0:t0 + ts])
+                     + track_gap * (ts - 1)) if t0 is not None else (
+                    sum(track_sizes[0:ts]) + track_gap * (ts - 1))
+                justify_self = (child.style.get("justify-self", "")
+                                .strip().casefold() or justify_items)
+                if justify_self in ("stretch", "normal", "auto", "") \
+                        and auto_size(child.style, "width"):
+                    box.forced_width = max(w, 0.0)
+                else:
+                    spec_w = parse_size(child.style.get("width"), w, em)
+                    if spec_w is None:
+                        try:
+                            spec_w = _measure_content_width(child, doc)
+                        except Exception:
+                            spec_w = w
+                    box.forced_width = max(min(spec_w, w), 0.0)
+            else:
+                if not auto_size(child.style, "width"):
+                    spec_w = parse_size(
+                        child.style.get("width"), self.width, em)
+                    if spec_w is not None:
+                        box.forced_width = spec_w
+                else:
+                    try:
+                        box.forced_width = max(min(
+                            _measure_content_width(child, doc),
+                            self.width), 0.0)
+                    except Exception:
+                        box.forced_width = self.width
+            box.flex_origin = (0.0, 0.0)
+            box.layout()
+            boxes.append(box)
+
+        # placement: shortest lane wins; a genuinely-behind earlier
+        # lane wins within the tolerance; an *exact* tie goes to the
+        # lane most recently advanced (untouched lanes rank by index).
+        # Both WPT row-auto-placement references encode exactly this:
+        # 001's tied item follows the later of two touched lanes,
+        # 002's first item takes lane one of three untouched ones.
+        running = [0.0] * n
+        touched = [-i for i in range(n)]
+        seq = 0
+        placed = []  # (box, t0, ts, lane_pos)
+        for (child, t0, ts), box in zip(specs, boxes):
+            if t0 is None:
+                cands = [max(running[i:i + ts])
+                         for i in range(0, n - ts + 1)]
+                best = min(cands)
+                t0 = next((i for i, p in enumerate(cands)
+                           if p < best + tolerance), None)
+                if t0 is None:
+                    tied = [i for i, p in enumerate(cands) if p == best]
+                    t0 = max(tied, key=lambda i: (
+                        max(touched[i:i + ts]), -i))
+            pos = max(running[t0:t0 + ts])
+            extent = box.outer_height() if column_tracks \
+                else box.outer_width()
+            seq += 1
+            for i in range(t0, t0 + ts):
+                running[i] = pos + extent + lane_gap
+                touched[i] = seq
+            placed.append((child, box, t0, ts, pos))
+
+        used_lane = max(
+            (running[i] - lane_gap for i in range(n)), default=0.0)
+        used_lane = max(used_lane, 0.0)
+
+        # for row tracks, intrinsic rows take the tallest item placed
+        # in them (a fixed track keeps its size)
+        if not column_tracks:
+            for child, box, t0, ts, pos in placed:
+                if tracks[t0][0] != "fixed" and ts == 1:
+                    track_sizes[t0] = max(
+                        track_sizes[t0], box.outer_height())
+
+        offsets = []
+        cur = lead
+        for i in range(n):
+            offsets.append(cur)
+            cur += track_sizes[i] + track_gap + spread
+
+        self.children = []
+        for child, box, t0, ts, pos in placed:
+            span_size = (sum(track_sizes[t0:t0 + ts])
+                         + track_gap * (ts - 1))
+            if column_tracks:
+                ox = self.x + offsets[t0]
+                oy = self.y + pos
+            else:
+                ox = self.x + pos
+                oy = self.y + offsets[t0]
+                align_self = (child.style.get("align-self", "")
+                              .strip().casefold() or align_items)
+                if align_self in ("stretch", "normal", "auto", "") \
+                        and auto_size(child.style, "height") \
+                        and box.outer_height() < span_size:
+                    box.forced_height = max(
+                        span_size - box.margin_top - box.margin_bottom,
+                        0.0)
+                else:
+                    oy += _static_offset(
+                        align_self, span_size, box.outer_height())
+            box.flex_origin = (ox, oy)
+            box.layout()
+            self.children.append(box)
+
+        if column_tracks:
+            self.height = self.definite_height \
+                if self.definite_height is not None else used_lane
+        else:
+            total = (sum(track_sizes) + track_gap * max(n - 1, 0)) \
+                if placed or any(t[0] == "fixed" for t in tracks) else 0.0
+            self.height = self.definite_height \
+                if self.definite_height is not None else total
+        self.height = max(self.height, 0.0)
+        apply_relative_offsets(self.children)
+
     def _layout_grid(self, node, em):
         """CSS Grid with fixed/fr tracks, named lines and two-axis spans.
         Explicit placements reserve an occupancy grid before row-major
@@ -4715,7 +4965,12 @@ class BlockLayout:
             box.flex_origin = (0.0, 0.0)
             box.layout()
             p.append(box)
-            if rspan == 1:
+            # only an intrinsic row is sized by its content: a fixed
+            # track keeps its size and a taller item overflows it
+            # (CSS Grid 1 §11.5) — growing 100px rows to fit was
+            # moving every later row down
+            if rspan == 1 and (r0 >= len(row_tracks)
+                               or row_tracks[r0][0] != "fixed"):
                 row_h[r0] = max(row_h[r0], box.outer_height())
         for p in placed:                 # multi-row items grow their last row
             child, c0, cspan, r0, rspan, box = p

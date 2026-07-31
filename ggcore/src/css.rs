@@ -20,6 +20,11 @@ pub enum Simple {
     Not(Vec<Simple>),
     /// :nth-child(..): 0=odd, 1=even, n>=2 -> exact index n-1 (1-based).
     NthChild(u32),
+    /// :nth-of-type(..), same encoding, counting same-tag siblings only.
+    NthOfType(u32),
+    /// :first-of-type / :last-of-type
+    FirstOfType,
+    LastOfType,
     /// :first-child / :last-child
     FirstChild,
     LastChild,
@@ -68,8 +73,11 @@ impl Selector {
                     Simple::Attr { .. } => s.1 += 1,
                     Simple::Not(_)
                     | Simple::NthChild(_)
+                    | Simple::NthOfType(_)
                     | Simple::FirstChild
                     | Simple::LastChild
+                    | Simple::FirstOfType
+                    | Simple::LastOfType
                     | Simple::Hover
                     | Simple::Focus => s.1 += 1,
                     Simple::Universal | Simple::Where(_) => {}
@@ -236,6 +244,43 @@ pub fn compound_matches(doc: &Document, idx: usize, compound: &[Simple]) -> bool
                 0 => nth % 2 == 1, // odd
                 1 => nth % 2 == 0, // even
                 k => nth == (*k as usize) - 1,
+            }
+        }
+        Simple::NthOfType(spec) => {
+            let Some(p) = node.parent else { return false };
+            let sibs: Vec<usize> = doc.nodes[p]
+                .children
+                .iter()
+                .copied()
+                .filter(|&c| {
+                    doc.nodes[c].is_element()
+                        && doc.nodes[c].tag == node.tag
+                })
+                .collect();
+            let Some(pos) = sibs.iter().position(|&c| c == idx) else {
+                return false;
+            };
+            let nth = pos + 1;
+            match spec {
+                0 => nth % 2 == 1,
+                1 => nth % 2 == 0,
+                k => nth == (*k as usize) - 1,
+            }
+        }
+        Simple::FirstOfType | Simple::LastOfType => {
+            let Some(p) = node.parent else { return false };
+            let sibs: Vec<usize> = doc.nodes[p]
+                .children
+                .iter()
+                .copied()
+                .filter(|&c| {
+                    doc.nodes[c].is_element()
+                        && doc.nodes[c].tag == node.tag
+                })
+                .collect();
+            match part {
+                Simple::FirstOfType => sibs.first() == Some(&idx),
+                _ => sibs.last() == Some(&idx),
             }
         }
         Simple::FirstChild | Simple::LastChild => {
@@ -521,6 +566,30 @@ fn leading_noise(rest: &str) -> Option<usize> {
                         },
                     };
                     parts.push(Simple::NthChild(spec));
+                } else if self.peek_ci(":nth-of-type(") {
+                    self.i += 13;
+                    let arg = self.until_chars(b")").trim()
+                        .to_ascii_lowercase();
+                    self.literal(b')')?;
+                    let spec = match arg.as_str() {
+                        "odd" => 0,
+                        "even" => 1,
+                        n => match n.parse::<u32>() {
+                            Ok(k) => k + 1,
+                            Err(_) => return Err(()),
+                        },
+                    };
+                    parts.push(Simple::NthOfType(spec));
+                } else if self.peek_ci(":first-of-type")
+                    && !self.name_char_at(14)
+                {
+                    self.i += 14;
+                    parts.push(Simple::FirstOfType);
+                } else if self.peek_ci(":last-of-type")
+                    && !self.name_char_at(13)
+                {
+                    self.i += 13;
+                    parts.push(Simple::LastOfType);
                 } else if self.peek_ci(":first-child")
                     && !self.name_char_at(12)
                 {
