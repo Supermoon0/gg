@@ -675,6 +675,28 @@ def outline_ring(style, em=16.0):
     return px, safe_color(raw_color, default="black"), offset
 
 
+def _split_ws_top(value):
+    """Split on top-level whitespace: `calc(2px * 2) 0 red` is three
+    components, not five."""
+    out, buf, depth = [], "", 0
+    for ch in value:
+        if ch == "(":
+            depth += 1
+            buf += ch
+        elif ch == ")":
+            depth = max(depth - 1, 0)
+            buf += ch
+        elif ch.isspace() and depth == 0:
+            if buf:
+                out.append(buf)
+                buf = ""
+        else:
+            buf += ch
+    if buf:
+        out.append(buf)
+    return out
+
+
 def box_shadow(value):
     """Parse the first paintable box-shadow layer to (dx, dy, color), or
     None. Blur/spread are ignored (we paint a flat offset rect), so a
@@ -703,7 +725,7 @@ def box_shadow(value):
         color = ""
         alpha = 1.0
         nums = []
-        for tok in v.split():
+        for tok in _split_ws_top(v):
             c = safe_color(tok, default="")
             # a color-shaped token safe_color rejects (#rrggbbaa) still
             # decides the layer's alpha — otherwise the translucent
@@ -713,6 +735,10 @@ def box_shadow(value):
             if (c or looks_color) and not color:
                 color = c or "#000000"
                 alpha = _color_alpha(tok)
+            elif tok.casefold().startswith("calc("):
+                val = parse_size(tok, 0.0, 16.0)
+                if val is not None:
+                    nums.append(val)
             elif tok.endswith("px") or _num_re.fullmatch(tok):
                 try:
                     nums.append(float(tok.rstrip("px")))
@@ -1537,6 +1563,48 @@ def _margin_context_allows_children(node):
     return style.get("display", "").strip().casefold() not in (
         "flow-root", "inline-block", "inline-flex", "inline-grid",
         "inline-table")
+
+
+def margin_trim_flags(node):
+    """(trim_block_start, trim_block_end) this element's *parent*
+    imposes on it via margin-trim (CSS Box 4 §4): a container may
+    discard the block margins of the children that touch its edges.
+    """
+    parent = getattr(node, "parent", None)
+    raw = (parent.style.get("margin-trim") or "").strip().casefold() \
+        if isinstance(parent, Element) else ""
+    if not raw or raw == "none":
+        return False, False
+    tokens = raw.split()
+    start = "block" in tokens or "block-start" in tokens
+    end = "block" in tokens or "block-end" in tokens
+    if not (start or end):
+        return False, False
+    flow = [c for c in parent.children
+            if isinstance(c, Element) and is_visible(c)
+            and not is_out_of_flow(c)]
+    if not flow:
+        return False, False
+    return (start and flow[0] is node), (end and flow[-1] is node)
+
+
+def marker_content(node):
+    """The ::marker content override for a list item, or None.
+
+    The cascade synthesizes a `::marker` child (display:none — it
+    never flows) whose text is the resolved content, counters
+    included. `content: none`/`normal` keep the default marker.
+    """
+    for c in node.children:
+        if isinstance(c, Element) and c.tag == "::marker":
+            raw = (c.style.get("content") or "").strip().casefold()
+            if not raw or raw in ("normal", "none"):
+                return None
+            for t in c.children:
+                if isinstance(t, Text):
+                    return t.text
+            return ""
+    return None
 
 
 def _flow_edge_children(node, reverse=False):
@@ -2630,8 +2698,14 @@ def _measure_min_content_width(node, doc):
                 w = 0.0 if not trimmed else measure(
                     cached_font(b.node), trimmed)
             m = max(m, (b.x + w) - origin)
-        else:
-            stack.extend(getattr(b, "children", []))
+            continue
+        if isinstance(b, BlockLayout) and _definite_box_width(b) is not None:
+            # a block child with a definite width cannot shrink below
+            # it, so it is a floor of the min-content size too
+            left = b.x - b.pl - b.bl - b.ml
+            m = max(m, left + b.outer_width() - origin)
+            continue
+        stack.extend(getattr(b, "children", []))
     m += box.pl + box.pr + box.bl + box.br
     cache[id(node)] = m
     return m
@@ -2745,6 +2819,17 @@ def _measure_content_width(node, doc):
     return result
 
 
+def _definite_box_width(b):
+    """The box's specified width in px when it is definite (an absolute
+    length -- not %, auto, or viewport-relative), else None."""
+    raw = (getattr(b.node, "style", {}).get("width") or "").strip()
+    low = raw.casefold()
+    if not raw or "%" in raw or "vw" in low or "vh" in low:
+        return None
+    return parse_size(
+        raw, 0.0, parse_px(b.node.style.get("font-size", "16px"), 16.0))
+
+
 def _measure_min_width(node, doc):
     """Min-content (border-box) width of `node`: lay its subtree out under
     a near-zero constraint so every breakable run wraps, then return the
@@ -2774,6 +2859,10 @@ def _measure_min_width(node, doc):
         b = stack.pop()
         if isinstance(b, (TextLayout, ImageLayout)):
             m = max(m, getattr(b, "width", 0.0))
+        elif isinstance(b, BlockLayout) \
+                and _definite_box_width(b) is not None:
+            m = max(m, b.outer_width())
+            continue
         stack.extend(getattr(b, "children", []))
     result = m + box.pl + box.pr + box.bl + box.br
     if cache is not None:
@@ -3153,14 +3242,22 @@ class BlockLayout:
                    if "border-left-width" in st else self.bw) or 0
         self.margin_top = size("margin-top") or 0
         self.margin_bottom = size("margin-bottom") or 0
+        trim_start, trim_end = margin_trim_flags(node)
+        if trim_start:
+            self.margin_top = 0
+        if trim_end:
+            self.margin_bottom = 0
         ml_raw = st.get("margin-left", "0").strip()
         mr_raw = st.get("margin-right", "0").strip()
         self.ml = size("margin-left") or 0
         self.mr = size("margin-right") or 0
 
         mode = layout_mode(node)
+        own_trim = (st.get("margin-trim") or "").strip().casefold().split()
         if _margin_context_allows_children(node) \
-                and self.pt == 0 and self.bt == 0:
+                and self.pt == 0 and self.bt == 0 \
+                and "block" not in own_trim \
+                and "block-start" not in own_trim:
             adjoining = [self.margin_top]
             for child in _flow_edge_children(node):
                 if child.style.get(
@@ -3522,7 +3619,11 @@ class BlockLayout:
                     and _list_marker_visible(node) \
                     and list_style_position(node) == "inside":
                 kind = list_style_type(node)
-                if kind[:1] in "\"'":
+                override = marker_content(node)
+                if override is not None:
+                    label = override
+                    trailing = False
+                elif kind[:1] in "\"'":
                     label = kind[1:-1] if kind[-1:] == kind[:1] \
                         else kind[1:]
                     trailing = False
@@ -5781,7 +5882,17 @@ class BlockLayout:
                 color = safe_color(self.node.style.get("color", "black"))
                 kind = list_style_type(self.node)
                 cy = self.y + font.gg_linespace / 2
-                if kind[:1] in "\"'":
+                override = marker_content(self.node)
+                if override is not None:
+                    # an outside marker right-aligns by its visible
+                    # glyphs: `content: "1.\00a0"` sits exactly where
+                    # the default "1." does
+                    text = override.rstrip("\u00a0 \t")
+                    if text:
+                        w = measure(font, text)
+                        cmds.append(DrawText(self.x - 8 - w, self.y,
+                                             text, font, color))
+                elif kind[:1] in "\"'":
                     label = kind[1:-1] if kind[-1:] == kind[:1] \
                         else kind[1:]
                     if label:

@@ -788,9 +788,11 @@ fn leading_noise(rest: &str) -> Option<usize> {
         Ok(Selector { chain, combinators, specificity, pseudo: None })
     }
 
-    /// Consume ::before/::after (and the legacy single-colon forms).
+    /// Consume ::before/::after/::marker (and the legacy
+    /// single-colon before/after forms).
     fn eat_pseudo_element(&mut self) -> Option<u8> {
         for (pat, p) in [("::before", 0u8), ("::after", 1),
+                         ("::marker", 2),
                          (":before", 0), (":after", 1)] {
             if self.peek_ci(pat) {
                 self.i += pat.len();

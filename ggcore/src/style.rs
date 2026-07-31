@@ -781,7 +781,7 @@ fn counter_visit(
     ctrs.prune(depth);
     let is_pseudo = matches!(
         doc.nodes[idx].tag.as_deref(),
-        Some("::before" | "::after")
+        Some("::before" | "::after" | "::marker")
     );
     if let Some(raw) = doc.nodes[idx].style.get("counter-reset").cloned() {
         for (name, val, reversed) in parse_counter_decl(&raw) {
@@ -1004,6 +1004,16 @@ fn content_text_ctr(
         }
         let name: String =
             b[start..i].iter().collect::<String>().to_ascii_lowercase();
+        if i >= b.len() || b[i] != '(' {
+            // quote keywords are content the engine can draw; the
+            // nesting-depth refinement is not modelled, so every
+            // level gets the outer pair
+            match name.as_str() {
+                "open-quote" => out.push('\u{201c}'),
+                "close-quote" => out.push('\u{201d}'),
+                _ => {}
+            }
+        }
         if i < b.len() && b[i] == '(' {
             let mut depth = 0;
             let arg_start = i + 1;
@@ -1396,13 +1406,17 @@ fn style_node(
         None
     } else {
         Some(match fs.as_str() {
-            "xx-small" => 9.0,
-            "x-small" => 10.0,
-            "small" => 13.0,
-            "medium" => 16.0,
-            "large" => 18.0,
-            "x-large" => 24.0,
-            "xx-large" => 32.0,
+            // absolute-size keywords resolve to fresh px, so the zoom
+            // that already scaled every set-here length applies here
+            // too; the parent_px fallback is pre-scaled and is not
+            // multiplied again
+            "xx-small" => 9.0 * effective_zoom,
+            "x-small" => 10.0 * effective_zoom,
+            "small" => 13.0 * effective_zoom,
+            "medium" => 16.0 * effective_zoom,
+            "large" => 18.0 * effective_zoom,
+            "x-large" => 24.0 * effective_zoom,
+            "xx-large" => 32.0 * effective_zoom,
             _ => parent_px,
         })
     };
@@ -1452,7 +1466,7 @@ fn synthesize_pseudos(
     if pseudo_rules.is_empty() {
         return;
     }
-    for which in [0u8, 1u8] {
+    for which in [0u8, 1u8, 2u8] {
         // Probe before building anything. The inherited style map below
         // costs a HashMap and sixteen Strings, and hardly any element
         // has a ::before or ::after — paying for it on every element of
@@ -1502,16 +1516,28 @@ fn synthesize_pseudos(
         let host_attrs = |name: &str| {
             doc.nodes[idx].attr(name).map(|v| v.to_string())
         };
-        let Some(text) = style
+        let text = match style
             .get("content")
             .and_then(|c| content_text(c, &host_attrs))
-        else {
-            continue; // no content -> no box
+        {
+            Some(t) => t,
+            // ::marker without content still styles the default
+            // marker; before/after without content have no box
+            None if which == 2 => String::new(),
+            None => continue,
         };
-        if !style.contains_key("display") {
+        if which == 2 {
+            // the marker box never flows; layout reads its text and
+            // style off the child directly
+            style.insert("display".into(), "none".into());
+        } else if !style.contains_key("display") {
             style.insert("display".into(), "inline".into());
         }
-        let tag = if which == 0 { "::before" } else { "::after" };
+        let tag = match which {
+            0 => "::before",
+            1 => "::after",
+            _ => "::marker",
+        };
         // reuse an existing synthesized child (restyle pass)
         let existing = doc.nodes[idx]
             .children
@@ -1523,10 +1549,11 @@ fn synthesize_pseudos(
             None => {
                 let p = doc.new_element(tag.to_string(), Vec::new(), None);
                 doc.nodes[p].parent = Some(idx);
-                if which == 0 {
-                    doc.nodes[idx].children.insert(0, p);
-                } else {
+                if which == 1 {
                     doc.nodes[idx].children.push(p);
+                } else {
+                    // ::marker sits before ::before in tree order
+                    doc.nodes[idx].children.insert(0, p);
                 }
                 p
             }
