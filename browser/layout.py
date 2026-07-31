@@ -4340,11 +4340,24 @@ class BlockLayout:
                         and b.definite_height is None:
                     # stretch (the default): an auto-height item grows to
                     # the line's cross size, so a row of cards ends up
-                    # equal height (their backgrounds/borders fill)
+                    # equal height (their backgrounds/borders fill).
+                    # The item's own children must see the stretched
+                    # size — a column-reverse stack inside packs to the
+                    # bottom of it — so it lays out again with the size
+                    # imposed rather than having height inflated after
+                    # the fact.
                     fill = height - b.margin_top - b.margin_bottom \
                         - b.bt - b.bb - b.pt - b.pb
                     if fill > b.height:
-                        b.height = fill
+                        # justify-content may already have shifted the
+                        # box; the re-layout snaps back to flex_origin,
+                        # so the shift is carried across it
+                        kept_x, kept_y = b.x, b.y
+                        b.forced_height = (fill + b.pt + b.pb
+                                           + b.bt + b.bb)
+                        b.layout()
+                        if (b.x, b.y) != (kept_x, kept_y):
+                            translate(b, kept_x - b.x, kept_y - b.y)
                 # flex-start / baseline: top edge, no change
         self._flex_gap_rules(node, em)
         apply_relative_offsets(self.children)
