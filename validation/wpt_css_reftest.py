@@ -288,6 +288,17 @@ def render(page: Path, corpus: Path):
         if page_target is not None:
             page_scroll = max(0.0, float(page_target[0]))
 
+    if page_scroll:
+        # painting subtracts the scroll from everything, but a
+        # position:fixed box is anchored to the viewport — shift it
+        # down by the same amount so the two cancel
+        from browser.layout import BlockLayout, translate
+        from browser.html_parser import Element as _El
+        for b in document.children:
+            if isinstance(b, BlockLayout) and isinstance(b.node, _El) \
+                    and b.node.style.get("position") == "fixed":
+                translate(b, 0, page_scroll)
+
     cmds = [c.native(page_scroll) for c in paint_tree(document, [])]
     return bytes(engine.render_raw(
         WIDTH, HEIGHT, (255, 255, 255), cmds))

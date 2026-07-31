@@ -7277,6 +7277,53 @@ def paint_tree(layout_object, display_list):
     return display_list
 
 
+def _sticky_scroller_shift(box):
+    """(dy, dx) an in-scroller sticky box shifts by at its scroller's
+    current offset, or None when no ancestor element scrolls it. The
+    static render knows the scroller's position, so the clamp resolves
+    to a plain translation here instead of a raster-time bracket."""
+    if not isinstance(box, BlockLayout) or not isinstance(box.node, Element):
+        return None
+    style = box.node.style
+    if style.get("position", "static").strip().casefold() != "sticky":
+        return None
+    anc = box.parent
+    scroller = None
+    while isinstance(anc, BlockLayout):
+        if is_scroll_container(anc):
+            scroller = anc
+            break
+        anc = anc.parent
+    if scroller is None:
+        return None
+    em = parse_px(style.get("font-size", "16px"), 16.0)
+    sc_y, sc_x = scroll_position(scroller)
+    cb = box.parent
+    top = parse_size(style.get("top"), scroller.height, em)
+    bottom = parse_size(style.get("bottom"), scroller.height, em)
+    left = parse_size(style.get("left"), scroller.width, em)
+    normal_top = box.y - box.pt - box.bt - box.margin_top
+    normal_left = box.x - box.pl - box.bl - box.ml
+    cb_bottom = cb.y + cb.height + getattr(cb, "pb", 0.0)
+    dy = dx = 0.0
+    if top is not None:
+        want = (scroller.y + top) - (normal_top - sc_y)
+        max_dy = max(cb_bottom - box.outer_height() - normal_top, 0.0)
+        dy = min(max(want, 0.0), max_dy)
+    elif bottom is not None:
+        viewport_bottom = scroller.y + scroller.height
+        normal_bottom = normal_top + box.outer_height()
+        want = (normal_bottom - sc_y) - (viewport_bottom - bottom)
+        max_up = max(normal_top - cb.y, 0.0)
+        dy = -min(max(want, 0.0), max_up)
+    if left is not None:
+        want = (scroller.x + left) - (normal_left - sc_x)
+        max_dx = max(cb.x + cb.width - box.outer_width() - normal_left,
+                     0.0)
+        dx = min(max(want, 0.0), max_dx)
+    return dy, dx
+
+
 def _paint_tree_uncomposited(layout_object, display_list):
     # transform applies to an element's principal box (blocks only —
     # line/text boxes share their block's node and must not re-apply)
@@ -7284,14 +7331,25 @@ def _paint_tree_uncomposited(layout_object, display_list):
         style = getattr(layout_object.node, "style", None)
         tf = style.get("transform") if style else None
         sticky = _sticky_metrics(layout_object)
+        scroller_shift = _sticky_scroller_shift(layout_object)
+        if scroller_shift is not None:
+            # an element scroller owns this sticky: the shift is
+            # resolved here and the page-scroll bracket must not
+            # re-clamp it
+            sticky = None
         inherited_tfs = getattr(layout_object, "_abs_transforms", ()) or ()
         # absolutely-positioned boxes paint from the document's abs
         # pass, outside their ancestors' clip brackets — re-apply the
         # overflow clips recorded at queue time so they can't escape
         aclips = getattr(layout_object, "_abs_clips", None) or []
         if (tf and tf != "none") or inherited_tfs \
-                or sticky is not None or aclips:
+                or sticky is not None or aclips \
+                or (scroller_shift is not None
+                    and any(scroller_shift)):
             sub = _paint_tree_inner(layout_object, [])
+            if scroller_shift is not None and any(scroller_shift):
+                translate_cmds(sub, scroller_shift[1],
+                               scroller_shift[0])
             # Absolutely-positioned descendants are painted from the
             # document pass, outside their original ancestor subtree.
             # Replay the translations of those visual ancestors here.
