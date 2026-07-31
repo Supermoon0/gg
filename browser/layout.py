@@ -4626,6 +4626,35 @@ class BlockLayout:
         if tolerance is None:
             tolerance = em  # `normal`
 
+        # repeat(auto-fill, <intrinsic>) has no width until the items
+        # are known — Grid L1 resolves it to one copy, but a masonry
+        # lane template is *supposed* to be sized from the items: the
+        # largest contribution decides how many lanes fit (css-grid-3).
+        m_rep = re.search(r"repeat\(\s*(auto-fill|auto-fit)\s*,(.+)\)",
+                          spec, re.I)
+        if m_rep and column_tracks and items:
+            pattern = _parse_grid_tracks(m_rep.group(2), avail, em,
+                                         track_gap)
+            if pattern and all(t[0] not in ("fixed", "fr", "frmin")
+                               or (t[0] == "fixed" and t[1] <= 0)
+                               for t in pattern):
+                largest = 1.0
+                for child in items:
+                    try:
+                        w = _measure_content_width(child, doc)
+                    except Exception:
+                        continue
+                    spec_w = parse_size(child.style.get("width"),
+                                        avail, em)
+                    largest = max(largest, min(spec_w if spec_w
+                                               is not None else w, avail))
+                per = largest + track_gap
+                count = max(1, int((avail + track_gap) / per + 1e-6)) \
+                    if per > 0 else 1
+                spec = (spec[:m_rep.start()]
+                        + " ".join([m_rep.group(2).strip()] * count)
+                        + spec[m_rep.end():])
+
         tracks, lines = _parse_grid_template(spec, avail, em, track_gap)
         if not tracks:
             tracks = [("intrinsic", "min", "auto")]
@@ -4722,13 +4751,13 @@ class BlockLayout:
 
         # placement: shortest lane wins; a genuinely-behind earlier
         # lane wins within the tolerance; an *exact* tie goes to the
-        # lane most recently advanced (untouched lanes rank by index).
-        # Both WPT row-auto-placement references encode exactly this:
-        # 001's tied item follows the later of two touched lanes,
-        # 002's first item takes lane one of three untouched ones.
+        # first tied lane at or after the cursor — one past the last
+        # lane the previous placement covered, cyclic. All three WPT
+        # auto-placement references (row 001/002, column auto-repeat)
+        # encode exactly this cursor, and no first/last/most-recent
+        # rule satisfies more than two of them.
         running = [0.0] * n
-        touched = [-i for i in range(n)]
-        seq = 0
+        cursor = 0
         placed = []  # (box, t0, ts, lane_pos)
         for (child, t0, ts), box in zip(specs, boxes):
             if t0 is None:
@@ -4739,15 +4768,13 @@ class BlockLayout:
                            if p < best + tolerance), None)
                 if t0 is None:
                     tied = [i for i, p in enumerate(cands) if p == best]
-                    t0 = max(tied, key=lambda i: (
-                        max(touched[i:i + ts]), -i))
+                    t0 = next((i for i in tied if i >= cursor), tied[0])
             pos = max(running[t0:t0 + ts])
             extent = box.outer_height() if column_tracks \
                 else box.outer_width()
-            seq += 1
             for i in range(t0, t0 + ts):
                 running[i] = pos + extent + lane_gap
-                touched[i] = seq
+            cursor = (t0 + ts) % n
             placed.append((child, box, t0, ts, pos))
 
         used_lane = max(
