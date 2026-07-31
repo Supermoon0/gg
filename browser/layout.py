@@ -1665,14 +1665,14 @@ _LB_NO_BREAK_BEFORE = frozenset(
     "〛〞）］｝｠｣⦆"
     "!?！？‼⁇⁈⁉"
     ",.:;、。，．：；"
-    "ー〜ゝゞヽヾ々・"
+    "ー〜ゝゞヽヾ々‐–・"
     "ぁぃぅぇぉっゃゅょゎ"
     "ァィゥェォッャュョヮ"
     "ヵヶ"
     "%‰°′″℃¢")
 
 
-def break_segments(word, cjk=True):
+def break_segments(word, cjk=True, loose=False):
     """`word` cut at its break opportunities.
 
     Two kinds, and they are not the same rule. A breaking space always
@@ -1689,8 +1689,12 @@ def break_segments(word, cjk=True):
             buf = ""
             continue
         opens = cjk and (_is_cjk(ch) or (buf and _is_cjk(buf[-1])))
+        # `line-break: loose` grants the break before a hyphen that
+        # normal and strict withhold (CSS Text 3 §5.3)
+        before_ok = ch not in _LB_NO_BREAK_BEFORE \
+            or (loose and ch in "\u2010\u2013")
         if opens and buf and buf[-1] not in _LB_NO_BREAK_AFTER \
-                and ch not in _LB_NO_BREAK_BEFORE:
+                and before_ok:
             segs.append(buf)
             buf = ""
         buf += ch
@@ -1742,6 +1746,8 @@ def list_style_type(node):
             raw = (n.style.get(prop) or "").strip().casefold()
             if not raw:
                 continue
+            if prop == "list-style-type" and raw[:1] in "\"'":
+                return raw          # a string marker, quotes included
             for token in raw.split():
                 if token in ("none", "inside", "outside") \
                         or token.startswith("url("):
@@ -1753,6 +1759,28 @@ def list_style_type(node):
             return "decimal" if n.tag == "ol" else "disc"
         n = getattr(n, "parent", None)
     return "disc"
+
+
+_BULLET_GLYPHS = {"disc": "•", "circle": "◦", "square": "▪"}
+
+
+def list_style_position(node):
+    """inside markers share the line box with the content; outside
+    (the default) hang in the margin. Inherited, and the shorthand can
+    carry it, so the chain is walked the same way the type is."""
+    n = node
+    for _ in range(12):
+        if not isinstance(n, Element):
+            break
+        raw = (n.style.get("list-style-position") or "").strip().casefold()
+        if raw in ("inside", "outside"):
+            return raw
+        short = (n.style.get("list-style") or "").casefold().split()
+        for token in short:
+            if token in ("inside", "outside"):
+                return token
+        n = getattr(n, "parent", None)
+    return "outside"
 
 
 def _int_attr(el, name, default):
@@ -3482,6 +3510,32 @@ class BlockLayout:
         else:
             self.new_line()
             self._ws_pending = False   # no space owed before the first atom
+            # a list-style-position:inside marker is part of the line
+            # box: it flows exactly like a first word, which is what
+            # lets `counter(x, disc)` in a reference and a real inside
+            # marker render identically
+            if isinstance(node, Element) and node.tag == "li" \
+                    and _list_marker_visible(node) \
+                    and list_style_position(node) == "inside":
+                kind = list_style_type(node)
+                if kind[:1] in "\"'":
+                    label = kind[1:-1] if kind[-1:] == kind[:1] \
+                        else kind[1:]
+                    trailing = False
+                elif kind in _BULLETS:
+                    label = _BULLET_GLYPHS.get(kind)
+                    trailing = True
+                elif kind != "none":
+                    label = marker_label(kind, _list_item_index(node))
+                    trailing = True
+                else:
+                    label = None
+                if label:
+                    self.word(node, label, space_before=False)
+                    line = self.children[-1]
+                    if line.children:
+                        line.children[-1].no_transform = True
+                    self._ws_pending = trailing
             self.recurse(node)
             # -webkit-line-clamp: N — keep the first N wrapped lines and
             # mark the overflow with an ellipsis (card titles clamp to 2
@@ -5138,7 +5192,8 @@ class BlockLayout:
             cjk = wb != "keep-all" and _has_cjk(word)
             if force or cjk or any(ch in BREAK_SPACE for ch in word):
                 self._emit_broken(node, word, font,
-                                  anywhere=force, cjk=cjk)
+                                  anywhere=force, cjk=cjk,
+                                  loose=lb == "loose")
                 return
         line = self.children[-1]
         # a leading space only when the source had whitespace here and we
@@ -5175,14 +5230,16 @@ class BlockLayout:
         line.children.append(text)
         self.cursor_x += sp + w
 
-    def _emit_broken(self, node, word, font, anywhere=False, cjk=True):
+    def _emit_broken(self, node, word, font, anywhere=False, cjk=True,
+                     loose=False):
         """Emit a run split at its break opportunities, wrapping across
         lines. `anywhere` breaks between any two characters (break-all,
         line-break: anywhere, an over-wide run under break-word);
         otherwise the opportunities are the ones the text itself gives.
         Segments carry no inter-segment space — CJK is written without
         them, and a breaking space stays inside its own segment."""
-        segs = list(word) if anywhere else break_segments(word, cjk=cjk)
+        segs = list(word) if anywhere \
+            else break_segments(word, cjk=cjk, loose=loose)
         for seg in segs:
             sw = measure(font, seg)
             sfit = sw if seg[-1:] not in BREAK_SPACE \
@@ -5293,7 +5350,9 @@ class BlockLayout:
                         and _has_cjk(token):
                     # a run of ideographs breaks between characters, so
                     # it fills the line instead of overflowing it whole
-                    pieces = break_segments(token)
+                    pieces = break_segments(
+                        token,
+                        loose=_inherited_kw(node, "line-break") == "loose")
                 for piece in pieces:
                     w = measure(font, piece)
                     # a preserved space run hangs past the end of the
@@ -5461,12 +5520,20 @@ class BlockLayout:
             if self.node.tag in REPLACED_CONTROLS:
                 cmds.extend(self._paint_control())
 
-            if self.node.tag == "li" and _list_marker_visible(self.node):
+            if self.node.tag == "li" and _list_marker_visible(self.node) \
+                    and list_style_position(self.node) != "inside":
                 font = cached_font(self.node)
                 color = safe_color(self.node.style.get("color", "black"))
                 kind = list_style_type(self.node)
                 cy = self.y + font.gg_linespace / 2
-                if kind in ("disc", "circle", "square"):
+                if kind[:1] in "\"'":
+                    label = kind[1:-1] if kind[-1:] == kind[:1] \
+                        else kind[1:]
+                    if label:
+                        w = measure(font, label)
+                        cmds.append(DrawText(self.x - 8 - w, self.y,
+                                             label, font, color))
+                elif kind in ("disc", "circle", "square"):
                     r = 2
                     left = self.x - 12
                     if kind == "square":
@@ -6137,7 +6204,8 @@ class TextLayout:
         self.previous = previous
         self.children = []
         self.keep_spaces = keep_spaces
-        self.x = 0
+        self.no_transform = False  # marker text: li's text-transform
+        self.x = 0                 # does not reach it (css-pseudo 4)
         self.y = 0
         self.width = 0
         self.height = 0
@@ -6157,7 +6225,8 @@ class TextLayout:
             self.x = self.previous.x + self.previous.width + space
         else:
             self.x = self.parent.x + getattr(self.parent, "indent", 0.0)
-        shown = transformed_text(self.node, self.word)
+        shown = self.word if self.no_transform \
+            else transformed_text(self.node, self.word)
         self.spacing = letter_spacing_px(self.node, self.font.size)
         self.width = measure(self.font, shown)
         if self.spacing:
@@ -6195,7 +6264,8 @@ class TextLayout:
                     else:
                         hi = mid - 1
                 word = word[:lo] + "…"
-        word = transformed_text(self.node, word)
+        if not self.no_transform:
+            word = transformed_text(self.node, word)
         spacing = getattr(self, "spacing", 0.0)
         if spacing:
             # spread the glyphs: one DrawText per character, since the

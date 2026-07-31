@@ -1137,10 +1137,10 @@ check("a unicode escape is the codepoint, not its digits",
 check("an escaped backslash stays a backslash",
       _gen("#t::before{content:\"" + chr(92) * 2 + "\"}",
            "<div id=t>z</div>") == [chr(92), "z"])
-check("counters and url() still generate an empty box",
+check("a counter with no scope reads 0; url() still an empty box",
       (_gen("#t::before{content:counter(x)}", "<div id=t>z</div>"),
        _gen("#t::before{content:url(a.png)}", "<div id=t>z</div>"))
-      == (["z"], ["z"]))
+      == (["0", "z"], ["z"]))
 
 _RTL = [round(c[1]) for c in _lines_all(
     "body{margin:0}div{width:200px}", "<div dir=rtl>alpha beta</div>")
@@ -1163,11 +1163,30 @@ check("ordinary text is returned untouched",
 check("an escape of zero is U+FFFD, not a NUL that draws nothing",
       _gen("#t::before{content:\"" + chr(92) + "0000\"}",
            "<div id=t>z</div>") == ["\ufffd", "z"])
-check("a content list with an unresolvable part renders nothing",
+check("counters resolve in generated content",
       (_gen("#t::before{content:counter(a) \",\" counter(b)}",
             "<div id=t>z</div>"),
        _gen("#t::before{content:\"x\" counter(a)}",
-            "<div id=t>z</div>")) == (["z"], ["z"]))
+            "<div id=t>z</div>")) == (["0,0", "z"], ["x0", "z"]))
+check("counter-increment counts document order",
+      _gen("h2{counter-increment:c} h2::before{content:counter(c) '. '}",
+           "<h2>a</h2><h2>b</h2>") == ["1.", "a", "2.", "b"])
+check("counters() joins nested scopes",
+      _gen("ol{list-style:none} li{counter-increment:i}"
+           " li::before{content:counters(i,'.')}",
+           "<ol style='counter-reset:i'><li>x"
+           "<ol style='counter-reset:i'><li>y</li></ol></li></ol>")
+      == ["1", "x", "1.1", "y"])
+check("reversed() runs the counter down",
+      _gen(".u::before{content:counter(f)}",
+           "<div style='counter-reset: reversed(f)'>"
+           "<div class=u style='counter-increment:f -1'></div></div>"
+           "<div class=u style='counter-increment:f -2'></div>")
+      == ["4", "2"])
+check("@counter-style system:extends is the style it extends",
+      _gen("@counter-style my{system: extends upper-roman}"
+           "h2{counter-increment:c} h2::before{content:counter(c, my)}",
+           "<h2>a</h2>") == ["I", "a"])
 
 
 # CSS collapses space, tab and newline -- and nothing else. Python's

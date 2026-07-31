@@ -244,6 +244,24 @@ pub(crate) fn parse_sheets(
         }
         rules.extend(parsed);
     }
+    // @counter-style with `system: extends X` is an alias for X as far
+    // as this engine renders one (no @counter-style machinery of its
+    // own). Rewriting the alias away at parse time lets the marker and
+    // counter formatting code stay ignorant of at-rules.
+    let aliases = counter_style_aliases(css_sources);
+    if !aliases.is_empty() {
+        for r in &mut rules {
+            for (prop, value) in &mut r.decls {
+                if matches!(
+                    prop.as_str(),
+                    "list-style-type" | "list-style" | "content"
+                ) {
+                    *value = replace_idents(value, &aliases);
+                }
+            }
+        }
+    }
+
     // stable sort keeps source order among equal keys; origin outranks
     // specificity so author resets can override the UA sheet
     rules.sort_by_key(|r| (r.origin, r.selector.specificity));
@@ -301,6 +319,10 @@ pub fn compute_styles_vw(
             &HashMap::new(), &mut scratch,
         );
     });
+    // counters need the whole styled tree (a reset's scope covers the
+    // element's *following siblings* too), so they resolve after the
+    // cascade rather than inside it
+    resolve_counters(doc);
 }
 
 /// Record every ancestor's tag/id/class names into each node's bloom
@@ -360,7 +382,564 @@ struct Scratch {
 /// removing the box). Counters and images still contribute nothing —
 /// the box is generated but empty, which is what it was doing for
 /// every non-string value before.
+/// Predefined counter styles the formatter knows how to draw.
+fn is_predefined_counter_style(name: &str) -> bool {
+    matches!(
+        name,
+        "decimal" | "decimal-leading-zero" | "disc" | "circle" | "square"
+            | "lower-roman" | "upper-roman" | "lower-alpha" | "upper-alpha"
+            | "lower-latin" | "upper-latin" | "none"
+    )
+}
+
+/// name -> predefined target for every `@counter-style name { system:
+/// extends target }` in the sources, chains flattened. Anything more
+/// exotic (symbols:, additive:) is left to the decimal fallback.
+fn counter_style_aliases(css_sources: &[String]) -> HashMap<String, String> {
+    let mut raw: HashMap<String, String> = HashMap::new();
+    for src in css_sources {
+        let low = src.to_ascii_lowercase();
+        let mut from = 0usize;
+        while let Some(pos) = low[from..].find("@counter-style") {
+            let at = from + pos + "@counter-style".len();
+            let Some(open_rel) = low[at..].find('{') else { break };
+            let open = at + open_rel;
+            let name = low[at..open].trim().to_string();
+            let close = low[open..]
+                .find('}')
+                .map(|c| open + c)
+                .unwrap_or(low.len());
+            let body = &low[open + 1..close];
+            for decl in body.split(';') {
+                if let Some((k, v)) = decl.split_once(':') {
+                    if k.trim() == "system" {
+                        if let Some(target) = v.trim().strip_prefix("extends")
+                        {
+                            if !name.is_empty() {
+                                raw.insert(
+                                    name.clone(),
+                                    target.trim().to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            from = close;
+        }
+    }
+    // flatten alias-of-alias chains onto predefined styles
+    let mut out = HashMap::new();
+    for name in raw.keys() {
+        let mut target = raw.get(name).cloned();
+        for _ in 0..8 {
+            match target {
+                Some(ref t) if is_predefined_counter_style(t) => break,
+                Some(ref t) => target = raw.get(t).cloned(),
+                None => break,
+            }
+        }
+        if let Some(t) = target {
+            if is_predefined_counter_style(&t) {
+                out.insert(name.clone(), t);
+            }
+        }
+    }
+    out
+}
+
+/// Replace whole identifier tokens in a declaration value.
+fn replace_idents(value: &str, map: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut token = String::new();
+    let flush = |token: &mut String, out: &mut String| {
+        if token.is_empty() {
+            return;
+        }
+        let key = token.to_ascii_lowercase();
+        match map.get(&key) {
+            Some(rep) => out.push_str(rep),
+            None => out.push_str(token),
+        }
+        token.clear();
+    };
+    for c in value.chars() {
+        if c.is_alphanumeric() || c == '-' || c == '_' {
+            token.push(c);
+        } else {
+            flush(&mut token, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut token, &mut out);
+    out
+}
+
+/// Split a function's argument list on top-level commas (commas inside
+/// nested parentheses or quotes stay put).
+fn split_args_top(inner: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    for c in inner.chars() {
+        match quote {
+            Some(q) => {
+                buf.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' => {
+                    quote = Some(c);
+                    buf.push(c);
+                }
+                '(' => {
+                    depth += 1;
+                    buf.push(c);
+                }
+                ')' => {
+                    depth -= 1;
+                    buf.push(c);
+                }
+                ',' if depth == 0 => {
+                    out.push(std::mem::take(&mut buf));
+                }
+                _ => buf.push(c),
+            },
+        }
+    }
+    if !buf.trim().is_empty() || !out.is_empty() {
+        out.push(buf);
+    }
+    out
+}
+
+/// Live counter values during the document-order counter pass.
+/// One stack per name: each entry is (depth of the element that opened
+/// the scope, current value). Innermost scope is the last entry.
+#[derive(Default)]
+pub(crate) struct CounterScopes {
+    stacks: HashMap<String, Vec<(usize, i64)>>,
+}
+
+impl CounterScopes {
+    /// Leaving a subtree: scopes opened deeper than `depth` are gone.
+    /// A scope opened by a preceding sibling (same depth) survives —
+    /// counter-reset covers the element, its descendants *and* its
+    /// following siblings (CSS 2.1 §12.4.2).
+    fn prune(&mut self, depth: usize) {
+        for stack in self.stacks.values_mut() {
+            while stack.last().is_some_and(|&(d, _)| d > depth) {
+                stack.pop();
+            }
+        }
+        self.stacks.retain(|_, s| !s.is_empty());
+    }
+
+    fn reset(&mut self, name: &str, depth: usize, value: i64) {
+        let stack = self.stacks.entry(name.to_string()).or_default();
+        // a second reset by a sibling replaces the sibling's scope
+        // rather than nesting inside it
+        if stack.last().is_some_and(|&(d, _)| d == depth) {
+            stack.pop();
+        }
+        stack.push((depth, value));
+    }
+
+    fn increment(&mut self, name: &str, depth: usize, by: i64) {
+        let stack = self.stacks.entry(name.to_string()).or_default();
+        match stack.last_mut() {
+            Some((_, v)) => *v += by,
+            None => stack.push((depth, by)), // increment opens a scope at 0
+        }
+    }
+
+    fn value(&self, name: &str) -> i64 {
+        self.stacks
+            .get(name)
+            .and_then(|s| s.last())
+            .map_or(0, |&(_, v)| v)
+    }
+
+    fn all(&self, name: &str) -> Vec<i64> {
+        self.stacks
+            .get(name)
+            .map(|s| s.iter().map(|&(_, v)| v).collect())
+            .unwrap_or_default()
+    }
+}
+
+impl CounterScopes {
+    /// counter-set: change the innermost value without opening a scope
+    /// (unless none exists, in which case it behaves like a reset).
+    fn set(&mut self, name: &str, depth: usize, value: i64) {
+        let stack = self.stacks.entry(name.to_string()).or_default();
+        match stack.last_mut() {
+            Some((_, v)) => *v = value,
+            None => stack.push((depth, value)),
+        }
+    }
+}
+
+/// One `counter-reset` / `counter-increment` item:
+/// (name, explicit value, was spelled reversed(name)).
+fn parse_counter_decl(raw: &str) -> Vec<(String, Option<i64>, bool)> {
+    let mut out: Vec<(String, Option<i64>, bool)> = Vec::new();
+    for tok in raw.split_whitespace() {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Ok(n) = t.parse::<i64>() {
+            if let Some(last) = out.last_mut() {
+                if last.1.is_none() {
+                    last.1 = Some(n);
+                    continue;
+                }
+            }
+            continue; // stray integer: drop it
+        }
+        let low = t.to_ascii_lowercase();
+        if matches!(low.as_str(), "none" | "inherit" | "initial" | "unset") {
+            continue;
+        }
+        if let Some(inner) = low
+            .strip_prefix("reversed(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            out.push((inner.trim().to_string(), None, true));
+        } else {
+            out.push((t.to_string(), None, false));
+        }
+    }
+    out
+}
+
+/// Whether this element's own `counter-reset` names `name` (a nested
+/// reset opens an inner scope, which shadows ours for everything after
+/// it — the reversed() pre-scan must stop there).
+fn resets_counter(doc: &Document, idx: usize, name: &str) -> bool {
+    doc.nodes[idx]
+        .style
+        .get("counter-reset")
+        .map(|raw| parse_counter_decl(raw).iter().any(|(n, _, _)| n == name))
+        .unwrap_or(false)
+}
+
+/// Is this element a list item for the implicit `list-item` counter,
+/// and by how much does it implicitly increment? (±1; reversed <ol>
+/// children count down.)
+fn implicit_list_increment(doc: &Document, idx: usize) -> Option<i64> {
+    let node = &doc.nodes[idx];
+    let is_item = match node.style.get("display") {
+        Some(d) => d.trim().eq_ignore_ascii_case("list-item"),
+        None => node.tag.as_deref() == Some("li"),
+    };
+    if !is_item {
+        return None;
+    }
+    if node
+        .style
+        .get("counter-increment")
+        .map(|raw| {
+            parse_counter_decl(raw).iter().any(|(n, _, _)| n == "list-item")
+        })
+        .unwrap_or(false)
+    {
+        return None; // an explicit increment replaces the implicit one
+    }
+    let reversed = node
+        .parent
+        .map(|p| {
+            doc.nodes[p].tag.as_deref() == Some("ol")
+                && doc.nodes[p].attr("reversed").is_some()
+        })
+        .unwrap_or(false);
+    Some(if reversed { -1 } else { 1 })
+}
+
+/// Sum and last of the increments of `name` over one element (its own
+/// increment, then its subtree in document order).
+fn scan_increments(
+    doc: &Document,
+    idx: usize,
+    name: &str,
+    sum: &mut i64,
+    last: &mut Option<i64>,
+) {
+    if !doc.nodes[idx].is_element() {
+        return;
+    }
+    if let Some(raw) = doc.nodes[idx].style.get("counter-increment") {
+        for (n, v, _) in parse_counter_decl(raw) {
+            if n == name {
+                let by = v.unwrap_or(1);
+                *sum += by;
+                *last = Some(by);
+            }
+        }
+    }
+    if name == "list-item" {
+        if let Some(by) = implicit_list_increment(doc, idx) {
+            *sum += by;
+            *last = Some(by);
+        }
+    }
+    for k in 0..doc.nodes[idx].children.len() {
+        let child = doc.nodes[idx].children[k];
+        if !doc.nodes[child].is_element() {
+            continue;
+        }
+        if resets_counter(doc, child, name) {
+            break; // inner scope shadows the rest of this level
+        }
+        scan_increments(doc, child, name, sum, last);
+    }
+}
+
+/// Starting value of `counter-reset: reversed(name)` with no explicit
+/// integer: chosen so the value after the final increment in scope is
+/// the negation of that increment — an <ol reversed> of N items runs
+/// N..1 (CSS Lists 3 §3.1.1). Scope: the element, its subtree, then
+/// its following siblings until one resets the same counter.
+fn reversed_start(doc: &Document, el: usize, name: &str) -> i64 {
+    let mut sum = 0i64;
+    let mut last: Option<i64> = None;
+    if let Some(raw) = doc.nodes[el].style.get("counter-increment") {
+        for (n, v, _) in parse_counter_decl(raw) {
+            if n == name {
+                let by = v.unwrap_or(1);
+                sum += by;
+                last = Some(by);
+            }
+        }
+    }
+    for k in 0..doc.nodes[el].children.len() {
+        let child = doc.nodes[el].children[k];
+        if !doc.nodes[child].is_element() {
+            continue;
+        }
+        if resets_counter(doc, child, name) {
+            break;
+        }
+        scan_increments(doc, child, name, &mut sum, &mut last);
+    }
+    if let Some(p) = doc.nodes[el].parent {
+        let sibs: Vec<usize> = doc.nodes[p].children.clone();
+        if let Some(pos) = sibs.iter().position(|&c| c == el) {
+            for &s in &sibs[pos + 1..] {
+                if !doc.nodes[s].is_element() {
+                    continue;
+                }
+                if resets_counter(doc, s, name) {
+                    break;
+                }
+                scan_increments(doc, s, name, &mut sum, &mut last);
+            }
+        }
+    }
+    match last {
+        Some(l) => -sum - l,
+        None => 0,
+    }
+}
+
+/// The document-order counter pass (CSS Lists 3): walk elements and
+/// pseudos in tree order, apply counter-reset/-set/-increment, and
+/// re-resolve any ::before/::after content that reads a counter.
+/// Runs after styling — the pseudos exist as real children by then,
+/// created with an empty text box that this pass fills in.
+pub(crate) fn resolve_counters(doc: &mut Document) {
+    // pay for the walk only when the page uses counters at all
+    let used = doc.nodes.iter().any(|n| {
+        n.style.contains_key("counter-reset")
+            || n.style.contains_key("counter-increment")
+            || n.style.contains_key("counter-set")
+            || n.style
+                .get("content")
+                .is_some_and(|c| c.contains("counter"))
+    });
+    if !used {
+        return;
+    }
+    let mut ctrs = CounterScopes::default();
+    let root = doc.root;
+    counter_visit(doc, root, 0, &mut ctrs);
+}
+
+fn counter_visit(
+    doc: &mut Document,
+    idx: usize,
+    depth: usize,
+    ctrs: &mut CounterScopes,
+) {
+    if !doc.nodes[idx].is_element() {
+        return;
+    }
+    ctrs.prune(depth);
+    let is_pseudo = matches!(
+        doc.nodes[idx].tag.as_deref(),
+        Some("::before" | "::after")
+    );
+    if let Some(raw) = doc.nodes[idx].style.get("counter-reset").cloned() {
+        for (name, val, reversed) in parse_counter_decl(&raw) {
+            let start = match (reversed, val) {
+                (true, Some(v)) => v,
+                (true, None) => reversed_start(doc, idx, &name),
+                (false, v) => v.unwrap_or(0),
+            };
+            ctrs.reset(&name, depth, start);
+        }
+    }
+    // <ol>/<ul> open the implicit list-item scope; <ol start> shifts
+    // it and <ol reversed> counts down through it
+    if matches!(doc.nodes[idx].tag.as_deref(), Some("ol" | "ul" | "menu")) {
+        let start = doc.nodes[idx]
+            .attr("start")
+            .and_then(|s| s.trim().parse::<i64>().ok());
+        let reversed = doc.nodes[idx].tag.as_deref() == Some("ol")
+            && doc.nodes[idx].attr("reversed").is_some();
+        let value = match (reversed, start) {
+            (true, Some(s)) => s + 1,
+            (true, None) => reversed_start(doc, idx, "list-item"),
+            (false, Some(s)) => s - 1,
+            (false, None) => 0,
+        };
+        ctrs.reset("list-item", depth, value);
+    }
+    if let Some(raw) = doc.nodes[idx].style.get("counter-set").cloned() {
+        for (name, val, _) in parse_counter_decl(&raw) {
+            ctrs.set(&name, depth, val.unwrap_or(0));
+        }
+    }
+    if let Some(raw) = doc.nodes[idx].style.get("counter-increment").cloned()
+    {
+        for (name, val, _) in parse_counter_decl(&raw) {
+            ctrs.increment(&name, depth, val.unwrap_or(1));
+        }
+    }
+    if let Some(by) = implicit_list_increment(doc, idx) {
+        match doc.nodes[idx]
+            .attr("value")
+            .and_then(|s| s.trim().parse::<i64>().ok())
+        {
+            Some(v) => ctrs.set("list-item", depth, v),
+            None => ctrs.increment("list-item", depth, by),
+        }
+    }
+    // a pseudo's content reads the state as of this point
+    if is_pseudo {
+        let content = doc.nodes[idx].style.get("content").cloned();
+        if let Some(c) = content {
+            if c.contains("counter") {
+                let host = doc.nodes[idx].parent.unwrap_or(idx);
+                let text = {
+                    let host_attrs = |name: &str| {
+                        doc.nodes[host].attr(name).map(|v| v.to_string())
+                    };
+                    content_text_ctr(&c, &host_attrs, Some(ctrs))
+                };
+                if let Some(text) = text {
+                    let existing = doc.nodes[idx]
+                        .children
+                        .iter()
+                        .copied()
+                        .find(|&c| doc.nodes[c].is_text());
+                    match existing {
+                        Some(t) => doc.nodes[t].text = text,
+                        None if !text.is_empty() => {
+                            doc.new_text(text, idx);
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+    }
+    // `display: contents` removes the element from the box tree, and
+    // counters follow that flattened order: its children number as if
+    // they were siblings of the element itself (this is exactly what
+    // css-lists/counter-order-display-contents.html asserts).
+    let contents = doc.nodes[idx]
+        .style
+        .get("display")
+        .is_some_and(|d| d.trim().eq_ignore_ascii_case("contents"));
+    let child_depth = if contents { depth } else { depth + 1 };
+    for k in 0..doc.nodes[idx].children.len() {
+        let child = doc.nodes[idx].children[k];
+        counter_visit(doc, child, child_depth, ctrs);
+    }
+}
+
+/// One counter value rendered in a @counter-style-less world: the
+/// predefined styles a page actually uses, anything else as decimal.
+fn format_counter(v: i64, style: &str) -> String {
+    match style.trim().to_ascii_lowercase().as_str() {
+        "none" => String::new(),
+        "disc" => "\u{2022}".into(),
+        "circle" => "\u{25e6}".into(),
+        "square" => "\u{25aa}".into(),
+        "decimal-leading-zero" => {
+            if (0..=9).contains(&v) {
+                format!("0{v}")
+            } else if (-9..0).contains(&v) {
+                format!("-0{}", -v)
+            } else {
+                v.to_string()
+            }
+        }
+        s @ ("lower-roman" | "upper-roman") if v >= 1 => {
+            let mut n = v;
+            let mut out = String::new();
+            for (val, sym) in [
+                (1000, "m"), (900, "cm"), (500, "d"), (400, "cd"),
+                (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
+                (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"),
+            ] {
+                while n >= val {
+                    out.push_str(sym);
+                    n -= val;
+                }
+            }
+            if s == "upper-roman" {
+                out.to_ascii_uppercase()
+            } else {
+                out
+            }
+        }
+        s @ ("lower-alpha" | "lower-latin" | "upper-alpha"
+        | "upper-latin") if v >= 1 => {
+            // bijective base 26: 1..26 = a..z, 27 = aa
+            let mut n = v;
+            let mut out = Vec::new();
+            while n > 0 {
+                n -= 1;
+                out.push(b'a' + (n % 26) as u8);
+                n /= 26;
+            }
+            out.reverse();
+            let text = String::from_utf8(out).unwrap_or_default();
+            if s.starts_with("upper") {
+                text.to_ascii_uppercase()
+            } else {
+                text
+            }
+        }
+        _ => v.to_string(),
+    }
+}
+
 fn content_text(raw: &str, attrs: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    content_text_ctr(raw, attrs, None)
+}
+
+fn content_text_ctr(
+    raw: &str,
+    attrs: &dyn Fn(&str) -> Option<String>,
+    counters: Option<&CounterScopes>,
+) -> Option<String> {
     let t = raw.trim();
     if t.is_empty() || t == "none" || t == "normal" {
         return None;
@@ -441,14 +1020,43 @@ fn content_text(raw: &str, attrs: &dyn Fn(&str) -> Option<String>) -> Option<Str
             }
             let inner: String = b[arg_start..i.min(b.len())].iter().collect();
             i += 1;
-            if name != "attr" {
-                // A component this engine cannot resolve — counter(),
-                // counters(), url(), image() — makes the whole value
-                // unresolvable. Emitting the string parts around it
+            if name == "counter" || name == "counters" {
+                // With no live counter state this component is
+                // unresolvable and the whole value collapses to an
+                // empty box — emitting the string parts around it
                 // would draw the separators of a value whose contents
-                // are missing: `counter(a) "," counter(b)` would come
-                // out as a bare comma. An empty box is the honest
-                // rendering, and it is what this did before attr().
+                // are missing. The counter pass re-resolves the same
+                // declaration with the state filled in.
+                let Some(ctrs) = counters else {
+                    return Some(String::new());
+                };
+                let args: Vec<String> = split_args_top(&inner);
+                let cname = args
+                    .first()
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                if name == "counter" {
+                    let style = args.get(1).map(|s| s.as_str()).unwrap_or("decimal");
+                    out.push_str(&format_counter(ctrs.value(&cname), style));
+                } else {
+                    let sep = args
+                        .get(1)
+                        .map(|s| s.trim().trim_matches(['"', '\'']).to_string())
+                        .unwrap_or_default();
+                    let style = args.get(2).map(|s| s.as_str()).unwrap_or("decimal");
+                    let vals = ctrs.all(&cname);
+                    let vals = if vals.is_empty() { vec![0] } else { vals };
+                    let parts: Vec<String> = vals
+                        .iter()
+                        .map(|&v| format_counter(v, style))
+                        .collect();
+                    out.push_str(&parts.join(&sep));
+                }
+                continue;
+            }
+            if name != "attr" {
+                // url(), image(), element() — nothing this engine can
+                // put in a text run; the whole value is unresolvable.
                 return Some(String::new());
             }
             {
