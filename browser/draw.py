@@ -324,6 +324,40 @@ class DrawOpacityPop:
         return (12, 0.0, 0.0, 0.0, 0.0, (0, 0, 0), 0.0, 0, "")
 
 
+class DrawClipEllipse:
+    """Clip to the ellipse inscribed in this rect until the matching
+    pop — circle() and ellipse() clip-paths land here. Survives
+    culling for the same stack-balance reason as the rect clip."""
+
+    def __init__(self, x1, y1, x2, y2):
+        self.left = x1
+        self.right = x2
+        self.clip_top = y1
+        self.clip_bottom = y2
+        self.top = -1e9
+        self.bottom = 1e9
+
+    def execute(self, scroll, canvas):
+        pass  # tk fallback does not clip
+
+    def native(self, scroll, hscroll=0.0):
+        return (13, self.left - hscroll, self.clip_top - scroll,
+                self.right - hscroll, self.clip_bottom - scroll,
+                (0, 0, 0), 0.0, 0, "")
+
+
+class DrawClipEllipsePop:
+    def __init__(self):
+        self.top = -1e9
+        self.bottom = 1e9
+
+    def execute(self, scroll, canvas):
+        pass
+
+    def native(self, scroll, hscroll=0.0):
+        return (14, 0.0, 0.0, 0.0, 0.0, (0, 0, 0), 0.0, 0, "")
+
+
 class DrawClipPush:
     """Intersect the clip region with this rect until the matching pop.
     Always survives viewport culling (top/bottom span the page) so the

@@ -243,7 +243,7 @@ impl TextEngine {
         match kind {
             // brackets carry no geometry of their own and must survive
             // culling, or a push loses its pop and the state leaks
-            6 | 7 | 11 | 12 => Some((
+            6 | 7 | 11 | 12 | 13 | 14 => Some((
                 kind,
                 x1 - dx,
                 y1 - dy,
@@ -389,6 +389,10 @@ impl TextEngine {
             bg,
         );
         let mut clip_stack: Vec<(i32, i32, i32, i32)> = Vec::new();
+        let mut eclip_stack: Vec<(
+            (i32, i32, i32, i32),
+            Option<(f64, f64, f64, f64)>,
+        )> = Vec::new();
         let mut opacity_stack: Vec<u8> = Vec::new();
         for (kind, x1, y1, x2, y2, color, aux, font, text) in cmds {
             match kind {
@@ -451,6 +455,15 @@ impl TextEngine {
                 7 => {
                     if let Some(prev) = clip_stack.pop() {
                         r.set_clip(prev);
+                    }
+                }
+                // kind 13: elliptical clip inscribed in the rect;
+                // kind 14: pop it
+                13 => eclip_stack
+                    .push(r.push_clip_ellipse(*x1, *y1, *x2, *y2)),
+                14 => {
+                    if let Some(prev) = eclip_stack.pop() {
+                        r.pop_clip_ellipse(prev);
                     }
                 }
                 _ => {}

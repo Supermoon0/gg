@@ -10,7 +10,8 @@ import tkinter.font
 
 from . import textengine
 from .colors import NAMED, to_rgb
-from .draw import (DrawBgImage, DrawClipPop, DrawClipPush, DrawGradient,
+from .draw import (DrawBgImage, DrawClipEllipse, DrawClipEllipsePop,
+                   DrawClipPop, DrawClipPush, DrawGradient,
                    DrawImage, DrawLine, DrawOpacityPop, DrawOpacityPush,
                    DrawOval, DrawRect, DrawStickyPop,
                    DrawStickyPush, DrawText,
@@ -5814,6 +5815,17 @@ class BlockLayout:
                                         grad[0], grad[1], radius=r)
                 return DrawRect(bx1, by1, bx2, by2, color, radius=r)
 
+            # four equal elliptical corner radii covering half the box
+            # make the box an ellipse — the shape corner_radius (one
+            # circular value) cannot spell. Paint the background
+            # through an elliptical clip instead.
+            if color and _full_ellipse_box(self.node, cx2 - cx1,
+                                           cy2 - cy1):
+                cmds.append(DrawClipEllipse(cx1, cy1, cx2, cy2))
+                cmds.append(bg_fill(cx1, cy1, cx2, cy2, 0))
+                cmds.append(DrawClipEllipsePop())
+                color = ""
+
             if radius > 0 and self.bt > 0 and uniform_border and color:
                 # rounded box: border ring = outer rounded fill,
                 # then the background inset by the border width
@@ -6985,6 +6997,229 @@ def clip_path_inset(node, em, x1, y1, x2, y2):
             max(y2 - bottom, y1 + top))
 
 
+def _shape_position(tokens, w, h, em):
+    """`at <position>` -> (cx, cy) within a w x h box (defaults center)."""
+    cx, cy = w / 2.0, h / 2.0
+    if not tokens:
+        return cx, cy
+    xs = []
+    for t in tokens:
+        low = t.casefold()
+        if low == "left":
+            xs.append(("x", 0.0))
+        elif low == "right":
+            xs.append(("x", w))
+        elif low == "top":
+            xs.append(("y", 0.0))
+        elif low == "bottom":
+            xs.append(("y", h))
+        elif low == "center":
+            xs.append(("c", None))
+        else:
+            v = parse_size(t, w if not xs or xs[-1][0] != "y" else h, em)
+            xs.append(("v", v if v is not None else 0.0))
+    plain = [e for e in xs if e[0] in ("v", "c")]
+    if len(plain) == len(xs):                # positional: x then y
+        if len(xs) >= 1 and xs[0][0] == "v":
+            cx = parse_size(tokens[0], w, em) or 0.0
+        if len(xs) >= 2 and xs[1][0] == "v":
+            cy = parse_size(tokens[1], h, em) or 0.0
+        return cx, cy
+    for kind, v in xs:
+        if kind == "x":
+            cx = v
+        elif kind == "y":
+            cy = v
+    return cx, cy
+
+
+def _radius_px(token, extent, em):
+    """One circle/ellipse radius against its axis extent."""
+    t = (token or "").casefold()
+    if t in ("closest-side", "farthest-side", ""):
+        return extent / 2.0
+    v = parse_size(token, extent, em)
+    return v if v is not None else extent / 2.0
+
+
+def clip_path_shape(node, em, x1, y1, x2, y2):
+    """The clip a `clip-path` asks for, in the shapes this display
+    list can express: ("rect", x1, y1, x2, y2) or ("ellipse",
+    bounding box). None means no clip (or a shape this engine still
+    cannot cut — a polygon that is not an axis-aligned rectangle is
+    left alone rather than approximated: a box is not a hexagon).
+    """
+    spec = ((getattr(node, "style", None) or {}).get("clip-path")
+            or "").strip()
+    if not spec or spec.casefold() == "none":
+        return None
+    low = spec.casefold()
+    w, h = x2 - x1, y2 - y1
+
+    # a bare geometry-box keyword clips to that box; one following a
+    # shape re-bases the shape's reference box
+    box_kw = None
+    for kw in ("margin-box", "border-box", "padding-box", "content-box",
+               "fill-box", "stroke-box", "view-box"):
+        if kw in low:
+            box_kw = kw
+            break
+    if box_kw and "(" not in low:
+        bx1, by1, bx2, by2 = _geometry_box(node, box_kw, x1, y1, x2, y2)
+        return ("rect", bx1, by1, bx2, by2)
+    if box_kw:
+        x1, y1, x2, y2 = _geometry_box(node, box_kw, x1, y1, x2, y2)
+        w, h = x2 - x1, y2 - y1
+
+    m = re.search(r"(circle|ellipse|xywh|rect|polygon|inset)\s*\(",
+                  low)
+    if not m:
+        return None
+    fn = m.group(1)
+    inner = spec[m.end():]
+    depth = 1
+    for i, ch in enumerate(inner):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                inner = inner[:i]
+                break
+    if fn == "inset":
+        r = clip_path_inset(node, em, x1, y1, x2, y2)
+        return ("rect",) + r if r else None
+    if fn in ("circle", "ellipse"):
+        if "at" in inner.casefold().split():
+            shape_part, _, pos_part = inner.partition(" at ")
+        else:
+            shape_part, pos_part = inner, ""
+        radii = _split_ws_top(shape_part.strip())
+        cx, cy = _shape_position(
+            _split_ws_top(pos_part.strip()), w, h, em)
+        if fn == "circle":
+            diag = ((w * w + h * h) / 2.0) ** 0.5
+            rx = ry = _radius_px(radii[0] if radii else "", diag, em)
+            if radii and radii[0].casefold() == "closest-side":
+                rx = ry = min(cx, w - cx, cy, h - cy)
+            elif radii and radii[0].casefold() == "farthest-side":
+                rx = ry = max(cx, w - cx, cy, h - cy)
+        else:
+            rx = _radius_px(radii[0] if radii else "", w, em)
+            ry = _radius_px(radii[1] if len(radii) > 1 else "", h, em)
+            if radii and radii[0].casefold() == "closest-side":
+                rx = min(cx, w - cx)
+            if len(radii) > 1 and radii[1].casefold() == "closest-side":
+                ry = min(cy, h - cy)
+        return ("ellipse", x1 + cx - rx, y1 + cy - ry,
+                x1 + cx + rx, y1 + cy + ry)
+    if fn == "xywh":
+        parts = _split_ws_top(inner.split("round")[0])
+        if len(parts) < 4:
+            return None
+        vx = parse_size(parts[0], w, em) or 0.0
+        vy = parse_size(parts[1], h, em) or 0.0
+        vw = parse_size(parts[2], w, em) or 0.0
+        vh = parse_size(parts[3], h, em) or 0.0
+        return ("rect", x1 + vx, y1 + vy,
+                x1 + vx + max(vw, 0.0), y1 + vy + max(vh, 0.0))
+    if fn == "rect":
+        parts = _split_ws_top(inner.split("round")[0].replace(",", " "))
+        if len(parts) < 4:
+            return None
+        def side(tok, base, auto_to):
+            t = tok.casefold()
+            if t == "auto":
+                return auto_to
+            v = parse_size(tok, base, em)
+            return v if v is not None else auto_to
+        top = side(parts[0], h, 0.0)
+        right = side(parts[1], w, w)
+        bottom = side(parts[2], h, h)
+        left = side(parts[3], w, 0.0)
+        return ("rect", x1 + left, y1 + top,
+                x1 + max(right, left), y1 + max(bottom, top))
+    if fn == "polygon":
+        pts = []
+        for pair in inner.split(","):
+            toks = _split_ws_top(pair.strip())
+            if toks and toks[0].casefold() in ("nonzero", "evenodd"):
+                toks = toks[1:]
+            if len(toks) < 2:
+                continue
+            px2 = parse_size(toks[0], w, em)
+            py2 = parse_size(toks[1], h, em)
+            if px2 is None or py2 is None:
+                return None
+            pts.append((px2, py2))
+        if len(pts) < 3:
+            return None
+        xs = sorted({round(p[0], 3) for p in pts})
+        ys = sorted({round(p[1], 3) for p in pts})
+        if len(xs) != 2 or len(ys) != 2:
+            return None          # not an axis-aligned rectangle
+        corners = {(cx0, cy0) for cx0 in xs for cy0 in ys}
+        if {(round(p[0], 3), round(p[1], 3)) for p in pts} != corners:
+            return None
+        return ("rect", x1 + xs[0], y1 + ys[0], x1 + xs[1], y1 + ys[1])
+    return None
+
+
+def _geometry_box(node, kw, x1, y1, x2, y2):
+    """The named reference box, given the border box. Layout metrics
+    for the margins/padding live on the box object, not the node, so
+    they are re-derived from the style the same way layout did."""
+    st = getattr(node, "style", None) or {}
+    em = parse_px(st.get("font-size", "16px"), 16.0)
+
+    def px(prop):
+        return parse_size(st.get(prop), 0.0, em) or 0.0
+
+    if kw == "margin-box":
+        return (x1 - px("margin-left"), y1 - px("margin-top"),
+                x2 + px("margin-right"), y2 + px("margin-bottom"))
+    if kw in ("border-box", "stroke-box", "view-box"):
+        return x1, y1, x2, y2
+    bw = px("border-width")
+    bt = parse_size(st.get("border-top-width"), 0.0, em)
+    bt = bw if bt is None else bt
+    br = parse_size(st.get("border-right-width"), 0.0, em)
+    br = bw if br is None else br
+    bb = parse_size(st.get("border-bottom-width"), 0.0, em)
+    bb = bw if bb is None else bb
+    bl = parse_size(st.get("border-left-width"), 0.0, em)
+    bl = bw if bl is None else bl
+    px1, py1 = x1 + bl, y1 + bt
+    px2, py2 = x2 - br, y2 - bb
+    if kw in ("padding-box",):
+        return px1, py1, px2, py2
+    return (px1 + px("padding-left"), py1 + px("padding-top"),
+            px2 - px("padding-right"), py2 - px("padding-bottom"))
+
+
+def _full_ellipse_box(node, w, h):
+    """True when all four corner radii are one elliptical pair that
+    reaches at least half the box each way: the border box is an
+    ellipse (`border-radius: 50%` twice over, corner by corner)."""
+    st = getattr(node, "style", None) or {}
+    corners = []
+    for c in ("top-left", "top-right", "bottom-right", "bottom-left"):
+        raw = (st.get(f"border-{c}-radius") or "").strip()
+        if not raw:
+            return False
+        parts = raw.split()
+        if len(parts) < 2:
+            return False
+        corners.append((parts[0], parts[1]))
+    if len(set(corners)) != 1:
+        return False
+    em = parse_px(st.get("font-size", "16px"), 16.0)
+    rx = parse_size(corners[0][0], w, em)
+    ry = parse_size(corners[0][1], h, em)
+    return (rx is not None and ry is not None and w > 0 and h > 0
+            and rx >= w / 2 - 0.5 and ry >= h / 2 - 0.5)
+
+
 def paint_tree(layout_object, display_list):
     # opacity fades the whole subtree, so it brackets everything the box
     # paints rather than tinting one command
@@ -6992,7 +7227,7 @@ def paint_tree(layout_object, display_list):
         return _paint_tree_uncomposited(layout_object, display_list)
     alpha = own_opacity(layout_object.node)
     box = layout_object
-    clip = clip_path_inset(
+    clip = clip_path_shape(
         box.node,
         parse_px((getattr(box.node, "style", None) or {}).get(
             "font-size", "16px"), 16.0),
@@ -7004,8 +7239,11 @@ def paint_tree(layout_object, display_list):
     inner = _paint_tree_uncomposited(layout_object, [])
     if not inner:
         return display_list
-    if clip is not None:
-        inner = [DrawClipPush(*clip)] + inner + [DrawClipPop()]
+    if clip is not None and clip[0] == "rect":
+        inner = [DrawClipPush(*clip[1:])] + inner + [DrawClipPop()]
+    elif clip is not None:
+        inner = [DrawClipEllipse(*clip[1:])] + inner \
+            + [DrawClipEllipsePop()]
     if alpha is not None:
         inner = [DrawOpacityPush(alpha)] + inner + [DrawOpacityPop()]
     display_list.extend(inner)

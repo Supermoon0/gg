@@ -78,6 +78,10 @@ pub struct Raster {
     pub buf: Vec<u8>, // RGB
     /// current clip rect (x1, y1, x2, y2); pixels outside are skipped
     clip: (i32, i32, i32, i32),
+    /// optional elliptical clip (cx, cy, rx, ry): a pixel must also be
+    /// inside this ellipse. One level — clip-path does not nest inside
+    /// a single element's paint bracket.
+    clip_ellipse: Option<(f64, f64, f64, f64)>,
     /// CSS opacity in force, 0..=255, applied to every pixel written.
     ///
     /// This is per-command alpha, not group compositing: two
@@ -103,6 +107,7 @@ impl Raster {
             height,
             buf,
             clip: (0, 0, width as i32, height as i32),
+            clip_ellipse: None,
             opacity: 255,
         }
     }
@@ -132,6 +137,52 @@ impl Raster {
 
     pub fn set_clip(&mut self, c: (i32, i32, i32, i32)) {
         self.clip = c;
+    }
+
+    /// Clip to the ellipse inscribed in (x1, y1, x2, y2), intersecting
+    /// the rect clip with its bounding box. Returns the previous
+    /// (rect, ellipse) state for the matching pop.
+    #[allow(clippy::type_complexity)]
+    pub fn push_clip_ellipse(
+        &mut self,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    ) -> ((i32, i32, i32, i32), Option<(f64, f64, f64, f64)>) {
+        let prev_e = self.clip_ellipse;
+        let prev_r = self.push_clip(x1, y1, x2, y2);
+        self.clip_ellipse = Some((
+            (x1 + x2) / 2.0,
+            (y1 + y2) / 2.0,
+            ((x2 - x1) / 2.0).max(0.01),
+            ((y2 - y1) / 2.0).max(0.01),
+        ));
+        (prev_r, prev_e)
+    }
+
+    pub fn pop_clip_ellipse(
+        &mut self,
+        prev: ((i32, i32, i32, i32), Option<(f64, f64, f64, f64)>),
+    ) {
+        self.clip = prev.0;
+        self.clip_ellipse = prev.1;
+    }
+
+    /// Coverage of a pixel under the elliptical clip: 1 well inside,
+    /// 0 outside, a ~1px feather at the rim so a clipped box matches
+    /// the antialiased edge a border-radius circle draws.
+    #[inline]
+    fn ellipse_coverage(&self, x: i32, y: i32) -> f64 {
+        match self.clip_ellipse {
+            None => 1.0,
+            Some((cx, cy, rx, ry)) => {
+                let dx = (x as f64 + 0.5 - cx) / rx;
+                let dy = (y as f64 + 0.5 - cy) / ry;
+                let d = (dx * dx + dy * dy).sqrt();
+                ((1.0 - d) * rx.min(ry) + 0.5).clamp(0.0, 1.0)
+            }
+        }
     }
 
     #[inline]
@@ -167,6 +218,11 @@ impl Raster {
         {
             return;
         }
+        let alpha = if self.clip_ellipse.is_none() {
+            alpha
+        } else {
+            (alpha as f64 * self.ellipse_coverage(x, y)) as u8
+        };
         if alpha == 0 {
             return;
         }
@@ -192,6 +248,14 @@ impl Raster {
         let x2 = (x2.round() as i32).min(self.width as i32).min(self.clip.2);
         let y2 = (y2.round() as i32).min(self.height as i32).min(self.clip.3);
         if self.opacity != 255 {
+            for y in y1..y2 {
+                for x in x1..x2 {
+                    self.blend(x, y, color, 255);
+                }
+            }
+            return;
+        }
+        if self.clip_ellipse.is_some() {
             for y in y1..y2 {
                 for x in x1..x2 {
                     self.blend(x, y, color, 255);
