@@ -3118,6 +3118,43 @@ class DocumentLayout:
         return []
 
 
+class _JustifySwap:
+    """A node view whose justify-content is replaced — how
+    column-reverse re-anchors the main axis without the column
+    algorithm knowing."""
+
+    __slots__ = ("_node", "_justify", "style")
+
+    def __init__(self, node, justify):
+        self._node = node
+        self._justify = justify
+        self.style = _SwappedStyle(node.style, justify)
+
+    def __getattr__(self, name):
+        return getattr(self._node, name)
+
+
+class _SwappedStyle:
+    __slots__ = ("_style", "_justify")
+
+    def __init__(self, style, justify):
+        self._style = style
+        self._justify = justify
+
+    def get(self, key, default=None):
+        if key == "justify-content":
+            return self._justify
+        return self._style.get(key, default)
+
+    def __contains__(self, key):
+        return key == "justify-content" or key in self._style
+
+    def __getitem__(self, key):
+        if key == "justify-content":
+            return self._justify
+        return self._style[key]
+
+
 class BlockLayout:
     def __init__(self, node, parent, previous):
         self.node = node
@@ -3858,8 +3895,23 @@ class BlockLayout:
         justify-content distributes leftover space down the column and
         align-items/align-self place items across it (stretch fills the
         width, center/end shrink-to-fit and shift). row-gap sits between
-        items."""
+        items.
+
+        column-reverse runs the same algorithm on the reversed item
+        list with the main-axis start swapped to the far end: the
+        first item lands at the bottom, which is where its default
+        justify-content packs it."""
         doc = self._document()
+        if node.style.get("flex-direction", "").strip().casefold() \
+                == "column-reverse":
+            kids = list(reversed(kids))
+            justify = (node.style.get("justify-content", "flex-start")
+                       .strip().casefold())
+            swap = {"flex-start": "flex-end", "start": "end",
+                    "": "flex-end", "normal": "flex-end",
+                    "flex-end": "flex-start", "end": "start"}
+            if justify in swap:
+                node = _JustifySwap(node, swap[justify])
         align = node.style.get("align-items", "stretch").strip().casefold()
 
         def _num(v, default):
@@ -3990,7 +4042,22 @@ class BlockLayout:
 
         if node.style.get("flex-direction", "row").startswith("column"):
             self._layout_flex_column(node, em, kid_nodes, row_gap)
+            if node.style.get("flex-direction", "") \
+                    .strip().casefold() == "column-reverse":
+                # layout ran on the reversed list; painting still
+                # follows DOM order, so overlaps stack correctly
+                self.children.reverse()
             return
+        if node.style.get("flex-direction", "row").strip().casefold() \
+                == "row-reverse":
+            kid_nodes = list(reversed(kid_nodes))
+            justify = (node.style.get("justify-content", "flex-start")
+                       .strip().casefold())
+            swap = {"flex-start": "flex-end", "start": "end",
+                    "": "flex-end", "normal": "flex-end",
+                    "flex-end": "flex-start", "end": "start"}
+            if justify in swap:
+                node = _JustifySwap(node, swap[justify])
 
         # main size: flex-basis (length) > width > max-content of the
         # item's own content. Every item gets a definite base size; then
@@ -4575,8 +4642,11 @@ class BlockLayout:
         rows_spec = style.get("grid-template-rows", "")
         direction = (style.get("grid-lanes-direction")
                      or style.get("masonry-direction") or "").casefold()
+        dir_tokens = direction.split()
         column_tracks = bool(cols_spec) or (
-            not rows_spec and "row" not in direction.split())
+            not rows_spec and "row" not in dir_tokens)
+        fill_reverse = "fill-reverse" in dir_tokens
+        track_reverse = "track-reverse" in dir_tokens
 
         gap_parts = style.get("gap", "").split()
         row_gap = parse_size(
@@ -4795,16 +4865,37 @@ class BlockLayout:
             offsets.append(cur)
             cur += track_sizes[i] + track_gap + spread
 
+        # fill-reverse stacks each lane from the far edge of the
+        # container (its definite size, else the used extent);
+        # track-reverse mirrors the lane order itself
+        lane_total = None
+        if fill_reverse:
+            if column_tracks:
+                lane_total = (self.definite_height
+                              if self.definite_height is not None
+                              else used_lane)
+            else:
+                lane_total = self.width
+        track_run = (sum(track_sizes) + track_gap * max(n - 1, 0))
+
         self.children = []
         for child, box, t0, ts, pos in placed:
             span_size = (sum(track_sizes[t0:t0 + ts])
                          + track_gap * (ts - 1))
+            t_off = offsets[t0]
+            if track_reverse:
+                t_off = lead + (track_run - (offsets[t0] - lead)
+                                - span_size)
             if column_tracks:
-                ox = self.x + offsets[t0]
+                ox = self.x + t_off
                 oy = self.y + pos
+                if fill_reverse:
+                    oy = self.y + lane_total - pos - box.outer_height()
             else:
                 ox = self.x + pos
-                oy = self.y + offsets[t0]
+                if fill_reverse:
+                    ox = self.x + lane_total - pos - box.outer_width()
+                oy = self.y + t_off
                 align_self = (child.style.get("align-self", "")
                               .strip().casefold() or align_items)
                 if align_self in ("stretch", "normal", "auto", "") \
